@@ -36,6 +36,8 @@ export type PulseVaultAuthorizePhase =
 export type PulseVaultAuthorizeContext = {
   phase: PulseVaultAuthorizePhase;
   videoid: string;
+  /** Bearer / query-string token forwarded from the watch URL, if present. Only populated during the `"resolve"` phase. */
+  token?: string;
 };
 
 export type PulseVaultAuthorize = (
@@ -195,6 +197,16 @@ const videoGetSchema: OpenApiRouteSchema = {
       },
     },
     required: ["videoid"],
+  },
+  querystring: {
+    type: "object",
+    properties: {
+      token: {
+        type: "string",
+        description:
+          "Optional bearer token for pre-authenticated watch links. Forwarded to the `authorize` hook as `ctx.token` so parent servers can validate it without a separate login step.",
+      },
+    },
   },
   response: {
     400: {
@@ -387,12 +399,15 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
 
     request.pulseVault = { videoid };
 
+    // Extract the optional token forwarded by the mobile app in the watch URL.
+    const token = (request.query as { token?: string })?.token;
+
     // Run authorize *before* resolve so consumers can reject without the
     // response leaking "this videoid exists but you don't own it" vs. "no such
     // videoid".
     if (authorize) {
       try {
-        await authorize(request, { phase: "resolve", videoid });
+        await authorize(request, { phase: "resolve", videoid, token });
       } catch (err) {
         const statusCode = extractAuthzStatus(err);
         const message = extractAuthzMessage(err);

@@ -135,6 +135,31 @@
       <p class="mono" id="deeplinkUpload"></p>
     </div>
 
+    <div class="card" style="border-color:#1f6feb;">
+      <strong>3 — Save this server <em>with token</em> <span style="font-size:0.75rem;color:#1f6feb;font-weight:400;">(auth demo)</span></strong>
+      <p style="font-size:0.875rem; color:#8b949e; margin:0.5rem 0 0;">
+        Scan this QR to save the server <strong>with a session token</strong> in the app.
+        Any video you upload using that saved destination will be token-protected:
+        the watch link will include the token, and the server will reject playback without it.
+      </p>
+
+      <hr class="divider" />
+
+      <p style="font-size:0.875rem; color:#8b949e; margin:0 0 0.5rem;">
+        Scan from your phone's camera app, or tap the button if you're on the same device:
+      </p>
+
+      <img id="qrConfigureToken" width="224" height="224" style="display:block;margin:1.25rem auto;border-radius:8px;background:#fff;padding:10px;" />
+
+      <a id="openBtnConfigureToken" class="open-btn" style="background:#1f6feb;" href="#">Save server with token in Pulse App</a>
+
+      <label>Session Token <span style="color:#6e7681;">(verified on every watch request)</span></label>
+      <p class="mono" id="sessionToken"></p>
+
+      <label>Deep link</label>
+      <p class="mono" id="deeplinkConfigureToken"></p>
+    </div>
+
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;">
         <strong>Uploaded Videos</strong>
@@ -162,7 +187,17 @@
         document.getElementById("qrUpload").src = data.qrUpload;
       }
 
+      async function loadTokenDeeplinks() {
+        const data = await fetch("/deeplinks-token").then((r) => r.json());
+
+        document.getElementById("sessionToken").textContent = data.token;
+        document.getElementById("deeplinkConfigureToken").textContent = data.configureDestination;
+        document.getElementById("openBtnConfigureToken").href = data.configureDestination;
+        document.getElementById("qrConfigureToken").src = data.qrConfigure;
+      }
+
       loadDeeplinks();
+      loadTokenDeeplinks();
       document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
 
       function formatSize(bytes) {
@@ -181,8 +216,8 @@
         }
         list.innerHTML = videos.map((v) => `
           <div style="margin-bottom:1rem;padding-bottom:1rem;border-bottom:1px solid #30363d;">
-            <video src="/${v.videoid}" controls preload="metadata" style="width:100%;max-height:26rem;border-radius:6px;background:#000;display:block;object-fit:contain;"></video>
-            <p class="mono" style="margin:0.4rem 0 0;">${v.filename}</p>
+            <video src="/${v.videoid}${v.token ? '?token=' + encodeURIComponent(v.token) : ''}" controls preload="metadata" style="width:100%;max-height:26rem;border-radius:6px;background:#000;display:block;object-fit:contain;"></video>
+            <p class="mono" style="margin:0.4rem 0 0;">${v.filename}${v.token ? ' <span style="color:#1f6feb;">🔒 token-protected</span>' : ''}</p>
             <p class="mono" style="margin:0.15rem 0 0;color:#6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
             <p class="mono" style="margin:0.15rem 0 0;color:#6e7681;">${v.videoid}</p>
           </div>
