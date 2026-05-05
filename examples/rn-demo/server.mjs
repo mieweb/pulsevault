@@ -19,6 +19,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
 const dataDir = path.join(__dirname, "data");
 
+/**
+ * In-memory token store: maps videoid → token for token-protected uploads.
+ * Populated in the authorize hook during the 'create' phase when the app
+ * sends a Bearer token that matches SESSION_TOKEN.
+ * No persistence — tokens are lost when the server restarts.
+ */
+const tokenStore = new Map();
+
+/**
+ * A single server-level session token generated at startup.
+ * Embed it in the configure-destination QR so the Pulse app stores it
+ * alongside the server URL. Every upload made with that saved destination
+ * will include the token as a Bearer header, registering the video as
+ * token-protected.
+ */
+const SESSION_TOKEN = randomUUID();
+console.log(`[auth] Session token: ${SESSION_TOKEN}`);
+
 const app = Fastify({
   logger: true,
   bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
@@ -107,6 +125,7 @@ const videoSummarySchema = {
     filename: { type: "string" },
     size: { type: "integer", minimum: 0 },
     creation_date: { type: "string", format: "date-time" },
+    token: { type: "string", description: "Present when this video requires a token to watch." },
   },
   required: ["videoid", "filename", "size", "creation_date"],
 };
@@ -170,6 +189,7 @@ app.get(
             size: mp4Stat.size,
             creation_date:
               meta?.creation_date ?? mp4Stat.birthtime.toISOString(),
+            ...(tokenStore.has(videoid) && { token: tokenStore.get(videoid) }),
           };
         }),
     );
@@ -253,6 +273,54 @@ app.get(
   },
 );
 
+// Token-protected server-configuration QR: uses buildConfigureDestinationLink
+// (same as Section 1) but embeds SESSION_TOKEN so the Pulse app stores the
+// token alongside the server URL. Uploads made with this saved destination
+// send "Authorization: Bearer <token>", which the authorize hook uses to
+// register the videoid as token-protected before the bytes are written.
+app.get(
+  "/deeplinks-token",
+  {
+    schema: {
+      tags: ["demo"],
+      summary: "Token-protected server-config QR",
+      description:
+        "Returns a configure-destination deep link that embeds the server-level session token. " +
+        "Scanning this QR saves the server + token in the app. Any subsequent upload from that " +
+        "saved destination will be token-protected: the server registers the videoid in its token " +
+        "store and rejects watch requests that omit the correct token.",
+      response: {
+        200: {
+          description: "Token-scoped configure-destination link and QR code.",
+          type: "object",
+          properties: {
+            configureDestination: { type: "string", format: "uri" },
+            token: { type: "string", description: "The session token embedded in the QR." },
+            qrConfigure: { type: "string", description: "data:image/png;base64 QR for the token-scoped configure-destination link." },
+          },
+          required: ["configureDestination", "token", "qrConfigure"],
+        },
+      },
+    },
+  },
+  async (req, reply) => {
+    const proto = req.headers["x-forwarded-proto"] ?? "http";
+    const host = req.headers["x-forwarded-host"] ?? req.headers.host;
+    const server = `${proto}://${host}`;
+
+    const configureDestination = buildConfigureDestinationLink({
+      server,
+      name: "Demo Server (Token Auth)",
+      token: SESSION_TOKEN,
+    });
+
+    const qrOpts = { width: 224, margin: 1, color: { dark: "#000000", light: "#ffffff" } };
+    const qrConfigure = await QRCode.toDataURL(configureDestination, qrOpts);
+
+    return reply.send({ configureDestination, token: SESSION_TOKEN, qrConfigure });
+  },
+);
+
 // Mount plugin at root prefix so TUS is at POST /upload and video GET is at /:videoid
 const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
 await app.register(pulseVault, {
@@ -262,6 +330,48 @@ await app.register(pulseVault, {
   allowedExtensions: [".mp4"],
   // Reject anything that doesn't look like an MP4 at the final PATCH.
   validatePayload: createMp4Sniffer(pulseStorage),
+  /**
+   * Authorization hook — called before every create/patch/resolve/delete.
+   *
+   * For the "resolve" phase the mobile app forwards any upload token as
+   * `?token=<value>` in the watch URL; the plugin surfaces it here as
+   * `ctx.token` so the parent server can validate it without a separate
+   * browser login.
+   *
+   * This demo server has no real auth store, so it accepts all requests.
+   * A production deployment would look up the token in a DB/session store
+   * and throw to reject (e.g. `throw { statusCode: 403, message: "Forbidden" }`).
+   */
+  authorize: async (request, ctx) => {
+    if (ctx.phase === "create") {
+      // When the app uploads using the token-protected saved destination it
+      // sends "Authorization: Bearer <SESSION_TOKEN>". Register this videoid
+      // in the token store so the resolve phase can protect it.
+      const authHeader = request.headers["authorization"];
+      const bearer = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+        ? authHeader.slice(7)
+        : undefined;
+      if (bearer !== undefined && bearer === SESSION_TOKEN) {
+        tokenStore.set(ctx.videoid, SESSION_TOKEN);
+        app.log.info(
+          { videoid: ctx.videoid },
+          "pulsevault authorize: token-protected videoid registered",
+        );
+      }
+    } else if (ctx.phase === "resolve") {
+      const expectedToken = tokenStore.get(ctx.videoid);
+      if (expectedToken !== undefined) {
+        // This videoid requires a token to watch.
+        if (ctx.token !== expectedToken) {
+          throw { statusCode: 403, message: "Invalid or missing watch token" };
+        }
+        app.log.info(
+          { videoid: ctx.videoid },
+          "pulsevault authorize: token-protected watch request verified",
+        );
+      }
+    }
+  },
 });
 
 const port = Number(process.env.PORT ?? 3000);
