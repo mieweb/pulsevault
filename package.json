@@ -1,6 +1,6 @@
 {
   "name": "@mieweb/pulsevault",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Fastify plugin for resumable video uploads via TUS, with a pluggable storage adapter and a filesystem-first local-storage default.",
   "type": "module",
   "main": "./dist/app.js",
