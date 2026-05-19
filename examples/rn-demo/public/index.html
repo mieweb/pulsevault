@@ -3,109 +3,44 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Pulse — Connect Your Phone</title>
+    <title>PulseVault demo</title>
     <style>
-      :root {
-        font-family: system-ui, sans-serif;
-        background: #0f1419;
-        color: #e6edf3;
-      }
-      body {
-        max-width: 44rem;
-        margin: 2rem auto;
-        padding: 0 1rem;
-        line-height: 1.5;
-      }
-      h1 {
-        font-size: 1.25rem;
-        font-weight: 600;
-      }
-      .card {
-        background: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 1rem 1.25rem;
-        margin-top: 1rem;
-      }
-      .open-btn {
-        display: block;
-        padding: 0.6rem 1.2rem;
-        font-size: 0.9rem;
-        font-weight: 600;
-        color: #fff;
-        background: #238636;
-        border-radius: 6px;
-        text-align: center;
-        text-decoration: none;
-        margin-bottom: 0.75rem;
-      }
-      .open-btn:hover {
-        background: #2ea043;
-      }
-      .mono {
-        font-family: ui-monospace, monospace;
-        font-size: 0.75rem;
-        word-break: break-all;
-        color: #8b949e;
-      }
-      label {
-        display: block;
-        font-size: 0.875rem;
-        color: #8b949e;
-        margin-bottom: 0.25rem;
-      }
-      ol {
-        padding-left: 1.25rem;
-        margin: 0.5rem 0 0;
-      }
-      li {
-        margin-bottom: 0.5rem;
-        font-size: 0.9rem;
-      }
-      .divider {
-        border: none;
-        border-top: 1px solid #30363d;
-        margin: 1rem 0;
-      }
+      :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e6edf3; }
+      body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+      h1 { font-size: 1.25rem; font-weight: 600; margin: 0; }
+      .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 1rem; }
+      .open-btn { display: block; padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600; color: #fff; background: #238636; border-radius: 6px; text-align: center; text-decoration: none; margin-bottom: 0.75rem; }
+      .open-btn:hover { background: #2ea043; }
+      .mono { font-family: ui-monospace, monospace; font-size: 0.75rem; word-break: break-all; color: #8b949e; }
+      label { display: block; font-size: 0.875rem; color: #8b949e; margin-bottom: 0.25rem; }
+      .ghost-btn { display: block; width: 100%; padding: 0.5rem; margin-bottom: 0.75rem; font-size: 0.875rem; background: #161b22; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; }
+      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+      .docs-link { display: inline-block; margin: 0; padding: 0.35rem 0.7rem; font-size: 0.75rem; background: #1f6feb; color: #fff; border-radius: 6px; text-decoration: none; font-weight: 600; }
+      .auth-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; background: #1f2937; border: 1px solid #30363d; color: #8b949e; }
+      .auth-badge.on { background: #1d3a1d; border-color: #2ea043; color: #b9e6b9; }
     </style>
   </head>
   <body>
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;">
-      <h1 style="margin:0;">Pulse — Connect Your Phone</h1>
-      <a href="/docs" class="open-btn" style="display:inline-block;margin:0;padding:0.35rem 0.7rem;font-size:0.75rem;background:#1f6feb;">API Docs →</a>
+    <div class="top-row">
+      <h1>PulseVault demo</h1>
+      <a href="/docs" class="docs-link">API Docs →</a>
     </div>
-    <p>Pair the Pulse app with this local demo server to upload videos over your WiFi network.</p>
+    <p style="font-size: 0.9rem; color: #8b949e;">
+      <span id="authBadge" class="auth-badge">auth: off</span>
+      Pair the Pulse app with this demo server and upload a video.
+    </p>
 
     <div class="card">
-      <strong>How to use</strong>
-      <ol>
-        <li>Make sure the Pulse app is on <strong>version 1.1.2 Build 3</strong> or higher.</li>
-        <li>Scan the <em>Upload draft</em> QR below — it opens the app pointed at this server with a fresh draft ready to upload.</li>
-        <li><span style="color:#8b949e;font-size:0.75rem;">(local only)</span> Make sure your phone is on the <strong>same WiFi</strong> as this computer.</li>
-        <li><span style="color:#8b949e;font-size:0.75rem;">(local only)</span> Open this page from your phone's browser using your laptop's IP address.</li>
-      </ol>
-      <p style="font-size:0.75rem;color:#8b949e;margin:0.5rem 0 0;">Steps marked <em>local only</em> apply when running this demo on your laptop. Skip them if the server is deployed publicly.</p>
-    </div>
-
-    <div class="card">
-      <strong>Upload a specific draft</strong>
-      <p style="font-size:0.875rem; color:#8b949e; margin:0.5rem 0 0;">
-        Each QR is tied to one draft. Scan it in the app to open that draft's upload screen pointed at this server.
+      <strong>Upload</strong>
+      <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
+        Each scan opens the chooser in the Pulse app: record a new video, or
+        pick an existing draft to upload to this server.
       </p>
 
-      <hr class="divider" />
+      <img id="qrUpload" width="224" height="224" style="display: block; margin: 1.25rem auto; border-radius: 8px; background: #fff; padding: 10px;" />
 
-      <p style="font-size:0.875rem; color:#8b949e; margin:0 0 0.5rem;">
-        Scan from your phone's camera app, or tap the button if you're on the same device:
-      </p>
-
-      <img id="qrUpload" width="224" height="224" style="display:block;margin:1.25rem auto;border-radius:8px;background:#fff;padding:10px;" />
-
-      <a id="openBtnUpload" class="open-btn" href="#">Open in Pulse App</a>
-
-      <button id="refreshUpload" style="display:block;width:100%;padding:0.5rem;margin-bottom:0.75rem;font-size:0.875rem;background:#161b22;color:#8b949e;border:1px solid #30363d;border-radius:6px;cursor:pointer;">
-        ↻ New draft QR
-      </button>
+      <a id="openBtnUpload" class="open-btn" href="#">Open in Pulse app</a>
+      <button id="refreshUpload" class="ghost-btn">↻ New QR</button>
 
       <label>Server</label>
       <p class="mono" id="serverUrl"></p>
@@ -117,13 +52,24 @@
       <p class="mono" id="deeplinkUpload"></p>
     </div>
 
+    <div id="authHelp" class="card" hidden>
+      <strong>Auth demo enabled</strong>
+      <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
+        This server requires a bearer token for every upload and watch request.
+        The QR above embeds it, so the Pulse app handles auth automatically.
+        Tampering with the token in the deeplink should produce a 403 from
+        <code>authorize</code>. To disable, restart the server without
+        <code>DEMO_TOKEN</code> set.
+      </p>
+    </div>
+
     <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;">
-        <strong>Uploaded Videos</strong>
-        <button id="refreshVideos" style="padding:0.3rem 0.7rem;font-size:0.75rem;background:#161b22;color:#8b949e;border:1px solid #30363d;border-radius:6px;cursor:pointer;">↻ Refresh</button>
+      <div class="top-row">
+        <strong>Uploads</strong>
+        <button id="refreshVideos" class="ghost-btn" style="width: auto; margin: 0; padding: 0.3rem 0.7rem;">↻ Refresh</button>
       </div>
-      <div id="videoList" style="margin-top:0.75rem;max-height:48rem;overflow-y:auto;padding-right:0.25rem;">
-        <p id="videoListEmpty" class="mono" style="color:#8b949e;">Loading…</p>
+      <div id="videoList" style="margin-top: 0.75rem; max-height: 48rem; overflow-y: auto; padding-right: 0.25rem;">
+        <p class="mono">Loading…</p>
       </div>
     </div>
 
@@ -136,10 +82,12 @@
         document.getElementById("deeplinkUpload").textContent = data.upload;
         document.getElementById("openBtnUpload").href = data.upload;
         document.getElementById("qrUpload").src = data.qrUpload;
-      }
 
-      loadDeeplinks();
-      document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
+        const badge = document.getElementById("authBadge");
+        badge.textContent = data.authMode ? "auth: on" : "auth: off";
+        badge.classList.toggle("on", data.authMode);
+        document.getElementById("authHelp").hidden = !data.authMode;
+      }
 
       function formatSize(bytes) {
         const units = ["B", "KB", "MB", "GB"];
@@ -152,20 +100,22 @@
         const list = document.getElementById("videoList");
         const videos = await fetch("/videos").then((r) => r.json());
         if (!videos.length) {
-          list.innerHTML = '<p class="mono" style="color:#8b949e;">No uploads yet.</p>';
+          list.innerHTML = '<p class="mono">No uploads yet.</p>';
           return;
         }
         list.innerHTML = videos.map((v) => `
-          <div style="margin-bottom:1rem;padding-bottom:1rem;border-bottom:1px solid #30363d;">
-            <video src="/${v.videoid}" controls preload="metadata" style="width:100%;max-height:26rem;border-radius:6px;background:#000;display:block;object-fit:contain;"></video>
-            <p class="mono" style="margin:0.4rem 0 0;">${v.filename}</p>
-            <p class="mono" style="margin:0.15rem 0 0;color:#6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
-            <p class="mono" style="margin:0.15rem 0 0;color:#6e7681;">${v.videoid}</p>
+          <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #30363d;">
+            <video src="/${v.videoid}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain;"></video>
+            <p class="mono" style="margin: 0.4rem 0 0;">${v.filename}</p>
+            <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
+            <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${v.videoid}</p>
           </div>
         `).join("");
       }
 
+      loadDeeplinks();
       loadVideos();
+      document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
       document.getElementById("refreshVideos").addEventListener("click", loadVideos);
     </script>
   </body>
