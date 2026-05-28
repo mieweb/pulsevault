@@ -5,6 +5,7 @@ import type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  UploadKind,
 } from "./types.js";
 
 /**
@@ -27,12 +28,26 @@ type Sidecar = {
    * `"ready"` sidecars — partially-written files never leak out.
    */
   status: "uploading" | "ready";
+  /**
+   * Artifact kind. Optional for back-compat — sidecars written before
+   * kind was introduced are read as `"video"` with no on-disk migration.
+   */
+  kind?: UploadKind;
 };
 
 const SIDECAR_NAME = ".pulsevault.json";
 const SIDECAR_VERSION = 1 as const;
 
-type CachedMeta = { ext: string; ready: boolean };
+type CachedMeta = { ext: string; ready: boolean; kind: UploadKind };
+
+/** Map a file extension to the `Content-Type` the GET route should return. */
+function extToContentType(ext: string): string {
+  switch (ext) {
+    case ".mp4": return "video/mp4";
+    case ".zip": return "application/zip";
+    default: return "application/octet-stream";
+  }
+}
 
 export type LocalStorageOptions = {
   /** Directory where per-video subdirectories are stored. Resolved against CWD if relative. */
@@ -65,6 +80,12 @@ export type LocalStorage = PulseVaultStorage & {
    * `null` if the videoid is unknown.
    */
   getLocalPath(videoid: string): Promise<string | null>;
+  /**
+   * Return the artifact kind for a known videoid without a full resolve.
+   * Returns `null` if the videoid is unknown. Satisfies the optional
+   * `PulseVaultStorage.getKind` contract.
+   */
+  getKind(videoid: string): Promise<UploadKind | null>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
@@ -79,8 +100,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     path.join(workspaceRoot, videoid);
   const sidecarPath = (videoid: string): string =>
     path.join(videoDir(videoid), SIDECAR_NAME);
-  const videoRelPath = (videoid: string, ext: string): string =>
-    `video/${videoid}${ext}`;
+  /** Relative path (from videoid root) to the artifact bytes. */
+  const artifactRelPath = (videoid: string, kind: UploadKind, ext: string): string =>
+    `${kind}/${videoid}${ext}`;
 
   const writeSidecar = async (
     videoid: string,
@@ -111,11 +133,14 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // `status` field explicitly.
       const status: Sidecar["status"] =
         parsed.status === "uploading" ? "uploading" : "ready";
+      // Older sidecars without `kind` default to `"video"` — no migration.
+      const kind: UploadKind = parsed.kind === "project" ? "project" : "video";
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
         filename: parsed.filename,
         status,
+        kind,
       };
     } catch {
       // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
@@ -132,6 +157,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     const meta: CachedMeta = {
       ext: sidecar.ext,
       ready: sidecar.status === "ready",
+      kind: sidecar.kind ?? "video",
     };
     metaCache.set(videoid, meta);
     return meta;
@@ -145,6 +171,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     videoid,
     filename,
     ext,
+    kind,
   }: ReserveUploadParams): Promise<string> => {
     // Collision guard: if an upload (in-progress or ready) already exists
     // for this videoid, refuse the new upload rather than letting
@@ -160,19 +187,20 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     }
 
     const dir = videoDir(videoid);
-    await fs.mkdir(path.join(dir, "video"), { recursive: true });
+    await fs.mkdir(path.join(dir, kind), { recursive: true });
 
     await writeSidecar(videoid, {
       version: SIDECAR_VERSION,
       ext,
       filename,
       status: "uploading",
+      kind,
     });
 
-    metaCache.set(videoid, { ext, ready: false });
+    metaCache.set(videoid, { ext, ready: false, kind });
     // @tus/file-store joins this onto its configured `directory`, so the
-    // actual file lands at `<workspaceRoot>/<videoid>/video/<videoid><ext>`.
-    return `${videoid}/${videoRelPath(videoid, ext)}`;
+    // actual file lands at `<workspaceRoot>/<videoid>/<kind>/<videoid><ext>`.
+    return `${videoid}/${artifactRelPath(videoid, kind, ext)}`;
   };
 
   const resolve = async (
@@ -183,7 +211,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     // GETting mid-upload would otherwise receive a truncated file.
     if (!meta || !meta.ready) return null;
     const root = videoDir(videoid);
-    const relFile = videoRelPath(videoid, meta.ext);
+    const relFile = artifactRelPath(videoid, meta.kind, meta.ext);
     try {
       const stat = await fs.stat(path.join(root, relFile));
       if (!stat.isFile()) return null;
@@ -191,7 +219,12 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
       throw err;
     }
-    return { kind: "stream", root, filename: relFile };
+    return {
+      kind: "stream",
+      root,
+      filename: relFile,
+      contentType: extToContentType(meta.ext),
+    };
   };
 
   const markReady = async (videoid: string): Promise<void> => {
@@ -205,11 +238,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     }
     if (sidecar.status === "ready") {
       // Idempotent: already ready is fine, keep the cache consistent.
-      metaCache.set(videoid, { ext: sidecar.ext, ready: true });
+      metaCache.set(videoid, { ext: sidecar.ext, ready: true, kind: sidecar.kind ?? "video" });
       return;
     }
     await writeSidecar(videoid, { ...sidecar, status: "ready" });
-    metaCache.set(videoid, { ext: sidecar.ext, ready: true });
+    metaCache.set(videoid, { ext: sidecar.ext, ready: true, kind: sidecar.kind ?? "video" });
   };
 
   const remove = async (videoid: string): Promise<boolean> => {
@@ -232,7 +265,12 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const getLocalPath = async (videoid: string): Promise<string | null> => {
     const meta = await loadMeta(videoid);
     if (!meta) return null;
-    return path.join(workspaceRoot, videoid, "video", `${videoid}${meta.ext}`);
+    return path.join(workspaceRoot, videoid, meta.kind, `${videoid}${meta.ext}`);
+  };
+
+  const getKind = async (videoid: string): Promise<UploadKind | null> => {
+    const meta = await loadMeta(videoid);
+    return meta ? meta.kind : null;
   };
 
   return {
@@ -244,5 +282,6 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     markReady,
     remove,
     getLocalPath,
+    getKind,
   };
 }

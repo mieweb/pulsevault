@@ -95,11 +95,16 @@ type PulseVaultPluginOptions = {
   prefix: string;
   maxUploadSize: number;
   decoratorName?: string; // default: "pulseVault"
-  allowedExtensions?: string[]; // default: [".mp4"]
+  allowedExtensions?:
+    | string[]                                    // legacy — treated as video-only
+    | { video?: string[]; project?: string[] };   // per-kind (recommended)
+  // defaults: { video: [".mp4"], project: [".pulse", ".zip"] }
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
-  validatePayload?: PulseVaultValidatePayload;
-  onUploadComplete?: PulseVaultOnUploadComplete;
+  validatePayload?: PulseVaultValidatePayload;          // video uploads only
+  validateProjectPayload?: PulseVaultValidatePayload;   // project uploads only
+  onUploadComplete?: PulseVaultOnUploadComplete;        // video uploads only
+  onProjectUploadComplete?: PulseVaultOnUploadComplete; // project uploads only
 };
 ```
 
@@ -129,7 +134,20 @@ import "@mieweb/pulsevault/augment";
 
 ### `allowedExtensions`
 
-File extensions accepted in `Upload-Metadata.filename`. Must include the leading dot. Defaults to `[".mp4"]`.
+File extensions accepted per artifact kind. Three accepted forms:
+
+```ts
+// 1. Omit entirely — uses both defaults:
+//    video: [".mp4"]   project: [".pulse", ".zip"]
+
+// 2. Flat array (legacy) — video-only; project defaults to [".pulse", ".zip"]:
+allowedExtensions: [".mp4"]
+
+// 3. Per-kind object — unset keys fall back to their defaults:
+allowedExtensions: { video: [".mp4"], project: [".pulse"] }
+```
+
+All extensions must include the leading dot and are matched case-insensitively. The `kind` field in `Upload-Metadata` determines which list is checked.
 
 ### `cache`
 
@@ -155,6 +173,8 @@ type PulseVaultAuthorize = (
   ctx: {
     phase: "create" | "patch" | "resolve" | "delete";
     videoid: string;
+    kind: "video" | "project";  // artifact kind; always present
+    token?: string;             // only on "resolve" phase
   },
 ) => void | Promise<void>;
 ```
@@ -162,7 +182,7 @@ type PulseVaultAuthorize = (
 ```ts
 await app.register(pulseVault, {
   // ...
-  authorize: async (request, { phase, videoid }) => {
+  authorize: async (request, { phase, videoid, kind }) => {
     const token = request.headers.authorization?.replace("Bearer ", "");
     if (!isValid(token, videoid)) {
       throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
@@ -173,7 +193,7 @@ await app.register(pulseVault, {
 
 ### `validatePayload`
 
-Optional async hook that runs _after_ TUS writes the final byte but _before_ the upload is marked ready or `onUploadComplete` fires. Throw to reject — the plugin calls `storage.remove` to free the bytes and returns a 4xx (default 422) to the client. The sidecar never flips to `"ready"`, so the video is never served.
+Optional async hook that runs _after_ TUS writes the final byte but _before_ the upload is marked ready or `onUploadComplete` fires — **for `kind=video` uploads only**. Throw to reject — the plugin calls `storage.remove` to free the bytes and returns a 4xx (default 422) to the client. The sidecar never flips to `"ready"`, so the file is never served.
 
 ```ts
 type PulseVaultValidatePayload = (
@@ -211,7 +231,7 @@ The lower-level `sniffMp4(path)` is also exported if you want to drive your own 
 
 ### `onUploadComplete`
 
-Optional async hook fired once the final byte is written, `validatePayload` has passed, and the sidecar has been marked ready. Use it to update a database row, enqueue a job, or write an audit log. Throwing returns a `500` to the client. The video is ready at this point — if you want all-or-nothing semantics, call `storage.remove` before throwing.
+Optional async hook fired once the final byte is written, `validatePayload` has passed, and the sidecar has been marked ready — **for `kind=video` uploads only**. Use it to update a database row, enqueue a job, or write an audit log. Throwing returns a `500` to the client. The video is ready at this point — if you want all-or-nothing semantics, call `storage.remove` before throwing.
 
 ```ts
 type PulseVaultOnUploadComplete = (
@@ -220,13 +240,46 @@ type PulseVaultOnUploadComplete = (
 ) => void | Promise<void>;
 ```
 
+### `validateProjectPayload`
+
+Same lifecycle and signature as `validatePayload`, but fires only for `kind=project` uploads (`.pulse`, `.zip`, etc.). Use this to inspect the bundle before it is marked ready.
+
+### `onProjectUploadComplete`
+
+Same lifecycle and signature as `onUploadComplete`, but fires only for `kind=project` uploads. Use this to index a draft, enable cross-device editing, relay a diagnostic bundle to an issue tracker, etc. The bundle bytes are opaque to PulseVault — the consumer decides what to do with them.
+
 ### Upload-complete sequencing
 
-When the final PATCH lands, the plugin runs the following in order. Any step failing short-circuits the rest.
+When the final PATCH lands the plugin runs the following steps in order. Any step failing short-circuits the rest.
+
+**For `kind=video`:**
 
 1. **`validatePayload`** (optional) — throws → `storage.remove(videoid)`, HTTP 4xx (default 422).
 2. **`storage.markReady(videoid)`** — flips the sidecar so `resolve()` will serve the bytes.
-3. **`onUploadComplete`** (optional) — throws → HTTP 500; bytes remain on disk and ready unless the consumer explicitly removes them.
+3. **`onUploadComplete`** (optional) — throws → HTTP 500; bytes remain ready unless the consumer removes them.
+
+**For `kind=project`:**
+
+1. **`validateProjectPayload`** (optional) — same semantics; throws → `storage.remove(videoid)`, HTTP 4xx.
+2. **`storage.markReady(videoid)`** — flips the sidecar.
+3. **`onProjectUploadComplete`** (optional) — throws → HTTP 500.
+
+## Upload-Metadata protocol
+
+The TUS `Upload-Metadata` header is a comma-separated list of `<key> <base64>` pairs. PulseVault reads the following keys on `POST /upload`:
+
+| Key | Required | Description |
+|---|---|---|
+| `videoid` | Yes (or `projectid`) | Server-generated UUID for this upload. |
+| `projectid` | Alias for `videoid` | Accepted as a synonym. Use `videoid` for new code. |
+| `filename` | Yes | Original filename. The extension is validated against the kind's allowed list. |
+| `kind` | No | `video` (default) or `project`. Determines the storage subdir and which hooks fire. |
+
+Example (`kind=project`):
+
+```
+Upload-Metadata: videoid <base64(uuid)>, filename <base64("draft.pulse")>, kind <base64("project")>
+```
 
 ## Local storage
 
@@ -240,18 +293,20 @@ const storage = createLocalStorage({
 
 ### Filesystem layout (stable contract)
 
-The local adapter writes each upload into a self-describing per-video directory. Downstream tools may rely on this layout across minor versions:
+The local adapter writes each upload into a self-describing per-resource directory. Downstream tools may rely on this layout across minor versions:
 
 ```text
-<workspaceRoot>/<videoid>/
-  .pulsevault.json           # sidecar: { version, ext, filename, status }
-  video/<videoid><ext>       # upload bytes (partial during upload, full when ready)
-  video/<videoid><ext>.json  # @tus/file-store's offset/metadata sidecar
+<workspaceRoot>/<id>/
+  .pulsevault.json                # sidecar: { version, ext, filename, status, kind }
+  video/<id><ext>                 # video upload bytes  (kind="video")
+  video/<id><ext>.json            # @tus/file-store offset/metadata sidecar
+  project/<id><ext>               # project bundle bytes (kind="project")
+  project/<id><ext>.json          # @tus/file-store offset/metadata sidecar
 ```
 
-`status` is `"uploading"` between `reserveUpload` and the successful final PATCH; `"ready"` thereafter. `GET /:videoid` only serves `"ready"` uploads.
+`status` is `"uploading"` between `reserveUpload` and the successful final PATCH; `"ready"` thereafter. `GET /:id` only serves `"ready"` uploads. `kind` defaults to `"video"` when absent (back-compat with pre-kind sidecars).
 
-The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-video paths without re-implementing the layout.
+The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-resource paths without re-implementing the layout. `storage.getKind(id)` returns `"video" | "project" | null` for a lightweight kind check without a full `resolve()` call.
 
 ### Post-processing (transcription, thumbnails, AI)
 
@@ -363,7 +418,21 @@ const uploadLink = buildUploadLink({
 npm test
 ```
 
-Runs a Node `--test` suite against the built plugin: TUS create/HEAD/PATCH resume, collision handling, extension rejection, range GETs, the ready-gate (`GET` returns 404 while uploading), `DELETE /:videoid`, `authorize` rejection on every phase, `validatePayload` + `createMp4Sniffer`, `onUploadComplete` dispatch, and sidecar corruption recovery.
+Runs a Node `--test` suite against the built plugin. Coverage includes:
+
+- TUS create/HEAD/PATCH resume, collision handling, extension rejection, range GETs
+- Ready-gate (`GET` returns 404 while uploading)
+- `DELETE /:id`
+- `authorize` rejection on every phase; `kind` in authorize context
+- `validatePayload` + `createMp4Sniffer` for video; `validateProjectPayload` for projects
+- `onUploadComplete` and `onProjectUploadComplete` dispatch
+- `kind=project` happy paths (`.pulse`, `.zip`) — correct subdir, `Content-Type`, sidecar
+- Extension mismatch rejections in both directions
+- `projectid` metadata alias
+- `getKind()` storage method
+- Legacy sidecars (no `kind` field) default to `"video"` without migration
+- Sidecar corruption recovery
+- `allowedExtensions` object form
 
 ## Accessing storage outside the plugin routes
 

@@ -1,4 +1,5 @@
 import type { PulseVaultStorage } from "./storage/types.js";
+import type { UploadKind } from "./storage/types.js";
 
 /**
  * Opt-in TypeScript augmentation for the default `pulseVault` decorator and
@@ -37,7 +38,7 @@ declare module "fastify" {
      * request the plugin routes serve that refer to a valid UUID — use it
      * from your own `preHandler` / auth hooks to avoid re-parsing.
      */
-    pulseVault?: { videoid: string };
+    pulseVault?: { videoid: string; kind: UploadKind };
   }
 }
 

@@ -116,18 +116,20 @@ app.post(
   },
 );
 
-// List all uploaded videos under dataDir. The TUS file-store layout is
-// data/<videoid>/video/<videoid>.<ext>(+ .json sidecar with metadata).
-const videoSummarySchema = {
+// List all uploads under dataDir. Reads each upload's sidecar to determine
+// kind and subdir rather than hard-coding "video/" — handles video + project.
+const uploadSummarySchema = {
   type: "object",
   properties: {
     videoid: { type: "string", format: "uuid" },
+    kind: { type: "string", enum: ["video", "project"], description: "Artifact kind." },
     filename: { type: "string" },
+    ext: { type: "string" },
     size: { type: "integer", minimum: 0 },
     creation_date: { type: "string", format: "date-time" },
-    token: { type: "string", description: "Present when this video requires a token to watch." },
+    token: { type: "string", description: "Present when this upload requires a token to watch." },
   },
-  required: ["videoid", "filename", "size", "creation_date"],
+  required: ["videoid", "kind", "filename", "ext", "size", "creation_date"],
 };
 
 app.get(
@@ -135,14 +137,14 @@ app.get(
   {
     schema: {
       tags: ["demo"],
-      summary: "List previously uploaded videos",
+      summary: "List previously uploaded artifacts",
       description:
-        "Enumerates completed uploads on disk by scanning the local data directory.",
+        "Enumerates completed uploads on disk by reading each upload's sidecar. Returns both `kind=video` and `kind=project` artifacts.",
       response: {
         200: {
-          description: "Videos sorted by creation time, newest first.",
+          description: "Uploads sorted by creation time, newest first.",
           type: "array",
-          items: videoSummarySchema,
+          items: uploadSummarySchema,
         },
       },
     },
@@ -156,46 +158,51 @@ app.get(
       throw err;
     }
 
-    const videos = await Promise.all(
+    const uploads = await Promise.all(
       entries
         .filter((e) => e.isDirectory())
         .map(async (e) => {
           const videoid = e.name;
-          const videoDir = path.join(dataDir, videoid, "video");
-          let files;
+          const sidecarPath = path.join(dataDir, videoid, ".pulsevault.json");
+          let sidecar;
           try {
-            files = await readdir(videoDir);
+            sidecar = JSON.parse(await readFile(sidecarPath, "utf8"));
           } catch {
-            return null;
+            return null; // not a managed upload directory
           }
-          const mp4 = files.find(
-            (f) => f.endsWith(".mp4") && !f.endsWith(".mp4.json"),
-          );
-          if (!mp4) return null;
+          // Only list ready uploads; skip in-progress ones.
+          if (sidecar.status !== "ready") return null;
 
-          const mp4Path = path.join(videoDir, mp4);
-          const jsonPath = `${mp4Path}.json`;
-          const [mp4Stat, meta] = await Promise.all([
-            stat(mp4Path).catch(() => null),
-            readFile(jsonPath, "utf8")
+          const kind = sidecar.kind ?? "video";
+          const ext = sidecar.ext ?? ".mp4";
+          const artifactDir = path.join(dataDir, videoid, kind);
+          const artifactFile = `${videoid}${ext}`;
+          const artifactPath = path.join(artifactDir, artifactFile);
+          const tusJsonPath = `${artifactPath}.json`;
+
+          const [artifactStat, tusMeta] = await Promise.all([
+            stat(artifactPath).catch(() => null),
+            readFile(tusJsonPath, "utf8")
               .then(JSON.parse)
               .catch(() => null),
           ]);
-          if (!mp4Stat || mp4Stat.size === 0) return null;
+          if (!artifactStat || artifactStat.size === 0) return null;
 
           return {
             videoid,
-            filename: meta?.metadata?.filename ?? mp4,
-            size: mp4Stat.size,
+            kind,
+            filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
+            ext,
+            size: artifactStat.size,
             creation_date:
-              meta?.creation_date ?? mp4Stat.birthtime.toISOString(),
+              tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
             ...(tokenStore.has(videoid) && { token: tokenStore.get(videoid) }),
           };
         }),
     );
 
     return reply.send(
-      videos
+      uploads
         .filter(Boolean)
         .sort((a, b) => b.creation_date.localeCompare(a.creation_date)),
     );
@@ -327,9 +334,15 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  allowedExtensions: [".mp4"],
-  // Reject anything that doesn't look like an MP4 at the final PATCH.
+  // Accept MP4 videos and Pulse draft bundles (.pulse) + diagnostic zips.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"] },
+  // Reject non-MP4 bytes on video uploads (magic-byte sniff).
   validatePayload: createMp4Sniffer(pulseStorage),
+  // Fired when a project bundle finishes uploading. The bundle is opaque
+  // to the plugin — index it, relay it, or leave it for a later request.
+  onProjectUploadComplete: async (_req, { videoid, size }) => {
+    app.log.info({ videoid, size }, "pulsevault project upload complete");
+  },
   /**
    * Authorization hook — called before every create/patch/resolve/delete.
    *
@@ -354,8 +367,8 @@ await app.register(pulseVault, {
       if (bearer !== undefined && bearer === SESSION_TOKEN) {
         tokenStore.set(ctx.videoid, SESSION_TOKEN);
         app.log.info(
-          { videoid: ctx.videoid },
-          "pulsevault authorize: token-protected videoid registered",
+          { videoid: ctx.videoid, kind: ctx.kind },
+          "pulsevault authorize: token-protected upload registered",
         );
       }
     } else if (ctx.phase === "resolve") {
@@ -366,7 +379,7 @@ await app.register(pulseVault, {
           throw { statusCode: 403, message: "Invalid or missing watch token" };
         }
         app.log.info(
-          { videoid: ctx.videoid },
+          { videoid: ctx.videoid, kind: ctx.kind },
           "pulsevault authorize: token-protected watch request verified",
         );
       }
