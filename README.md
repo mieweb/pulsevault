@@ -386,29 +386,19 @@ const storage: PulseVaultStorage = {
 };
 ```
 
-## Deep link helpers
+## Deep link helper
 
-Use these to generate `pulsecam://` deep links for pairing the Pulse mobile app with your server. Typically encoded as QR codes on a pairing page.
+Use this to generate a `pulsecam://` deep link for pairing the Pulse mobile app with your server. Typically encoded as a QR code on a pairing page.
 
 ```ts
-import {
-  buildConfigureDestinationLink,
-  buildUploadLink,
-} from "@mieweb/pulsevault";
+import { buildUploadLink } from "@mieweb/pulsevault";
 import { randomUUID } from "node:crypto";
-
-// Adds this server as a saved destination in the Pulse app.
-const configureLink = buildConfigureDestinationLink({
-  server: "https://example.com",
-  name: "My Server", // optional — shown in the app's destination list
-  token: "secret", // optional — forwarded to your authorize hook
-});
 
 // Opens the app directly on the upload screen for a specific video.
 const uploadLink = buildUploadLink({
   server: "https://example.com",
   videoid: randomUUID(), // generate server-side; skip POST /reserve on the app
-  token: "secret", // optional
+  token: "secret", // optional — forwarded to your authorize hook
 });
 ```
 

@@ -237,11 +237,6 @@ export type {
 } from "./routes/pulsevault.js";
 export type { PulseVaultOnUploadComplete } from "./lib/pulsevaultTus.js";
 export { sniffMp4, createMp4Sniffer } from "./lib/magic.js";
-export type { PulseVaultValidatePayload } from "./lib/magic.js";export {
-  buildConfigureDestinationLink,
-  buildUploadLink,
-} from "./lib/deeplinks.js";
-export type {
-  ConfigureDestinationLinkOptions,
-  UploadLinkOptions,
-} from "./lib/deeplinks.js";
+export type { PulseVaultValidatePayload } from "./lib/magic.js";
+export { buildUploadLink } from "./lib/deeplinks.js";
+export type { UploadLinkOptions } from "./lib/deeplinks.js";

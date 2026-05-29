@@ -2,7 +2,7 @@ name: Publish to npm
 
 on:
   release:
-    types: [ published ]
+    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -10,19 +10,28 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Required for npm trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org/
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # never use caching in release builds
+
+      # Trusted publishing requires npm >= 11.5.1; Node 24 ships with npm 11.x
+      # but pin to latest to be safe.
+      - run: npm install -g npm@latest
 
       - run: npm ci
 
+      - run: npm run build --if-present
+
       - run: npm test
 
-      - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_PULSE_SECRET }}
+      # No NODE_AUTH_TOKEN — auth happens via OIDC against the trusted
+      # publisher configured for @mieweb/pulsevault on npmjs.com.
+      # `--access public` is unnecessary because publishConfig.access in
+      # package.json already sets it.
+      - run: npm publish

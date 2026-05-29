@@ -11,7 +11,6 @@ import QRCode from "qrcode";
 import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
-  buildConfigureDestinationLink,
   buildUploadLink,
 } from "@mieweb/pulsevault";
 
@@ -19,23 +18,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
 const dataDir = path.join(__dirname, "data");
 
-/**
- * In-memory token store: maps videoid → token for token-protected uploads.
- * Populated in the authorize hook during the 'create' phase when the app
- * sends a Bearer token that matches SESSION_TOKEN.
- * No persistence — tokens are lost when the server restarts.
- */
-const tokenStore = new Map();
-
-/**
- * A single server-level session token generated at startup.
- * Embed it in the configure-destination QR so the Pulse app stores it
- * alongside the server URL. Every upload made with that saved destination
- * will include the token as a Bearer header, registering the video as
- * token-protected.
- */
-const SESSION_TOKEN = randomUUID();
-console.log(`[auth] Session token: ${SESSION_TOKEN}`);
+// Set DEMO_TOKEN to enable the auth demo: every upload + watch is verified
+// against this token. Leave unset for an open demo with no authentication.
+const DEMO_TOKEN = process.env.DEMO_TOKEN || null;
 
 const app = Fastify({
   logger: true,
@@ -76,7 +61,7 @@ app.get(
       tags: ["demo"],
       summary: "Pairing page (HTML)",
       description:
-        "Returns the static pairing UI that renders the configure-destination and upload QR codes.",
+        "Returns the static pairing UI that renders the upload QR code.",
       response: {
         200: {
           description: "HTML pairing page.",
@@ -127,7 +112,6 @@ const uploadSummarySchema = {
     ext: { type: "string" },
     size: { type: "integer", minimum: 0 },
     creation_date: { type: "string", format: "date-time" },
-    token: { type: "string", description: "Present when this upload requires a token to watch." },
   },
   required: ["videoid", "kind", "filename", "ext", "size", "creation_date"],
 };
@@ -196,7 +180,6 @@ app.get(
             size: artifactStat.size,
             creation_date:
               tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
-            ...(tokenStore.has(videoid) && { token: tokenStore.get(videoid) }),
           };
         }),
     );
@@ -209,124 +192,33 @@ app.get(
   },
 );
 
-// Return pre-built deep links for the pairing page.
-// draftId and videoid are generated here so the server is the single source of truth.
-app.get(
-  "/deeplinks",
-  {
-    schema: {
-      tags: ["demo"],
-      summary: "Deep links + QR codes for RN pairing",
-      description:
-        "Builds a configure-destination link and a videoid-scoped upload link, then encodes both as data-URL PNG QR codes.",
-      response: {
-        200: {
-          description: "Deep links and their QR-code renderings.",
-          type: "object",
-          properties: {
-            configureDestination: { type: "string", format: "uri" },
-            upload: { type: "string", format: "uri" },
-            videoid: { type: "string", format: "uuid" },
-            qrConfigure: {
-              type: "string",
-              description:
-                "data:image/png;base64 QR for `configureDestination`.",
-            },
-            qrUpload: {
-              type: "string",
-              description: "data:image/png;base64 QR for `upload`.",
-            },
-          },
-          required: [
-            "configureDestination",
-            "upload",
-            "videoid",
-            "qrConfigure",
-            "qrUpload",
-          ],
-        },
-      },
-    },
-  },
-  async (req, reply) => {
-    const proto = req.headers["x-forwarded-proto"] ?? "http";
-    const host = req.headers["x-forwarded-host"] ?? req.headers.host;
-    const server = `${proto}://${host}`;
-    const videoid = randomUUID();
+// One deeplink + matching QR per request. videoid is generated server-side so
+// it stays the source of truth.
+app.get("/deeplinks", async (req, reply) => {
+  const proto = req.headers["x-forwarded-proto"] ?? "http";
+  const host = req.headers["x-forwarded-host"] ?? req.headers.host;
+  const server = `${proto}://${host}`;
+  const videoid = randomUUID();
 
-    const configureDestination = buildConfigureDestinationLink({
-      server,
-      name: "Demo Server",
-    });
-    const upload = buildUploadLink({ server, videoid });
+  const upload = buildUploadLink({
+    server,
+    videoid,
+    ...(DEMO_TOKEN && { token: DEMO_TOKEN }),
+  });
 
-    const qrOpts = {
-      width: 224,
-      margin: 1,
-      color: { dark: "#000000", light: "#ffffff" },
-    };
-    const [qrConfigure, qrUpload] = await Promise.all([
-      QRCode.toDataURL(configureDestination, qrOpts),
-      QRCode.toDataURL(upload, qrOpts),
-    ]);
+  const qrUpload = await QRCode.toDataURL(upload, {
+    width: 224,
+    margin: 1,
+    color: { dark: "#000000", light: "#ffffff" },
+  });
 
-    return reply.send({
-      configureDestination,
-      upload,
-      videoid,
-      qrConfigure,
-      qrUpload,
-    });
-  },
-);
-
-// Token-protected server-configuration QR: uses buildConfigureDestinationLink
-// (same as Section 1) but embeds SESSION_TOKEN so the Pulse app stores the
-// token alongside the server URL. Uploads made with this saved destination
-// send "Authorization: Bearer <token>", which the authorize hook uses to
-// register the videoid as token-protected before the bytes are written.
-app.get(
-  "/deeplinks-token",
-  {
-    schema: {
-      tags: ["demo"],
-      summary: "Token-protected server-config QR",
-      description:
-        "Returns a configure-destination deep link that embeds the server-level session token. " +
-        "Scanning this QR saves the server + token in the app. Any subsequent upload from that " +
-        "saved destination will be token-protected: the server registers the videoid in its token " +
-        "store and rejects watch requests that omit the correct token.",
-      response: {
-        200: {
-          description: "Token-scoped configure-destination link and QR code.",
-          type: "object",
-          properties: {
-            configureDestination: { type: "string", format: "uri" },
-            token: { type: "string", description: "The session token embedded in the QR." },
-            qrConfigure: { type: "string", description: "data:image/png;base64 QR for the token-scoped configure-destination link." },
-          },
-          required: ["configureDestination", "token", "qrConfigure"],
-        },
-      },
-    },
-  },
-  async (req, reply) => {
-    const proto = req.headers["x-forwarded-proto"] ?? "http";
-    const host = req.headers["x-forwarded-host"] ?? req.headers.host;
-    const server = `${proto}://${host}`;
-
-    const configureDestination = buildConfigureDestinationLink({
-      server,
-      name: "Demo Server (Token Auth)",
-      token: SESSION_TOKEN,
-    });
-
-    const qrOpts = { width: 224, margin: 1, color: { dark: "#000000", light: "#ffffff" } };
-    const qrConfigure = await QRCode.toDataURL(configureDestination, qrOpts);
-
-    return reply.send({ configureDestination, token: SESSION_TOKEN, qrConfigure });
-  },
-);
+  return reply.send({
+    upload,
+    videoid,
+    qrUpload,
+    authMode: Boolean(DEMO_TOKEN),
+  });
+});
 
 // Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and video GET is at /pulsevault/:videoid
 const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
@@ -344,45 +236,24 @@ await app.register(pulseVault, {
     app.log.info({ videoid, size }, "pulsevault project upload complete");
   },
   /**
-   * Authorization hook — called before every create/patch/resolve/delete.
+   * authorize hook — the demo's auth proof-of-concept.
    *
-   * For the "resolve" phase the mobile app forwards any upload token as
-   * `?token=<value>` in the watch URL; the plugin surfaces it here as
-   * `ctx.token` so the parent server can validate it without a separate
-   * browser login.
-   *
-   * This demo server has no real auth store, so it accepts all requests.
-   * A production deployment would look up the token in a DB/session store
-   * and throw to reject (e.g. `throw { statusCode: 403, message: "Forbidden" }`).
+   * When DEMO_TOKEN is unset (default), this is a no-op and the server accepts
+   * every request. When DEMO_TOKEN is set, every TUS create/patch must carry
+   * `Authorization: Bearer <DEMO_TOKEN>` and every watch must carry
+   * `?token=<DEMO_TOKEN>`. Swap this body with your real auth — sessions, JWT,
+   * mTLS, etc.
    */
   authorize: async (request, ctx) => {
-    if (ctx.phase === "create") {
-      // When the app uploads using the token-protected saved destination it
-      // sends "Authorization: Bearer <SESSION_TOKEN>". Register this videoid
-      // in the token store so the resolve phase can protect it.
-      const authHeader = request.headers["authorization"];
-      const bearer = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
-        ? authHeader.slice(7)
-        : undefined;
-      if (bearer !== undefined && bearer === SESSION_TOKEN) {
-        tokenStore.set(ctx.videoid, SESSION_TOKEN);
-        app.log.info(
-          { videoid: ctx.videoid, kind: ctx.kind },
-          "pulsevault authorize: token-protected upload registered",
-        );
-      }
-    } else if (ctx.phase === "resolve") {
-      const expectedToken = tokenStore.get(ctx.videoid);
-      if (expectedToken !== undefined) {
-        // This videoid requires a token to watch.
-        if (ctx.token !== expectedToken) {
-          throw { statusCode: 403, message: "Invalid or missing watch token" };
-        }
-        app.log.info(
-          { videoid: ctx.videoid, kind: ctx.kind },
-          "pulsevault authorize: token-protected watch request verified",
-        );
-      }
+    if (!DEMO_TOKEN) return;
+
+    const supplied =
+      ctx.phase === "resolve"
+        ? ctx.token
+        : (request.headers.authorization || "").replace(/^Bearer\s+/i, "");
+
+    if (supplied !== DEMO_TOKEN) {
+      throw { statusCode: 403, message: "Forbidden: invalid demo token" };
     }
   },
 });
@@ -391,9 +262,10 @@ const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 
 await app.listen({ port, host });
-console.log(`\nRN demo server running.`);
-console.log(`Pairing page: http://localhost:${port}/`);
-console.log(`Swagger UI:   http://localhost:${port}/docs`);
-console.log(
-  `From your phone (same WiFi): open http://<your-laptop-ip>:${port}/ in the browser`,
-);
+console.log(`\nPulseVault demo running on http://localhost:${port}/`);
+console.log(`Swagger UI:                   http://localhost:${port}/docs`);
+if (DEMO_TOKEN) {
+  console.log(`Auth demo:                    ON  (DEMO_TOKEN is set)`);
+} else {
+  console.log(`Auth demo:                    off (set DEMO_TOKEN=... to enable)`);
+}
