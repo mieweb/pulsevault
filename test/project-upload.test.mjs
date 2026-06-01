@@ -119,7 +119,7 @@ test("kind=project .pulse happy path: file under project/ subdir, correct Conten
     assert.equal(sidecar.status, "ready");
 
     // GET must return 200 with application/octet-stream
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
     assert.ok(ct?.includes("application/octet-stream"), `content-type was: ${ct}`);
@@ -145,7 +145,7 @@ test("kind=project .zip happy path: file under project/ subdir, Content-Type: ap
     const stat = await fs.stat(expectedPath);
     assert.ok(stat.isFile(), "zip exists at project/ subdir");
 
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
     assert.ok(ct?.includes("application/zip"), `content-type was: ${ct}`);
@@ -209,8 +209,8 @@ test("authorize receives kind='project' on create and resolve", async () => {
 
     assert.equal(capturedPhases["create"], "project", "kind on create");
 
-    // GET triggers resolve phase
-    await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    // GET /project/:projectid triggers resolve phase
+    await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(capturedPhases["resolve"], "project", "kind on resolve");
   } finally {
     await ctx.teardown();
@@ -315,7 +315,7 @@ test("projectid metadata alias works identically to videoid", async () => {
       payload,
     });
 
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(get.status, 200, "GET succeeds with projectid alias");
     const ct = get.headers.get("content-type");
     assert.ok(ct?.includes("application/octet-stream"), `content-type was: ${ct}`);
@@ -409,16 +409,16 @@ test("DELETE works for kind=project", async () => {
       payload,
     });
 
-    const preGet = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    const preGet = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(preGet.status, 200);
 
-    const del = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, { method: "DELETE" });
+    const del = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`, { method: "DELETE" });
     assert.equal(del.status, 204);
 
     const sidecarStat = await fs.stat(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`)).catch(() => null);
     assert.equal(sidecarStat, null, "sidecar removed");
 
-    const postGet = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
+    const postGet = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
     assert.equal(postGet.status, 404);
   } finally {
     await ctx.teardown();
@@ -450,7 +450,7 @@ test("allowedExtensions object form: custom video and project extensions", async
       kind: "project",
       payload,
     });
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID2}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID2}`);
     assert.equal(get.status, 200);
   } finally {
     await ctx.teardown();

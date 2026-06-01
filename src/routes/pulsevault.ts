@@ -181,7 +181,7 @@ const videoDeleteSchema: OpenApiRouteSchema = {
   tags: ["pulsevault"],
   summary: "Delete an uploaded video",
   description:
-    "Deletes all storage for a videoid (bytes + sidecar metadata). Runs the `authorize` hook with `phase: \"delete\"` before the adapter's `remove` is called. Returns 204 on success, 404 if the videoid was unknown, 501 if the adapter does not implement `remove`.",
+    "Deletes all storage for a videoid (bytes + sidecar metadata). Only deletes `kind=video` uploads — returns 404 for project artifacts (use `DELETE /project/:projectid` instead). Runs the `authorize` hook with `phase: \"delete\"` before the adapter's `remove` is called. Returns 204 on success, 404 if the videoid was unknown, 501 if the adapter does not implement `remove`.",
   params: {
     type: "object",
     properties: {
@@ -214,7 +214,7 @@ const videoGetSchema: OpenApiRouteSchema = {
   tags: ["pulsevault"],
   summary: "Serve a previously uploaded video",
   description:
-    "Resolves the `videoid` through the configured storage adapter and either streams the bytes or redirects (for CDN-backed adapters). Runs the `authorize` hook before resolve.",
+    "Resolves the `videoid` through the configured storage adapter and either streams the bytes or redirects (for CDN-backed adapters). Only serves `kind=video` uploads — returns 404 for project artifacts (use `GET /project/:projectid` instead). Runs the `authorize` hook before resolve.",
   params: {
     type: "object",
     properties: {
@@ -246,6 +246,78 @@ const videoGetSchema: OpenApiRouteSchema = {
       ...pulseVaultErrorResponse,
     },
     404: { description: "Video not found.", ...pulseVaultErrorResponse },
+  },
+};
+
+const projectGetSchema: OpenApiRouteSchema = {
+  tags: ["pulsevault"],
+  summary: "Serve a previously uploaded project artifact",
+  description:
+    "Resolves the `projectid` through the configured storage adapter and streams the bytes. Only serves `kind=project` uploads — returns 404 for video artifacts. Runs the `authorize` hook before resolve.",
+  params: {
+    type: "object",
+    properties: {
+      projectid: {
+        type: "string",
+        format: "uuid",
+        description: "UUID of the project upload.",
+      },
+    },
+    required: ["projectid"],
+  },
+  querystring: {
+    type: "object",
+    properties: {
+      token: {
+        type: "string",
+        description:
+          "Optional bearer token for pre-authenticated watch links. Forwarded to the `authorize` hook as `ctx.token`.",
+      },
+    },
+  },
+  response: {
+    400: {
+      description: "`projectid` is not a valid UUID.",
+      ...pulseVaultErrorResponse,
+    },
+    403: {
+      description: "Authorize hook rejected the request.",
+      ...pulseVaultErrorResponse,
+    },
+    404: { description: "Project not found.", ...pulseVaultErrorResponse },
+  },
+};
+
+const projectDeleteSchema: OpenApiRouteSchema = {
+  tags: ["pulsevault"],
+  summary: "Delete an uploaded project artifact",
+  description:
+    "Deletes all storage for a projectid (bytes + sidecar metadata). Only deletes `kind=project` uploads — returns 404 for video artifacts. Runs the `authorize` hook with `phase: \"delete\"` before the adapter's `remove` is called.",
+  params: {
+    type: "object",
+    properties: {
+      projectid: {
+        type: "string",
+        format: "uuid",
+        description: "UUID of the project upload to delete.",
+      },
+    },
+    required: ["projectid"],
+  },
+  response: {
+    400: {
+      description: "`projectid` is not a valid UUID.",
+      ...pulseVaultErrorResponse,
+    },
+    403: {
+      description: "Authorize hook rejected the request.",
+      ...pulseVaultErrorResponse,
+    },
+    404: { description: "Project not found.", ...pulseVaultErrorResponse },
+    501: {
+      description: "Storage adapter does not implement delete.",
+      ...pulseVaultErrorResponse,
+    },
   },
 };
 
@@ -393,6 +465,12 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
       }
 
       const deleteKind = await resolveStorageKind(storage, videoid);
+
+      // This route is video-only. Project artifacts must use DELETE /project/:projectid.
+      if (deleteKind !== "video") {
+        return reply.code(404).send(pulseVaultError("Video not found"));
+      }
+
       request.pulseVault = { videoid, kind: deleteKind };
 
       if (authorize) {
@@ -438,6 +516,12 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     // Resolve kind before setting request.pulseVault so authorize hooks get
     // a fully-populated context (cache hit after reserveUpload).
     const resolvedKind = await resolveStorageKind(storage, videoid);
+
+    // This route is video-only. Project artifacts must use GET /project/:projectid.
+    if (resolvedKind !== "video") {
+      return reply.code(404).send(pulseVaultError("Video not found"));
+    }
+
     request.pulseVault = { videoid, kind: resolvedKind };
 
     // Extract the optional token forwarded by the mobile app in the watch URL.
@@ -483,6 +567,117 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     // If the storage adapter provided an explicit content type (e.g. for
     // non-standard extensions like `.pulse`), override what @fastify/send
     // would otherwise infer from the filename.
+    if (resolved.contentType) {
+      reply.header("content-type", resolved.contentType);
+    }
+
+    for (const [name, value] of Object.entries(result.headers)) {
+      reply.header(name, value);
+    }
+    return reply.code(result.statusCode).send(result.stream);
+  });
+
+  fastify.delete(
+    "/project/:projectid",
+    { schema: projectDeleteSchema },
+    async (request, reply) => {
+      const projectid = (request.params as { projectid?: unknown })?.projectid;
+      if (!isUuid(projectid)) {
+        return reply
+          .code(400)
+          .send(pulseVaultError("`projectid` must be a valid UUID"));
+      }
+
+      const deleteKind = await resolveStorageKind(storage, projectid);
+
+      // This route is project-only. Video artifacts must use DELETE /:videoid.
+      if (deleteKind !== "project") {
+        return reply.code(404).send(pulseVaultError("Project not found"));
+      }
+
+      request.pulseVault = { videoid: projectid, kind: "project" };
+
+      if (authorize) {
+        try {
+          await authorize(request, { phase: "delete", videoid: projectid, kind: "project" });
+        } catch (err) {
+          const statusCode = extractAuthzStatus(err);
+          const message = extractAuthzMessage(err);
+          request.log.info(
+            { err, videoid: projectid, phase: "delete", statusCode },
+            "pulsevault authorize rejected",
+          );
+          return reply.code(statusCode).send(pulseVaultError(message));
+        }
+      }
+
+      if (typeof storage.remove !== "function") {
+        return reply
+          .code(501)
+          .send(pulseVaultError("Storage adapter does not support delete"));
+      }
+
+      const removed = await storage.remove(projectid);
+      if (!removed) {
+        return reply.code(404).send(pulseVaultError("Project not found"));
+      }
+      return reply.code(204).send();
+    },
+  );
+
+  fastify.get("/project/:projectid", { schema: projectGetSchema }, async (request, reply) => {
+    const projectid = (request.params as { projectid?: unknown })?.projectid;
+    if (!isUuid(projectid)) {
+      return reply
+        .code(400)
+        .send(pulseVaultError("`projectid` must be a valid UUID"));
+    }
+
+    const resolvedKind = await resolveStorageKind(storage, projectid);
+
+    // This route is project-only. Video artifacts must use GET /:videoid.
+    if (resolvedKind !== "project") {
+      return reply.code(404).send(pulseVaultError("Project not found"));
+    }
+
+    request.pulseVault = { videoid: projectid, kind: "project" };
+
+    const token = (request.query as { token?: string })?.token;
+
+    if (authorize) {
+      try {
+        await authorize(request, { phase: "resolve", videoid: projectid, kind: "project", token });
+      } catch (err) {
+        const statusCode = extractAuthzStatus(err);
+        const message = extractAuthzMessage(err);
+        request.log.info(
+          { err, videoid: projectid, phase: "resolve", statusCode },
+          "pulsevault authorize rejected",
+        );
+        return reply.code(statusCode).send(pulseVaultError(message));
+      }
+    }
+
+    const resolved = await storage.resolve(projectid);
+    if (!resolved) {
+      return reply.code(404).send(pulseVaultError("Project not found"));
+    }
+
+    if (resolved.kind === "redirect") {
+      return reply.redirect(resolved.url, resolved.statusCode ?? 302);
+    }
+
+    const result = await send(request.raw, resolved.filename, {
+      root: resolved.root,
+      ...cache,
+    });
+
+    if (result.type === "error") {
+      return reply
+        .code(result.statusCode)
+        .send(pulseVaultError(result.metadata.error.message));
+    }
+
     if (resolved.contentType) {
       reply.header("content-type", resolved.contentType);
     }
