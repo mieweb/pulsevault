@@ -434,6 +434,13 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     });
 
     if (result.type === "error") {
+      // RFC 7233: 416 responses must carry `Content-Range: bytes */total`.
+      // `@fastify/send` computes it, but its remaining error headers describe
+      // the HTML error body we replace with JSON, so forward only this one.
+      const contentRange = result.headers["Content-Range"];
+      if (contentRange) {
+        reply.header("content-range", contentRange);
+      }
       return reply
         .code(result.statusCode)
         .send(pulseVaultError(result.metadata.error.message));

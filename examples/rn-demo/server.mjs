@@ -16,11 +16,40 @@ import pulseVault, {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
+const watchHtml = readFileSync(path.join(__dirname, "public/watch.html"), "utf8");
 const dataDir = path.join(__dirname, "data");
+const rangeLogs = [];
+const MAX_RANGE_LOGS = 200;
+
+function pushRangeLog(entry) {
+  rangeLogs.push(entry);
+  if (rangeLogs.length > MAX_RANGE_LOGS) {
+    rangeLogs.splice(0, rangeLogs.length - MAX_RANGE_LOGS);
+  }
+}
+
+function asHeaderString(value) {
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "number") return String(value);
+  return typeof value === "string" ? value : null;
+}
+
+function extractPathname(url) {
+  try {
+    return new URL(url, "http://local").pathname;
+  } catch {
+    return url.split("?")[0] || url;
+  }
+}
+
+function isVideoGetPath(pathname) {
+  return /^\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pathname);
+}
 
 // Set DEMO_TOKEN to enable the auth demo: every upload + watch is verified
 // against this token. Leave unset for an open demo with no authentication.
 const DEMO_TOKEN = process.env.DEMO_TOKEN || null;
+const DEMO_STRICT_MP4 = process.env.DEMO_STRICT_MP4 === "1";
 
 const app = Fastify({
   logger: true,
@@ -44,6 +73,20 @@ await app.register(fastifySwaggerUI, {
 
 // Pairing page — registered before the plugin so it isn't swallowed by /:videoid
 app.get("/", (_req, reply) => reply.type("text/html").send(html));
+
+// Standalone watch page for a single video.
+app.get("/watch/:videoid", async (req, reply) => {
+  const { videoid } = req.params;
+  if (typeof videoid !== "string" || !isVideoGetPath(`/${videoid}`)) {
+    return reply.code(400).type("text/plain").send("Invalid videoid");
+  }
+
+  return reply.type("text/html").send(
+    watchHtml
+      .replaceAll("__VIDEOID__", videoid)
+      .replaceAll("__VIDEO_SRC__", `/${videoid}`),
+  );
+});
 
 // One deeplink + matching QR per request. videoid is generated server-side so
 // it stays the source of truth.
@@ -119,6 +162,45 @@ app.get("/videos", async (_req, reply) => {
   );
 });
 
+// Expose recent GET /:videoid responses so the demo UI can show seek->range traffic.
+app.get("/range-logs", async (req, reply) => {
+  const requestedVideoid = (req.query || {}).videoid;
+  if (typeof requestedVideoid !== "string" || !requestedVideoid) {
+    return reply.send(rangeLogs);
+  }
+  return reply.send(rangeLogs.filter((item) => item.videoid === requestedVideoid));
+});
+
+app.delete("/range-logs", async (_req, reply) => {
+  rangeLogs.length = 0;
+  return reply.code(204).send();
+});
+
+app.addHook("onResponse", async (request, reply) => {
+  if (request.method !== "GET") return;
+
+  const pathname = extractPathname(request.raw.url || request.url || "");
+  if (!isVideoGetPath(pathname)) return;
+
+  const videoid = pathname.slice(1);
+  const rangeHeader = request.headers.range;
+  const contentRange = asHeaderString(reply.getHeader("content-range"));
+  const contentLength = asHeaderString(reply.getHeader("content-length"));
+  const acceptRanges = asHeaderString(reply.getHeader("accept-ranges"));
+
+  pushRangeLog({
+    at: new Date().toISOString(),
+    method: request.method,
+    videoid,
+    url: request.raw.url || request.url,
+    range: typeof rangeHeader === "string" ? rangeHeader : null,
+    status: reply.statusCode,
+    acceptRanges,
+    contentRange,
+    contentLength,
+  });
+});
+
 // Mount the plugin at root so TUS is at POST /upload and watch is GET /:videoid
 const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
 await app.register(pulseVault, {
@@ -126,7 +208,7 @@ await app.register(pulseVault, {
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   allowedExtensions: [".mp4"],
-  validatePayload: createMp4Sniffer(pulseStorage),
+  ...(DEMO_STRICT_MP4 ? { validatePayload: createMp4Sniffer(pulseStorage) } : {}),
 
   /**
    * authorize hook — the demo's auth proof-of-concept.
@@ -161,4 +243,9 @@ if (DEMO_TOKEN) {
   console.log(`Auth demo:                    ON  (DEMO_TOKEN is set)`);
 } else {
   console.log(`Auth demo:                    off (set DEMO_TOKEN=... to enable)`);
+}
+if (DEMO_STRICT_MP4) {
+  console.log(`MP4 validation:               ON  (DEMO_STRICT_MP4=1)`);
+} else {
+  console.log(`MP4 validation:               off (set DEMO_STRICT_MP4=1 to enforce)`);
 }

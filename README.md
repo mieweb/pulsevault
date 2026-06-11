@@ -145,6 +145,52 @@ type PulseVaultCacheOptions = {
 
 Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` is non-zero.
 
+### HTTP Range Requests (RFC 7233)
+
+`GET /:videoid` supports HTTP Range requests, allowing clients to stream specific byte ranges without downloading the entire file. This enables browser seeking in video players and iOS AVPlayer scrubbing.
+
+**Behavior:**
+
+- **No Range header:** Returns `200 OK` with the full file and `Accept-Ranges: bytes`.
+- **Valid range (e.g., `Range: bytes=0-99`):** Returns `206 Partial Content` with the requested byte range, `Content-Range: bytes 0-99/total`, and `Content-Length`.
+- **Open-ended range (e.g., `Range: bytes=512-`):** Returns `206 Partial Content` from byte 512 to EOF.
+- **Suffix range (e.g., `Range: bytes=-1024`):** Returns `206 Partial Content` for the last 1024 bytes.
+- **Invalid or out-of-bounds range:** Returns `416 Range Not Satisfiable` with `Content-Range: bytes */total`.
+
+Ranges are streamed via `fs.createReadStream` with `start`/`end` offsets; the entire file is never buffered.
+
+**Example client code:**
+
+```ts
+// Fetch bytes 0-999 (first 1000 bytes)
+const res = await fetch("/api/video/abc123", {
+  headers: { Range: "bytes=0-999" },
+});
+if (res.status === 206) {
+  const chunk = await res.arrayBuffer();
+  // Process 1000-byte chunk
+}
+
+// Seek to 1MB into a video (open-ended range)
+const res = await fetch("/api/video/abc123", {
+  headers: { Range: "bytes=1048576-" },
+});
+```
+
+**Framework-independent parser:**
+
+For framework adaptations (e.g., Hono), the `parseRangeRequest` utility parses RFC 7233 headers and returns status code, byte offsets, and response headers:
+
+```ts
+import { parseRangeRequest } from "@mieweb/pulsevault";
+
+const result = parseRangeRequest("bytes=0-99", 1000);
+// { status: 206, start: 0, end: 99, headers: { ... } }
+
+const invalid = parseRangeRequest("bytes=9999-10000", 1000);
+// { status: 416, headers: { "content-range": "bytes */1000" } }
+```
+
 ### `authorize`
 
 Optional async hook called before TUS create/patch, before GET resolve, and before DELETE. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).

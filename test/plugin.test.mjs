@@ -298,6 +298,107 @@ test("range GET returns 206 with the requested slice", async () => {
     const slice = Buffer.from(await range.arrayBuffer());
     assert.equal(slice.length, 100);
     assert.equal(Buffer.compare(slice, body.subarray(0, 100)), 0);
+    assert.equal(range.headers.get("accept-ranges"), "bytes");
+    assert.ok(range.headers.get("content-range"));
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("no Range header returns 200 with Accept-Ranges header", async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1, 2048);
+
+    const res = await fetch(`${ctx.baseUrl}/${ID1}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("accept-ranges"), "bytes");
+    const bytes = Buffer.from(await res.arrayBuffer());
+    assert.equal(bytes.length, body.length);
+    assert.equal(Buffer.compare(bytes, body), 0);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("open-ended range (bytes=N-) returns 206 with correct headers", async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1, 2048);
+    const total = body.length;
+    const startByte = 512;
+
+    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+      headers: { Range: `bytes=${startByte}-` },
+    });
+    assert.equal(res.status, 206);
+    assert.equal(res.headers.get("accept-ranges"), "bytes");
+    const contentRange = res.headers.get("content-range");
+    assert.ok(
+      contentRange.includes(`${startByte}-`) && contentRange.includes(`/${total}`),
+      `expected Content-Range like "bytes ${startByte}-*/${total}", got "${contentRange}"`
+    );
+    const slice = Buffer.from(await res.arrayBuffer());
+    assert.equal(slice.length, total - startByte);
+    assert.equal(Buffer.compare(slice, body.subarray(startByte)), 0);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("suffix range (bytes=-N) returns 206 with correct headers", async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1, 2048);
+    const total = body.length;
+    const suffixLength = 256;
+
+    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+      headers: { Range: `bytes=-${suffixLength}` },
+    });
+    assert.equal(res.status, 206);
+    assert.equal(res.headers.get("accept-ranges"), "bytes");
+    const contentRange = res.headers.get("content-range");
+    const expectedStart = total - suffixLength;
+    assert.ok(
+      contentRange.includes(`${expectedStart}-`) && contentRange.includes(`/${total}`),
+      `expected Content-Range like "bytes ${expectedStart}-*/${total}", got "${contentRange}"`
+    );
+    const slice = Buffer.from(await res.arrayBuffer());
+    assert.equal(slice.length, suffixLength);
+    assert.equal(Buffer.compare(slice, body.subarray(expectedStart)), 0);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("out-of-bounds range returns 416 with Content-Range", async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1, 2048);
+    const total = body.length;
+
+    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+      headers: { Range: "bytes=9999-10000" },
+    });
+    assert.equal(res.status, 416);
+    assert.equal(res.headers.get("content-range"), `bytes */${total}`);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("malformed range returns 416 with Content-Range", async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1, 2048);
+    const total = body.length;
+
+    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+      headers: { Range: "bytes=abc-def" },
+    });
+    assert.equal(res.status, 416);
+    assert.equal(res.headers.get("content-range"), `bytes */${total}`);
   } finally {
     await ctx.teardown();
   }

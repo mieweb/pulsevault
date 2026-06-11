@@ -192,3 +192,5 @@ export { sniffMp4, createMp4Sniffer } from "./lib/magic.js";
 export type { PulseVaultValidatePayload } from "./lib/magic.js";
 export { buildUploadLink } from "./lib/deeplinks.js";
 export type { UploadLinkOptions } from "./lib/deeplinks.js";
+export { parseRangeRequest } from "./lib/rangeStreaming.js";
+export type { RangeParseResult } from "./lib/rangeStreaming.js";

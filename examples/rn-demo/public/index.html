@@ -73,6 +73,30 @@
       </div>
     </div>
 
+    <div class="card">
+      <strong>Seek demo (real player + live range logs)</strong>
+      <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0.75rem;">
+        Pick a video, click <em>Load player</em>, then scrub the timeline. The
+        panel below shows the actual GET requests the server handled, including
+        Range and Content-Range headers.
+      </p>
+
+      <label for="rangeVideo">Video</label>
+      <select id="rangeVideo" style="width: 100%; margin-bottom: 0.75rem; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.5rem;"></select>
+
+      <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem;">
+        <button id="loadSeekPlayer" class="open-btn" style="margin: 0; width: auto;">Load player</button>
+        <button id="refreshRangeLogs" class="ghost-btn" style="width: auto; margin: 0; padding: 0.35rem 0.65rem;">Refresh logs</button>
+        <button id="clearRangeLogs" class="ghost-btn" style="width: auto; margin: 0; padding: 0.35rem 0.65rem;">Clear logs</button>
+      </div>
+
+      <video id="seekDemoPlayer" controls preload="metadata" style="width: 100%; max-height: 24rem; border-radius: 6px; background: #000; display: block; object-fit: contain; margin-bottom: 0.65rem;"></video>
+      <p id="seekState" class="mono" style="margin: 0 0 0.75rem; color: #6e7681;">Player not loaded.</p>
+
+      <label>Recent GET logs for selected video</label>
+      <pre id="rangeResult" class="mono" style="white-space: pre-wrap; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem; max-height: 16rem; overflow: auto;">No logs yet.</pre>
+    </div>
+
     <script>
       async function loadDeeplinks() {
         const data = await fetch("/deeplinks").then((r) => r.json());
@@ -98,14 +122,29 @@
 
       async function loadVideos() {
         const list = document.getElementById("videoList");
+        const rangeVideo = document.getElementById("rangeVideo");
         const videos = await fetch("/videos").then((r) => r.json());
+
+        if (!videos.length) {
+          rangeVideo.innerHTML = '<option value="">No uploads yet</option>';
+          rangeVideo.disabled = true;
+          document.getElementById("loadSeekPlayer").disabled = true;
+        } else {
+          rangeVideo.innerHTML = videos
+            .map((v) => `<option value="${v.videoid}">${v.filename} (${v.videoid})</option>`)
+            .join("");
+          rangeVideo.disabled = false;
+          document.getElementById("loadSeekPlayer").disabled = false;
+        }
+
         if (!videos.length) {
           list.innerHTML = '<p class="mono">No uploads yet.</p>';
           return;
         }
         list.innerHTML = videos.map((v) => `
           <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #30363d;">
-            <video src="/${v.videoid}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain;"></video>
+            <a href="/watch/${v.videoid}" style="display: inline-block; margin-bottom: 0.45rem; font-size: 0.8rem; color: #58a6ff; text-decoration: none;">Open standalone player →</a>
+            <video src="/${v.videoid}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain; cursor: pointer;" onclick="window.location.href='/watch/${v.videoid}'"></video>
             <p class="mono" style="margin: 0.4rem 0 0;">${v.filename}</p>
             <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
             <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${v.videoid}</p>
@@ -115,8 +154,98 @@
 
       loadDeeplinks();
       loadVideos();
+
+      function nowLabel() {
+        return new Date().toLocaleTimeString();
+      }
+
+      function setSeekState(text) {
+        document.getElementById("seekState").textContent = `[${nowLabel()}] ${text}`;
+      }
+
+      async function loadSeekPlayer() {
+        const videoid = document.getElementById("rangeVideo").value;
+        if (!videoid) {
+          setSeekState("No video selected.");
+          return;
+        }
+
+        const player = document.getElementById("seekDemoPlayer");
+        player.src = `/${videoid}`;
+        player.load();
+        setSeekState(`Loaded /${videoid}. Play and scrub the timeline to trigger range requests.`);
+        await refreshRangeLogs();
+      }
+
+      async function refreshRangeLogs() {
+        const videoid = document.getElementById("rangeVideo").value;
+        const out = document.getElementById("rangeResult");
+
+        if (!videoid) {
+          out.textContent = "No video selected.";
+          return;
+        }
+
+        const logs = await fetch(`/range-logs?videoid=${encodeURIComponent(videoid)}`).then((r) => r.json());
+        if (!Array.isArray(logs) || !logs.length) {
+          out.textContent = "No logs yet for this video. Start playback or scrub to generate requests.";
+          return;
+        }
+
+        const lines = logs
+          .slice(-20)
+          .reverse()
+          .map((item) => {
+            return [
+              `${item.at} | ${item.method} ${item.url}`,
+              `  status=${item.status}`,
+              `  range=${item.range || "<none>"}`,
+              `  accept-ranges=${item.acceptRanges || "<none>"}`,
+              `  content-range=${item.contentRange || "<none>"}`,
+              `  content-length=${item.contentLength || "<none>"}`,
+            ].join("\n");
+          });
+        out.textContent = lines.join("\n\n");
+      }
+
+      async function clearRangeLogs() {
+        await fetch("/range-logs", { method: "DELETE" });
+        await refreshRangeLogs();
+      }
+
+      let logsPoll = null;
+      function startRangeLogPolling() {
+        if (logsPoll) return;
+        logsPoll = setInterval(() => {
+          refreshRangeLogs().catch(() => {});
+        }, 1500);
+      }
+
+      const seekDemoPlayer = document.getElementById("seekDemoPlayer");
+      seekDemoPlayer.addEventListener("play", () => {
+        setSeekState("Playing.");
+        startRangeLogPolling();
+      });
+      seekDemoPlayer.addEventListener("seeking", () => {
+        setSeekState(`Seeking to ${seekDemoPlayer.currentTime.toFixed(2)}s...`);
+        refreshRangeLogs().catch(() => {});
+      });
+      seekDemoPlayer.addEventListener("seeked", () => {
+        setSeekState(`Seeked to ${seekDemoPlayer.currentTime.toFixed(2)}s.`);
+        refreshRangeLogs().catch(() => {});
+      });
+      seekDemoPlayer.addEventListener("error", () => {
+        setSeekState("Player error. Check server logs and uploaded file validity.");
+      });
+
       document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
       document.getElementById("refreshVideos").addEventListener("click", loadVideos);
+      document.getElementById("loadSeekPlayer").addEventListener("click", loadSeekPlayer);
+      document.getElementById("refreshRangeLogs").addEventListener("click", refreshRangeLogs);
+      document.getElementById("clearRangeLogs").addEventListener("click", clearRangeLogs);
+      document.getElementById("rangeVideo").addEventListener("change", () => {
+        refreshRangeLogs().catch(() => {});
+      });
     </script>
   </body>
 </html>
