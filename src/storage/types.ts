@@ -12,6 +12,12 @@ export type PulseVaultResolution =
       root: string;
       /** Filename relative to `root`. */
       filename: string;
+      /**
+       * Explicit `Content-Type` to set on the response. When present the GET
+       * route overrides whatever `@fastify/send` infers from the extension.
+       * Populated by adapters for non-standard extensions (e.g. `.pulse`).
+       */
+      contentType?: string;
     }
   | {
       kind: "redirect";
@@ -20,13 +26,17 @@ export type PulseVaultResolution =
       statusCode?: number;
     };
 
+export type UploadKind = "video" | "project";
+
 export type ReserveUploadParams = {
-  /** UUID from `Upload-Metadata.videoid`. */
+  /** UUID from `Upload-Metadata.videoid` (or `projectid` alias). */
   videoid: string;
   /** Raw filename from `Upload-Metadata.filename`. */
   filename: string;
   /** Lowercase extension including the leading dot, validated upstream. */
   ext: string;
+  /** Artifact kind derived from `Upload-Metadata.kind`. Defaults to `"video"`. */
+  kind: UploadKind;
 };
 
 /**
@@ -79,4 +89,11 @@ export interface PulseVaultStorage {
    * cleanup path when `validatePayload` rejects a completed upload.
    */
   remove?(videoid: string): Promise<boolean>;
+
+  /**
+   * Return the artifact kind for a known videoid, or `null` if the videoid
+   * is not found. Used by consumer routes (e.g. `report-issue`) to assert
+   * the kind before acting on an upload without a full resolve.
+   */
+  getKind?(videoid: string): Promise<UploadKind | null>;
 }

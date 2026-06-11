@@ -144,7 +144,7 @@
         list.innerHTML = videos.map((v) => `
           <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #30363d;">
             <a href="/watch/${v.videoid}" style="display: inline-block; margin-bottom: 0.45rem; font-size: 0.8rem; color: #58a6ff; text-decoration: none;">Open standalone player →</a>
-            <video src="/${v.videoid}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain; cursor: pointer;" onclick="window.location.href='/watch/${v.videoid}'"></video>
+            <video src="/pulsevault/${v.videoid}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain; cursor: pointer;" onclick="window.location.href='/watch/${v.videoid}'"></video>
             <p class="mono" style="margin: 0.4rem 0 0;">${v.filename}</p>
             <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
             <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${v.videoid}</p>
@@ -171,9 +171,9 @@
         }
 
         const player = document.getElementById("seekDemoPlayer");
-        player.src = `/${videoid}`;
+        player.src = `/pulsevault/${videoid}`;
         player.load();
-        setSeekState(`Loaded /${videoid}. Play and scrub the timeline to trigger range requests.`);
+        setSeekState(`Loaded /pulsevault/${videoid}. Play and scrub the timeline to trigger range requests.`);
         await refreshRangeLogs();
       }
 

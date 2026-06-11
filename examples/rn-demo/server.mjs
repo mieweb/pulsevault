@@ -42,8 +42,15 @@ function extractPathname(url) {
   }
 }
 
-function isVideoGetPath(pathname) {
-  return /^\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pathname);
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+// Video GETs are served by the plugin mounted at /pulsevault, so media URLs
+// look like /pulsevault/<uuid>. Returns the videoid or null.
+function videoidFromVideoGetPath(pathname) {
+  const match = pathname.match(/^\/pulsevault\/([0-9a-f-]{36})$/i);
+  return match && isUuid(match[1]) ? match[1] : null;
 }
 
 // Set DEMO_TOKEN to enable the auth demo: every upload + watch is verified
@@ -56,35 +63,182 @@ const app = Fastify({
   bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
 });
 
+// Swagger MUST be registered before any route (including the plugin's) so
+// their schemas are picked up for the generated OpenAPI spec.
 await app.register(fastifySwagger, {
   openapi: {
     openapi: "3.0.3",
     info: {
-      title: "PulseVault demo",
-      description: "Reference server pairing the Pulse RN app with @mieweb/pulsevault.",
+      title: "PulseVault Fastify",
+      description:
+        "Reference server pairing the React Native demo app with `@mieweb/pulsevault`.",
       version: "0.0.1",
     },
+    tags: [
+      { name: "demo", description: "RN demo server endpoints" },
+      {
+        name: "pulsevault",
+        description: "Routes contributed by the `@mieweb/pulsevault` plugin",
+      },
+    ],
   },
 });
+
 await app.register(fastifySwaggerUI, {
   routePrefix: "/docs",
   uiConfig: { docExpansion: "list", deepLinking: false },
 });
 
-// Pairing page — registered before the plugin so it isn't swallowed by /:videoid
-app.get("/", (_req, reply) => reply.type("text/html").send(html));
+// Serve pairing page before the plugin so it isn't swallowed by /:videoid
+app.get(
+  "/",
+  {
+    schema: {
+      tags: ["demo"],
+      summary: "Pairing page (HTML)",
+      description:
+        "Returns the static pairing UI that renders the upload QR code.",
+      response: {
+        200: {
+          description: "HTML pairing page.",
+          type: "string",
+        },
+      },
+    },
+  },
+  (_req, reply) => reply.type("text/html").send(html),
+);
+
+// Reserve a videoid for an upload. The server owns ID generation so it can
+// later attach auth tokens, quotas, or other server-side state here.
+app.post(
+  "/reserve",
+  {
+    schema: {
+      tags: ["demo"],
+      summary: "Reserve a new videoid",
+      description:
+        "Generates a fresh UUID for the client to use as the `videoid` metadata entry on its TUS upload.",
+      response: {
+        200: {
+          description: "A newly minted videoid.",
+          type: "object",
+          properties: {
+            videoid: { type: "string", format: "uuid" },
+          },
+          required: ["videoid"],
+        },
+      },
+    },
+  },
+  async (_req, reply) => {
+    const videoid = randomUUID();
+    return reply.send({ videoid });
+  },
+);
+
+// List all uploads under dataDir. Reads each upload's sidecar to determine
+// kind and subdir rather than hard-coding "video/" — handles video + project.
+const uploadSummarySchema = {
+  type: "object",
+  properties: {
+    videoid: { type: "string", format: "uuid" },
+    kind: { type: "string", enum: ["video", "project"], description: "Artifact kind." },
+    filename: { type: "string" },
+    ext: { type: "string" },
+    size: { type: "integer", minimum: 0 },
+    creation_date: { type: "string", format: "date-time" },
+  },
+  required: ["videoid", "kind", "filename", "ext", "size", "creation_date"],
+};
+
+app.get(
+  "/videos",
+  {
+    schema: {
+      tags: ["demo"],
+      summary: "List previously uploaded artifacts",
+      description:
+        "Enumerates completed uploads on disk by reading each upload's sidecar. Returns both `kind=video` and `kind=project` artifacts.",
+      response: {
+        200: {
+          description: "Uploads sorted by creation time, newest first.",
+          type: "array",
+          items: uploadSummarySchema,
+        },
+      },
+    },
+  },
+  async (_req, reply) => {
+    const pulsevaultMetaDir = path.join(dataDir, ".pulsevault");
+    let entries;
+    try {
+      entries = await readdir(pulsevaultMetaDir, { withFileTypes: true });
+    } catch (err) {
+      if (err.code === "ENOENT") return reply.send([]);
+      throw err;
+    }
+
+    const uploads = await Promise.all(
+      entries
+        .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
+        .map(async (e) => {
+          const videoid = e.name.slice(0, -".json".length);
+          const sidecarFilePath = path.join(pulsevaultMetaDir, e.name);
+          let sidecar;
+          try {
+            sidecar = JSON.parse(await readFile(sidecarFilePath, "utf8"));
+          } catch {
+            return null;
+          }
+          // Only list ready uploads; skip in-progress ones.
+          if (sidecar.status !== "ready") return null;
+
+          const kind = sidecar.kind ?? "video";
+          const ext = sidecar.ext ?? ".mp4";
+          const artifactFile = `${videoid}${ext}`;
+          const artifactPath = path.join(dataDir, kind, artifactFile);
+          const tusJsonPath = `${artifactPath}.json`;
+
+          const [artifactStat, tusMeta] = await Promise.all([
+            stat(artifactPath).catch(() => null),
+            readFile(tusJsonPath, "utf8")
+              .then(JSON.parse)
+              .catch(() => null),
+          ]);
+          if (!artifactStat || artifactStat.size === 0) return null;
+
+          return {
+            videoid,
+            kind,
+            filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
+            ext,
+            size: artifactStat.size,
+            creation_date:
+              tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
+          };
+        }),
+    );
+
+    return reply.send(
+      uploads
+        .filter(Boolean)
+        .sort((a, b) => b.creation_date.localeCompare(a.creation_date)),
+    );
+  },
+);
 
 // Standalone watch page for a single video.
 app.get("/watch/:videoid", async (req, reply) => {
   const { videoid } = req.params;
-  if (typeof videoid !== "string" || !isVideoGetPath(`/${videoid}`)) {
+  if (typeof videoid !== "string" || !isUuid(videoid)) {
     return reply.code(400).type("text/plain").send("Invalid videoid");
   }
 
   return reply.type("text/html").send(
     watchHtml
       .replaceAll("__VIDEOID__", videoid)
-      .replaceAll("__VIDEO_SRC__", `/${videoid}`),
+      .replaceAll("__VIDEO_SRC__", `/pulsevault/${videoid}`),
   );
 });
 
@@ -116,53 +270,7 @@ app.get("/deeplinks", async (req, reply) => {
   });
 });
 
-// List uploaded videos by scanning the on-disk TUS layout: data/<videoid>/video/<videoid>.mp4 + .json sidecar.
-app.get("/videos", async (_req, reply) => {
-  let entries;
-  try {
-    entries = await readdir(dataDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code === "ENOENT") return reply.send([]);
-    throw err;
-  }
-
-  const videos = await Promise.all(
-    entries
-      .filter((e) => e.isDirectory())
-      .map(async (e) => {
-        const videoid = e.name;
-        const videoDir = path.join(dataDir, videoid, "video");
-        let files;
-        try {
-          files = await readdir(videoDir);
-        } catch {
-          return null;
-        }
-        const mp4 = files.find((f) => f.endsWith(".mp4") && !f.endsWith(".mp4.json"));
-        if (!mp4) return null;
-
-        const mp4Path = path.join(videoDir, mp4);
-        const [mp4Stat, meta] = await Promise.all([
-          stat(mp4Path).catch(() => null),
-          readFile(`${mp4Path}.json`, "utf8").then(JSON.parse).catch(() => null),
-        ]);
-        if (!mp4Stat || mp4Stat.size === 0) return null;
-
-        return {
-          videoid,
-          filename: meta?.metadata?.filename ?? mp4,
-          size: mp4Stat.size,
-          creation_date: meta?.creation_date ?? mp4Stat.birthtime.toISOString(),
-        };
-      }),
-  );
-
-  return reply.send(
-    videos.filter(Boolean).sort((a, b) => b.creation_date.localeCompare(a.creation_date)),
-  );
-});
-
-// Expose recent GET /:videoid responses so the demo UI can show seek->range traffic.
+// Expose recent video GET responses so the demo UI can show seek->range traffic.
 app.get("/range-logs", async (req, reply) => {
   const requestedVideoid = (req.query || {}).videoid;
   if (typeof requestedVideoid !== "string" || !requestedVideoid) {
@@ -180,9 +288,8 @@ app.addHook("onResponse", async (request, reply) => {
   if (request.method !== "GET") return;
 
   const pathname = extractPathname(request.raw.url || request.url || "");
-  if (!isVideoGetPath(pathname)) return;
-
-  const videoid = pathname.slice(1);
+  const videoid = videoidFromVideoGetPath(pathname);
+  if (!videoid) return;
   const rangeHeader = request.headers.range;
   const contentRange = asHeaderString(reply.getHeader("content-range"));
   const contentLength = asHeaderString(reply.getHeader("content-length"));
@@ -201,15 +308,22 @@ app.addHook("onResponse", async (request, reply) => {
   });
 });
 
-// Mount the plugin at root so TUS is at POST /upload and watch is GET /:videoid
+// Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and video GET is at /pulsevault/:videoid
 const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
 await app.register(pulseVault, {
-  prefix: "",
+  prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  allowedExtensions: [".mp4"],
+  // Accept MP4 videos and Pulse draft bundles (.pulse) + diagnostic zips.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"] },
+  // Strict fast-start MP4 validation is opt-in for the demo so non-fast-start
+  // test files still upload unless DEMO_STRICT_MP4=1 is set.
   ...(DEMO_STRICT_MP4 ? { validatePayload: createMp4Sniffer(pulseStorage) } : {}),
-
+  // Fired when a project bundle finishes uploading. The bundle is opaque
+  // to the plugin — index it, relay it, or leave it for a later request.
+  onProjectUploadComplete: async (_req, { videoid, size }) => {
+    app.log.info({ videoid, size }, "pulsevault project upload complete");
+  },
   /**
    * authorize hook — the demo's auth proof-of-concept.
    *

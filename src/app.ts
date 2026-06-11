@@ -8,6 +8,7 @@ import pulseVaultRoutes, {
 import type { PulseVaultOnUploadComplete } from "./lib/pulsevaultTus.js";
 import type { PulseVaultValidatePayload } from "./lib/magic.js";
 import type { PulseVaultStorage } from "./storage/types.js";
+import type { UploadKind } from "./storage/types.js";
 
 /**
  * Subset of `@fastify/send`'s cache-related options forwarded to the GET
@@ -60,10 +61,16 @@ export type PulseVaultPluginOptions = {
    */
   decoratorName?: string;
   /**
-   * File extensions allowed in the upload `filename` metadata. Must include
-   * the leading dot; matched case-insensitively. Defaults to `[".mp4"]`.
+   * File extensions allowed per artifact kind. Accepts:
+   * - A flat array (`[".mp4"]`) — treated as video-only; project defaults to
+   *   `[".pulse", ".zip"]`. This is the legacy form for back-compat.
+   * - An object with optional `video` and/or `project` keys; unset keys fall
+   *   back to their defaults.
+   * - Omitted entirely — defaults to `{ video: [".mp4"], project: [".pulse", ".zip"] }`.
+   *
+   * All extensions must include the leading dot and are matched case-insensitively.
    */
-  allowedExtensions?: readonly string[];
+  allowedExtensions?: readonly string[] | { video?: readonly string[]; project?: readonly string[] };
   /**
    * Cache-control options forwarded to `@fastify/send` for the GET route.
    * When omitted, `@fastify/send`'s defaults apply (`Cache-Control: public,
@@ -106,11 +113,48 @@ export type PulseVaultPluginOptions = {
    * semantics should `storage.remove` before throwing.
    */
   onUploadComplete?: PulseVaultOnUploadComplete;
+  /**
+   * Optional payload-validation hook for `kind=project` uploads. Same
+   * lifecycle as `validatePayload` but only fires for project artifacts
+   * (`.pulse`, `.zip`, etc.). Throwing causes `storage.remove` + 4xx.
+   */
+  validateProjectPayload?: PulseVaultValidatePayload;
+  /**
+   * Optional post-upload hook for `kind=project` uploads. Fires after
+   * `validateProjectPayload` passes and `markReady` runs. Use this to
+   * index the draft, enable cross-device editing, etc.
+   */
+  onProjectUploadComplete?: PulseVaultOnUploadComplete;
 };
 
 const DEFAULT_DECORATOR_NAME = "pulseVault";
-const DEFAULT_ALLOWED_EXTENSIONS: readonly string[] = [".mp4"];
+const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = [".mp4"];
+const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = [".pulse", ".zip"];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
+
+/**
+ * Normalize the consumer's `allowedExtensions` option (legacy array or per-kind
+ * object) into the canonical `{ video, project }` shape the route layer expects.
+ */
+function normalizeAllowedExtensions(
+  raw: PulseVaultPluginOptions["allowedExtensions"],
+): { video: readonly string[]; project: readonly string[] } {
+  if (!raw) {
+    return { video: DEFAULT_VIDEO_EXTENSIONS, project: DEFAULT_PROJECT_EXTENSIONS };
+  }
+  if (Array.isArray(raw)) {
+    // Legacy flat array: treat as video-only, project keeps its default.
+    return {
+      video: (raw as readonly string[]).map((e) => e.toLowerCase()),
+      project: DEFAULT_PROJECT_EXTENSIONS,
+    };
+  }
+  const obj = raw as { video?: readonly string[]; project?: readonly string[] };
+  return {
+    video: (obj.video ?? DEFAULT_VIDEO_EXTENSIONS).map((e) => e.toLowerCase()),
+    project: (obj.project ?? DEFAULT_PROJECT_EXTENSIONS).map((e) => e.toLowerCase()),
+  };
+}
 
 function validateOptions(opts: PulseVaultPluginOptions): void {
   if (opts.prefix !== "" && (!opts.prefix.startsWith("/") || opts.prefix.endsWith("/"))) {
@@ -124,10 +168,13 @@ function validateOptions(opts: PulseVaultPluginOptions): void {
     );
   }
   if (opts.allowedExtensions) {
-    if (opts.allowedExtensions.length === 0) {
-      throw new TypeError("`allowedExtensions` must not be empty");
-    }
-    for (const ext of opts.allowedExtensions) {
+    const exts = Array.isArray(opts.allowedExtensions)
+      ? (opts.allowedExtensions as readonly string[])
+      : [
+          ...((opts.allowedExtensions as { video?: readonly string[] }).video ?? []),
+          ...((opts.allowedExtensions as { project?: readonly string[] }).project ?? []),
+        ];
+    for (const ext of exts) {
       if (!EXTENSION_REGEX.test(ext)) {
         throw new TypeError(
           `\`allowedExtensions\` entry ${JSON.stringify(ext)} must start with '.' and contain no nested dots, slashes, or whitespace (e.g. '.mp4')`,
@@ -152,9 +199,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
   await opts.storage.initialize?.();
 
   const decoratorName = opts.decoratorName ?? DEFAULT_DECORATOR_NAME;
-  const allowedExtensions = (
-    opts.allowedExtensions ?? DEFAULT_ALLOWED_EXTENSIONS
-  ).map((e) => e.toLowerCase());
+  const allowedExtensions = normalizeAllowedExtensions(opts.allowedExtensions);
 
   fastify.decorate(decoratorName, opts.storage);
 
@@ -166,7 +211,9 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
     cache: opts.cache,
     authorize: opts.authorize,
     validatePayload: opts.validatePayload,
+    validateProjectPayload: opts.validateProjectPayload,
     onUploadComplete: opts.onUploadComplete,
+    onProjectUploadComplete: opts.onProjectUploadComplete,
   });
 };
 
@@ -181,6 +228,7 @@ export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  UploadKind,
 } from "./storage/types.js";
 export type {
   PulseVaultAuthorize,

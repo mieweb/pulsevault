@@ -19,6 +19,9 @@ import pulseVault, {
 const ID1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ID2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
+// All plugin-owned routes are mounted under this prefix.
+const PREFIX = "/pulsevault";
+
 // ---------- helpers ----------
 
 function b64(str) {
@@ -100,7 +103,7 @@ async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
   const storage = createLocalStorage({ workspaceDir });
   const app = Fastify({ logger: false });
   await app.register(pulseVault, {
-    prefix: "",
+    prefix: PREFIX,
     storage,
     maxUploadSize: 10 * 1024 * 1024,
     ...(withSniffer ? { validatePayload: createMp4Sniffer(storage) } : {}),
@@ -124,7 +127,7 @@ async function tusCreate(baseUrl, { videoid, filename, size }) {
     `videoid ${b64(videoid)}`,
     `filename ${b64(filename)}`,
   ].join(",");
-  return fetch(`${baseUrl}/upload`, {
+  return fetch(`${baseUrl}${PREFIX}/upload`, {
     method: "POST",
     headers: {
       "Tus-Resumable": "1.0.0",
@@ -177,7 +180,7 @@ test("reserve + full upload flips sidecar to ready and GET streams the bytes", a
 
     const sidecar = JSON.parse(
       await fs.readFile(
-        path.join(ctx.workspaceDir, ID1, ".pulsevault.json"),
+        path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`),
         "utf8",
       ),
     );
@@ -185,7 +188,7 @@ test("reserve + full upload flips sidecar to ready and GET streams the bytes", a
     assert.equal(sidecar.ext, ".mp4");
     assert.equal(sidecar.version, 1);
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 200);
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(bytes.length, body.length);
@@ -206,7 +209,7 @@ test("GET returns 404 while the upload is still in progress", async () => {
     });
     assert.equal(create.status, 201);
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 404);
   } finally {
     await ctx.teardown();
@@ -233,13 +236,13 @@ test("HEAD + resume PATCH completes the upload", async () => {
     assert.equal(head.headers.get("upload-offset"), String(half));
 
     // Before the final PATCH, GET must still be 404.
-    const midGet = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const midGet = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(midGet.status, 404);
 
     const p2 = await tusPatch(location, half, body.subarray(half));
     assert.equal(p2.status, 204);
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 200);
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(Buffer.compare(bytes, body), 0);
@@ -291,7 +294,7 @@ test("range GET returns 206 with the requested slice", async () => {
   try {
     const { body } = await uploadFullMp4(ctx, ID1, 2048);
 
-    const range = await fetch(`${ctx.baseUrl}/${ID1}`, {
+    const range = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, {
       headers: { Range: "bytes=0-99" },
     });
     assert.equal(range.status, 206);
@@ -310,7 +313,7 @@ test("no Range header returns 200 with Accept-Ranges header", async () => {
   try {
     const { body } = await uploadFullMp4(ctx, ID1, 2048);
 
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("accept-ranges"), "bytes");
     const bytes = Buffer.from(await res.arrayBuffer());
@@ -328,7 +331,7 @@ test("open-ended range (bytes=N-) returns 206 with correct headers", async () =>
     const total = body.length;
     const startByte = 512;
 
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, {
       headers: { Range: `bytes=${startByte}-` },
     });
     assert.equal(res.status, 206);
@@ -353,7 +356,7 @@ test("suffix range (bytes=-N) returns 206 with correct headers", async () => {
     const total = body.length;
     const suffixLength = 256;
 
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, {
       headers: { Range: `bytes=-${suffixLength}` },
     });
     assert.equal(res.status, 206);
@@ -378,7 +381,7 @@ test("out-of-bounds range returns 416 with Content-Range", async () => {
     const { body } = await uploadFullMp4(ctx, ID1, 2048);
     const total = body.length;
 
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, {
       headers: { Range: "bytes=9999-10000" },
     });
     assert.equal(res.status, 416);
@@ -394,7 +397,7 @@ test("malformed range returns 416 with Content-Range", async () => {
     const { body } = await uploadFullMp4(ctx, ID1, 2048);
     const total = body.length;
 
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`, {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, {
       headers: { Range: "bytes=abc-def" },
     });
     assert.equal(res.status, 416);
@@ -407,7 +410,7 @@ test("malformed range returns 416 with Content-Range", async () => {
 test("GET of an unknown videoid returns 404", async () => {
   const ctx = await startApp();
   try {
-    const res = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(res.status, 404);
   } finally {
     await ctx.teardown();
@@ -430,10 +433,10 @@ test("authorize rejection blocks create, GET, and DELETE", async () => {
     });
     assert.equal(create.status, 403);
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 403);
 
-    const del = await fetch(`${ctx.baseUrl}/${ID1}`, { method: "DELETE" });
+    const del = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, { method: "DELETE" });
     assert.equal(del.status, 403);
   } finally {
     await ctx.teardown();
@@ -445,21 +448,21 @@ test("DELETE removes the video; second DELETE is 404", async () => {
   try {
     await uploadFullMp4(ctx, ID1);
 
-    const preGet = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const preGet = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(preGet.status, 200);
 
-    const del = await fetch(`${ctx.baseUrl}/${ID1}`, { method: "DELETE" });
+    const del = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, { method: "DELETE" });
     assert.equal(del.status, 204);
 
-    const dirStat = await fs
-      .stat(path.join(ctx.workspaceDir, ID1))
+    const sidecarStat = await fs
+      .stat(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`))
       .catch(() => null);
-    assert.equal(dirStat, null);
+    assert.equal(sidecarStat, null);
 
-    const postGet = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const postGet = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(postGet.status, 404);
 
-    const del2 = await fetch(`${ctx.baseUrl}/${ID1}`, { method: "DELETE" });
+    const del2 = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`, { method: "DELETE" });
     assert.equal(del2.status, 404);
   } finally {
     await ctx.teardown();
@@ -488,12 +491,12 @@ test("createMp4Sniffer rejects non-MP4 bytes and removes the video", async () =>
       `expected 4xx, got ${patch.status}`,
     );
 
-    const dirStat = await fs
-      .stat(path.join(ctx.workspaceDir, ID1))
+    const sidecarStat = await fs
+      .stat(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`))
       .catch(() => null);
-    assert.equal(dirStat, null, "videoid dir should be removed");
+    assert.equal(sidecarStat, null, "sidecar should be removed");
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 404);
   } finally {
     await ctx.teardown();
@@ -505,7 +508,7 @@ test("createMp4Sniffer accepts a valid MP4 payload", async () => {
   try {
     await uploadFullMp4(ctx, ID2, 2048);
 
-    const get = await fetch(`${ctx.baseUrl}/${ID2}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID2}`);
     assert.equal(get.status, 200);
   } finally {
     await ctx.teardown();
@@ -536,11 +539,10 @@ test("onUploadComplete fires exactly once with the right ctx", async () => {
 test("malformed sidecar is treated as absent; reserve rewrites it", async () => {
   const ctx = await startApp();
   try {
-    const dir = path.join(ctx.workspaceDir, ID1);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, ".pulsevault.json"), "not json");
+    await fs.mkdir(path.join(ctx.workspaceDir, ".pulsevault"), { recursive: true });
+    await fs.writeFile(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`), "not json");
 
-    const get = await fetch(`${ctx.baseUrl}/${ID1}`);
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
     assert.equal(get.status, 404);
 
     const create = await tusCreate(ctx.baseUrl, {
@@ -549,6 +551,32 @@ test("malformed sidecar is treated as absent; reserve rewrites it", async () => 
       size: 1024,
     });
     assert.equal(create.status, 201);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("old root-level plugin paths return 404", async () => {
+  const ctx = await startApp();
+  try {
+    // POST /upload (root) must not exist — plugin is mounted at /pulsevault.
+    const uploadRoot = await fetch(`${ctx.baseUrl}/upload`, {
+      method: "POST",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Length": "1024",
+        "Upload-Metadata": `videoid ${Buffer.from(ID1).toString("base64")}`,
+      },
+    });
+    assert.equal(uploadRoot.status, 404, "POST /upload should be 404");
+
+    // GET /:videoid (root) must not exist.
+    const getRoot = await fetch(`${ctx.baseUrl}/${ID1}`);
+    assert.equal(getRoot.status, 404, "GET /:videoid at root should be 404");
+
+    // DELETE /:videoid (root) must not exist.
+    const delRoot = await fetch(`${ctx.baseUrl}/${ID1}`, { method: "DELETE" });
+    assert.equal(delRoot.status, 404, "DELETE /:videoid at root should be 404");
   } finally {
     await ctx.teardown();
   }

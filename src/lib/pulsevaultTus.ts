@@ -5,6 +5,7 @@ import path from "node:path";
 import { isUuid } from "./uuid.js";
 import type { PulseVaultValidatePayload } from "./magic.js";
 import type { PulseVaultStorage } from "../storage/types.js";
+import type { UploadKind } from "../storage/types.js";
 
 /**
  * Context the plugin stashes on each incoming Fastify request for the lifetime
@@ -14,6 +15,8 @@ import type { PulseVaultStorage } from "../storage/types.js";
 export type PulseVaultTusContext = {
   request: FastifyRequest;
   videoid?: string;
+  /** Kind resolved during TUS create; available on the same request only. */
+  kind?: UploadKind;
 };
 
 export const pulseVaultTusContext = new AsyncLocalStorage<PulseVaultTusContext>();
@@ -30,25 +33,31 @@ export type PulsevaultTusOptions = {
   /** Max total upload size in bytes. Use `Infinity` for no cap. */
   maxSize: number;
   /**
-   * File extensions allowed in the upload `filename` metadata. Must be
-   * pre-normalized to lowercase and include the leading dot.
+   * Allowed extensions per kind. Must be pre-normalized to lowercase and
+   * include the leading dot.
    */
-  allowedExtensions: readonly string[];
+  allowedExtensions: { video: readonly string[]; project: readonly string[] };
   /**
-   * Optional payload-validation hook. Runs after TUS writes the final byte
-   * but before `markReady` and `onUploadComplete`. Throwing from this hook
-   * causes the plugin to `storage.remove?.(videoid)` and return a 4xx
-   * (default 422) to the client. Use for magic-byte sniffing, virus
-   * scanning, size re-checks — anything that needs the final bytes.
+   * Optional payload-validation hook for `kind=video` uploads. Runs after
+   * TUS writes the final byte but before `markReady` and `onUploadComplete`.
+   * Throwing causes `storage.remove?.(videoid)` and a 4xx (default 422).
    */
   validatePayload?: PulseVaultValidatePayload;
   /**
-   * Fired once the final byte of an upload has been written *and* any
-   * `validatePayload` has passed. Use this to flip consumer state (DB row,
-   * queue job, audit log). Throwing here returns a 500 — bytes are on disk
-   * and marked ready, but consumer-side work failed.
+   * Optional payload-validation hook for `kind=project` uploads. Same
+   * lifecycle as `validatePayload` but only fires for project artifacts.
+   */
+  validateProjectPayload?: PulseVaultValidatePayload;
+  /**
+   * Fired once the final byte of a `kind=video` upload has been written and
+   * any `validatePayload` has passed.
    */
   onUploadComplete?: PulseVaultOnUploadComplete;
+  /**
+   * Fired once the final byte of a `kind=project` upload has been written
+   * and any `validateProjectPayload` has passed.
+   */
+  onProjectUploadComplete?: PulseVaultOnUploadComplete;
 };
 
 /**
@@ -87,8 +96,11 @@ function validationErrorBody(err: unknown): { error: string; reason: string } | 
 
 /** Parse the videoid UUID from a tus upload id of the form `<kind>/<videoid><ext>`. */
 function videoidFromUploadId(id: string): string | undefined {
-  const first = id.split("/", 1)[0];
-  return isUuid(first) ? first : undefined;
+  const [, nameWithExt] = id.split("/");
+  if (!nameWithExt) return undefined;
+  const ext = path.extname(nameWithExt);
+  const candidate = ext ? nameWithExt.slice(0, -ext.length) : nameWithExt;
+  return isUuid(candidate) ? candidate : undefined;
 }
 
 /**
@@ -109,7 +121,9 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     maxSize,
     allowedExtensions,
     validatePayload,
+    validateProjectPayload,
     onUploadComplete,
+    onProjectUploadComplete,
   } = options;
 
   return new Server({
@@ -117,27 +131,41 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     datastore: storage.datastore,
     maxSize,
     namingFunction: async (_req, metadata) => {
-      const videoid = metadata?.videoid ?? "";
+      // Accept both `videoid` and `projectid` as the UUID key (alias for
+      // back-compat with the Pulse mobile client).
+      const videoid =
+        (metadata?.videoid ?? metadata?.projectid ?? "").trim();
       const filename = (metadata?.filename ?? "").trim();
+      // `kind` defaults to `"video"` so existing clients that don't send
+      // the field continue to work without any changes.
+      const rawKind = (metadata?.kind ?? "").trim().toLowerCase();
+      const kind: UploadKind = rawKind === "project" ? "project" : "video";
 
       if (!isUuid(videoid)) {
         throw tusError(
           400,
-          "Upload-Metadata must include a valid `videoid` (UUID).\n",
+          "Upload-Metadata must include a valid `videoid` (or `projectid`) UUID.\n",
         );
       }
 
       const ext = path.extname(filename).toLowerCase();
-      if (!ext || !allowedExtensions.includes(ext)) {
+      const allowed = allowedExtensions[kind];
+      if (!ext || !allowed.includes(ext)) {
         throw tusError(
           400,
-          `Upload-Metadata \`filename\` must end with one of: ${allowedExtensions.join(
-            ", ",
-          )}\n`,
+          `Upload-Metadata \`filename\` for kind="${kind}" must end with one of: ${allowed.join(", ")}\n`,
         );
       }
 
-      return storage.reserveUpload({ videoid, filename, ext });
+      // Store kind in the AsyncLocalStorage context so the authorize hook
+      // (already running) and onUploadFinish (same-request uploads) can
+      // read it without a storage round-trip.
+      const store = pulseVaultTusContext.getStore();
+      if (store) {
+        store.kind = kind;
+      }
+
+      return storage.reserveUpload({ videoid, filename, ext, kind });
     },
     generateUrl(_req, { proto, host, path: tusBasePath, id }) {
       const encoded = Buffer.from(id, "utf8").toString("base64url");
@@ -166,12 +194,21 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       const size = upload.size ?? 0;
       const uploadId = upload.id;
 
+      // Resolve the kind: prefer the context value (set during the same
+      // request's namingFunction for single-request uploads), fall back to
+      // a storage lookup (cheap in-memory cache hit for chunked uploads).
+      const kind: UploadKind = store.kind ?? (await resolveKind(storage, videoid));
+
+      // Pick the right validate and complete hooks based on kind.
+      const effectiveValidate = kind === "project" ? validateProjectPayload : validatePayload;
+      const effectiveComplete = kind === "project" ? onProjectUploadComplete : onUploadComplete;
+
       // 1. Validate payload (magic bytes, virus scan, etc.). If this throws
       //    we wipe the bytes from storage — the client gets a 4xx, the
       //    sidecar is gone, and they can safely retry with a corrected file.
-      if (validatePayload) {
+      if (effectiveValidate) {
         try {
-          await validatePayload(store.request, {
+          await effectiveValidate(store.request, {
             videoid,
             size,
             uploadId,
@@ -213,9 +250,9 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       }
 
       // 3. Consumer hook — business logic (DB writes, queue jobs).
-      if (onUploadComplete) {
+      if (effectiveComplete) {
         try {
-          await onUploadComplete(store.request, { videoid, size, uploadId });
+          await effectiveComplete(store.request, { videoid, size, uploadId });
         } catch (err) {
           // Propagate as a tus error so the client sees a non-2xx and can
           // distinguish "bytes stored but completion hook failed" from
@@ -231,6 +268,22 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       return {};
     },
   });
+}
+
+/**
+ * Resolve the artifact kind from storage for a known videoid. Used by
+ * `onUploadFinish` for chunked uploads where the kind is not in the current
+ * request's context. Defaults to `"video"` for adapters that don't implement
+ * `getKind` or when the videoid is not found.
+ */
+async function resolveKind(
+  storage: PulseVaultStorage,
+  videoid: string,
+): Promise<UploadKind> {
+  const candidate = (storage as { getKind?: unknown }).getKind;
+  if (typeof candidate !== "function") return "video";
+  const result = await (candidate as (id: string) => Promise<UploadKind | null>)(videoid);
+  return result ?? "video";
 }
 
 /**
