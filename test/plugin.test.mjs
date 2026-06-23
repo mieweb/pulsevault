@@ -13,6 +13,13 @@ import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
 } from "../dist/app.js";
+import {
+  makeMp4,
+  tusCreate as tusCreateRaw,
+  tusPatch,
+  tusHead,
+  uploadFull,
+} from "./helpers.mjs";
 
 // Reusable UUIDs. Each test uses its own workspace, so collisions across
 // tests are impossible — these just need to be valid UUIDs.
@@ -24,28 +31,11 @@ const PREFIX = "/pulsevault";
 
 // ---------- helpers ----------
 
-function b64(str) {
-  return Buffer.from(str, "utf8").toString("base64");
-}
-
-// Minimal ISOBMFF header: "ftyp" box with brand "isom". Enough bytes for
-// `sniffMp4` to accept and for realistic-looking upload sizes.
-const MP4_HEADER = Buffer.from([
-  0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // box size + "ftyp"
-  0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // brand "isom" + version
-]);
-
-function makeMp4(size) {
-  if (size < MP4_HEADER.length) {
-    throw new Error(`makeMp4: size ${size} < header ${MP4_HEADER.length}`);
-  }
-  const body = Buffer.alloc(size);
-  MP4_HEADER.copy(body, 0);
-  for (let i = MP4_HEADER.length; i < body.length; i++) {
-    body[i] = i & 0xff;
-  }
-  return body;
-}
+// Prefix-bound wrappers so the test bodies below read the same as before the
+// shared helpers were extracted.
+const tusCreate = (baseUrl, opts) => tusCreateRaw(baseUrl, PREFIX, opts);
+const uploadFullMp4 = (ctx, videoid, size = 1024) =>
+  uploadFull(ctx.baseUrl, PREFIX, { videoid, size });
 
 async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
@@ -69,55 +59,6 @@ async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     },
   };
-}
-
-async function tusCreate(baseUrl, { videoid, filename, size }) {
-  const metadata = [
-    `videoid ${b64(videoid)}`,
-    `filename ${b64(filename)}`,
-  ].join(",");
-  return fetch(`${baseUrl}${PREFIX}/upload`, {
-    method: "POST",
-    headers: {
-      "Tus-Resumable": "1.0.0",
-      "Upload-Length": String(size),
-      "Upload-Metadata": metadata,
-    },
-  });
-}
-
-async function tusPatch(url, offset, body) {
-  return fetch(url, {
-    method: "PATCH",
-    headers: {
-      "Tus-Resumable": "1.0.0",
-      "Upload-Offset": String(offset),
-      "Content-Type": "application/offset+octet-stream",
-    },
-    body,
-  });
-}
-
-async function tusHead(url) {
-  return fetch(url, {
-    method: "HEAD",
-    headers: { "Tus-Resumable": "1.0.0" },
-  });
-}
-
-async function uploadFullMp4(ctx, videoid, size = 1024) {
-  const body = makeMp4(size);
-  const create = await tusCreate(ctx.baseUrl, {
-    videoid,
-    filename: "clip.mp4",
-    size: body.length,
-  });
-  assert.equal(create.status, 201, "create");
-  const location = create.headers.get("location");
-  assert.ok(location, "location header");
-  const patch = await tusPatch(location, 0, body);
-  assert.equal(patch.status, 204, "patch");
-  return { body, location };
 }
 
 // ---------- tests ----------

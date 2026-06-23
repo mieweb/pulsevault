@@ -110,7 +110,7 @@ type PulseVaultPluginOptions = {
 
 ### `storage`
 
-A `PulseVaultStorage` adapter. Use the built-in `createLocalStorage` for filesystem-backed deployments (the blessed default) or implement the interface for custom backends (S3, GCS, etc.).
+A `PulseVaultStorage` adapter. Use the built-in `createLocalStorage` for filesystem-backed deployments (the blessed default), `createS3Storage` for Cloudflare R2 / AWS S3 (see [Object storage](#object-storage-cloudflare-r2--aws-s3)), or implement the interface for custom backends (GCS, database, etc.).
 
 ### `prefix`
 
@@ -339,6 +339,87 @@ await app.register(pulseVault, {
 
 `@mieweb/artipod` is **not** a dependency of this plugin — install it in your app only if you want it. Any filesystem-native pipeline (ffmpeg, whisper, rsync) works equally well.
 
+## Object storage (Cloudflare R2 / AWS S3)
+
+`createS3Storage` is a built-in adapter that streams uploads into an S3-compatible bucket via S3 multipart upload and serves playback by redirecting the client to a short-lived **presigned URL** (so bytes never flow back through your server). Because Cloudflare R2 speaks the S3 API, the same adapter covers both R2 and AWS S3 — they differ only by endpoint and credentials.
+
+It's **opt-in**: the AWS SDK and `@tus/s3-store` are `optionalDependencies`, loaded lazily only when you call `createS3Storage`. Install them in your app:
+
+```bash
+npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store
+```
+
+`createS3Storage` is **async** (it lazily imports those packages), so `await` it before registering the plugin.
+
+**Cloudflare R2:**
+
+```ts
+import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault";
+
+const storage = await createS3Storage({
+  bucket: "pulse-videos",
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  accessKeyId: process.env.R2_ACCESS_KEY,
+  secretAccessKey: process.env.R2_SECRET_KEY,
+});
+
+await app.register(pulseVault, {
+  prefix: "/pulsevault",
+  storage,
+  maxUploadSize: 5 * 1024 * 1024 * 1024,
+  validatePayload: createS3Mp4Sniffer(storage), // ranged-read MP4 sniff
+});
+```
+
+**AWS S3** — drop the custom `endpoint` and set `region`:
+
+```ts
+const storage = await createS3Storage({
+  bucket: "pulse-videos",
+  region: "us-east-1",
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+```
+
+Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS SDK's default credential chain (env vars, IAM role, etc.). **Never hard-code keys; read them from the environment.**
+
+### Object layout
+
+```text
+<bucket>/
+  .pulsevault/<id>.json   # metadata sidecar: { version, ext, filename, status, kind }
+  video/<id><ext>         # finalized video object   (kind="video")
+  project/<id><ext>       # finalized project object (kind="project")
+  <key>.info              # @tus/s3-store multipart bookkeeping (transient)
+```
+
+`resolve()` only returns a presigned URL once the sidecar `status` is `"ready"` (after the final byte lands and `validatePayload` passes), so in-progress or rejected uploads are never served. `getKind(id)` returns the kind without a full resolve.
+
+### Options
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `bucket` | — | Required. Must already exist. |
+| `endpoint` | — | Custom S3 endpoint (set for R2). Omit for AWS S3. |
+| `region` | `"auto"` when `endpoint` is set | Required for AWS S3. |
+| `accessKeyId` / `secretAccessKey` | SDK default chain | Optional; omit both to use env/IAM credentials. |
+| `sessionToken` | — | Optional STS session token for temporary credentials. |
+| `forcePathStyle` | `true` when `endpoint` is set | R2 and most S3-compatible stores need path-style. |
+| `presignTtlSeconds` | `900` | Lifetime of the playback presigned URL. |
+| `partSize` | computed | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
+
+> The runnable demo wires these to environment variables — see [`examples/rn-demo/.env.example`](examples/rn-demo/.env.example) for the full list (`STORAGE`, `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, …).
+
+### Payload validation on remote storage
+
+The default `createMp4Sniffer` reads a local file path, which doesn't exist for a bucket object. Use **`createS3Mp4Sniffer(storage)`** instead: it fetches the first 12 bytes via a small ranged GET (`storage.readHeader`) and applies the same ISOBMFF `ftyp` check, rejecting non-MP4 uploads with 422 and removing the object — no full download.
+
+### Direct playback & CORS
+
+Because playback is a 302 redirect to a presigned URL, a browser fetching it goes **directly** to R2/S3. If you play back from a web origin, add a bucket CORS rule allowing your origin (`GET`, and `Range` for seeking). Native clients that follow redirects need no CORS.
+
 ## Custom storage adapter
 
 Implement `PulseVaultStorage` to back uploads with any system (S3, GCS, database, etc.):
@@ -423,6 +504,7 @@ Runs a Node `--test` suite against the built plugin. Coverage includes:
 - Legacy sidecars (no `kind` field) default to `"video"` without migration
 - Sidecar corruption recovery
 - `allowedExtensions` object form
+- S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `DELETE`, `kind=project`, run against an in-process [s3rver](https://github.com/jamhall/s3rver) mock (no cloud credentials needed)
 
 ## Accessing storage outside the plugin routes
 

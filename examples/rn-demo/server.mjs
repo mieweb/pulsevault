@@ -11,6 +11,8 @@ import QRCode from "qrcode";
 import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
+  createS3Storage,
+  createS3Mp4Sniffer,
   buildUploadLink,
 } from "@mieweb/pulsevault";
 
@@ -220,16 +222,49 @@ app.get("/deeplinks", async (req, reply) => {
   });
 });
 
+// Storage backend. Defaults to the local filesystem; set STORAGE=s3 to stream
+// uploads into Cloudflare R2 / AWS S3 instead and serve playback via presigned
+// redirects. S3 mode needs the optional packages installed
+// (`@aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store`) and the
+// S3_*/AWS_* env vars below — see `.env.example`. Note: the demo's GET /videos
+// route lists local sidecars only, so it returns [] in S3 mode.
+const useS3 = (process.env.STORAGE || "local").toLowerCase() === "s3";
+const pulseStorage = useS3
+  ? await createS3Storage({
+      bucket: process.env.S3_BUCKET,
+      // Set S3_ENDPOINT for R2 (https://<account>.r2.cloudflarestorage.com);
+      // omit it and set AWS_REGION for AWS S3.
+      endpoint: process.env.S3_ENDPOINT,
+      region: process.env.AWS_REGION,
+      // Credentials are optional — omit both to use the AWS SDK default chain.
+      accessKeyId: process.env.S3_ACCESS_KEY_ID,
+      secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      sessionToken: process.env.S3_SESSION_TOKEN,
+      // Advanced (all optional): override path-style, presigned URL TTL, part size.
+      ...(process.env.S3_FORCE_PATH_STYLE
+        ? { forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true" }
+        : {}),
+      ...(process.env.S3_PRESIGN_TTL_SECONDS
+        ? { presignTtlSeconds: Number(process.env.S3_PRESIGN_TTL_SECONDS) }
+        : {}),
+      ...(process.env.S3_PART_SIZE
+        ? { partSize: Number(process.env.S3_PART_SIZE) }
+        : {}),
+    })
+  : createLocalStorage({ workspaceDir: dataDir });
+
 // Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and video GET is at /pulsevault/:videoid
-const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
 await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   // Accept MP4 videos and Pulse draft bundles (.pulse) + diagnostic zips.
   allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"] },
-  // Reject non-MP4 bytes on video uploads (magic-byte sniff).
-  validatePayload: createMp4Sniffer(pulseStorage),
+  // Reject non-MP4 bytes on video uploads (magic-byte sniff). The S3 sniffer
+  // does a ranged read of the object; the local one reads the file on disk.
+  validatePayload: useS3
+    ? createS3Mp4Sniffer(pulseStorage)
+    : createMp4Sniffer(pulseStorage),
   // Fired when a project bundle finishes uploading. The bundle is opaque
   // to the plugin — index it, relay it, or leave it for a later request.
   onProjectUploadComplete: async (_req, { videoid, size }) => {

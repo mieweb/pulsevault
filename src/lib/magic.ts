@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import type { FastifyRequest } from "fastify";
 import type { LocalStorage } from "../storage/local.js";
+import type { S3Storage } from "../storage/s3.js";
 
 /**
  * Optional plugin-level hook: after TUS writes the final byte but before the
@@ -46,19 +47,26 @@ export async function sniffMp4(filePath: string): Promise<boolean> {
     const buf = Buffer.alloc(12);
     const { bytesRead } = await fd.read(buf, 0, 12, 0);
     if (bytesRead < 12) return false;
-    // Bytes 4..7 must spell "ftyp" (ASCII 0x66 0x74 0x79 0x70). The first
-    // four bytes are the box size and the remaining four after "ftyp" are
-    // the brand (e.g. "isom", "mp42", "qt  ") — brand validation is left
-    // to downstream tools.
-    return (
-      buf[4] === 0x66 &&
-      buf[5] === 0x74 &&
-      buf[6] === 0x79 &&
-      buf[7] === 0x70
-    );
+    return hasFtypBox(buf);
   } finally {
     await fd.close();
   }
+}
+
+/**
+ * Whether a buffer's first 12 bytes carry an ISO base media `ftyp` box.
+ * Bytes 4..7 must spell "ftyp" (ASCII 0x66 0x74 0x79 0x70). The first four
+ * bytes are the box size and the four after "ftyp" are the brand (e.g.
+ * "isom", "mp42", "qt  ") — brand validation is left to downstream tools.
+ */
+function hasFtypBox(buf: Buffer): boolean {
+  if (buf.length < 12) return false;
+  return (
+    buf[4] === 0x66 &&
+    buf[5] === 0x74 &&
+    buf[6] === 0x79 &&
+    buf[7] === 0x70
+  );
 }
 
 /**
@@ -92,6 +100,44 @@ export function createMp4Sniffer(
     }
     const ok = await sniffMp4(localPath);
     if (!ok) {
+      throw Object.assign(
+        new Error("Uploaded bytes are not a valid MP4 (missing ftyp header)"),
+        { statusCode: 422 },
+      );
+    }
+  };
+}
+
+/**
+ * `createMp4Sniffer` for the S3 / R2 backend. Instead of opening a local file,
+ * it asks the adapter for the first 12 bytes of the finalized object via a
+ * small ranged GET (`S3Storage.readHeader`) and applies the same `ftyp` check.
+ * Runs in the same lifecycle slot — after `@tus/s3-store` completes the
+ * multipart upload (so the object is readable) but before `markReady` — so a
+ * non-MP4 upload is removed and never served.
+ *
+ * Usage:
+ * ```ts
+ * const storage = await createS3Storage({ ... });
+ * await app.register(pulseVault, {
+ *   storage,
+ *   validatePayload: createS3Mp4Sniffer(storage),
+ *   // ...
+ * });
+ * ```
+ */
+export function createS3Mp4Sniffer(
+  storage: S3Storage,
+): PulseVaultValidatePayload {
+  return async (_request, { videoid }) => {
+    const header = await storage.readHeader(videoid, 12);
+    if (!header) {
+      throw Object.assign(
+        new Error(`Cannot validate upload ${videoid}: no object bytes available`),
+        { statusCode: 500 },
+      );
+    }
+    if (!hasFtypBox(header)) {
       throw Object.assign(
         new Error("Uploaded bytes are not a valid MP4 (missing ftyp header)"),
         { statusCode: 422 },
