@@ -249,8 +249,7 @@ function composeValidatePayload(
 ): PulseVaultValidatePayload | undefined {
   if (!legacyProject) return generic;
   return async (request, ctx) => {
-    const kind = (ctx as typeof ctx & { kind?: UploadKind }).kind;
-    if (kind === "project") {
+    if (ctx.kind === "project") {
       await legacyProject(request, ctx);
       return;
     }

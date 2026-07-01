@@ -41,7 +41,7 @@ The response body MUST be a JSON object with at least the following fields:
   "kinds": ["video", "project", "captions"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".srt"] },
   "maxUploadSize": 5368709120,
-  "checksum": { "algorithms": ["sha256"] }
+  "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
 ```
 
@@ -60,7 +60,10 @@ The response body MUST be a JSON object with at least the following fields:
 - `maxUploadSize` (integer, REQUIRED): maximum artifact size in bytes.
 - `checksum.algorithms` (array of string, OPTIONAL): digest algorithms this
   server can verify (§6.3). Absent or empty means the server does not
-  support checksum verification.
+  support checksum verification. Note for implementers: this field
+  describes capability, not whether verification is actually wired in for
+  every upload — a server MAY list an algorithm it's capable of checking
+  even for a deployment where the operator hasn't enabled that check.
 
 A server response to this endpoint MUST NOT include any secret. Every other
 response from the server MUST include a `Protocol-Version` header carrying

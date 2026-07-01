@@ -2,12 +2,13 @@ import fs from "node:fs/promises";
 import type { FastifyRequest } from "fastify";
 import type { LocalStorage } from "../storage/local.js";
 import type { S3Storage } from "../storage/s3.js";
+import type { UploadKind } from "../storage/types.js";
 
 /**
  * Optional plugin-level hook: after TUS writes the final byte but before the
  * upload is marked ready (or the consumer's `onUploadComplete` runs),
  * validate the payload bytes. Throw to reject — the plugin translates the
- * throw into a 422 response, calls `storage.remove?.(videoid)` to free the
+ * throw into a 422 response, calls `storage.remove?.(artifactId)` to free the
  * disk, and never flips the sidecar to `"ready"`.
  *
  * The `localPath` field is populated for adapters that expose
@@ -21,8 +22,12 @@ export type PulseVaultValidatePayload = (
     artifactId: string;
     size: number;
     uploadId: string;
+    /** Which artifact kind this upload is. Runs for every kind — branch on this if you only want a check applied to one. */
+    kind: UploadKind;
     /** Absolute local path to the finalized bytes, or `null` if unavailable. */
     localPath: string | null;
+    /** Client-supplied `<algorithm>:<hex>` digest, if `Upload-Metadata.checksum` was sent. */
+    checksum?: string;
   },
 ) => void | Promise<void>;
 

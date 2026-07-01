@@ -65,9 +65,7 @@ export function createChecksumValidator(
   next?: PulseVaultValidatePayload,
 ): PulseVaultValidatePayload {
   return async (request, ctx) => {
-    const checksum = parseChecksumMetadata(
-      (ctx as typeof ctx & { checksum?: string }).checksum,
-    );
+    const checksum = parseChecksumMetadata(ctx.checksum);
     if (checksum) {
       if (!ctx.localPath) {
         throw checksumError(
@@ -96,9 +94,7 @@ export function createS3ChecksumValidator(
   next?: PulseVaultValidatePayload,
 ): PulseVaultValidatePayload {
   return async (request, ctx) => {
-    const checksum = parseChecksumMetadata(
-      (ctx as typeof ctx & { checksum?: string }).checksum,
-    );
+    const checksum = parseChecksumMetadata(ctx.checksum);
     if (checksum) {
       const bytes = await storage.readAll(ctx.artifactId);
       if (!bytes) {

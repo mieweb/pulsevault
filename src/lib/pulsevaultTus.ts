@@ -214,7 +214,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
             localPath: await resolveLocalPath(storage, artifactId),
             ...(checksum ? { checksum } : {}),
             kind,
-          } as Parameters<PulseVaultValidatePayload>[1] & { kind: UploadKind; checksum?: string });
+          });
         } catch (err) {
           const status = statusCodeOf(err, 422);
           const message =
