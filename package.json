@@ -57,7 +57,7 @@
   "contributors": [
     "morepriyam (https://github.com/morepriyam)"
   ],
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mieweb/pulsevault.git"

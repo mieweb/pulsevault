@@ -2,8 +2,6 @@
 
 Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. Ships as a Fastify plugin (`@mieweb/pulsevault`) and as a framework-agnostic core (`@mieweb/pulsevault/core`) for Express, Meteor, or plain `http.createServer` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
-**Licensing note**: this package is currently Source Available (free for non-commercial use; see [License](#license)) — a move to a fully OSI-approved open source license is planned but not yet landed. If you're evaluating this for adoption, read [License](#license) before investing evaluation time.
-
 See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server *without* this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
 
 Self-hosted video capture for places that can't ship recordings to a vendor. Pulse records the walkthrough on the phone; Pulsevault receives it inside the backend you already run, behind your auth, on your storage. Pair a device by QR code and upload over TUS so two-minute captures from the floor survive signal drops and device restarts.
@@ -786,8 +784,6 @@ Under `@mieweb/pulsevault/core` there's no decorator (no Fastify instance to han
 
 ## License
 
-Source Available — free for non-commercial use under the terms in [LICENSE](LICENSE), which also requires that redistributions be published under an OSI-approved open source license. Commercial use requires a separate license from Medical Informatics Engineering, LLC — contact [helpdesk@mieweb.com](mailto:helpdesk@mieweb.com) or [mieweb.com](https://www.mieweb.com).
+MIT — see [LICENSE](LICENSE).
 
-A move to a fully OSI-approved open source license for this package itself is planned, to remove this friction for adopters entirely — tracked as a follow-up, not yet decided which license.
-
-Copyright © 2026 Medical Informatics Engineering, LLC. All rights reserved.
+Copyright © 2026 Medical Informatics Engineering, LLC.
