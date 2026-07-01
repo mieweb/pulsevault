@@ -81,6 +81,8 @@ await app.register(rateLimit, {
 });
 ```
 
+Under `@mieweb/pulsevault/core` (Express, Meteor, plain `http`), use the equivalent middleware for your host — e.g. `express-rate-limit` mounted ahead of `pulseVault.handler`, scoped the same way.
+
 ## Monitoring and audit logging
 
 Wire `onArtifactEvent` once to get both ops metrics and a compliance audit
@@ -113,6 +115,15 @@ onArtifactEvent: (event) => {
   }
 },
 ```
+
+`onArtifactEvent` isn't request-scoped (no Fastify instance to hang a logger
+off of either way), so the examples above read the same under
+`@mieweb/pulsevault/core` — just close over whatever logger (or `console`)
+your app already uses instead of `app.log`. The core's own internal
+diagnostics (authorize-rejection/error logging separate from
+`onArtifactEvent`) accept an explicit `logger` option on
+`createPulseVaultCore(...)` for the same reason — see "Non-Fastify hosts" in
+`README.md`.
 
 What to alert on: a sustained rise in `reject`/`authorize`-rejection events
 (misconfigured auth, or an attacker probing), disk usage on the local

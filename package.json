@@ -1,7 +1,7 @@
 {
   "name": "@mieweb/pulsevault",
   "version": "0.1.0",
-  "description": "Fastify plugin for resumable video uploads via TUS, with a pluggable storage adapter and a filesystem-first local-storage default.",
+  "description": "Resumable video uploads via TUS for Fastify (plugin) or any Node backend (framework-agnostic core), with a pluggable storage adapter and a filesystem-first local-storage default.",
   "type": "module",
   "main": "./dist/app.js",
   "types": "./dist/app.d.ts",
@@ -15,10 +15,19 @@
       "types": "./dist/augment.d.ts",
       "import": "./dist/augment.js",
       "default": "./dist/augment.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "import": "./dist/core.js",
+      "default": "./dist/core.js"
     }
   },
   "files": [
     "dist",
+    "core.js",
+    "core.d.ts",
+    "augment.js",
+    "augment.d.ts",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -35,6 +44,8 @@
   "keywords": [
     "fastify",
     "fastify-plugin",
+    "express",
+    "meteor",
     "tus",
     "tus-server",
     "video",
@@ -67,12 +78,14 @@
   },
   "dependencies": {
     "@fastify/send": "^4.1.0",
-    "@tus/file-store": "^2.0.0",
-    "@tus/server": "^2.0.0",
+    "@tus/file-store": "2.0.0",
+    "@tus/server": "2.0.0",
     "fastify-plugin": "^5.1.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
+    "express": "^5.2.1",
     "fastify": "^5.8.5",
     "s3rver": "^3.7.1",
     "typescript": "^6.0.2"

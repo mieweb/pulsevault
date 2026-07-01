@@ -5,6 +5,16 @@ import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from "./li
 import type { PulseVaultValidatePayload } from "./lib/magic.js";
 import type { PulseVaultStorage } from "./storage/types.js";
 import type { UploadKind } from "./storage/types.js";
+import {
+  normalizeAllowedExtensions,
+  validateBasePath,
+  validateMaxUploadSize,
+  validateUploadUnit,
+  validateAllowedExtensions,
+  warnIfUsingDeprecatedProjectHooks,
+  composeValidatePayload,
+  composeOnUploadComplete,
+} from "./lib/options.js";
 
 /**
  * Subset of `@fastify/send`'s cache-related options forwarded to the GET
@@ -89,11 +99,14 @@ export type PulseVaultPluginOptions = {
    * and before `resolve` on GET. Throw to reject the request; a thrown
    * `statusCode`/`status_code` number on the error is honored (default 403).
    *
-   * The hook is called with the `FastifyRequest`, so consumers can look up
-   * sessions, API keys, JWTs, etc. using whatever auth system they have
-   * registered higher up in the Fastify tree. Use `createCapabilityAuthorize`
-   * (from `./lib/capability-token.js`) for a secure-by-default option that
-   * doesn't require writing your own.
+   * The hook is called with the actual `FastifyRequest` (typed more loosely
+   * as `PulseVaultRequest` — the shared shape this option also uses under
+   * `@mieweb/pulsevault/core` — since only `.headers` is guaranteed; cast if
+   * you need Fastify-specific fields), so consumers can look up sessions,
+   * API keys, JWTs, etc. using whatever auth system they have registered
+   * higher up in the Fastify tree. Use `createCapabilityAuthorize` (from
+   * `./lib/capability-token.js`) for a secure-by-default option that doesn't
+   * require writing your own.
    *
    * When omitted, the plugin performs no authorization. For production
    * deployments you almost certainly want to set this — register your auth
@@ -150,132 +163,15 @@ export type PulseVaultPluginOptions = {
 };
 
 const DEFAULT_DECORATOR_NAME = "pulseVault";
-const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = [".mp4"];
-const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = [".pulse", ".zip"];
-const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = [".srt"];
-const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
-
-/**
- * Normalize the consumer's `allowedExtensions` option (legacy array or per-kind
- * object) into the canonical `{ video, project, captions }` shape the route
- * layer expects.
- */
-function normalizeAllowedExtensions(
-  raw: PulseVaultPluginOptions["allowedExtensions"],
-): { video: readonly string[]; project: readonly string[]; captions: readonly string[] } {
-  if (!raw) {
-    return {
-      video: DEFAULT_VIDEO_EXTENSIONS,
-      project: DEFAULT_PROJECT_EXTENSIONS,
-      captions: DEFAULT_CAPTIONS_EXTENSIONS,
-    };
-  }
-  if (Array.isArray(raw)) {
-    // Legacy flat array: treat as video-only, project/captions keep their defaults.
-    return {
-      video: (raw as readonly string[]).map((e) => e.toLowerCase()),
-      project: DEFAULT_PROJECT_EXTENSIONS,
-      captions: DEFAULT_CAPTIONS_EXTENSIONS,
-    };
-  }
-  const obj = raw as {
-    video?: readonly string[];
-    project?: readonly string[];
-    captions?: readonly string[];
-  };
-  return {
-    video: (obj.video ?? DEFAULT_VIDEO_EXTENSIONS).map((e) => e.toLowerCase()),
-    project: (obj.project ?? DEFAULT_PROJECT_EXTENSIONS).map((e) => e.toLowerCase()),
-    captions: (obj.captions ?? DEFAULT_CAPTIONS_EXTENSIONS).map((e) => e.toLowerCase()),
-  };
-}
-
-function validateOptions(opts: PulseVaultPluginOptions): void {
-  if (opts.prefix !== "" && (!opts.prefix.startsWith("/") || opts.prefix.endsWith("/"))) {
-    throw new TypeError(
-      "`prefix` must be '' or start with '/' with no trailing slash (e.g. '/pulsevault')",
-    );
-  }
-  if (!(opts.maxUploadSize > 0)) {
-    throw new TypeError(
-      "`maxUploadSize` must be a positive number (use Infinity for no cap)",
-    );
-  }
-  if (opts.uploadUnit && opts.uploadUnit !== "beat" && opts.uploadUnit !== "merged") {
-    throw new TypeError('`uploadUnit` must be "beat" or "merged"');
-  }
-  if (opts.allowedExtensions) {
-    const exts = Array.isArray(opts.allowedExtensions)
-      ? (opts.allowedExtensions as readonly string[])
-      : [
-          ...((opts.allowedExtensions as { video?: readonly string[] }).video ?? []),
-          ...((opts.allowedExtensions as { project?: readonly string[] }).project ?? []),
-          ...((opts.allowedExtensions as { captions?: readonly string[] }).captions ?? []),
-        ];
-    for (const ext of exts) {
-      if (!EXTENSION_REGEX.test(ext)) {
-        throw new TypeError(
-          `\`allowedExtensions\` entry ${JSON.stringify(ext)} must start with '.' and contain no nested dots, slashes, or whitespace (e.g. '.mp4')`,
-        );
-      }
-    }
-  }
-}
-
-/**
- * One-time (not per-request) warning for the now-deprecated per-kind project
- * hooks, so consumers notice the migration need instead of it being silently
- * aliased away until a future major version removes it outright.
- */
-function warnIfUsingDeprecatedProjectHooks(opts: PulseVaultPluginOptions): void {
-  if (opts.validateProjectPayload) {
-    process.emitWarning(
-      "pulsevault: `validateProjectPayload` is deprecated — use `validatePayload` and branch on `ctx.kind === \"project\"` instead. Still honored this release.",
-      "DeprecationWarning",
-    );
-  }
-  if (opts.onProjectUploadComplete) {
-    process.emitWarning(
-      "pulsevault: `onProjectUploadComplete` is deprecated — use `onUploadComplete` and branch on `ctx.kind === \"project\"` instead. Still honored this release.",
-      "DeprecationWarning",
-    );
-  }
-}
-
-/** Compose the legacy per-kind hook (if any) with the generic hook, mapped onto the `"project"` kind only. */
-function composeValidatePayload(
-  generic: PulseVaultValidatePayload | undefined,
-  legacyProject: PulseVaultValidatePayload | undefined,
-): PulseVaultValidatePayload | undefined {
-  if (!legacyProject) return generic;
-  return async (request, ctx) => {
-    if (ctx.kind === "project") {
-      await legacyProject(request, ctx);
-      return;
-    }
-    if (generic) await generic(request, ctx);
-  };
-}
-
-function composeOnUploadComplete(
-  generic: PulseVaultOnUploadComplete | undefined,
-  legacyProject: PulseVaultOnUploadComplete | undefined,
-): PulseVaultOnUploadComplete | undefined {
-  if (!legacyProject) return generic;
-  return async (request, ctx) => {
-    if (ctx.kind === "project") {
-      await legacyProject(request, ctx);
-      return;
-    }
-    if (generic) await generic(request, ctx);
-  };
-}
 
 const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
   fastify,
   opts,
 ) => {
-  validateOptions(opts);
+  validateBasePath(opts.prefix, "prefix");
+  validateMaxUploadSize(opts.maxUploadSize);
+  validateUploadUnit(opts.uploadUnit);
+  validateAllowedExtensions(opts.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(opts);
 
   // Register the shutdown hook *before* awaiting initialize() so any partial
@@ -351,3 +247,4 @@ export {
   parseChecksumMetadata,
 } from "./lib/checksum.js";
 export type { ChecksumAlgorithm, ParsedChecksum } from "./lib/checksum.js";
+export type { PulseVaultRequest, PulseVaultLogger } from "./lib/request.js";

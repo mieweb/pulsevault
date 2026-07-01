@@ -1,19 +1,20 @@
 import { Server } from "@tus/server";
-import type { FastifyRequest } from "fastify";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { isUuid } from "./uuid.js";
 import type { PulseVaultValidatePayload } from "./magic.js";
+import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from "./request.js";
 import type { PulseVaultStorage } from "../storage/types.js";
 import type { UploadKind } from "../storage/types.js";
 
 /**
- * Context the plugin stashes on each incoming Fastify request for the lifetime
- * of a TUS call. Shared with the tus hooks via `AsyncLocalStorage` because
- * `@tus/server` v2 hooks receive a web `Request`, not the FastifyRequest.
+ * Context the plugin stashes on each incoming request for the lifetime of a
+ * TUS call. Shared with the tus hooks via `AsyncLocalStorage` because
+ * `@tus/server` v2 hooks receive a raw `req`/`res`, not the host's request
+ * wrapper (Fastify's `FastifyRequest`, Express's `req`, etc.).
  */
 export type PulseVaultTusContext = {
-  request: FastifyRequest;
+  request: PulseVaultRequest;
   artifactId?: string;
   /** Kind resolved during TUS create; available on the same request only. */
   kind?: UploadKind;
@@ -26,7 +27,7 @@ export type PulseVaultTusContext = {
 export const pulseVaultTusContext = new AsyncLocalStorage<PulseVaultTusContext>();
 
 export type PulseVaultOnUploadComplete = (
-  request: FastifyRequest,
+  request: PulseVaultRequest,
   ctx: { artifactId: string; kind: UploadKind; size: number; uploadId: string },
 ) => void | Promise<void>;
 
@@ -68,6 +69,8 @@ export type PulsevaultTusOptions = {
   onUploadComplete?: PulseVaultOnUploadComplete;
   /** See `PulseVaultOnArtifactEvent`. */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
+  /** Logger for internal diagnostics (cleanup failures, etc). Defaults to `console`. */
+  logger?: PulseVaultLogger;
 };
 
 /**
@@ -113,6 +116,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     validatePayload,
     onUploadComplete,
     onArtifactEvent,
+    logger = consoleLogger,
   } = options;
 
   return new Server({
@@ -222,7 +226,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           try {
             await storage.remove?.(artifactId);
           } catch (rmErr) {
-            store.request.log.error(
+            logger.error(
               { err: rmErr, artifactId },
               "pulsevault failed to remove rejected upload",
             );

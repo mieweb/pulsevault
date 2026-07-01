@@ -1,0 +1,12 @@
+:root { font-family: system-ui, sans-serif; background: #0f1419; color: #e6edf3; }
+body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+h1 { font-size: 1.25rem; font-weight: 600; margin: 0; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 1rem; }
+.open-btn { display: block; padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600; color: #fff; background: #238636; border-radius: 6px; text-align: center; text-decoration: none; margin-bottom: 0.75rem; }
+.open-btn:hover { background: #2ea043; }
+.mono { font-family: ui-monospace, monospace; font-size: 0.75rem; word-break: break-all; color: #8b949e; }
+label { display: block; font-size: 0.875rem; color: #8b949e; margin-bottom: 0.25rem; }
+.ghost-btn { display: block; width: 100%; padding: 0.5rem; margin-bottom: 0.75rem; font-size: 0.875rem; background: #161b22; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; }
+.top-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.auth-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; background: #1f2937; border: 1px solid #30363d; color: #8b949e; }
+.auth-badge.on { background: #1d3a1d; border-color: #2ea043; color: #b9e6b9; }

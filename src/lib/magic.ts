@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import type { FastifyRequest } from "fastify";
+import type { PulseVaultRequest } from "./request.js";
 import type { LocalStorage } from "../storage/local.js";
 import type { S3Storage } from "../storage/s3.js";
 import type { UploadKind } from "../storage/types.js";
@@ -17,7 +17,7 @@ import type { UploadKind } from "../storage/types.js";
  * validator has to fetch bytes through whatever API the adapter provides.
  */
 export type PulseVaultValidatePayload = (
-  request: FastifyRequest,
+  request: PulseVaultRequest,
   ctx: {
     artifactId: string;
     size: number;

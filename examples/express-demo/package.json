@@ -1,0 +1,15 @@
+{
+  "name": "pulsevault-express-demo",
+  "private": true,
+  "type": "module",
+  "description": "Express demo server for the Pulse React Native app — same demo as ../rn-demo, but on @mieweb/pulsevault/core instead of the Fastify plugin",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "@mieweb/pulsevault": "file:../..",
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4"
+  }
+}
