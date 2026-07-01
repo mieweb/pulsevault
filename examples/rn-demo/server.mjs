@@ -95,6 +95,20 @@ function recordEvent(event) {
   if (recentEvents.length > MAX_EVENTS) recentEvents.length = MAX_EVENTS;
 }
 
+// ---------------------------------------------------------------------------
+// Upload-unit deployment default (README "Upload unit") — purely advertisory
+// via `GET /pulsevault/capabilities`; the plugin never enforces "beat" vs
+// "merged", it just reports whichever value this server passes at
+// registration. The plugin bakes this in as a fixed option captured once at
+// `register()` time — there's no live setter for it, so changing this
+// deployment-wide default means restarting with a different env var
+// (`UPLOAD_UNIT=merged npm start`), not a runtime toggle. To test both
+// "beat" and "merged" without restarting, use the per-link `uploadUnit`
+// override on `GET /deeplinks` / `buildUploadLink` instead (PROTOCOL.md §3,
+// §8) — the pairing page's "Upload unit for this link" selector drives it.
+// ---------------------------------------------------------------------------
+const uploadUnitDefault = process.env.UPLOAD_UNIT === "merged" ? "merged" : "beat";
+
 const app = Fastify({
   logger: true,
   bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
@@ -431,6 +445,13 @@ app.get(
 // so it stays the source of truth. `server` must include the plugin's
 // `prefix` ("/pulsevault") — the client builds every request as
 // `${server}/<path>` with no prefix concept of its own.
+//
+// `?uploadUnit=beat|merged` lets this *one* pairing link override the
+// deployment-wide default set above — demonstrates running "beat" and
+// "merged" sessions concurrently (README "Upload unit") instead of one fixed
+// value for every pairing. Omit it and behavior is unchanged: the link
+// carries no override, and the client falls back to whatever `/capabilities`
+// reports, same as before this param existed.
 app.get("/deeplinks", async (req, reply) => {
   // In the open (no-auth) case, keep deriving `server` from request headers —
   // convenient, and there's no issuer consistency requirement to protect.
@@ -442,6 +463,11 @@ app.get("/deeplinks", async (req, reply) => {
   const host = req.headers["x-forwarded-host"] ?? req.headers.host;
   const server = PULSEVAULT_SECRET ? `${ISSUER}/pulsevault` : `${proto}://${host}/pulsevault`;
   const artifactId = randomUUID();
+
+  const requestedUploadUnit = req.query?.uploadUnit;
+  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "beat" && requestedUploadUnit !== "merged") {
+    return reply.code(400).send({ error: '`uploadUnit` query param must be "beat" or "merged"' });
+  }
 
   const token = PULSEVAULT_SECRET
     ? issueCapabilityToken(artifactId, PULSEVAULT_SECRET, {
@@ -455,6 +481,7 @@ app.get("/deeplinks", async (req, reply) => {
     server,
     artifactId,
     ...(token && { token }),
+    ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
   });
 
   const qrUpload = await QRCode.toDataURL(upload, {
@@ -512,6 +539,7 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
+  uploadUnit: uploadUnitDefault,
   // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT captions.
   allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
   // validatePayload runs for every kind, with ctx.kind telling you which.
