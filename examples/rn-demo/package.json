@@ -9,12 +9,9 @@
   },
   "dependencies": {
     "@fastify/swagger": "^9.7.0",
-    "@fastify/swagger-ui": "^5.2.5",
+    "@fastify/swagger-ui": "^5.2.6",
     "@mieweb/pulsevault": "file:../..",
     "fastify": "^5.8.5",
     "qrcode": "^1.5.4"
-  },
-  "overrides": {
-    "@fastify/static": "9.1.0"
   }
 }
