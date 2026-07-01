@@ -187,6 +187,17 @@ sequenceDiagram
       <div class="panel">
         <img id="qrUpload" width="200" height="200" style="display: block; margin: 0 auto 1rem; border-radius: 8px; background: #fff; padding: 10px;" />
         <a id="openBtnUpload" class="btn btn-primary" href="#">Open in Pulse app</a>
+
+        <label for="uploadUnitOverride">
+          Upload unit for this link
+          <span class="mono" style="text-transform: none; font-weight: 400;" title="Per-link override — carried on the pairing link itself (PROTOCOL.md §3, §8), independent of the deployment-wide toggle in the status bar above. Lets you pair two devices to 'beat' and 'merged' sessions at the same time.">(overrides the status-bar toggle, this link only)</span>
+        </label>
+        <select id="uploadUnitOverride" class="btn btn-ghost" style="margin-bottom: 0.6rem;">
+          <option value="">Use server default (from /capabilities)</option>
+          <option value="beat">Force "beat" for this link</option>
+          <option value="merged">Force "merged" for this link</option>
+        </select>
+
         <button id="refreshUpload" class="btn btn-ghost">↻ Generate new pairing link</button>
         <details>
           <summary>Link details</summary>
@@ -194,6 +205,8 @@ sequenceDiagram
           <p class="mono" id="serverUrl"></p>
           <label>Artifact ID (session anchor)</label>
           <p class="mono" id="uploadArtifactId"></p>
+          <label>Upload unit on this link</label>
+          <p class="mono" id="uploadUnitOnLink"></p>
           <label>Deep link</label>
           <p class="mono" id="deeplinkUpload"></p>
         </details>
@@ -241,11 +254,12 @@ sequenceDiagram
       }
 
       function renderStatusBar(auth) {
+        window.__lastAuth = auth ?? window.__lastAuth;
         const caps = window.__caps;
         if (!caps) return;
         const chips = [
           `<span class="chip"><span class="dot success"></span>Protocol <b>v${caps.protocolVersion}</b></span>`,
-          `<span class="chip">Upload unit <b>${caps.uploadUnit}</b></span>`,
+          `<span class="chip" title="Deployment-wide default from /pulsevault/capabilities. Fixed at server startup (UPLOAD_UNIT env var) — use the per-link override below to test the other mode without restarting.">Upload unit default <b>${caps.uploadUnit}</b></span>`,
           window.__storage ? `<span class="chip">Storage <b>${window.__storage}</b></span>` : "",
           auth
             ? `<span class="chip"><span class="dot ${auth.authMode ? "success" : "off"}"></span>Auth <b>${auth.authMode ? `capability tokens (${auth.keyId})` : "open"}</b></span>`
@@ -255,7 +269,9 @@ sequenceDiagram
       }
 
       async function loadDeeplinks() {
-        const data = await fetch("/deeplinks").then((r) => r.json());
+        const override = document.getElementById("uploadUnitOverride").value;
+        const qs = override ? `?uploadUnit=${override}` : "";
+        const data = await fetch(`/deeplinks${qs}`).then((r) => r.json());
         window.__storage = data.storage;
 
         document.getElementById("serverUrl").textContent = window.location.origin;
@@ -263,6 +279,13 @@ sequenceDiagram
         document.getElementById("deeplinkUpload").textContent = data.upload;
         document.getElementById("openBtnUpload").href = data.upload;
         document.getElementById("qrUpload").src = data.qrUpload;
+
+        // Read straight off the generated link rather than trusting `override` blindly — this is
+        // what the link actually carries, i.e. exactly what the app will honor.
+        const linkUploadUnit = new URL(data.upload).searchParams.get("uploadUnit");
+        document.getElementById("uploadUnitOnLink").textContent = linkUploadUnit
+          ? `${linkUploadUnit} (per-link override)`
+          : `${window.__caps ? window.__caps.uploadUnit : "?"} (from /capabilities, no override on this link)`;
 
         renderStatusBar(data);
 
@@ -349,6 +372,9 @@ sequenceDiagram
       loadPulses();
       loadEvents();
       document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
+      // Changing the override regenerates immediately — no reason to make the user also hit
+      // "Generate new pairing link" to see the effect of their own selection.
+      document.getElementById("uploadUnitOverride").addEventListener("change", loadDeeplinks);
       document.getElementById("refreshPulses").addEventListener("click", loadPulses);
       // Live-ish feed: poll rather than hold a socket open, since this is a demo page, not
       // something that needs to survive a flaky connection.

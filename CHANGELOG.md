@@ -106,6 +106,13 @@ if you've evaluated against an intermediate build.
   purely advertised via `/capabilities`; the operator declares which upload
   strategy this deployment expects, the client branches on it. Not enforced
   by the plugin.
+- **`buildUploadLink({ uploadUnit })`** (PROTOCOL.md §3, §8) — optional
+  per-session override of the deployment-wide `uploadUnit`, carried on the
+  pairing link itself instead of only `/capabilities`. Lets an operator run
+  `"beat"` and `"merged"` sessions concurrently (staged rollout, A/B test,
+  per-tenant policy) without racing a client's separate `/capabilities` fetch
+  against a single, deployment-wide value. Fully backward compatible: omit it
+  and a client falls back to `/capabilities` exactly as before.
 - **`onArtifactEvent` plugin option** — one low-frequency hook (authorize
   rejection, completion, validation rejection — never per chunk) covering
   both ops metrics and a compliance audit trail from a single integration

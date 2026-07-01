@@ -64,3 +64,28 @@ test("rejects a hostname that merely contains 'localhost'", () => {
 test("rejects a malformed server URL", () => {
   assert.throws(() => buildUploadLink({ server: "not a url", artifactId: ARTIFACT_ID }));
 });
+
+test("includes uploadUnit when provided, omits it when not", () => {
+  const withUnit = buildUploadLink({
+    server: "https://vault.example.org/pulsevault",
+    artifactId: ARTIFACT_ID,
+    uploadUnit: "merged",
+  });
+  assert.equal(new URLSearchParams(withUnit.split("?")[1]).get("uploadUnit"), "merged");
+
+  const withoutUnit = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID });
+  assert.equal(new URLSearchParams(withoutUnit.split("?")[1]).get("uploadUnit"), null);
+});
+
+test("accepts both uploadUnit values", () => {
+  for (const uploadUnit of ["beat", "merged"]) {
+    const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, uploadUnit });
+    assert.equal(new URLSearchParams(link.split("?")[1]).get("uploadUnit"), uploadUnit);
+  }
+});
+
+test("rejects an invalid uploadUnit", () => {
+  assert.throws(() =>
+    buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, uploadUnit: "bogus" }),
+  );
+});
