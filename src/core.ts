@@ -1,18 +1,18 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
-import send from "@fastify/send";
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import send from '@fastify/send';
 import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
   artifactIdFromUploadId,
   type PulseVaultOnUploadComplete,
   type PulseVaultOnArtifactEvent,
-} from "./lib/pulsevaultTus.js";
-import type { PulseVaultValidatePayload } from "./lib/magic.js";
-import type { PulseVaultAuthorize } from "./lib/authorize.js";
-import { pulseVaultError } from "./lib/errors.js";
-import { isUuid } from "./lib/uuid.js";
-import { type PulseVaultLogger, consoleLogger } from "./lib/request.js";
-import type { PulseVaultStorage, UploadKind } from "./storage/types.js";
+} from './lib/pulsevaultTus.js';
+import type { PulseVaultValidatePayload } from './lib/magic.js';
+import type { PulseVaultAuthorize } from './lib/authorize.js';
+import { pulseVaultError } from './lib/errors.js';
+import { isUuid } from './lib/uuid.js';
+import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
+import type { PulseVaultStorage, UploadKind } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -23,7 +23,7 @@ import {
   composeValidatePayload,
   composeOnUploadComplete,
   type PulseVaultAllowedExtensionsInput,
-} from "./lib/options.js";
+} from './lib/options.js';
 
 /** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
 export const PROTOCOL_VERSION = 1;
@@ -63,7 +63,7 @@ export type PulseVaultCoreOptions = {
   /** Max TUS upload size in bytes. Required — consumers must choose an explicit cap. Use `Infinity` for no cap. */
   maxUploadSize: number;
   /** Which upload strategy this deployment expects. Purely advertised via `GET /capabilities`. Defaults to `"beat"`. */
-  uploadUnit?: "beat" | "merged";
+  uploadUnit?: 'beat' | 'merged';
   /** File extensions allowed per artifact kind. See the Fastify plugin's `allowedExtensions` for the full shape. */
   allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /** Cache-control options forwarded to `@fastify/send` for the GET route. */
@@ -129,41 +129,43 @@ export type PulseVaultCore = {
  * storage. If these two disagreed, `authorize()` could validate ownership of
  * a different artifactId than the one the upload actually lands under.
  */
-function parseUploadMetadata(
-  header: string,
-): { artifactId: string | undefined; kind: UploadKind; relatedTo: string | undefined } {
+function parseUploadMetadata(header: string): {
+  artifactId: string | undefined;
+  kind: UploadKind;
+  relatedTo: string | undefined;
+} {
   let artifactIdRaw: string | undefined;
   let videoidRaw: string | undefined;
   let projectidRaw: string | undefined;
-  let kind: UploadKind = "video";
+  let kind: UploadKind = 'video';
   let relatedTo: string | undefined;
-  for (const pair of header.split(",")) {
+  for (const pair of header.split(',')) {
     const trimmed = pair.trim();
     if (!trimmed) continue;
-    const sep = trimmed.indexOf(" ");
+    const sep = trimmed.indexOf(' ');
     if (sep < 0) continue;
     const key = trimmed.slice(0, sep);
     const value = trimmed.slice(sep + 1).trim();
     if (!value) continue;
     try {
-      const decoded = Buffer.from(value, "base64").toString("utf8");
-      if (key === "artifactId") {
+      const decoded = Buffer.from(value, 'base64').toString('utf8');
+      if (key === 'artifactId') {
         artifactIdRaw ??= decoded;
-      } else if (key === "videoid") {
+      } else if (key === 'videoid') {
         videoidRaw ??= decoded;
-      } else if (key === "projectid") {
+      } else if (key === 'projectid') {
         projectidRaw ??= decoded;
-      } else if (key === "kind") {
+      } else if (key === 'kind') {
         const lower = decoded.trim().toLowerCase();
-        kind = lower === "project" ? "project" : lower === "captions" ? "captions" : "video";
-      } else if (key === "relatedTo" && !relatedTo) {
+        kind = lower === 'project' ? 'project' : lower === 'captions' ? 'captions' : 'video';
+      } else if (key === 'relatedTo' && !relatedTo) {
         relatedTo = isUuid(decoded) ? decoded : undefined;
       }
     } catch {
       // ignore malformed base64
     }
   }
-  const candidate = (artifactIdRaw ?? videoidRaw ?? projectidRaw ?? "").trim();
+  const candidate = (artifactIdRaw ?? videoidRaw ?? projectidRaw ?? '').trim();
   const artifactId = isUuid(candidate) ? candidate : undefined;
   return { artifactId, kind, relatedTo };
 }
@@ -204,7 +206,7 @@ function artifactIdFromTusUrl(url: string): string | undefined {
   }
   let decoded: string;
   try {
-    decoded = Buffer.from(lastSegment, "base64url").toString("utf8");
+    decoded = Buffer.from(lastSegment, 'base64url').toString('utf8');
   } catch {
     return undefined;
   }
@@ -220,9 +222,9 @@ async function resolveStorageKind(
   artifactId: string,
 ): Promise<UploadKind> {
   const candidate = (storage as { getKind?: unknown }).getKind;
-  if (typeof candidate !== "function") return "video";
+  if (typeof candidate !== 'function') return 'video';
   const result = await (candidate as (id: string) => Promise<UploadKind | null>)(artifactId);
-  return result ?? "video";
+  return result ?? 'video';
 }
 
 /** Resolve the `relatedTo` artifact for an artifactId from storage, if the adapter supports it. */
@@ -231,25 +233,25 @@ async function resolveStorageRelatedTo(
   artifactId: string,
 ): Promise<string | undefined> {
   const candidate = (storage as { getRelatedTo?: unknown }).getRelatedTo;
-  if (typeof candidate !== "function") return undefined;
+  if (typeof candidate !== 'function') return undefined;
   const result = await (candidate as (id: string) => Promise<string | null>)(artifactId);
   return result ?? undefined;
 }
 
 function extractAuthzStatus(err: unknown): number {
   const e = err as { statusCode?: unknown; status_code?: unknown };
-  if (typeof e?.statusCode === "number") return e.statusCode;
-  if (typeof e?.status_code === "number") return e.status_code;
+  if (typeof e?.statusCode === 'number') return e.statusCode;
+  if (typeof e?.status_code === 'number') return e.status_code;
   return 403;
 }
 
 function extractAuthzMessage(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
-  return "Forbidden";
+  return 'Forbidden';
 }
 
 function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
-  res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
 }
 
@@ -264,7 +266,7 @@ function writeJson(res: ServerResponse, statusCode: number, body: unknown): void
  * whatever headers object a later `writeHead` call passes.
  */
 function stampProtocolVersion(res: ServerResponse): void {
-  res.setHeader("Protocol-Version", String(PROTOCOL_VERSION));
+  res.setHeader('Protocol-Version', String(PROTOCOL_VERSION));
 }
 
 type PulseVaultRequestContext = { artifactId: string; kind: UploadKind; relatedTo?: string };
@@ -283,7 +285,7 @@ function stashPulseVaultContext(req: IncomingMessage, ctx: PulseVaultRequestCont
  * `lib/pulsevaultTus.js` tus server, so behavior can't drift between them.
  */
 export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVaultCore {
-  validateBasePath(options.basePath, "basePath");
+  validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
   validateUploadUnit(options.uploadUnit);
   validateAllowedExtensions(options.allowedExtensions);
@@ -291,10 +293,16 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
   const stripBasePath = options.stripBasePath ?? true;
-  const uploadUnit = options.uploadUnit ?? "beat";
+  const uploadUnit = options.uploadUnit ?? 'beat';
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
-  const validatePayload = composeValidatePayload(options.validatePayload, options.validateProjectPayload);
-  const onUploadComplete = composeOnUploadComplete(options.onUploadComplete, options.onProjectUploadComplete);
+  const validatePayload = composeValidatePayload(
+    options.validatePayload,
+    options.validateProjectPayload,
+  );
+  const onUploadComplete = composeOnUploadComplete(
+    options.onUploadComplete,
+    options.onProjectUploadComplete,
+  );
   const logger = options.logger ?? consoleLogger;
 
   const tusPath = `${basePath}/upload`;
@@ -317,21 +325,21 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const runAuthorize = async (
     req: IncomingMessage,
     res: ServerResponse,
-    phase: "create" | "patch",
+    phase: 'create' | 'patch',
   ): Promise<
     | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
     | { ok: false }
   > => {
     let artifactId: string | undefined;
-    let kind: UploadKind = "video";
+    let kind: UploadKind = 'video';
     let relatedTo: string | undefined;
-    if (phase === "create") {
-      const meta = req.headers["upload-metadata"];
-      if (typeof meta === "string") {
+    if (phase === 'create') {
+      const meta = req.headers['upload-metadata'];
+      if (typeof meta === 'string') {
         ({ artifactId, kind, relatedTo } = parseUploadMetadata(meta));
       }
     } else {
-      artifactId = artifactIdFromTusUrl(req.url ?? "");
+      artifactId = artifactIdFromTusUrl(req.url ?? '');
       if (artifactId) {
         kind = await resolveStorageKind(storage, artifactId);
         relatedTo = await resolveStorageRelatedTo(storage, artifactId);
@@ -352,9 +360,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     } catch (err) {
       const statusCode = extractAuthzStatus(err);
       const message = extractAuthzMessage(err);
-      logger.info({ err, artifactId, phase, statusCode }, "pulsevault authorize rejected");
-      if (phase === "create") {
-        await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
+      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
+      if (phase === 'create') {
+        await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
       }
       writeJson(res, statusCode, pulseVaultError(message));
       return { ok: false };
@@ -363,24 +371,23 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const handleTus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
-    const phase: "create" | "patch" = req.method === "POST" ? "create" : "patch";
+    const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
     const authz = await runAuthorize(req, res, phase);
     if (!authz.ok) return;
 
     try {
-      await pulseVaultTusContext.run(
-        { request: req, artifactId: authz.artifactId },
-        () => tusServer.handle(req, res),
+      await pulseVaultTusContext.run({ request: req, artifactId: authz.artifactId }, () =>
+        tusServer.handle(req, res),
       );
     } catch (err) {
-      logger.error({ err }, "pulsevault tus handler failed");
+      logger.error({ err }, 'pulsevault tus handler failed');
       if (res.headersSent || res.writableEnded) {
         res.destroy();
         return;
       }
       res.statusCode = 500;
-      res.setHeader("content-type", "text/plain; charset=utf-8");
-      res.end("Internal Server Error");
+      res.setHeader('content-type', 'text/plain; charset=utf-8');
+      res.end('Internal Server Error');
     }
   };
 
@@ -391,11 +398,48 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
       maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
       uploadUnit,
-      kinds: ["video", "project", "captions"],
+      kinds: ['video', 'project', 'captions'],
       allowedExtensions,
       maxUploadSize,
-      checksum: { algorithms: ["sha256", "sha1", "md5"] },
+      checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
     });
+  };
+
+  /**
+   * Shared prelude for the artifact GET/DELETE handlers: resolve `kind`/
+   * `relatedTo` from storage, stash the request context, then run `authorize`
+   * (if configured) for the given phase. Returns `undefined` (having already
+   * written the response) when validation fails or `authorize` rejects.
+   */
+  const prepareArtifactRequest = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+    phase: 'resolve' | 'delete',
+    token?: string,
+  ): Promise<{ kind: UploadKind; relatedTo: string | undefined } | undefined> => {
+    if (!isUuid(artifactId)) {
+      writeJson(res, 400, pulseVaultError('`artifactId` must be a valid UUID'));
+      return undefined;
+    }
+
+    const kind = await resolveStorageKind(storage, artifactId);
+    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
+    stashPulseVaultContext(req, { artifactId, kind, relatedTo });
+
+    if (!authorize) return { kind, relatedTo };
+
+    try {
+      await authorize(req, { phase, artifactId, kind, relatedTo, token });
+      return { kind, relatedTo };
+    } catch (err) {
+      const statusCode = extractAuthzStatus(err);
+      const message = extractAuthzMessage(err);
+      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
+      await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
+      writeJson(res, statusCode, pulseVaultError(message));
+      return undefined;
+    }
   };
 
   const handleArtifactDelete = async (
@@ -404,36 +448,17 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     artifactId: string,
   ): Promise<void> => {
     stampProtocolVersion(res);
-    if (!isUuid(artifactId)) {
-      writeJson(res, 400, pulseVaultError("`artifactId` must be a valid UUID"));
-      return;
-    }
+    const prepared = await prepareArtifactRequest(req, res, artifactId, 'delete');
+    if (!prepared) return;
 
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-    stashPulseVaultContext(req, { artifactId, kind, relatedTo });
-
-    if (authorize) {
-      try {
-        await authorize(req, { phase: "delete", artifactId, kind, relatedTo });
-      } catch (err) {
-        const statusCode = extractAuthzStatus(err);
-        const message = extractAuthzMessage(err);
-        logger.info({ err, artifactId, phase: "delete", statusCode }, "pulsevault authorize rejected");
-        await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
-        writeJson(res, statusCode, pulseVaultError(message));
-        return;
-      }
-    }
-
-    if (typeof storage.remove !== "function") {
-      writeJson(res, 501, pulseVaultError("Storage adapter does not support delete"));
+    if (typeof storage.remove !== 'function') {
+      writeJson(res, 501, pulseVaultError('Storage adapter does not support delete'));
       return;
     }
 
     const removed = await storage.remove(artifactId);
     if (!removed) {
-      writeJson(res, 404, pulseVaultError("Artifact not found"));
+      writeJson(res, 404, pulseVaultError('Artifact not found'));
       return;
     }
     res.writeHead(204);
@@ -447,35 +472,16 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     token: string | undefined,
   ): Promise<void> => {
     stampProtocolVersion(res);
-    if (!isUuid(artifactId)) {
-      writeJson(res, 400, pulseVaultError("`artifactId` must be a valid UUID"));
-      return;
-    }
-
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-    stashPulseVaultContext(req, { artifactId, kind, relatedTo });
-
-    if (authorize) {
-      try {
-        await authorize(req, { phase: "resolve", artifactId, kind, relatedTo, token });
-      } catch (err) {
-        const statusCode = extractAuthzStatus(err);
-        const message = extractAuthzMessage(err);
-        logger.info({ err, artifactId, phase: "resolve", statusCode }, "pulsevault authorize rejected");
-        await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
-        writeJson(res, statusCode, pulseVaultError(message));
-        return;
-      }
-    }
+    const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
+    if (!prepared) return;
 
     const resolved = await storage.resolve(artifactId);
     if (!resolved) {
-      writeJson(res, 404, pulseVaultError("Artifact not found"));
+      writeJson(res, 404, pulseVaultError('Artifact not found'));
       return;
     }
 
-    if (resolved.kind === "redirect") {
+    if (resolved.kind === 'redirect') {
       res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
       res.end();
       return;
@@ -483,7 +489,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
     const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
 
-    if (result.type === "error") {
+    if (result.type === 'error') {
       writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
       return;
     }
@@ -493,7 +499,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     // non-standard extensions like `.pulse`), override what @fastify/send
     // would otherwise infer from the filename.
     if (resolved.contentType) {
-      headers["content-type"] = resolved.contentType;
+      headers['content-type'] = resolved.contentType;
     }
     res.writeHead(result.statusCode, headers);
     result.stream.pipe(res);
@@ -512,15 +518,15 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         next();
         return;
       }
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Not Found");
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Not Found');
     };
 
-    const url = new URL(req.url ?? "/", "http://internal");
+    const url = new URL(req.url ?? '/', 'http://internal');
     let pathname = url.pathname;
-    if (stripBasePath && basePath !== "") {
+    if (stripBasePath && basePath !== '') {
       if (pathname === basePath) {
-        pathname = "";
+        pathname = '';
       } else if (pathname.startsWith(`${basePath}/`)) {
         pathname = pathname.slice(basePath.length);
       } else {
@@ -528,24 +534,24 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         return;
       }
     }
-    if (pathname === "") pathname = "/";
+    if (pathname === '') pathname = '/';
 
-    if (pathname === "/upload" || pathname.startsWith("/upload/")) {
+    if (pathname === '/upload' || pathname.startsWith('/upload/')) {
       await handleTus(req, res);
       return;
     }
-    if (pathname === "/capabilities" && req.method === "GET") {
+    if (pathname === '/capabilities' && req.method === 'GET') {
       await handleCapabilities(req, res);
       return;
     }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
-      if (req.method === "GET") {
-        await handleArtifactGet(req, res, artifactId, url.searchParams.get("token") ?? undefined);
+      if (req.method === 'GET') {
+        await handleArtifactGet(req, res, artifactId, url.searchParams.get('token') ?? undefined);
         return;
       }
-      if (req.method === "DELETE") {
+      if (req.method === 'DELETE') {
         await handleArtifactDelete(req, res, artifactId);
         return;
       }
@@ -568,45 +574,45 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 // Re-exported so a non-Fastify consumer never needs to import from both `.`
 // and `./core` for a normal setup — these are already framework-agnostic
 // and identical to what the `.` (Fastify) entry point re-exports.
-export { createLocalStorage } from "./storage/local.js";
-export type { LocalStorage, LocalStorageOptions } from "./storage/local.js";
-export { createS3Storage } from "./storage/s3.js";
-export type { S3Storage, S3StorageOptions } from "./storage/s3.js";
+export { createLocalStorage } from './storage/local.js';
+export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
+export { createS3Storage } from './storage/s3.js';
+export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
-} from "./storage/types.js";
+} from './storage/types.js';
 export type {
   PulseVaultAuthorize,
   PulseVaultAuthorizeContext,
   PulseVaultAuthorizePhase,
-} from "./lib/authorize.js";
+} from './lib/authorize.js';
 export type {
   PulseVaultOnUploadComplete,
   PulseVaultOnArtifactEvent,
   PulseVaultArtifactEvent,
-} from "./lib/pulsevaultTus.js";
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from "./lib/magic.js";
-export type { PulseVaultValidatePayload } from "./lib/magic.js";
-export { buildUploadLink } from "./lib/deeplinks.js";
-export type { UploadLinkOptions } from "./lib/deeplinks.js";
+} from './lib/pulsevaultTus.js';
+export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
+export type { PulseVaultValidatePayload } from './lib/magic.js';
+export { buildUploadLink } from './lib/deeplinks.js';
+export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
-} from "./lib/capability-token.js";
+} from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
-} from "./lib/capability-token.js";
+} from './lib/capability-token.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,
   parseChecksumMetadata,
-} from "./lib/checksum.js";
-export type { ChecksumAlgorithm, ParsedChecksum } from "./lib/checksum.js";
-export { type PulseVaultRequest, type PulseVaultLogger } from "./lib/request.js";
+} from './lib/checksum.js';
+export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
+export { type PulseVaultRequest, type PulseVaultLogger } from './lib/request.js';

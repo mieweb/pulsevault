@@ -1,8 +1,8 @@
-import fs from "node:fs/promises";
-import type { PulseVaultRequest } from "./request.js";
-import type { LocalStorage } from "../storage/local.js";
-import type { S3Storage } from "../storage/s3.js";
-import type { UploadKind } from "../storage/types.js";
+import fs from 'node:fs/promises';
+import type { PulseVaultRequest } from './request.js';
+import type { LocalStorage } from '../storage/local.js';
+import type { S3Storage } from '../storage/s3.js';
+import type { UploadKind } from '../storage/types.js';
 
 /**
  * Optional plugin-level hook: after TUS writes the final byte but before the
@@ -44,7 +44,7 @@ export type PulseVaultValidatePayload = (
 export async function sniffMp4(filePath: string): Promise<boolean> {
   let fd: fs.FileHandle;
   try {
-    fd = await fs.open(filePath, "r");
+    fd = await fs.open(filePath, 'r');
   } catch {
     return false;
   }
@@ -66,12 +66,7 @@ export async function sniffMp4(filePath: string): Promise<boolean> {
  */
 function hasFtypBox(buf: Buffer): boolean {
   if (buf.length < 12) return false;
-  return (
-    buf[4] === 0x66 &&
-    buf[5] === 0x74 &&
-    buf[6] === 0x79 &&
-    buf[7] === 0x70
-  );
+  return buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70;
 }
 
 /**
@@ -90,25 +85,20 @@ function hasFtypBox(buf: Buffer): boolean {
  * });
  * ```
  */
-export function createMp4Sniffer(
-  storage: LocalStorage,
-): PulseVaultValidatePayload {
+export function createMp4Sniffer(storage: LocalStorage): PulseVaultValidatePayload {
   return async (_request, { artifactId }) => {
     const localPath = await storage.getLocalPath(artifactId);
     if (!localPath) {
       throw Object.assign(
-        new Error(
-          `Cannot validate upload ${artifactId}: no local path available`,
-        ),
+        new Error(`Cannot validate upload ${artifactId}: no local path available`),
         { statusCode: 500 },
       );
     }
     const ok = await sniffMp4(localPath);
     if (!ok) {
-      throw Object.assign(
-        new Error("Uploaded bytes are not a valid MP4 (missing ftyp header)"),
-        { statusCode: 422 },
-      );
+      throw Object.assign(new Error('Uploaded bytes are not a valid MP4 (missing ftyp header)'), {
+        statusCode: 422,
+      });
     }
   };
 }
@@ -131,9 +121,7 @@ export function createMp4Sniffer(
  * });
  * ```
  */
-export function createS3Mp4Sniffer(
-  storage: S3Storage,
-): PulseVaultValidatePayload {
+export function createS3Mp4Sniffer(storage: S3Storage): PulseVaultValidatePayload {
   return async (_request, { artifactId }) => {
     const header = await storage.readHeader(artifactId, 12);
     if (!header) {
@@ -143,10 +131,9 @@ export function createS3Mp4Sniffer(
       );
     }
     if (!hasFtypBox(header)) {
-      throw Object.assign(
-        new Error("Uploaded bytes are not a valid MP4 (missing ftyp header)"),
-        { statusCode: 422 },
-      );
+      throw Object.assign(new Error('Uploaded bytes are not a valid MP4 (missing ftyp header)'), {
+        statusCode: 422,
+      });
     }
   };
 }

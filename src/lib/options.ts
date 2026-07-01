@@ -1,9 +1,14 @@
-import type { PulseVaultValidatePayload } from "./magic.js";
-import type { PulseVaultOnUploadComplete } from "./pulsevaultTus.js";
+import type { PulseVaultValidatePayload } from './magic.js';
+import type { PulseVaultOnUploadComplete } from './pulsevaultTus.js';
 
-export type PulseVaultAllowedExtensionsInput =
-  | readonly string[]
-  | { video?: readonly string[]; project?: readonly string[]; captions?: readonly string[] };
+/** Per-kind form of `PulseVaultAllowedExtensionsInput`, named once so it isn't re-declared at every use site. */
+type AllowedExtensionsByKind = {
+  video?: readonly string[];
+  project?: readonly string[];
+  captions?: readonly string[];
+};
+
+export type PulseVaultAllowedExtensionsInput = readonly string[] | AllowedExtensionsByKind;
 
 export type PulseVaultAllowedExtensions = {
   video: readonly string[];
@@ -11,9 +16,9 @@ export type PulseVaultAllowedExtensions = {
   captions: readonly string[];
 };
 
-const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = [".mp4"];
-const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = [".pulse", ".zip"];
-const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = [".srt"];
+const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
+const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
+const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.srt'];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**
@@ -34,26 +39,22 @@ export function normalizeAllowedExtensions(
   if (Array.isArray(raw)) {
     // Legacy flat array: treat as video-only, project/captions keep their defaults.
     return {
-      video: (raw as readonly string[]).map((e) => e.toLowerCase()),
+      video: (raw as readonly string[]).map((ext) => ext.toLowerCase()),
       project: DEFAULT_PROJECT_EXTENSIONS,
       captions: DEFAULT_CAPTIONS_EXTENSIONS,
     };
   }
-  const obj = raw as {
-    video?: readonly string[];
-    project?: readonly string[];
-    captions?: readonly string[];
-  };
+  const byKind = raw as AllowedExtensionsByKind;
   return {
-    video: (obj.video ?? DEFAULT_VIDEO_EXTENSIONS).map((e) => e.toLowerCase()),
-    project: (obj.project ?? DEFAULT_PROJECT_EXTENSIONS).map((e) => e.toLowerCase()),
-    captions: (obj.captions ?? DEFAULT_CAPTIONS_EXTENSIONS).map((e) => e.toLowerCase()),
+    video: (byKind.video ?? DEFAULT_VIDEO_EXTENSIONS).map((ext) => ext.toLowerCase()),
+    project: (byKind.project ?? DEFAULT_PROJECT_EXTENSIONS).map((ext) => ext.toLowerCase()),
+    captions: (byKind.captions ?? DEFAULT_CAPTIONS_EXTENSIONS).map((ext) => ext.toLowerCase()),
   };
 }
 
 /** Shared by the Fastify plugin's `prefix` and the core's `basePath` — same shape, different option name. */
 export function validateBasePath(basePath: string, optionName: string): void {
-  if (basePath !== "" && (!basePath.startsWith("/") || basePath.endsWith("/"))) {
+  if (basePath !== '' && (!basePath.startsWith('/') || basePath.endsWith('/'))) {
     throw new TypeError(
       `\`${optionName}\` must be '' or start with '/' with no trailing slash (e.g. '/pulsevault')`,
     );
@@ -62,14 +63,12 @@ export function validateBasePath(basePath: string, optionName: string): void {
 
 export function validateMaxUploadSize(maxUploadSize: number): void {
   if (!(maxUploadSize > 0)) {
-    throw new TypeError(
-      "`maxUploadSize` must be a positive number (use Infinity for no cap)",
-    );
+    throw new TypeError('`maxUploadSize` must be a positive number (use Infinity for no cap)');
   }
 }
 
-export function validateUploadUnit(uploadUnit: "beat" | "merged" | undefined): void {
-  if (uploadUnit && uploadUnit !== "beat" && uploadUnit !== "merged") {
+export function validateUploadUnit(uploadUnit: 'beat' | 'merged' | undefined): void {
+  if (uploadUnit && uploadUnit !== 'beat' && uploadUnit !== 'merged') {
     throw new TypeError('`uploadUnit` must be "beat" or "merged"');
   }
 }
@@ -81,9 +80,9 @@ export function validateAllowedExtensions(
   const exts = Array.isArray(allowedExtensions)
     ? (allowedExtensions as readonly string[])
     : [
-        ...((allowedExtensions as { video?: readonly string[] }).video ?? []),
-        ...((allowedExtensions as { project?: readonly string[] }).project ?? []),
-        ...((allowedExtensions as { captions?: readonly string[] }).captions ?? []),
+        ...((allowedExtensions as AllowedExtensionsByKind).video ?? []),
+        ...((allowedExtensions as AllowedExtensionsByKind).project ?? []),
+        ...((allowedExtensions as AllowedExtensionsByKind).captions ?? []),
       ];
   for (const ext of exts) {
     if (!EXTENSION_REGEX.test(ext)) {
@@ -105,14 +104,14 @@ export function warnIfUsingDeprecatedProjectHooks(opts: {
 }): void {
   if (opts.validateProjectPayload) {
     process.emitWarning(
-      "pulsevault: `validateProjectPayload` is deprecated — use `validatePayload` and branch on `ctx.kind === \"project\"` instead. Still honored this release.",
-      "DeprecationWarning",
+      'pulsevault: `validateProjectPayload` is deprecated — use `validatePayload` and branch on `ctx.kind === "project"` instead. Still honored this release.',
+      'DeprecationWarning',
     );
   }
   if (opts.onProjectUploadComplete) {
     process.emitWarning(
-      "pulsevault: `onProjectUploadComplete` is deprecated — use `onUploadComplete` and branch on `ctx.kind === \"project\"` instead. Still honored this release.",
-      "DeprecationWarning",
+      'pulsevault: `onProjectUploadComplete` is deprecated — use `onUploadComplete` and branch on `ctx.kind === "project"` instead. Still honored this release.',
+      'DeprecationWarning',
     );
   }
 }
@@ -124,7 +123,7 @@ export function composeValidatePayload(
 ): PulseVaultValidatePayload | undefined {
   if (!legacyProject) return generic;
   return async (request, ctx) => {
-    if (ctx.kind === "project") {
+    if (ctx.kind === 'project') {
       await legacyProject(request, ctx);
       return;
     }
@@ -138,7 +137,7 @@ export function composeOnUploadComplete(
 ): PulseVaultOnUploadComplete | undefined {
   if (!legacyProject) return generic;
   return async (request, ctx) => {
-    if (ctx.kind === "project") {
+    if (ctx.kind === 'project') {
       await legacyProject(request, ctx);
       return;
     }

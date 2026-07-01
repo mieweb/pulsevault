@@ -1,10 +1,9 @@
-import type { FastifyPluginAsync } from "fastify";
-import fp from "fastify-plugin";
-import pulseVaultRoutes, { type PulseVaultAuthorize } from "./routes/pulsevault.js";
-import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from "./lib/pulsevaultTus.js";
-import type { PulseVaultValidatePayload } from "./lib/magic.js";
-import type { PulseVaultStorage } from "./storage/types.js";
-import type { UploadKind } from "./storage/types.js";
+import type { FastifyPluginAsync } from 'fastify';
+import fp from 'fastify-plugin';
+import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
+import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
+import type { PulseVaultValidatePayload } from './lib/magic.js';
+import type { PulseVaultStorage } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -14,7 +13,7 @@ import {
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
   composeOnUploadComplete,
-} from "./lib/options.js";
+} from './lib/options.js';
 
 /**
  * Subset of `@fastify/send`'s cache-related options forwarded to the GET
@@ -60,7 +59,7 @@ export type PulseVaultPluginOptions = {
    * pulse. Purely advertised via `GET /capabilities` for the client to branch
    * on — `pulsevault` doesn't enforce either. Defaults to `"beat"`.
    */
-  uploadUnit?: "beat" | "merged";
+  uploadUnit?: 'beat' | 'merged';
   /**
    * Fastify instance decorator name under which the storage adapter is
    * exposed. Defaults to `"pulseVault"`. Override when registering this
@@ -162,13 +161,10 @@ export type PulseVaultPluginOptions = {
   onProjectUploadComplete?: PulseVaultOnUploadComplete;
 };
 
-const DEFAULT_DECORATOR_NAME = "pulseVault";
+const DEFAULT_DECORATOR_NAME = 'pulseVault';
 
-const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
-  fastify,
-  opts,
-) => {
-  validateBasePath(opts.prefix, "prefix");
+const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) => {
+  validateBasePath(opts.prefix, 'prefix');
   validateMaxUploadSize(opts.maxUploadSize);
   validateUploadUnit(opts.uploadUnit);
   validateAllowedExtensions(opts.allowedExtensions);
@@ -177,7 +173,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
   // Register the shutdown hook *before* awaiting initialize() so any partial
   // state the adapter allocates mid-init still gets cleaned up if Fastify
   // later tears the plugin down.
-  fastify.addHook("onClose", async () => {
+  fastify.addHook('onClose', async () => {
     await opts.storage.shutdown?.();
   });
   await opts.storage.initialize?.();
@@ -191,7 +187,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
     prefix: opts.prefix,
     storage: opts.storage,
     maxUploadSize: opts.maxUploadSize,
-    uploadUnit: opts.uploadUnit ?? "beat",
+    uploadUnit: opts.uploadUnit ?? 'beat',
     allowedExtensions,
     cache: opts.cache,
     authorize: opts.authorize,
@@ -202,49 +198,49 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (
 };
 
 export default fp(app, {
-  name: "pulsevault",
-  fastify: "5.x",
+  name: 'pulsevault',
+  fastify: '5.x',
 });
 
-export { createLocalStorage } from "./storage/local.js";
-export type { LocalStorage, LocalStorageOptions } from "./storage/local.js";
-export { createS3Storage } from "./storage/s3.js";
-export type { S3Storage, S3StorageOptions } from "./storage/s3.js";
+export { createLocalStorage } from './storage/local.js';
+export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
+export { createS3Storage } from './storage/s3.js';
+export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
-} from "./storage/types.js";
+} from './storage/types.js';
 export type {
   PulseVaultAuthorize,
   PulseVaultAuthorizeContext,
   PulseVaultAuthorizePhase,
-} from "./routes/pulsevault.js";
+} from './routes/pulsevault.js';
 export type {
   PulseVaultOnUploadComplete,
   PulseVaultOnArtifactEvent,
   PulseVaultArtifactEvent,
-} from "./lib/pulsevaultTus.js";
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from "./lib/magic.js";
-export type { PulseVaultValidatePayload } from "./lib/magic.js";
-export { buildUploadLink } from "./lib/deeplinks.js";
-export type { UploadLinkOptions } from "./lib/deeplinks.js";
+} from './lib/pulsevaultTus.js';
+export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
+export type { PulseVaultValidatePayload } from './lib/magic.js';
+export { buildUploadLink } from './lib/deeplinks.js';
+export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
-} from "./lib/capability-token.js";
+} from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
-} from "./lib/capability-token.js";
+} from './lib/capability-token.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,
   parseChecksumMetadata,
-} from "./lib/checksum.js";
-export type { ChecksumAlgorithm, ParsedChecksum } from "./lib/checksum.js";
-export type { PulseVaultRequest, PulseVaultLogger } from "./lib/request.js";
+} from './lib/checksum.js';
+export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
+export type { PulseVaultRequest, PulseVaultLogger } from './lib/request.js';
