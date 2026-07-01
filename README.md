@@ -270,6 +270,8 @@ Maximum upload size in bytes. Use `Infinity` for no cap.
 
 A client reads this at pairing time, before doing any merge or upload work, and branches accordingly. See `PROTOCOL.md` §8 for the full contract.
 
+Need both strategies live at once instead of one fixed value for the whole deployment? Pass `uploadUnit` to [`buildUploadLink`](#deep-link-helper) per session — it overrides `/capabilities` for that pairing only, with no server-side option to change.
+
 ### `decoratorName`
 
 Name of the Fastify decorator that exposes the storage adapter on the instance. Defaults to `"pulseVault"`. Override when registering the plugin more than once in the same process.
@@ -736,9 +738,12 @@ const uploadLink = buildUploadLink({
   server: "https://example.com/pulsevault",
   artifactId: randomUUID(), // generate server-side; skip POST /reserve on the app
   token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
+  uploadUnit: "merged", // optional — see "Upload unit" below
 });
-// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
+// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret&uploadUnit=merged
 ```
+
+`uploadUnit` on the link is a **per-session override** of whatever `GET /capabilities` currently reports (PROTOCOL.md §3, §8). Omit it and nothing changes — the client falls back to `/capabilities` exactly as before. Set it when you want "beat" and "merged" sessions live at the same time (staged rollout, A/B test, per-tenant policy) instead of one fixed value for the whole deployment — `/capabilities` can only ever report one current value, and a client reading it separately from opening the link is racing whatever the server happened to be serving at that moment, not the value this specific session was paired under.
 
 ## Tests
 

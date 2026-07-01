@@ -74,7 +74,7 @@ the integer from `protocolVersion`.
 A server presents a pairing link or QR code of the form:
 
 ```
-pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
+pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>&uploadUnit=<beat|merged>
 ```
 
 - `v` (REQUIRED): the deep-link schema version. A client MUST refuse and
@@ -96,6 +96,17 @@ pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
   `artifactId` (or a session it anchors, §5.4), not a standing general
   credential — see §5.4 for the recommended (but not required) capability-
   token shape.
+- `uploadUnit` (OPTIONAL, `"beat"` or `"merged"`): per-session override of the
+  deployment-wide value reported by `GET /capabilities` (§2, §8). When
+  present, a client MUST use this value for the session anchored to this
+  link instead of whatever `/capabilities` currently reports, and MUST NOT
+  perform a separate `/capabilities` fetch just to decide merge/upload
+  strategy for it. When absent, a client MUST fall back to `/capabilities`
+  exactly as before this field existed — an operator that never sets it sees
+  no change in client behavior. This lets one deployment run "beat" and
+  "merged" sessions concurrently (e.g. a staged rollout) without racing a
+  single, deployment-wide `/capabilities` value against whichever moment a
+  client happened to fetch it.
 
 A client SHOULD display the server's origin (and, where feasible, its TLS
 certificate fingerprint) to the user before uploading anything, rather than
@@ -274,7 +285,9 @@ clear, specific message rather than a generic failure.
 A pulse (a short composed of one or more beats) MAY be uploaded as a single
 pre-merged video (`uploadUnit: "merged"`) or as individual per-beat artifacts
 plus a manifest (`uploadUnit: "beat"`) — the operator declares which via
-`/capabilities` (§2); this document does not prefer one over the other.
+`/capabilities` (§2), optionally overridden per session via the pairing
+link's `uploadUnit` param (§3); this document does not prefer one over the
+other.
 
 Under `uploadUnit: "beat"`, a client uploads each beat under its own
 `artifactId`, plus one manifest artifact (`kind: "project"`, a JSON document
