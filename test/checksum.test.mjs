@@ -89,10 +89,10 @@ test("createChecksumValidator throws a clear error when checksum is requested bu
   );
 });
 
-test("createS3ChecksumValidator verifies against storage.readAll", async () => {
+test("createS3ChecksumValidator verifies against storage.digestAll", async () => {
   const bytes = Buffer.from("s3 object bytes");
   const digest = createHash("sha256").update(bytes).digest("hex");
-  const fakeStorage = { readAll: async () => bytes };
+  const fakeStorage = { digestAll: async (_id, algorithm) => createHash(algorithm).update(bytes).digest("hex") };
 
   const validator = createS3ChecksumValidator(fakeStorage);
   await assert.doesNotReject(() =>

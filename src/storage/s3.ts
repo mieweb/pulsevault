@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DataStore } from "@tus/server";
 // Type-only imports: erased at compile time (verbatimModuleSyntax), so loading
 // this module never pulls in the AWS SDK. The real modules are loaded lazily
@@ -141,6 +142,14 @@ export type S3Storage = PulseVaultStorage & {
    * opt-in integrity check, not on every upload by default.
    */
   readAll(artifactId: string): Promise<Buffer | null>;
+  /**
+   * Streams a finalized upload's bytes through a hash digest, returning the
+   * hex digest, or `null` if the artifactId is unknown. The streaming
+   * counterpart to `readAll` — used by `createS3ChecksumValidator` so
+   * checksum verification never has to hold an entire (potentially
+   * multi-gigabyte) object in memory as one `Buffer`.
+   */
+  digestAll(artifactId: string, algorithm: "sha256" | "sha1" | "md5"): Promise<string | null>;
   /** Artifact kind for a known artifactId, or `null`. Satisfies `getKind`. */
   getKind(artifactId: string): Promise<UploadKind | null>;
   /** Satisfies the optional `PulseVaultStorage.getRelatedTo` contract. */
@@ -311,19 +320,7 @@ export async function createS3Storage(
     relatedTo,
     checksum,
   }: ReserveUploadParams): Promise<string> => {
-    // Collision guard, same contract as the local adapter: refuse a second
-    // upload for an artifactId that already has one (in-progress or ready)
-    // rather than letting the datastore silently reset the multipart upload.
-    // Surfaces as HTTP 409 via @tus/server's error path.
-    const meta = await loadMeta(artifactId);
-    if (meta) {
-      throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-        statusCode: 409,
-        status_code: 409,
-      });
-    }
-
-    await writeSidecar(artifactId, {
+    const sidecar: Sidecar = {
       version: SIDECAR_VERSION,
       ext,
       filename,
@@ -331,7 +328,59 @@ export async function createS3Storage(
       kind,
       relatedTo,
       checksum,
-    });
+    };
+
+    // Fast-path rejection for the common case. Not atomic by itself (two concurrent
+    // requests can both observe no existing meta before either writes) — the conditional
+    // write below closes that race on backends that support it — but it's also the only
+    // enforcement on S3-compatible backends that silently ignore `IfNoneMatch` instead of
+    // erroring (e.g. the `s3rver` mock this repo's own test suite runs against).
+    const existing = await loadMeta(artifactId);
+    if (existing) {
+      throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
+        statusCode: 409,
+        status_code: 409,
+      });
+    }
+
+    // Collision guard: `IfNoneMatch: "*"` makes the write itself atomically fail
+    // (PreconditionFailed) if a sidecar object already exists for this artifactId, closing
+    // the race the check above can't close by itself. Surfaces as HTTP 409 via @tus/server's
+    // error path, same as before.
+    try {
+      await client.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: sidecarKey(artifactId),
+          Body: JSON.stringify(sidecar),
+          ContentType: "application/json",
+          IfNoneMatch: "*",
+        }),
+      );
+    } catch (err) {
+      if (isPreconditionFailed(err)) {
+        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
+          statusCode: 409,
+          status_code: 409,
+        });
+      }
+      if (!isConditionalWriteUnsupported(err)) throw err;
+      // Some S3-compatible backends don't support conditional writes — fall back to the
+      // previous check-then-write. Weaker (the original TOCTOU window reopens) but keeps
+      // reserve working on those backends instead of hard-failing every upload. Surface
+      // this degraded mode once per process so operators know their backend can't fully
+      // guarantee collision safety under concurrent/retried creates for the same artifactId.
+      warnAboutConditionalWriteFallbackOnce();
+      const meta = await loadMeta(artifactId);
+      if (meta) {
+        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
+          statusCode: 409,
+          status_code: 409,
+        });
+      }
+      await writeSidecar(artifactId, sidecar);
+    }
+
     cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum });
     // @tus/s3-store uses this as the object key for the multipart upload, so
     // the finished object lands at `<kind>/<artifactId><ext>`.
@@ -444,6 +493,22 @@ export async function createS3Storage(
     }
   };
 
+  const digestAll = async (
+    artifactId: string,
+    algorithm: "sha256" | "sha1" | "md5",
+  ): Promise<string | null> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) return null;
+    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    try {
+      const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      return await digestBody(res.Body, algorithm);
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
+  };
+
   const getKind = async (artifactId: string): Promise<UploadKind | null> => {
     const meta = await loadMeta(artifactId);
     return meta ? meta.kind : null;
@@ -472,6 +537,7 @@ export async function createS3Storage(
     remove,
     readHeader,
     readAll,
+    digestAll,
     getKind,
     getRelatedTo,
     getChecksum,
@@ -498,6 +564,33 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+/**
+ * Stream an AWS SDK response body through a hash digest without buffering the
+ * whole thing into memory first — the streaming counterpart to
+ * `bodyToBuffer`, used by `digestAll`.
+ */
+async function digestBody(
+  body: unknown,
+  algorithm: "sha256" | "sha1" | "md5",
+): Promise<string> {
+  const hash = createHash(algorithm);
+  if (
+    body &&
+    typeof (body as { transformToByteArray?: unknown }).transformToByteArray ===
+      "function"
+  ) {
+    const arr = await (
+      body as { transformToByteArray(): Promise<Uint8Array> }
+    ).transformToByteArray();
+    hash.update(arr);
+    return hash.digest("hex");
+  }
+  for await (const chunk of body as AsyncIterable<Uint8Array>) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
 /** Whether an AWS SDK error represents a missing key/object (404-ish). */
 function isNotFound(err: unknown): boolean {
   const e = err as {
@@ -511,5 +604,55 @@ function isNotFound(err: unknown): boolean {
     e?.Code === "NoSuchKey" ||
     e?.Code === "NotFound" ||
     e?.$metadata?.httpStatusCode === 404
+  );
+}
+
+/** Whether a conditional `PutObjectCommand` (`IfNoneMatch`) failed because the object already exists. */
+function isPreconditionFailed(err: unknown): boolean {
+  const e = err as {
+    name?: string;
+    Code?: string;
+    $metadata?: { httpStatusCode?: number };
+  };
+  return (
+    e?.name === "PreconditionFailed" ||
+    e?.Code === "PreconditionFailed" ||
+    e?.$metadata?.httpStatusCode === 412
+  );
+}
+
+/** Whether the backend rejected the conditional-write header itself (some S3-compatible stores don't support it), as opposed to the condition failing. */
+function isConditionalWriteUnsupported(err: unknown): boolean {
+  const e = err as {
+    name?: string;
+    Code?: string;
+    $metadata?: { httpStatusCode?: number };
+  };
+  return (
+    e?.name === "NotImplemented" ||
+    e?.Code === "NotImplemented" ||
+    e?.$metadata?.httpStatusCode === 501
+  );
+}
+
+let warnedAboutConditionalWriteFallback = false;
+/**
+ * One-time-per-process warning when `reserveUpload` falls back to
+ * check-then-write because the configured S3-compatible backend doesn't
+ * support `IfNoneMatch`. That fallback reopens a genuine TOCTOU window
+ * (two concurrent/retried `reserveUpload` calls for the same artifactId can
+ * both pass the check before either writes, silently clobbering one
+ * another's sidecar) — there's no way to close it without a real distributed
+ * lock, so the best this library can do is make the degraded mode visible.
+ */
+function warnAboutConditionalWriteFallbackOnce(): void {
+  if (warnedAboutConditionalWriteFallback) return;
+  warnedAboutConditionalWriteFallback = true;
+  console.warn(
+    "[pulsevault] S3-compatible backend does not support conditional writes (IfNoneMatch); " +
+      "falling back to check-then-write for reserveUpload. This reopens a collision race " +
+      "between concurrent/retried creates for the same artifactId. If this matters for your " +
+      "deployment, use a backend that supports IfNoneMatch, or serialize artifactId creation " +
+      "in front of pulsevault (e.g. in your own /reserve endpoint).",
   );
 }

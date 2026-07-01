@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import type { S3Storage } from "../storage/s3.js";
 import type { PulseVaultValidatePayload } from "./magic.js";
 
@@ -29,12 +30,16 @@ function isSupportedAlgorithm(value: string): value is ChecksumAlgorithm {
   return (SUPPORTED_ALGORITHMS as readonly string[]).includes(value);
 }
 
-function digestBuffer(buf: Buffer, algorithm: ChecksumAlgorithm): string {
-  return createHash(algorithm).update(buf).digest("hex");
-}
-
+/**
+ * Hashes the file at `path` via a stream instead of `fs.readFile` so a
+ * multi-gigabyte upload (`maxUploadSize: Infinity` is a supported
+ * configuration) never has to be held in memory as a single `Buffer` just to
+ * compute its checksum.
+ */
 async function digestLocalFile(path: string, algorithm: ChecksumAlgorithm): Promise<string> {
-  return digestBuffer(await fs.readFile(path), algorithm);
+  const hash = createHash(algorithm);
+  await pipeline(createReadStream(path), hash);
+  return hash.digest("hex");
 }
 
 function checksumError(message: string): Error {
@@ -84,10 +89,12 @@ export function createChecksumValidator(
 }
 
 /**
- * `createChecksumValidator` for the S3/R2 backend — downloads the whole
- * finalized object (via `S3Storage.readAll`) to compute the digest, since
- * S3 has no local path to hash directly. Only worth using when checksum
- * verification is explicitly wanted; it's a full extra download per upload.
+ * `createChecksumValidator` for the S3/R2 backend — streams the whole
+ * finalized object through a hash digest via `S3Storage.digestAll`, since S3
+ * has no local path to hash directly. Only worth using when checksum
+ * verification is explicitly wanted; it's a full extra download per upload,
+ * but (unlike buffering the object via `readAll`) never holds the whole
+ * object in memory at once.
  */
 export function createS3ChecksumValidator(
   storage: S3Storage,
@@ -96,14 +103,13 @@ export function createS3ChecksumValidator(
   return async (request, ctx) => {
     const checksum = parseChecksumMetadata(ctx.checksum);
     if (checksum) {
-      const bytes = await storage.readAll(ctx.artifactId);
-      if (!bytes) {
+      const actual = await storage.digestAll(ctx.artifactId, checksum.algorithm);
+      if (actual === null) {
         throw Object.assign(
           new Error(`Cannot validate upload ${ctx.artifactId}: no object bytes available`),
           { statusCode: 500 },
         );
       }
-      const actual = digestBuffer(bytes, checksum.algorithm);
       if (actual !== checksum.digest) {
         throw checksumError(
           `Checksum mismatch: expected ${checksum.algorithm}:${checksum.digest}, got ${checksum.algorithm}:${actual}`,
