@@ -266,6 +266,8 @@ await app.register(pulseVault, {
 
 `createMp4Sniffer` reads the first 12 bytes and verifies the ISOBMFF `ftyp` header (MP4, MOV, M4V, 3GP). Uploads that pass the extension check but contain non-video bytes are rejected with 422 and the disk is cleaned up. The lower-level `sniffMp4(path)` is also exported if you want to drive your own validator.
 
+`createChecksumValidator`/`createS3ChecksumValidator` parse `ctx.checksum` with the also-exported `parseChecksumMetadata(raw)`, which returns `{ algorithm, digest }` or `null` for a missing/malformed value — use it directly if you're writing your own checksum check instead of the ship-ready validators.
+
 `createMp4Sniffer`/`createChecksumValidator` only make sense for `kind=video`/general payloads — they run unconditionally for every kind your hook receives, so branch on `ctx.kind` yourself if you only want them applied to one kind, or compose differently per kind:
 
 ```ts
@@ -336,6 +338,8 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
 ```
+
+`checksum.algorithms` always lists what `createChecksumValidator`/`createS3ChecksumValidator` are capable of verifying — it does not detect whether this deployment's `validatePayload` actually calls one of them. A client sending a `checksum` metadata value is only verified if the operator wired in one of these helpers (or an equivalent check of their own).
 
 See `PROTOCOL.md` §2 for the full normative shape.
 
@@ -611,7 +615,7 @@ const uploadLink = buildUploadLink({
   artifactId: randomUUID(), // generate server-side; skip POST /reserve on the app
   token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
 });
-// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com&token=secret
+// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
 
 ## Tests

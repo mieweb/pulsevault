@@ -76,9 +76,9 @@ in `OPERATIONS.md` for the migration path.
   both ops metrics and a compliance audit trail from a single integration
   point.
 - **`Protocol-Version` response header** on every route this plugin mounts.
-- Bounded, LRU-evicting in-memory metadata cache in both storage adapters
-  (`metaCacheLimit` option, default 10,000 entries) — previously unbounded
-  for the life of the process.
+- Bounded, insertion-order-evicting in-memory metadata cache in both storage
+  adapters (`metaCacheLimit` option, default 10,000 entries) — previously
+  unbounded for the life of the process.
 - `S3Storage.readAll` — full-object read, used by `createS3ChecksumValidator`.
 
 ### Fixed
@@ -87,4 +87,4 @@ in `OPERATIONS.md` for the migration path.
   have explicit test coverage proving bytes are rejected/hidden at the right
   point, not just implied by the implementation.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.1...HEAD
