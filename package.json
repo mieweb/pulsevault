@@ -94,5 +94,10 @@
     "@aws-sdk/client-s3": "^3.1074.0",
     "@aws-sdk/s3-request-presigner": "^3.1074.0",
     "@tus/s3-store": "^2.0.4"
+  },
+  "overrides": {
+    "s3rver": {
+      "fast-xml-parser": "^5.9.3"
+    }
   }
 }
