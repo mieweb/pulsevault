@@ -1,6 +1,6 @@
 {
   "name": "@mieweb/pulsevault",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "description": "Fastify plugin for resumable video uploads via TUS, with a pluggable storage adapter and a filesystem-first local-storage default.",
   "type": "module",
   "main": "./dist/app.js",
@@ -20,13 +20,17 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md",
+    "PROTOCOL.md",
+    "OPERATIONS.md"
   ],
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "pretest": "npm run build",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "e2e": "npm run build && node scripts/e2e-tus.mjs"
   },
   "keywords": [
     "fastify",
