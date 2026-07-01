@@ -13,6 +13,41 @@ just by reading this package's source. It bundles several breaking changes
 into one release rather than spreading them across several; see "Upgrading"
 in `OPERATIONS.md` for the migration path.
 
+### Security
+
+The `videoid` → `artifactId` / generic-route rework above introduced two
+related authorization bugs in `core.ts`'s `PATCH`/`HEAD` handling. Both are
+fixed in this same release; upgrade before this reaches a published version
+if you've evaluated against an intermediate build.
+
+- **`authorize` was never actually invoked for `PATCH`/`HEAD`/in-flight-`DELETE`
+  under `{prefix}/upload/<id>`**, regardless of configuration — including the
+  built-in `createCapabilityAuthorize`. The helper that recovered an
+  artifactId from the tus resource URL for the `authorize` context assumed
+  the wrong shape for the current `<kind>/<artifactId><ext>` tus id and never
+  successfully extracted a UUID, so the "no artifactId, so allow" fallback
+  silently took over on every such request. Since an artifactId is not a
+  secret (it's carried in the pairing deep link/QR code by design, per
+  `PROTOCOL.md` §3), this let anyone who had seen a pairing link write bytes
+  into that upload with no token at all. Fixed by resolving the artifactId
+  through the same parser the actual upload-completion path uses, and by
+  making authorization-context resolution failure a hard reject rather than
+  a silent allow (`PROTOCOL.md` §5.2).
+- **A crafted multi-segment `PATCH` URL could write bytes to a different
+  artifact than the one `authorize()` checked.** The `authorize`-context URL
+  parser took the first path segment after `/upload/`, while `@tus/server`'s
+  own request routing (which decides what's actually read/written) takes the
+  URL's last segment — a divergence exploitable via extra path segments
+  (accepted by the `/upload/*` wildcard route). A party holding a valid
+  token for their own artifact could append a second, victim artifactId as a
+  trailing segment: `authorize()` saw and approved their own id, while the
+  request body landed on the victim's file. Fixed by resolving the
+  authorization-context artifactId via the exact same last-segment
+  extraction `@tus/server` itself uses (`PROTOCOL.md` §4.4, a new normative
+  requirement on server implementations generally, not just this package).
+- Both are covered by new regression tests in `test/plugin.test.mjs` that
+  fail against the pre-fix code and pass against the fix.
+
 ### Breaking
 
 - **Renamed `videoid` → `artifactId`** across the storage interface
@@ -97,6 +132,10 @@ in `OPERATIONS.md` for the migration path.
   adapters (`metaCacheLimit` option, default 10,000 entries) — previously
   unbounded for the life of the process.
 - `S3Storage.readAll` — full-object read, used by `createS3ChecksumValidator`.
+- `S3Storage.digestAll` — streams a finalized object through a hash digest
+  without buffering the whole thing into memory first; the streaming
+  counterpart to `readAll`, now used internally by
+  `createS3ChecksumValidator` (see "Fixed" below).
 
 ### Fixed
 
@@ -118,5 +157,21 @@ in `OPERATIONS.md` for the migration path.
   resolution. Verified against a real Meteor 3.4 app: `WebApp.connectHandlers`
   resolves `@mieweb/pulsevault/core` cleanly and a full TUS
   create → PATCH → GET round-trip works.
+- **Unbounded memory use during checksum validation.** `createChecksumValidator`
+  read the whole finalized file into a single `Buffer` via `fs.readFile`
+  before hashing; combined with the documented-supported `maxUploadSize:
+  Infinity`, a large upload could exhaust process memory just to verify its
+  checksum. Now streams the file through the hash via `createReadStream` +
+  a stream pipeline. `createS3ChecksumValidator` had the same issue via
+  `S3Storage.readAll`'s full-object buffer — now uses the new streaming
+  `S3Storage.digestAll` instead.
+- **Silent TOCTOU on S3-compatible backends without `IfNoneMatch` support.**
+  `reserveUpload`'s conditional-write collision guard falls back to a
+  weaker check-then-write on backends that reject `IfNoneMatch` (some
+  S3-compatible stores, and the `s3rver` mock this repo's own test suite
+  runs against) — this reopens the race between concurrent/retried creates
+  for the same artifactId. There's no way to close it without an external
+  lock, so this is now at least surfaced: a one-time `console.warn` fires
+  per process the first time a deployment falls into this degraded mode.
 
 [Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.1...HEAD

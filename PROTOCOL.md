@@ -144,6 +144,43 @@ offset before resuming an interrupted upload — it MUST NOT trust a locally
 cached byte count, which can be stale (server restart, a partial write that
 never committed, clock differences between client and a previous session).
 
+### 4.3 `Location` header validation
+
+The TUS spec permits the `POST /upload` response's `Location` header to be
+absolute or relative, and takes no position on where it may point. A client
+MUST resolve `Location` against the request's own origin and MUST reject
+(rather than follow) a result whose origin differs from the server it is
+already talking to. Without this check, a malicious or compromised server
+could return an absolute `Location` on a different host and receive every
+subsequent `HEAD`/`PATCH`/`DELETE` request for that upload — each carrying
+the bearer token per §5.1 — redirecting the credential to that host instead.
+This is the "token redirect" threat named in
+[RFC 6750 §10.4](https://datatracker.ietf.org/doc/html/rfc6750#section-10.4)
+(a bearer token accepted by, or in this case sent to, a party other than the
+one it was issued for) and matches the same-origin validation
+[OWASP recommends](https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html)
+for any server-supplied redirect target before resending credentials.
+
+### 4.4 Consistent request routing (server-side)
+
+A server implementation MUST resolve which artifact a `PATCH`/`HEAD`/`DELETE`
+request under `{prefix}/upload/<id>` applies to the same way for every
+purpose within that request — the identifier an authorization check is run
+against MUST be the exact identifier the request is actually applied to. A
+server MUST NOT use one code path (e.g. a hand-rolled URL parser feeding an
+`authorize` hook) to decide "which artifact is this for" and a different code
+path (e.g. an underlying TUS library's own request routing) to decide "which
+artifact do I actually read or write" — any divergence between the two lets a
+party authorized for one artifact write to, or probe, a different artifact
+they are not authorized for, by exploiting a URL shape the two parsers
+disagree on (e.g. extra path segments after the real id, which many routers
+accept on a wildcard route). Where a server is layered over an existing TUS
+implementation, resolve the identifier for authorization by calling that
+library's own identifier-resolution logic directly (or an exact copy of it)
+rather than an independent reimplementation — two parsers that happen to
+agree on well-formed requests can still silently disagree on adversarial
+ones.
+
 ## 5. Authentication
 
 ### 5.1 Token transport
@@ -152,14 +189,24 @@ A client MUST send the pairing token as `Authorization: Bearer <token>` on
 every `POST`/`PATCH`/`DELETE` request to `{prefix}/upload*`, and SHOULD also
 send it as `?token=` on `GET` requests to a watch/playback URL (some servers
 validate playback links without requiring a header, e.g. for browser
-playback).
+playback). See §4.3 for why the resource URL these requests target must
+itself be validated before the token is attached to a request against it.
 
 ### 5.2 Server-side verification
 
 A server MAY implement authentication however it chooses — this document
 does not mandate a scheme. A server MUST reject requests it cannot authorize
 with `403` (or `401` if no credential was presented at all), and SHOULD do
-so before any bytes are accepted for a new upload.
+so before any bytes are accepted for a new upload. This applies uniformly to
+every phase of an upload's lifecycle — creation, each `PATCH` chunk, `HEAD`
+offset queries, and `DELETE` (both the in-flight-cancel route and the
+finalized-artifact route) — not only to the initial `POST`. A server
+implementation MUST NOT skip authorization for `PATCH`/`HEAD` merely because
+an internal helper failed to recover the artifactId from the resource URL;
+that failure MUST be treated as an authorization failure (reject), not as
+"no artifactId to check, so allow." See §4.4 for the related requirement
+that the artifactId resolved for this check must be the one the request is
+actually applied to.
 
 ### 5.3 Rejection responses
 

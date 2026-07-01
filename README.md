@@ -666,7 +666,7 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 
 ### Payload validation on remote storage
 
-The default `createMp4Sniffer`/`createChecksumValidator` read a local file path, which doesn't exist for a bucket object. Use **`createS3Mp4Sniffer(storage)`**/**`createS3ChecksumValidator(storage)`** instead: they fetch the bytes they need via the adapter (a small ranged GET for the MP4 sniff; a full object read for the checksum, since a digest needs every byte) rather than assuming a local path.
+The default `createMp4Sniffer`/`createChecksumValidator` read a local file path, which doesn't exist for a bucket object. Use **`createS3Mp4Sniffer(storage)`**/**`createS3ChecksumValidator(storage)`** instead: they fetch the bytes they need via the adapter (a small ranged GET for the MP4 sniff; a full object download for the checksum, since a digest needs every byte — streamed through the hash via `storage.digestAll` rather than buffered into memory at once) rather than assuming a local path.
 
 ### Direct playback & CORS
 
