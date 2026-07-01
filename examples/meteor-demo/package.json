@@ -1,0 +1,26 @@
+{
+  "name": "pulsevault-meteor-demo",
+  "private": true,
+  "description": "Meteor demo server for the Pulse React Native app — same demo as ../rn-demo and ../express-demo, but on @mieweb/pulsevault/core mounted via WebApp.connectHandlers",
+  "scripts": {
+    "start": "meteor run",
+    "test": "meteor test --once --driver-package meteortesting:mocha",
+    "test-app": "TEST_WATCH=1 meteor test --full-app --driver-package meteortesting:mocha",
+    "visualize": "meteor --production --extra-packages bundle-visualizer"
+  },
+  "dependencies": {
+    "@babel/runtime": "^7.23.5",
+    "@mieweb/pulsevault": "file:../..",
+    "@swc/helpers": "^0.5.17",
+    "meteor-node-stubs": "^1.2.12",
+    "qrcode": "^1.5.4"
+  },
+  "meteor": {
+    "mainModule": {
+      "client": "client/main.js",
+      "server": "server/main.js"
+    },
+    "testModule": "tests/main.js",
+    "modern": true
+  }
+}

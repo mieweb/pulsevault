@@ -5,24 +5,19 @@ import type {
   FastifyRequest,
   FastifySchema,
 } from "fastify";
-import send from "@fastify/send";
 import type { PulseVaultCacheOptions } from "../app.js";
-import {
-  createPulsevaultTusServer,
-  pulseVaultTusContext,
-  type PulseVaultOnUploadComplete,
-  type PulseVaultOnArtifactEvent,
-} from "../lib/pulsevaultTus.js";
+import { createPulseVaultCore, PROTOCOL_VERSION } from "../core.js";
+import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from "../lib/pulsevaultTus.js";
 import type { PulseVaultValidatePayload } from "../lib/magic.js";
-import { pulseVaultError } from "../lib/errors.js";
-import { isUuid } from "../lib/uuid.js";
+import { type PulseVaultAuthorize } from "../lib/authorize.js";
 import type { PulseVaultStorage } from "../storage/types.js";
 import type { UploadKind } from "../storage/types.js";
 
-/** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
-export const PROTOCOL_VERSION = 1;
-const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
-const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
+export type {
+  PulseVaultAuthorize,
+  PulseVaultAuthorizeContext,
+  PulseVaultAuthorizePhase,
+} from "../lib/authorize.js";
 
 // Internal augmentation — mirrored in the opt-in `./augment.ts` re-export so
 // consumers can `import "@mieweb/pulsevault/augment"` and get the
@@ -33,32 +28,6 @@ declare module "fastify" {
     pulseVault?: { artifactId: string; kind: UploadKind; relatedTo?: string };
   }
 }
-
-export type PulseVaultAuthorizePhase =
-  | "create"
-  | "patch"
-  | "resolve"
-  | "delete";
-
-export type PulseVaultAuthorizeContext = {
-  phase: PulseVaultAuthorizePhase;
-  artifactId: string;
-  /** Artifact kind: `"video"`, `"project"`, or `"captions"`. Always present. */
-  kind: UploadKind;
-  /** Bearer / query-string token forwarded from the watch URL, if present. Only populated during the `"resolve"` phase. */
-  token?: string;
-  /**
-   * The session-anchor artifact this one declared via `Upload-Metadata.relatedTo`,
-   * if any. Lets `createCapabilityAuthorize` authorize an artifact against a
-   * token scoped to the session it belongs to rather than its own id.
-   */
-  relatedTo?: string;
-};
-
-export type PulseVaultAuthorize = (
-  request: FastifyRequest,
-  ctx: PulseVaultAuthorizeContext,
-) => void | Promise<void>;
 
 export type PulseVaultRoutesOptions = {
   storage: PulseVaultStorage;
@@ -72,98 +41,6 @@ export type PulseVaultRoutesOptions = {
   onUploadComplete?: PulseVaultOnUploadComplete;
   onArtifactEvent?: PulseVaultOnArtifactEvent;
 } & FastifyPluginOptions;
-
-/**
- * Pull `artifactId` (or the legacy `videoid`/`projectid` aliases), `kind`,
- * and `relatedTo` out of a raw `Upload-Metadata` header. Format is a
- * comma-separated list of `<key> <base64-value>` pairs (tus v1 creation
- * extension).
- */
-function parseUploadMetadata(
-  header: string,
-): { artifactId: string | undefined; kind: UploadKind; relatedTo: string | undefined } {
-  let artifactId: string | undefined;
-  let kind: UploadKind = "video";
-  let relatedTo: string | undefined;
-  for (const pair of header.split(",")) {
-    const trimmed = pair.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(" ");
-    if (sep < 0) continue;
-    const key = trimmed.slice(0, sep);
-    const value = trimmed.slice(sep + 1).trim();
-    if (!value) continue;
-    try {
-      const decoded = Buffer.from(value, "base64").toString("utf8");
-      if ((key === "artifactId" || key === "videoid" || key === "projectid") && !artifactId) {
-        artifactId = isUuid(decoded) ? decoded : undefined;
-      } else if (key === "kind") {
-        const lower = decoded.trim().toLowerCase();
-        kind = lower === "project" ? "project" : lower === "captions" ? "captions" : "video";
-      } else if (key === "relatedTo" && !relatedTo) {
-        relatedTo = isUuid(decoded) ? decoded : undefined;
-      }
-    } catch {
-      // ignore malformed base64
-    }
-  }
-  return { artifactId, kind, relatedTo };
-}
-
-/**
- * Decode the last URL segment of a tus PATCH/HEAD/DELETE (base64url-encoded
- * id) and extract the first path component, which the plugin always shapes as
- * the artifactId (see `pulseVaultTus.ts`).
- */
-function artifactIdFromTusUrl(url: string): string | undefined {
-  const match = url.match(/\/upload\/([^/?#]+)/);
-  if (!match?.[1]) return undefined;
-  let decoded: string;
-  try {
-    decoded = Buffer.from(match[1], "base64url").toString("utf8");
-  } catch {
-    return undefined;
-  }
-  const first = decoded.split("/", 1)[0];
-  return isUuid(first) ? first : undefined;
-}
-
-/**
- * Resolve the artifact kind for an artifactId from storage. Duck-typed so it
- * works with any adapter (those without `getKind` return `"video"`).
- */
-async function resolveStorageKind(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<UploadKind> {
-  const candidate = (storage as { getKind?: unknown }).getKind;
-  if (typeof candidate !== "function") return "video";
-  const result = await (candidate as (id: string) => Promise<UploadKind | null>)(artifactId);
-  return result ?? "video";
-}
-
-/** Resolve the `relatedTo` artifact for an artifactId from storage, if the adapter supports it. */
-async function resolveStorageRelatedTo(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<string | undefined> {
-  const candidate = (storage as { getRelatedTo?: unknown }).getRelatedTo;
-  if (typeof candidate !== "function") return undefined;
-  const result = await (candidate as (id: string) => Promise<string | null>)(artifactId);
-  return result ?? undefined;
-}
-
-function extractAuthzStatus(err: unknown): number {
-  const e = err as { statusCode?: unknown; status_code?: unknown };
-  if (typeof e?.statusCode === "number") return e.statusCode;
-  if (typeof e?.status_code === "number") return e.status_code;
-  return 403;
-}
-
-function extractAuthzMessage(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  return "Forbidden";
-}
 
 // Local extension of FastifySchema that allows the OpenAPI-flavored fields
 // (`tags`, `summary`, `description`) without pulling `@fastify/swagger` into
@@ -312,6 +189,11 @@ const capabilitiesSchema: OpenApiRouteSchema = {
   },
 };
 
+/** Coerce a Fastify route param (typed `unknown`) to a string for the core to validate — an invalid UUID is rejected by the core's own check either way. */
+function paramToString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
 const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
   fastify,
   opts,
@@ -327,17 +209,26 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     onUploadComplete,
     onArtifactEvent,
   } = opts;
-  // `fastify.prefix` is `""` when the plugin is mounted at the root.
-  const tusPath = `${fastify.prefix}/upload`;
 
-  const tusServer = createPulsevaultTusServer({
+  // All the authorize/validatePayload/onUploadComplete/onArtifactEvent
+  // orchestration, tus glue, capabilities payload, and artifact GET/DELETE
+  // logic lives in the framework-agnostic core (`../core.js`) — this file
+  // only wires Fastify's routing/schema/lifecycle around it, so behavior
+  // can't drift between this plugin and the `./core` entry point non-Fastify
+  // hosts use.
+  const core = createPulseVaultCore({
     storage,
-    tusPath,
-    maxSize: maxUploadSize,
+    // `fastify.prefix` is `""` when the plugin is mounted at the root.
+    basePath: fastify.prefix,
+    maxUploadSize,
+    uploadUnit,
     allowedExtensions,
+    cache,
+    authorize,
     validatePayload,
     onUploadComplete,
     onArtifactEvent,
+    logger: fastify.log,
   });
 
   fastify.addContentTypeParser(
@@ -347,106 +238,14 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     },
   );
 
-  // Every response from this plugin carries the wire protocol version it
-  // implements, so a client can detect "this server is too old/new for me"
-  // without a dedicated round-trip.
-  fastify.addHook("onSend", async (_request, reply) => {
-    reply.header("Protocol-Version", String(PROTOCOL_VERSION));
-  });
-
-  /**
-   * Run the consumer's `authorize` hook (if any) for a TUS request. Returns
-   * `true` iff the request may proceed; on rejection, this function already
-   * wrote the response.
-   */
-  const runAuthorize = async (
-    request: FastifyRequest,
-    reply: FastifyReply,
-    phase: "create" | "patch",
-  ): Promise<
-    | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
-    | { ok: false }
-  > => {
-    let artifactId: string | undefined;
-    let kind: UploadKind = "video";
-    let relatedTo: string | undefined;
-    if (phase === "create") {
-      const meta = request.headers["upload-metadata"];
-      if (typeof meta === "string") {
-        ({ artifactId, kind, relatedTo } = parseUploadMetadata(meta));
-      }
-    } else {
-      artifactId = artifactIdFromTusUrl(request.url);
-      // For PATCH/HEAD, resolve kind/relatedTo from storage (cache hit after reserve).
-      if (artifactId) {
-        kind = await resolveStorageKind(storage, artifactId);
-        relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-      }
-    }
-
-    if (artifactId) {
-      request.pulseVault = { artifactId, kind, relatedTo };
-    }
-
-    if (!authorize) {
-      return { ok: true, artifactId, kind, relatedTo };
-    }
-
-    // If we can't extract an artifactId, let tus produce its own 4xx for
-    // malformed input rather than synthesize a fake authorize failure.
-    if (!artifactId) {
-      return { ok: true, artifactId, kind, relatedTo };
-    }
-
-    try {
-      await authorize(request, { phase, artifactId, kind, relatedTo });
-      return { ok: true, artifactId, kind, relatedTo };
-    } catch (err) {
-      const statusCode = extractAuthzStatus(err);
-      const message = extractAuthzMessage(err);
-      request.log.info(
-        { err, artifactId, phase, statusCode },
-        "pulsevault authorize rejected",
-      );
-      // Only the create phase is a meaningful, low-frequency audit point —
-      // patch runs once per chunk and would make this noisy.
-      if (phase === "create") {
-        await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
-      }
-      await reply.code(statusCode).send(pulseVaultError(message));
-      return { ok: false };
-    }
-  };
-
-  const tusHandler = async (request: FastifyRequest, reply: FastifyReply) => {
-    const phase: "create" | "patch" =
-      request.method === "POST" ? "create" : "patch";
-
-    const authz = await runAuthorize(request, reply, phase);
-    if (!authz.ok) return;
-
-    // Once hijacked, Fastify will not write to this reply on our behalf, so we
-    // must translate any unexpected throw from `@tus/server` into a response
-    // ourselves — otherwise the socket stays open until the client times out.
-    reply.hijack();
-    try {
-      await pulseVaultTusContext.run(
-        { request, artifactId: authz.artifactId },
-        () => tusServer.handle(request.raw, reply.raw),
-      );
-    } catch (err) {
-      request.log.error({ err }, "pulsevault tus handler failed");
-      if (reply.raw.headersSent || reply.raw.writableEnded) {
-        reply.raw.destroy();
-        return;
-      }
-      reply.raw.statusCode = 500;
-      reply.raw.setHeader("content-type", "text/plain; charset=utf-8");
-      reply.raw.end("Internal Server Error");
-    }
-  };
-
   const tusMethods = ["POST", "PATCH", "HEAD", "DELETE", "OPTIONS"] as const;
+  const tusHandler = async (request: FastifyRequest, reply: FastifyReply) => {
+    // The core writes directly to the raw response (tus dispatch, authorize
+    // rejections, error translation) — hijack so Fastify doesn't also try to
+    // manage this reply afterward.
+    reply.hijack();
+    await core.handleTus(request.raw, reply.raw);
+  };
   fastify.route({
     method: [...tusMethods],
     url: "/upload",
@@ -460,134 +259,28 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (
     handler: tusHandler,
   });
 
-  fastify.get("/capabilities", { schema: capabilitiesSchema }, async (_request, reply) => {
-    return reply.send({
-      protocolVersion: PROTOCOL_VERSION,
-      minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
-      maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
-      uploadUnit,
-      kinds: ["video", "project", "captions"],
-      allowedExtensions,
-      maxUploadSize,
-      checksum: { algorithms: ["sha256", "sha1", "md5"] },
-    });
+  fastify.get("/capabilities", { schema: capabilitiesSchema }, async (request, reply) => {
+    reply.hijack();
+    await core.handleCapabilities(request.raw, reply.raw);
   });
 
   fastify.delete(
     "/artifacts/:artifactId",
     { schema: artifactDeleteSchema },
     async (request, reply) => {
-      const artifactId = (request.params as { artifactId?: unknown })?.artifactId;
-      if (!isUuid(artifactId)) {
-        return reply
-          .code(400)
-          .send(pulseVaultError("`artifactId` must be a valid UUID"));
-      }
-
-      const kind = await resolveStorageKind(storage, artifactId);
-      const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-      request.pulseVault = { artifactId, kind, relatedTo };
-
-      if (authorize) {
-        try {
-          await authorize(request, { phase: "delete", artifactId, kind, relatedTo });
-        } catch (err) {
-          const statusCode = extractAuthzStatus(err);
-          const message = extractAuthzMessage(err);
-          request.log.info(
-            { err, artifactId, phase: "delete", statusCode },
-            "pulsevault authorize rejected",
-          );
-          await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
-          return reply.code(statusCode).send(pulseVaultError(message));
-        }
-      }
-
-      if (typeof storage.remove !== "function") {
-        return reply
-          .code(501)
-          .send(
-            pulseVaultError(
-              "Storage adapter does not support delete",
-            ),
-          );
-      }
-
-      const removed = await storage.remove(artifactId);
-      if (!removed) {
-        return reply.code(404).send(pulseVaultError("Artifact not found"));
-      }
-      return reply.code(204).send();
+      const artifactId = paramToString((request.params as { artifactId?: unknown })?.artifactId);
+      reply.hijack();
+      await core.handleArtifactDelete(request.raw, reply.raw, artifactId);
     },
   );
 
   fastify.get("/artifacts/:artifactId", { schema: artifactGetSchema }, async (request, reply) => {
-    const artifactId = (request.params as { artifactId?: unknown })?.artifactId;
-    if (!isUuid(artifactId)) {
-      return reply
-        .code(400)
-        .send(pulseVaultError("`artifactId` must be a valid UUID"));
-    }
-
-    // Resolve kind/relatedTo before setting request.pulseVault so authorize
-    // hooks get a fully-populated context (cache hit after reserveUpload).
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-    request.pulseVault = { artifactId, kind, relatedTo };
-
-    // Extract the optional token forwarded by the mobile app in the watch URL.
+    const artifactId = paramToString((request.params as { artifactId?: unknown })?.artifactId);
     const token = (request.query as { token?: string })?.token;
-
-    // Run authorize *before* resolve so consumers can reject without the
-    // response leaking "this artifactId exists but you don't own it" vs. "no
-    // such artifactId".
-    if (authorize) {
-      try {
-        await authorize(request, { phase: "resolve", artifactId, kind, relatedTo, token });
-      } catch (err) {
-        const statusCode = extractAuthzStatus(err);
-        const message = extractAuthzMessage(err);
-        request.log.info(
-          { err, artifactId, phase: "resolve", statusCode },
-          "pulsevault authorize rejected",
-        );
-        await onArtifactEvent?.({ phase: "authorize", artifactId, kind, reason: message });
-        return reply.code(statusCode).send(pulseVaultError(message));
-      }
-    }
-
-    const resolved = await storage.resolve(artifactId);
-    if (!resolved) {
-      return reply.code(404).send(pulseVaultError("Artifact not found"));
-    }
-
-    if (resolved.kind === "redirect") {
-      return reply.redirect(resolved.url, resolved.statusCode ?? 302);
-    }
-
-    const result = await send(request.raw, resolved.filename, {
-      root: resolved.root,
-      ...cache,
-    });
-
-    if (result.type === "error") {
-      return reply
-        .code(result.statusCode)
-        .send(pulseVaultError(result.metadata.error.message));
-    }
-
-    // If the storage adapter provided an explicit content type (e.g. for
-    // non-standard extensions like `.pulse`), override what @fastify/send
-    // would otherwise infer from the filename.
-    if (resolved.contentType) {
-      reply.header("content-type", resolved.contentType);
-    }
-
-    for (const [name, value] of Object.entries(result.headers)) {
-      reply.header(name, value);
-    }
-    return reply.code(result.statusCode).send(result.stream);
+    reply.hijack();
+    await core.handleArtifactGet(request.raw, reply.raw, artifactId, token);
   });
 };
 
 export default pulseVaultRoutes;
+export { PROTOCOL_VERSION };

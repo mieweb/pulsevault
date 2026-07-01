@@ -1,12 +1,12 @@
 # @mieweb/pulsevault
 
-Fastify plugin for resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app.
+Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. Ships as a Fastify plugin (`@mieweb/pulsevault`) and as a framework-agnostic core (`@mieweb/pulsevault/core`) for Express, Meteor, or plain `http.createServer` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 **Licensing note**: this package is currently Source Available (free for non-commercial use; see [License](#license)) — a move to a fully OSI-approved open source license is planned but not yet landed. If you're evaluating this for adoption, read [License](#license) before investing evaluation time.
 
 See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server *without* this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
 
-Self-hosted video capture for places that can't ship recordings to a vendor. Pulse records the walkthrough on the phone; Pulsevault receives it inside the Fastify app you already run, behind your auth, on your storage. Pair a device by QR code and upload over TUS so two-minute captures from the floor survive signal drops and device restarts.
+Self-hosted video capture for places that can't ship recordings to a vendor. Pulse records the walkthrough on the phone; Pulsevault receives it inside the backend you already run, behind your auth, on your storage. Pair a device by QR code and upload over TUS so two-minute captures from the floor survive signal drops and device restarts.
 
 Hook in at `authorize`, `validatePayload`, or `onUploadComplete` to bolt on whatever your institution already runs — SSO, audit logs, transcoding queues, AI pipelines. The plugin mounts a handful of routes; the rest stays yours. **Every deployment of this plugin is fully independent** — there's no central Pulse-run service anywhere in this picture:
 
@@ -29,8 +29,11 @@ The local storage adapter writes to a stable on-disk layout (see [Local storage]
 
 ## Requirements
 
-- Fastify `^5.x`
 - Node.js `>=18`
+- Fastify `^5.x` — only if you use the default `@mieweb/pulsevault` (Fastify
+  plugin) entry point. The framework-agnostic `@mieweb/pulsevault/core` entry
+  point (Express, Meteor, or plain `http.createServer`) has no Fastify
+  dependency at all — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 ## Installation
 
@@ -65,6 +68,122 @@ This is the minimal setup with no authentication — fine for local development,
 not for production. See [`authorize`](#authorize) and [Capability tokens](#capability-tokens)
 for a secure-by-default option, and `OPERATIONS.md` for the full production checklist.
 
+## Non-Fastify hosts (Express, Meteor, plain `http`)
+
+Everything above the Fastify-specific route/hook wiring — the authorize/
+validatePayload/onUploadComplete orchestration, the TUS glue, the
+capabilities payload, artifact GET/DELETE — lives in a framework-agnostic
+core that the Fastify plugin itself is a thin adapter over. That core is
+published as a separate entry point, `@mieweb/pulsevault/core`, with no
+Fastify dependency, so a non-Fastify backend gets full protocol parity for
+about the same amount of code as the Fastify quick-start above.
+
+`createPulseVaultCore(...)` returns a connect-style `handler(req, res, next?)`
+you can mount directly:
+
+```ts
+// Express
+import express from "express";
+import { randomUUID } from "node:crypto";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+
+const app = express();
+const pulseVault = createPulseVaultCore({
+  basePath: "/pulsevault",
+  // Express's app.use(prefix, ...) already strips the mount prefix from
+  // req.url before calling the middleware, so tell the core not to also
+  // match/strip it — basePath is still used for the tus Location header.
+  stripBasePath: false,
+  storage: createLocalStorage({ workspaceDir: "./data" }),
+  maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
+});
+app.use("/pulsevault", (req, res, next) => pulseVault.handler(req, res, next).catch(next));
+
+app.post("/reserve", express.json(), (_req, res) => {
+  res.json({ artifactId: randomUUID() });
+});
+
+app.listen(3030);
+```
+
+```ts
+// Meteor (server-only module)
+import { WebApp } from "meteor/webapp";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+
+const pulseVault = createPulseVaultCore({
+  basePath: "/pulsevault",
+  stripBasePath: false, // WebApp.connectHandlers strips the mount prefix too
+  storage: createLocalStorage({ workspaceDir: process.env.PULSEVAULT_DIR }),
+  maxUploadSize: 5 * 1024 * 1024 * 1024,
+});
+WebApp.connectHandlers.use("/pulsevault", (req, res, next) => {
+  pulseVault.handler(req, res, next).catch(next);
+});
+```
+
+**Meteor compatibility note.** `WebApp.connectHandlers.use(prefix, handler)`
+is the right integration point (it's `connect`, the same shape as Express),
+but Meteor's bundler (tested: Meteor 3.4, `modules@0.20.3`) doesn't resolve
+`package.json` `"exports"` subpath maps — neither this package's own
+`"./core"` entry, nor (transitively, until this release) `@tus/server`'s
+own dependency on `srvx`, which shipped *only* subpath exports with no
+legacy `main` fallback. Both are worked around: this package pins
+`@tus/server`/`@tus/file-store` to `2.0.0` (the last release before the
+`srvx` migration — see `CHANGELOG.md`) and ships plain root-level
+`core.js`/`augment.js` fallback files alongside the `"exports"` map, so
+resolvers that ignore `"exports"` (Meteor's included) still find them via
+ordinary relative-path resolution. Verified against a real
+`meteor create` app: `WebApp.connectHandlers.use("/pulsevault", ...)`
+resolves cleanly and a full TUS create → PATCH → GET round-trip works.
+
+For a bare `http.createServer` (or any host that hands `handler` the
+request's full, unmodified URL instead of pre-stripping a mount prefix),
+leave `stripBasePath` at its default (`true`):
+
+```ts
+import http from "node:http";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+
+const pulseVault = createPulseVaultCore({
+  basePath: "/pulsevault",
+  storage: createLocalStorage({ workspaceDir: "./data" }),
+  maxUploadSize: 5 * 1024 * 1024 * 1024,
+});
+http.createServer((req, res) => {
+  pulseVault.handler(req, res).catch((err) => {
+    res.writeHead(500);
+    res.end(String(err));
+  });
+}).listen(3030);
+```
+
+`@mieweb/pulsevault/core` re-exports everything the Fastify entry point does
+(`createLocalStorage`, `createS3Storage`, `createMp4Sniffer`,
+`createChecksumValidator`, `createCapabilityAuthorize`, etc.), so a
+non-Fastify integration only ever imports from this one path — every option
+documented under [Plugin options](#plugin-options) below (`authorize`,
+`validatePayload`, `onUploadComplete`, `allowedExtensions`, `cache`, and so
+on) applies identically. `createPulseVaultCore` differs from the Fastify
+plugin's options in a few small ways: it takes `basePath` where the plugin
+takes `prefix`; it has no `decoratorName` (there's no Fastify decorator to
+name — keep your own reference to `storage` instead); it adds `stripBasePath`
+(see above — `false` for hosts that already strip their own mount prefix,
+default `true` otherwise); and it adds an optional `logger` (`{ info(obj,
+msg?), error(obj, msg?) }`, Pino-shaped) for the core's own internal
+diagnostics — the Fastify plugin always uses `request.log` for these
+automatically, but a non-Fastify host has no equivalent to infer one from,
+so it falls back to `console` when omitted.
+
+See [`examples/express-demo`](examples/express-demo) and
+[`examples/meteor-demo`](examples/meteor-demo) for full runnable servers
+(pairing page, QR codes, auth demo, local/S3 storage) — the Express and
+Meteor counterparts to [`examples/rn-demo`](examples/rn-demo)'s Fastify
+demo, both built on `@mieweb/pulsevault/core` instead of the plugin. Both
+are verified against the real frameworks, not just the test suite —
+`meteor-demo` in particular against a real `meteor create` app, since
+Meteor's bundler needed the compatibility fixes described above.
+
 ## How a pairing + upload session flows
 
 ```mermaid
@@ -89,7 +208,7 @@ sequenceDiagram
 
 ## Routes
 
-The plugin mounts the following routes under `prefix`:
+The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core` mounts the identical set under `basePath` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http)):
 
 | Method | Path | Description |
 | --- | --- | --- |
@@ -200,7 +319,12 @@ Optional async hook called before TUS create/patch, before GET resolve, and befo
 
 ```ts
 type PulseVaultAuthorize = (
-  request: FastifyRequest,
+  // PulseVaultRequest only requires `.headers` — under the Fastify plugin
+  // this is always the real `FastifyRequest` object (cast if you need
+  // Fastify-specific fields); under @mieweb/pulsevault/core it's whatever
+  // the host framework hands the handler (Express's `req`, a raw
+  // `http.IncomingMessage`, etc.) — the same hook works under either.
+  request: PulseVaultRequest,
   ctx: {
     phase: "create" | "patch" | "resolve" | "delete";
     artifactId: string;
@@ -231,7 +355,7 @@ Optional async hook that runs _after_ TUS writes the final byte but _before_ the
 
 ```ts
 type PulseVaultValidatePayload = (
-  request: FastifyRequest,
+  request: PulseVaultRequest, // see the note under `authorize` above
   ctx: {
     artifactId: string;
     size: number;
@@ -283,7 +407,7 @@ Optional async hook fired once the final byte is written, `validatePayload` has 
 
 ```ts
 type PulseVaultOnUploadComplete = (
-  request: FastifyRequest,
+  request: PulseVaultRequest, // see the note under `authorize` above
   ctx: { artifactId: string; kind: "video" | "project" | "captions"; size: number; uploadId: string },
 ) => void | Promise<void>;
 ```
@@ -642,6 +766,7 @@ Runs a Node `--test` suite against the built plugin. Coverage includes:
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
 - `GET /capabilities`
 - S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, run against an in-process [s3rver](https://github.com/jamhall/s3rver) mock (no cloud credentials needed)
+- `@mieweb/pulsevault/core` (the framework-agnostic entry point): the same protocol suite re-run against a bare `http.createServer` wrapping `core.handler`, plus an Express-specific smoke test proving `app.use(prefix, handler)` composition
 
 ## Accessing storage outside the plugin routes
 
@@ -656,6 +781,8 @@ app.get("/admin/artifact/:id", async (req, reply) => {
   // custom logic...
 });
 ```
+
+Under `@mieweb/pulsevault/core` there's no decorator (no Fastify instance to hang one off of) — just keep the `storage` object you passed into `createPulseVaultCore(...)` and call it directly in your own routes.
 
 ## License
 

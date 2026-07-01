@@ -76,6 +76,23 @@ in `OPERATIONS.md` for the migration path.
   both ops metrics and a compliance audit trail from a single integration
   point.
 - **`Protocol-Version` response header** on every route this plugin mounts.
+- **`@mieweb/pulsevault/core`** — a framework-agnostic entry point with no
+  Fastify dependency. `createPulseVaultCore(...)` returns a connect-style
+  `handler(req, res, next?)` usable directly as Express middleware
+  (`app.use(prefix, handler)`), Meteor middleware
+  (`WebApp.connectHandlers.use(prefix, handler)`), or a bare
+  `http.createServer` callback — same options, hooks, and storage adapters as
+  the Fastify plugin (which is now itself a thin adapter over this core, so
+  behavior can't drift between the two). See "Non-Fastify hosts" in
+  `README.md`, and `examples/express-demo`/`examples/meteor-demo` for full
+  runnable servers verified against the real frameworks.
+  - As part of this, `PulseVaultAuthorize`/`PulseVaultValidatePayload`/
+    `PulseVaultOnUploadComplete`'s `request` parameter is now typed as the
+    generic `PulseVaultRequest` (just `{ headers }`) instead of
+    `FastifyRequest` — `FastifyRequest` still satisfies it structurally, so
+    untyped/inferred hook callbacks (the documented pattern) are unaffected;
+    only an explicit `(request: FastifyRequest, ctx) => ...` annotation on
+    one of these three hooks would need loosening.
 - Bounded, insertion-order-evicting in-memory metadata cache in both storage
   adapters (`metaCacheLimit` option, default 10,000 entries) — previously
   unbounded for the life of the process.
@@ -86,5 +103,20 @@ in `OPERATIONS.md` for the migration path.
 - `maxUploadSize` enforcement and the in-progress-upload 404 behavior now
   have explicit test coverage proving bytes are rejected/hidden at the right
   point, not just implied by the implementation.
+- **Meteor compatibility.** Meteor's bundler doesn't resolve `package.json`
+  `"exports"` subpath maps, which broke both this package's own `"./core"`
+  entry and, transitively, `@tus/server`'s dependency on `srvx` (which as of
+  `@tus/server@2.1.0` ships *only* subpath exports, no legacy `main`
+  fallback). Fixed two ways: `@tus/server`/`@tus/file-store` are pinned to
+  `2.0.0` (the last release before the `srvx` migration — everything added
+  in `2.1.0`–`2.4.1` was either the `srvx` migration itself, follow-up
+  fixes for regressions it introduced, or one unused `exposedHeaders`
+  option, so nothing this package relies on is lost); and plain root-level
+  `core.js`/`core.d.ts`/`augment.js`/`augment.d.ts` files now ship alongside
+  the `"exports"` map, so resolvers that ignore `"exports"` (Meteor's
+  included) still find these entry points via ordinary relative-path
+  resolution. Verified against a real Meteor 3.4 app: `WebApp.connectHandlers`
+  resolves `@mieweb/pulsevault/core` cleanly and a full TUS
+  create → PATCH → GET round-trip works.
 
 [Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.1...HEAD

@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { FastifyRequest } from "fastify";
-import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from "../routes/pulsevault.js";
+import type { PulseVaultRequest } from "./request.js";
+import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from "./authorize.js";
 
 /**
  * Claims signed into a capability token. `kid` lets a secret be rotated with
@@ -137,7 +137,7 @@ export function verifyCapabilityToken(
 
 /** Pull a bearer token from the `Authorization` header, falling back to `ctx.token` (the `resolve`-phase query-string forward). */
 function extractToken(
-  request: FastifyRequest,
+  request: PulseVaultRequest,
   ctx: Pick<PulseVaultAuthorizeContext, "token">,
 ): string | undefined {
   const header = request.headers.authorization;
