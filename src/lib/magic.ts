@@ -18,7 +18,7 @@ import type { S3Storage } from "../storage/s3.js";
 export type PulseVaultValidatePayload = (
   request: FastifyRequest,
   ctx: {
-    videoid: string;
+    artifactId: string;
     size: number;
     uploadId: string;
     /** Absolute local path to the finalized bytes, or `null` if unavailable. */
@@ -88,12 +88,12 @@ function hasFtypBox(buf: Buffer): boolean {
 export function createMp4Sniffer(
   storage: LocalStorage,
 ): PulseVaultValidatePayload {
-  return async (_request, { videoid }) => {
-    const localPath = await storage.getLocalPath(videoid);
+  return async (_request, { artifactId }) => {
+    const localPath = await storage.getLocalPath(artifactId);
     if (!localPath) {
       throw Object.assign(
         new Error(
-          `Cannot validate upload ${videoid}: no local path available`,
+          `Cannot validate upload ${artifactId}: no local path available`,
         ),
         { statusCode: 500 },
       );
@@ -129,11 +129,11 @@ export function createMp4Sniffer(
 export function createS3Mp4Sniffer(
   storage: S3Storage,
 ): PulseVaultValidatePayload {
-  return async (_request, { videoid }) => {
-    const header = await storage.readHeader(videoid, 12);
+  return async (_request, { artifactId }) => {
+    const header = await storage.readHeader(artifactId, 12);
     if (!header) {
       throw Object.assign(
-        new Error(`Cannot validate upload ${videoid}: no object bytes available`),
+        new Error(`Cannot validate upload ${artifactId}: no object bytes available`),
         { statusCode: 500 },
       );
     }
