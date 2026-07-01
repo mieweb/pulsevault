@@ -55,7 +55,7 @@ await app.register(fastifySwaggerUI, {
   uiConfig: { docExpansion: "list", deepLinking: false },
 });
 
-// Serve pairing page before the plugin so it isn't swallowed by /:videoid
+// Serve pairing page before the plugin so it isn't swallowed by /pulsevault/artifacts/:artifactId
 app.get(
   "/",
   {
@@ -75,47 +75,47 @@ app.get(
   (_req, reply) => reply.type("text/html").send(html),
 );
 
-// Reserve a videoid for an upload. The server owns ID generation so it can
-// later attach auth tokens, quotas, or other server-side state here.
+// Reserve an artifactId for an upload. The server owns ID generation so it
+// can later attach auth tokens, quotas, or other server-side state here.
 app.post(
   "/reserve",
   {
     schema: {
       tags: ["demo"],
-      summary: "Reserve a new videoid",
+      summary: "Reserve a new artifactId",
       description:
-        "Generates a fresh UUID for the client to use as the `videoid` metadata entry on its TUS upload.",
+        "Generates a fresh UUID for the client to use as the `artifactId` metadata entry on its TUS upload.",
       response: {
         200: {
-          description: "A newly minted videoid.",
+          description: "A newly minted artifactId.",
           type: "object",
           properties: {
-            videoid: { type: "string", format: "uuid" },
+            artifactId: { type: "string", format: "uuid" },
           },
-          required: ["videoid"],
+          required: ["artifactId"],
         },
       },
     },
   },
   async (_req, reply) => {
-    const videoid = randomUUID();
-    return reply.send({ videoid });
+    const artifactId = randomUUID();
+    return reply.send({ artifactId });
   },
 );
 
 // List all uploads under dataDir. Reads each upload's sidecar to determine
-// kind and subdir rather than hard-coding "video/" — handles video + project.
+// kind and subdir rather than hard-coding "video/" — handles video/project/captions.
 const uploadSummarySchema = {
   type: "object",
   properties: {
-    videoid: { type: "string", format: "uuid" },
-    kind: { type: "string", enum: ["video", "project"], description: "Artifact kind." },
+    artifactId: { type: "string", format: "uuid" },
+    kind: { type: "string", enum: ["video", "project", "captions"], description: "Artifact kind." },
     filename: { type: "string" },
     ext: { type: "string" },
     size: { type: "integer", minimum: 0 },
     creation_date: { type: "string", format: "date-time" },
   },
-  required: ["videoid", "kind", "filename", "ext", "size", "creation_date"],
+  required: ["artifactId", "kind", "filename", "ext", "size", "creation_date"],
 };
 
 app.get(
@@ -149,7 +149,7 @@ app.get(
       entries
         .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
         .map(async (e) => {
-          const videoid = e.name.slice(0, -".json".length);
+          const artifactId = e.name.slice(0, -".json".length);
           const sidecarFilePath = path.join(pulsevaultMetaDir, e.name);
           let sidecar;
           try {
@@ -162,7 +162,7 @@ app.get(
 
           const kind = sidecar.kind ?? "video";
           const ext = sidecar.ext ?? ".mp4";
-          const artifactFile = `${videoid}${ext}`;
+          const artifactFile = `${artifactId}${ext}`;
           const artifactPath = path.join(dataDir, kind, artifactFile);
           const tusJsonPath = `${artifactPath}.json`;
 
@@ -175,7 +175,7 @@ app.get(
           if (!artifactStat || artifactStat.size === 0) return null;
 
           return {
-            videoid,
+            artifactId,
             kind,
             filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
             ext,
@@ -194,17 +194,19 @@ app.get(
   },
 );
 
-// One deeplink + matching QR per request. videoid is generated server-side so
-// it stays the source of truth.
+// One deeplink + matching QR per request. artifactId is generated server-side
+// so it stays the source of truth. `server` must include the plugin's
+// `prefix` ("/pulsevault") — the client builds every request as
+// `${server}/<path>` with no prefix concept of its own.
 app.get("/deeplinks", async (req, reply) => {
   const proto = req.headers["x-forwarded-proto"] ?? "http";
   const host = req.headers["x-forwarded-host"] ?? req.headers.host;
-  const server = `${proto}://${host}`;
-  const videoid = randomUUID();
+  const server = `${proto}://${host}/pulsevault`;
+  const artifactId = randomUUID();
 
   const upload = buildUploadLink({
     server,
-    videoid,
+    artifactId,
     ...(DEMO_TOKEN && { token: DEMO_TOKEN }),
   });
 
@@ -216,7 +218,7 @@ app.get("/deeplinks", async (req, reply) => {
 
   return reply.send({
     upload,
-    videoid,
+    artifactId,
     qrUpload,
     authMode: Boolean(DEMO_TOKEN),
   });
@@ -253,22 +255,29 @@ const pulseStorage = useS3
     })
   : createLocalStorage({ workspaceDir: dataDir });
 
-// Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and video GET is at /pulsevault/:videoid
+// Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and
+// artifact GET is at /pulsevault/artifacts/:artifactId.
 await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  // Accept MP4 videos and Pulse draft bundles (.pulse) + diagnostic zips.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"] },
-  // Reject non-MP4 bytes on video uploads (magic-byte sniff). The S3 sniffer
-  // does a ranged read of the object; the local one reads the file on disk.
-  validatePayload: useS3
-    ? createS3Mp4Sniffer(pulseStorage)
-    : createMp4Sniffer(pulseStorage),
-  // Fired when a project bundle finishes uploading. The bundle is opaque
-  // to the plugin — index it, relay it, or leave it for a later request.
-  onProjectUploadComplete: async (_req, { videoid, size }) => {
-    app.log.info({ videoid, size }, "pulsevault project upload complete");
+  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT captions.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
+  // validatePayload now runs for every kind, with ctx.kind telling you which
+  // — only apply the MP4 magic-byte sniff to actual videos, since project
+  // bundles and SRT captions never start with an ISOBMFF ftyp box. The S3
+  // sniffer does a ranged read of the object; the local one reads the file
+  // on disk.
+  validatePayload: async (request, ctx) => {
+    if (ctx.kind !== "video") return;
+    const sniff = useS3 ? createS3Mp4Sniffer(pulseStorage) : createMp4Sniffer(pulseStorage);
+    await sniff(request, ctx);
+  },
+  // Fired once any artifact (video, project bundle, or captions) finishes
+  // uploading. The bytes are opaque to the plugin — index them, relay them,
+  // or leave them for a later request.
+  onUploadComplete: async (_req, { artifactId, kind, size }) => {
+    app.log.info({ artifactId, kind, size }, "pulsevault upload complete");
   },
   /**
    * authorize hook — the demo's auth proof-of-concept.
