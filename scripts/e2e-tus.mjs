@@ -20,7 +20,12 @@ const demoDir = path.join(__dirname, "..", "examples", "rn-demo");
 const PORT = 4173;
 const BASE = `http://127.0.0.1:${PORT}`;
 const PREFIX = `${BASE}/pulsevault`;
-const DEMO_TOKEN = "e2e-smoke-test-token";
+const PULSEVAULT_SECRET = "e2e-smoke-test-secret";
+
+/** Extracts the `token` query param from a `pulsecam://` deep link, the same way a real client parses it. */
+function tokenFromDeepLink(deepLink) {
+  return new URL(deepLink.replace("pulsecam://", "http://x/")).searchParams.get("token");
+}
 
 function b64(str) {
   return Buffer.from(str, "utf8").toString("base64");
@@ -57,7 +62,14 @@ async function main() {
   console.log("Starting rn-demo server...");
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: demoDir,
-    env: { ...process.env, PORT: String(PORT), HOST: "127.0.0.1", DEMO_TOKEN, STORAGE: "local" },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      HOST: "127.0.0.1",
+      STORAGE: "local",
+      PULSEVAULT_SECRET,
+      PULSEVAULT_ISSUER: BASE,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -83,15 +95,20 @@ async function main() {
     assert.ok(["beat", "merged"].includes(caps.uploadUnit));
     console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
 
-    // 2. Pairing — mints an artifactId + deep link carrying the demo token.
+    // 2. Pairing — mints an artifactId + a real HMAC-signed capability token
+    // (issueCapabilityToken), carried in the deep link exactly as a real
+    // client would receive it.
     const linkRes = await fetch(`${BASE}/deeplinks`);
     assert.equal(linkRes.status, 200, "GET /deeplinks should be 200");
-    const { artifactId, upload: deepLink } = await linkRes.json();
+    const { artifactId, upload: deepLink, authMode } = await linkRes.json();
     assert.ok(artifactId, "deeplinks response should include an artifactId");
     assert.ok(deepLink.startsWith("pulsecam://"), "deep link should use the pulsecam scheme");
-    console.log(`  ✓ /deeplinks minted artifactId=${artifactId}`);
+    assert.equal(authMode, true, "PULSEVAULT_SECRET is set, so authMode should be true");
+    const token = tokenFromDeepLink(deepLink);
+    assert.ok(token, "deep link should carry a capability token when PULSEVAULT_SECRET is set");
+    console.log(`  ✓ /deeplinks minted artifactId=${artifactId} with a signed capability token`);
 
-    // 3. Full chunked TUS upload, authorized with the demo bearer token.
+    // 3. Full chunked TUS upload, authorized with the real capability token.
     const body = makeMp4(2 * 1024 * 1024);
     const digest = createHash("sha256").update(body).digest("hex");
     const metadata = [
@@ -106,7 +123,7 @@ async function main() {
         "Tus-Resumable": "1.0.0",
         "Upload-Length": String(body.length),
         "Upload-Metadata": metadata,
-        Authorization: `Bearer ${DEMO_TOKEN}`,
+        Authorization: `Bearer ${token}`,
       },
     });
     assert.equal(create.status, 201, `create should be 201, got ${create.status}`);
@@ -121,7 +138,7 @@ async function main() {
         "Tus-Resumable": "1.0.0",
         "Upload-Offset": "0",
         "Content-Type": "application/offset+octet-stream",
-        Authorization: `Bearer ${DEMO_TOKEN}`,
+        Authorization: `Bearer ${token}`,
       },
       body: body.subarray(0, half),
     });
@@ -130,7 +147,7 @@ async function main() {
     // Resume via HEAD before the second chunk — never trust a cached offset.
     const head = await fetch(location, {
       method: "HEAD",
-      headers: { "Tus-Resumable": "1.0.0", Authorization: `Bearer ${DEMO_TOKEN}` },
+      headers: { "Tus-Resumable": "1.0.0", Authorization: `Bearer ${token}` },
     });
     assert.equal(Number(head.headers.get("upload-offset")), half, "HEAD should report the offset after chunk 1");
 
@@ -140,7 +157,7 @@ async function main() {
         "Tus-Resumable": "1.0.0",
         "Upload-Offset": String(half),
         "Content-Type": "application/offset+octet-stream",
-        Authorization: `Bearer ${DEMO_TOKEN}`,
+        Authorization: `Bearer ${token}`,
       },
       body: body.subarray(half),
     });
@@ -151,16 +168,22 @@ async function main() {
     // demo's authorize hook reads the resolve-phase token from `?token=`
     // (forwarded from the watch URL), not the Authorization header — that's
     // the documented contract for the "resolve" phase specifically.
-    const get = await fetch(`${PREFIX}/artifacts/${artifactId}?token=${DEMO_TOKEN}`);
+    const get = await fetch(`${PREFIX}/artifacts/${artifactId}?token=${token}`);
     assert.equal(get.status, 200, `GET /artifacts/:id should be 200, got ${get.status}`);
     const got = Buffer.from(await get.arrayBuffer());
     assert.equal(Buffer.compare(got, body), 0, "downloaded bytes should match what was uploaded");
     console.log("  ✓ GET /artifacts/:artifactId serves the exact uploaded bytes");
 
-    // 5. A request with no/wrong token must be rejected, not silently accepted.
-    const unauthorized = await fetch(`${PREFIX}/artifacts/${artifactId}`);
-    assert.equal(unauthorized.status, 403, "unauthenticated GET should be rejected");
-    console.log("  ✓ request with no token is rejected (403)");
+    // 5. No credential at all -> 401; a well-formed but wrong/unrelated token -> 403.
+    // createCapabilityAuthorize distinguishes these (PROTOCOL.md §5.2) — neither is
+    // silently accepted.
+    const noToken = await fetch(`${PREFIX}/artifacts/${artifactId}`);
+    assert.equal(noToken.status, 401, "GET with no token should be 401");
+    const other = await fetch(`${BASE}/deeplinks`).then((r) => r.json());
+    const otherToken = tokenFromDeepLink(other.upload);
+    const wrongToken = await fetch(`${PREFIX}/artifacts/${artifactId}?token=${otherToken}`);
+    assert.equal(wrongToken.status, 403, "GET with a token for a different artifact should be 403");
+    console.log("  ✓ no token -> 401, wrong-artifact token -> 403");
 
     console.log("\nAll e2e checks passed.");
   } finally {
