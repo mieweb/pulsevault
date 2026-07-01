@@ -61,6 +61,26 @@ instance talks to the same bucket, so it scales horizontally with zero
 additional configuration. Prefer it for any multi-instance deployment unless
 you have a specific reason to use local disk.
 
+### S3-compatible backend collision-guard fallback
+
+`reserveUpload`'s collision guard normally uses `PutObjectCommand`'s
+`IfNoneMatch: "*"` to atomically reject a second create for an artifactId
+that already has an upload. Some S3-compatible backends (older/less-complete
+implementations; the `s3rver` mock this package's own test suite runs
+against) don't support conditional writes and reject that header outright.
+On those backends, `reserveUpload` falls back to a weaker check-then-write —
+functionally the same guard, but with the original race reopened: two
+truly concurrent (or retried) creates for the same artifactId can both pass
+the check before either writes, and the second silently clobbers the
+first's metadata. There's no way to close this without an external lock,
+since it's a limitation of the backend, not this package. If your bucket
+provider doesn't support `IfNoneMatch`, this fallback logs a one-time
+`console.warn` per process the first time it's used — treat that warning as
+a signal to either move to a backend that supports conditional writes, or
+serialize artifactId creation yourself (e.g. in your own `/reserve`
+endpoint) if concurrent creates for the same id are a real possibility in
+your deployment.
+
 ## Resource limits and abuse prevention
 
 `pulsevault` does not implement rate limiting or a concurrent-upload cap

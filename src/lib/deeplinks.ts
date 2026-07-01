@@ -22,14 +22,56 @@ export type UploadLinkOptions = {
 const LINK_VERSION = "1";
 
 /**
+ * Private/dev origins allowed over plain http — mirrors the Pulse client's
+ * own `isPrivateDevOrigin` check (PROTOCOL.md §3) exactly, so a link this
+ * helper is willing to build is also one the client is willing to accept.
+ * Never extended beyond non-globally-routable address space (RFC 1918
+ * private ranges, RFC 6598 carrier-grade NAT, link-local) plus
+ * loopback/localhost — never a public IP or domain just because it "looks
+ * internal."
+ */
+function isPrivateDevOrigin(url: URL): boolean {
+  if (url.protocol !== "http:") return false;
+  const host = url.hostname;
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    /^10\.\d+\.\d+\.\d+$/.test(host) ||
+    /^192\.168\.\d+\.\d+$/.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(host) ||
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/.test(host) || // RFC 6598, 100.64.0.0/10
+    /^169\.254\.\d+\.\d+$/.test(host) // link-local
+  );
+}
+
+/**
  * Build a `pulsecam://` deep link that opens the Pulse app directly on the
  * upload screen for a specific artifact, pointed at this server.
  *
  * No `mode` param — there's only one mode, so it was always redundant. `v`
  * lets the app refuse/explain a future incompatible link shape instead of
  * misparsing it.
+ *
+ * Throws if `server` isn't `https://` (or the narrow localhost/private-IP dev
+ * exception PROTOCOL.md §3 carves out) — failing fast here, at the one place
+ * that constructs the link, is more reliable than relying on every client to
+ * independently reject a plaintext origin the operator never should have
+ * issued in the first place.
  */
 export function buildUploadLink(opts: UploadLinkOptions): string {
+  let server: URL;
+  try {
+    server = new URL(opts.server);
+  } catch {
+    throw new Error(`buildUploadLink: \`server\` is not a valid URL: ${opts.server}`);
+  }
+  if (server.protocol !== "https:" && !isPrivateDevOrigin(server)) {
+    throw new Error(
+      `buildUploadLink: \`server\` must be https:// (got "${opts.server}") — ` +
+        "the only exception is http://localhost or a private IP literal for local development.",
+    );
+  }
+
   const params = new URLSearchParams({
     v: LINK_VERSION,
     artifactId: opts.artifactId,

@@ -216,6 +216,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const initialize = async (): Promise<void> => {
     await fs.mkdir(sidecarDir(), { recursive: true });
+    // @tus/file-store creates `workspaceRoot` with mode 0777 if it doesn't already exist;
+    // tighten it so the upload tree isn't world-writable under a permissive umask.
+    await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
   const reserveUpload = async ({
@@ -226,22 +229,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     relatedTo,
     checksum,
   }: ReserveUploadParams): Promise<string> => {
-    // Collision guard: if an upload (in-progress or ready) already exists
-    // for this artifactId, refuse the new upload rather than letting
-    // @tus/file-store silently reset the metadata sidecar to offset 0 and
-    // overwrite the file chunk-by-chunk on subsequent PATCHes. Translates
-    // to HTTP 409 via @tus/server's error path.
-    const meta = await loadMeta(artifactId);
-    if (meta) {
-      throw Object.assign(
-        new Error(`artifactId ${artifactId} already has an upload`),
-        { statusCode: 409, status_code: 409 },
-      );
-    }
-
     await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true });
+    await fs.mkdir(sidecarDir(), { recursive: true });
 
-    await writeSidecar(artifactId, {
+    const sidecar: Sidecar = {
       version: SIDECAR_VERSION,
       ext,
       filename,
@@ -249,7 +240,30 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       kind,
       relatedTo,
       checksum,
-    });
+    };
+
+    // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
+    // this artifactId, rather than the previous read-then-write (`loadMeta` then
+    // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
+    // the check before either had written — letting the second silently clobber the first's
+    // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
+    // @tus/server's error path, same as before.
+    try {
+      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: "wx" });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+      // A file already exists at this path, but `readSidecar` treats a malformed/corrupt
+      // one as absent (e.g. debris from a crash mid-write) — re-check before deciding this
+      // is a genuine collision rather than debris that's safe to overwrite.
+      const existing = await readSidecar(artifactId);
+      if (existing) {
+        throw Object.assign(
+          new Error(`artifactId ${artifactId} already has an upload`),
+          { statusCode: 409, status_code: 409 },
+        );
+      }
+      await writeSidecar(artifactId, sidecar);
+    }
 
     cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum });
     // @tus/file-store joins this onto its configured `directory`, so the

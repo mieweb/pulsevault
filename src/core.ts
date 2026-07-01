@@ -3,6 +3,7 @@ import send from "@fastify/send";
 import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
+  artifactIdFromUploadId,
   type PulseVaultOnUploadComplete,
   type PulseVaultOnArtifactEvent,
 } from "./lib/pulsevaultTus.js";
@@ -120,11 +121,20 @@ export type PulseVaultCore = {
  * and `relatedTo` out of a raw `Upload-Metadata` header. Format is a
  * comma-separated list of `<key> <base64-value>` pairs (tus v1 creation
  * extension).
+ *
+ * Alias precedence is a fixed priority (`artifactId` beats `videoid` beats
+ * `projectid`, regardless of header order) so this always agrees with
+ * `namingFunction` in `lib/pulsevaultTus.ts` — which uses the same
+ * `?? `-chain precedence to decide what's actually reserved/written to
+ * storage. If these two disagreed, `authorize()` could validate ownership of
+ * a different artifactId than the one the upload actually lands under.
  */
 function parseUploadMetadata(
   header: string,
 ): { artifactId: string | undefined; kind: UploadKind; relatedTo: string | undefined } {
-  let artifactId: string | undefined;
+  let artifactIdRaw: string | undefined;
+  let videoidRaw: string | undefined;
+  let projectidRaw: string | undefined;
   let kind: UploadKind = "video";
   let relatedTo: string | undefined;
   for (const pair of header.split(",")) {
@@ -137,8 +147,12 @@ function parseUploadMetadata(
     if (!value) continue;
     try {
       const decoded = Buffer.from(value, "base64").toString("utf8");
-      if ((key === "artifactId" || key === "videoid" || key === "projectid") && !artifactId) {
-        artifactId = isUuid(decoded) ? decoded : undefined;
+      if (key === "artifactId") {
+        artifactIdRaw ??= decoded;
+      } else if (key === "videoid") {
+        videoidRaw ??= decoded;
+      } else if (key === "projectid") {
+        projectidRaw ??= decoded;
       } else if (key === "kind") {
         const lower = decoded.trim().toLowerCase();
         kind = lower === "project" ? "project" : lower === "captions" ? "captions" : "video";
@@ -149,25 +163,52 @@ function parseUploadMetadata(
       // ignore malformed base64
     }
   }
+  const candidate = (artifactIdRaw ?? videoidRaw ?? projectidRaw ?? "").trim();
+  const artifactId = isUuid(candidate) ? candidate : undefined;
   return { artifactId, kind, relatedTo };
 }
 
 /**
- * Decode the last URL segment of a tus PATCH/HEAD/DELETE (base64url-encoded
- * id) and extract the first path component, which the plugin always shapes as
- * the artifactId (see `lib/pulsevaultTus.ts`).
+ * `@tus/server`'s `BaseHandler.getFileIdFromRequest` — the function that
+ * ultimately decides which upload a PATCH/HEAD/DELETE actually operates on —
+ * extracts its file id from the request URL's *last* `/`-delimited segment
+ * (`reExtractFileID = /([^/]+)\/?$/`), not from the first segment after
+ * `/upload/`. This MUST mirror that exact regex: a URL with extra path
+ * segments after the real id (Fastify's `/upload/*` route accepts them) would
+ * otherwise let `authorize()` see and approve one artifactId (whichever this
+ * function resolved) while `@tus/server` writes the request body against a
+ * *different* one (whichever it resolved) — an attacker holding a valid
+ * token for their own artifact could smuggle a second, victim artifactId as
+ * a trailing path segment and have their bytes land there instead, fully
+ * bypassing authorization for the artifact actually written to.
+ */
+const TUS_LAST_URL_SEGMENT = /([^/]+)\/?$/;
+
+/**
+ * Decode the tus file id (base64url-encoded, shaped `<kind>/<artifactId><ext>`
+ * by `namingFunction` in `lib/pulsevaultTus.ts`) that `@tus/server` itself
+ * will resolve a PATCH/HEAD/DELETE request to, and recover the artifactId via
+ * the exact same parser `onUploadFinish` uses — so this can never drift from
+ * what `@tus/server` actually operates on. See `TUS_LAST_URL_SEGMENT` above
+ * for why this must match the *last* URL segment, not the first one after
+ * `/upload/`.
  */
 function artifactIdFromTusUrl(url: string): string | undefined {
-  const match = url.match(/\/upload\/([^/?#]+)/);
+  const match = TUS_LAST_URL_SEGMENT.exec(url);
   if (!match?.[1]) return undefined;
-  let decoded: string;
+  let lastSegment: string;
   try {
-    decoded = Buffer.from(match[1], "base64url").toString("utf8");
+    lastSegment = decodeURIComponent(match[1]);
   } catch {
     return undefined;
   }
-  const first = decoded.split("/", 1)[0];
-  return isUuid(first) ? first : undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(lastSegment, "base64url").toString("utf8");
+  } catch {
+    return undefined;
+  }
+  return artifactIdFromUploadId(decoded);
 }
 
 /**

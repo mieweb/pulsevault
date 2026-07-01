@@ -88,7 +88,7 @@ export function tusError(status: number, body: string): Error {
 }
 
 /** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
-function artifactIdFromUploadId(id: string): string | undefined {
+export function artifactIdFromUploadId(id: string): string | undefined {
   const [, nameWithExt] = id.split("/");
   if (!nameWithExt) return undefined;
   const ext = path.extname(nameWithExt);

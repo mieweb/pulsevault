@@ -43,8 +43,14 @@ export type ReserveUploadParams = {
    * "session" artifact (e.g. a video) authorize related artifacts uploaded in
    * the same session (its captions, or — under `uploadUnit: "beat"` — each
    * beat plus the pulse manifest) without minting a token per artifact.
-   * Purely bookkeeping for the storage layer; `pulsevault` does not enforce
-   * any relationship semantics beyond storing and returning it.
+   * The storage layer itself only stores and returns this value — it does not
+   * validate that the referenced artifact exists or was created by the same
+   * caller. The actual authorization check lives in `createCapabilityAuthorize`
+   * (`lib/capability-token.ts`), which treats a request's `relatedTo` as
+   * authorized whenever it matches the presented token's own signed
+   * `artifactId` claim. That's safe only because a token can't be forged or
+   * guessed (HMAC-signed) — do not read this field as "unauthenticated
+   * metadata with no security relevance."
    */
   relatedTo?: string;
   /**

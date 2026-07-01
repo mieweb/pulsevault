@@ -192,6 +192,16 @@ test("second reserve for same artifactId returns 409", async () => {
   }
 });
 
+// No genuinely-concurrent equivalent of `plugin.test.mjs`'s "two truly concurrent
+// reserves" test here: `reserveUpload`'s collision guard uses `PutObjectCommand`'s
+// `IfNoneMatch: "*"` to close the race atomically, but `s3rver` (this suite's local S3
+// double) doesn't enforce conditional writes — it silently accepts both concurrent puts,
+// so a test written the same way would pass against real AWS S3/R2 but fail here for a
+// reason unrelated to the code under test. The local-filesystem adapter's equivalent test
+// (`plugin.test.mjs`) exercises the same technique (atomic create-if-absent) against a
+// primitive (`fs.writeFile` with the `wx` flag) that this test runner's environment does
+// enforce, and is the real regression check for the underlying race.
+
 test("createS3Mp4Sniffer rejects non-MP4 bytes and removes the object", async () => {
   const ctx = await startApp({ withSniffer: true });
   const id = randomUUID();
