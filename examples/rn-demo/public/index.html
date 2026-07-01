@@ -3,79 +3,260 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PulseVault demo</title>
+    <title>PulseVault — Reference Server</title>
     <style>
-      :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e6edf3; }
-      body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-      h1 { font-size: 1.25rem; font-weight: 600; margin: 0; }
-      .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 1rem; }
-      .open-btn { display: block; padding: 0.6rem 1.2rem; font-size: 0.9rem; font-weight: 600; color: #fff; background: #238636; border-radius: 6px; text-align: center; text-decoration: none; margin-bottom: 0.75rem; }
-      .open-btn:hover { background: #2ea043; }
-      .mono { font-family: ui-monospace, monospace; font-size: 0.75rem; word-break: break-all; color: #8b949e; }
-      label { display: block; font-size: 0.875rem; color: #8b949e; margin-bottom: 0.25rem; }
-      .ghost-btn { display: block; width: 100%; padding: 0.5rem; margin-bottom: 0.75rem; font-size: 0.875rem; background: #161b22; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; }
-      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
-      .docs-link { display: inline-block; margin: 0; padding: 0.35rem 0.7rem; font-size: 0.75rem; background: #1f6feb; color: #fff; border-radius: 6px; text-decoration: none; font-weight: 600; }
-      .auth-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.7rem; font-weight: 600; background: #1f2937; border: 1px solid #30363d; color: #8b949e; }
-      .auth-badge.on { background: #1d3a1d; border-color: #2ea043; color: #b9e6b9; }
+      :root {
+        --bg: #0a0e16;
+        --surface: #11161f;
+        --surface-2: #161c28;
+        --border: #232a38;
+        --text: #e7eaf0;
+        --text-2: #9aa4b8;
+        --text-3: #626d82;
+        --accent: #5b8cff;
+        --accent-soft: rgba(91, 140, 255, 0.14);
+        --success: #34d399;
+        --success-soft: rgba(52, 211, 153, 0.14);
+        --warning: #fbbf24;
+        --warning-soft: rgba(251, 191, 36, 0.14);
+        --danger: #f87171;
+        --danger-soft: rgba(248, 113, 113, 0.14);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      * { box-sizing: border-box; min-width: 0; }
+      html { overflow-x: hidden; }
+      body { max-width: 46rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; line-height: 1.5; overflow-x: hidden; }
+
+      .eyebrow { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 0.6rem; }
+      h1 { font-size: 1.05rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+      h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
+
+      .brand-row { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+      .brand-mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #7c5cff); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; flex: none; }
+      .brand-sub { font-size: 0.75rem; color: var(--text-3); margin: 0.1rem 0 0; }
+      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+
+      /* A sequence diagram with 3 participants routinely renders wider than a phone screen —
+         scroll it horizontally rather than letting it force the whole page to scroll, or
+         shrinking it down to illegible. */
+      .diagram-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 0 0.75rem; }
+      .diagram-wrap .mermaid { min-width: 460px; }
+      .diagram-caption { font-size: 0.72rem; font-weight: 600; color: var(--text-3); margin: 0 0 0.4rem; }
+
+      @media (max-width: 480px) {
+        body { padding: 1.25rem 1rem 3rem; }
+        .brand-mark { width: 1.7rem; height: 1.7rem; font-size: 0.75rem; }
+        h1 { font-size: 0.95rem; }
+        .brand-sub { font-size: 0.68rem; }
+        .docs-link { font-size: 0.68rem; padding: 0.35rem 0.6rem; }
+        .beat-row video { width: 8.5rem; max-height: 11rem; }
+        footer { flex-direction: column; align-items: flex-start; gap: 0.35rem; }
+      }
+
+      .docs-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.4rem 0.75rem; font-size: 0.75rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); border-radius: 6px; text-decoration: none; }
+      .docs-link:hover { border-color: var(--accent); color: var(--text); }
+
+      .status-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
+      .chip { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.7rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--text-2); }
+      .chip b { color: var(--text); font-weight: 600; }
+      .dot { width: 0.45rem; height: 0.45rem; border-radius: 999px; background: var(--text-3); flex: none; }
+      .dot.success { background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+      .dot.warning { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); }
+      .dot.off { background: var(--text-3); }
+
+      section { margin-top: 1.75rem; }
+      .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+
+      .btn { display: block; width: 100%; padding: 0.55rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 7px; text-align: center; text-decoration: none; cursor: pointer; border: 1px solid transparent; }
+      .btn-primary { color: #fff; background: var(--accent); margin-bottom: 0.6rem; }
+      .btn-primary:hover { background: #4a7bef; }
+      .btn-ghost { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+      .btn-ghost:hover { color: var(--text); border-color: var(--accent); }
+      .btn-sm { width: auto; padding: 0.3rem 0.65rem; font-size: 0.72rem; }
+
+      .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; word-break: break-all; color: var(--text-3); }
+      label { display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); margin: 0.7rem 0 0.2rem; }
+      label:first-of-type { margin-top: 0; }
+
+      details summary { cursor: pointer; list-style: none; }
+      details summary::-webkit-details-marker { display: none; }
+      details.panel summary { font-weight: 600; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
+      details.panel summary::before { content: "▸"; color: var(--text-3); font-size: 0.7rem; }
+      details.panel[open] summary::before { content: "▾"; }
+      details.panel[open] summary { margin-bottom: 0.9rem; }
+      details:not(.panel) summary { font-size: 0.72rem; color: var(--text-3); font-weight: 600; margin-top: 0.5rem; }
+      details:not(.panel) summary::before { content: "▸ "; }
+      details:not(.panel)[open] summary::before { content: "▾ "; }
+
+      .feature-list { margin: 0; padding: 0; list-style: none; font-size: 0.8rem; color: var(--text-2); }
+      /* Deliberately NOT display:flex — this <li> mixes plain text with inline <code>/<em> tags
+         that need to wrap normally. Flex would treat each text run/tag as its own flex item
+         (stretched to the row's cross-axis height by default), breaking natural text flow into
+         overlapping columns instead of wrapped paragraphs. An absolutely-positioned marker keeps
+         normal inline flow intact. */
+      .feature-list li { position: relative; padding: 0.4rem 0 0.4rem 1.1rem; border-top: 1px solid var(--border); }
+      .feature-list li:first-child { border-top: none; }
+      .feature-list li::before { content: "→"; color: var(--accent); position: absolute; left: 0; top: 0.4rem; }
+      code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; }
+
+      .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
+      .badge.on { background: var(--success-soft); border-color: rgba(52, 211, 153, 0.35); color: var(--success); }
+
+      .pulse-card { padding: 0.9rem 0; border-top: 1px solid var(--border); }
+      .pulse-card:first-child { border-top: none; padding-top: 0; }
+      .beat-row { display: flex; gap: 0.6rem; overflow-x: auto; padding-bottom: 0.4rem; -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity; }
+      .beat-row video { scroll-snap-align: start; }
+      .beat-row video { width: 10.5rem; max-height: 13rem; border-radius: 7px; background: #000; flex: none; border: 1px solid var(--border); }
+      .pulse-meta { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin: 0.6rem 0 0; }
+
+      .event-row { display: flex; gap: 0.6rem; align-items: center; font-size: 0.76rem; padding: 0.35rem 0; border-top: 1px solid var(--border); }
+      .event-row:first-child { border-top: none; }
+      .event-phase { flex: none; width: 5rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; color: var(--text-2); }
+      #eventList { max-height: 12rem; overflow-y: auto; }
+      #eventList::-webkit-scrollbar, #pulseList::-webkit-scrollbar { width: 6px; }
+      #eventList::-webkit-scrollbar-thumb, #pulseList::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+      footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
+      footer a { color: var(--text-3); word-break: break-all; }
     </style>
   </head>
   <body>
     <div class="top-row">
-      <h1>PulseVault demo</h1>
-      <a href="/docs" class="docs-link">API Docs →</a>
-    </div>
-    <p style="font-size: 0.9rem; color: #8b949e;">
-      <span id="authBadge" class="auth-badge">auth: off</span>
-      Pair the Pulse app with this demo server and upload a video.
-    </p>
-
-    <div class="card">
-      <strong>Upload</strong>
-      <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
-        Each scan opens the chooser in the Pulse app: record a new video, or
-        pick an existing draft to upload to this server.
-      </p>
-
-      <img id="qrUpload" width="224" height="224" style="display: block; margin: 1.25rem auto; border-radius: 8px; background: #fff; padding: 10px;" />
-
-      <a id="openBtnUpload" class="open-btn" href="#">Open in Pulse app</a>
-      <button id="refreshUpload" class="ghost-btn">↻ New QR</button>
-
-      <label>Server</label>
-      <p class="mono" id="serverUrl"></p>
-
-      <label>Artifact ID</label>
-      <p class="mono" id="uploadArtifactId"></p>
-
-      <label>Deep link</label>
-      <p class="mono" id="deeplinkUpload"></p>
-    </div>
-
-    <div id="authHelp" class="card" hidden>
-      <strong>Auth demo enabled</strong>
-      <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
-        This server requires a bearer token for every upload and watch request.
-        The QR above embeds it, so the Pulse app handles auth automatically.
-        Tampering with the token in the deeplink should produce a 403 from
-        <code>authorize</code>. To disable, restart the server without
-        <code>DEMO_TOKEN</code> set.
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="top-row">
-        <strong>Uploads</strong>
-        <button id="refreshVideos" class="ghost-btn" style="width: auto; margin: 0; padding: 0.3rem 0.7rem;">↻ Refresh</button>
+      <div class="brand-row">
+        <div class="brand-mark">PV</div>
+        <div>
+          <h1>PulseVault</h1>
+          <p class="brand-sub">Reference server · Fastify</p>
+        </div>
       </div>
-      <div id="videoList" style="margin-top: 0.75rem; max-height: 48rem; overflow-y: auto; padding-right: 0.25rem;">
-        <p class="mono">Loading…</p>
-      </div>
+      <a href="/docs" class="docs-link">API Reference ↗</a>
     </div>
 
+    <div class="status-bar" id="statusBar"></div>
+
+    <section>
+      <details class="panel">
+        <summary>How this works</summary>
+        <p class="diagram-caption">Deployment model — this server is one fully independent "Org", no central Pulse service involved</p>
+        <div class="diagram-wrap">
+          <pre class="mermaid">
+graph LR
+    subgraph thisOrg ["This server — fully independent"]
+        A1["This Fastify server"] -->|registers| A2["@mieweb/pulsevault"]
+        A1 -->|owns| A3["artifactId minting, token issuance,<br/>TTL policy, secret rotation, revocation"]
+    end
+    subgraph otherOrg ["Any other org — fully independent, no pulsevault required"]
+        B1["Their own server"] -->|implements from spec only| B2["PROTOCOL.md"]
+        B1 -->|owns| B3["its own auth scheme entirely"]
+    end
+    P["Pulse mobile app<br/>multi-tenant client"] -->|pairs + uploads via open contract| A1
+    P -->|pairs + uploads via open contract| B1
+    P -.->|no dependency on either| X[("No central Pulse service")]
+          </pre>
+        </div>
+        <p class="diagram-caption">Pairing + upload flow — what happens once you scan the QR below</p>
+        <div class="diagram-wrap">
+          <pre class="mermaid">
+sequenceDiagram
+    participant Org as This server
+    participant User
+    participant Pulse as Pulse app
+
+    Org->>Org: mint artifactId + issue a token
+    Org->>User: show QR / deep link
+    User->>Pulse: open link
+    Pulse->>Pulse: validate link, show pairing screen
+    User->>Pulse: confirm and choose draft
+    Pulse->>Org: POST upload, Bearer token, kind video, checksum
+    Org->>Pulse: 201 Location
+    Pulse->>Org: PATCH chunks, HEAD before resume
+    Org->>Org: validatePayload, markReady, onUploadComplete
+    Pulse->>Org: POST upload, kind captions, same session
+    Org->>Org: validatePayload, markReady, onUploadComplete
+    Org->>Pulse: ready for playback and captions fetch
+          </pre>
+        </div>
+        <ul class="feature-list" id="howItWorksList"></ul>
+      </details>
+    </section>
+
+    <section>
+      <p class="eyebrow">Pair a device</p>
+      <div class="panel">
+        <img id="qrUpload" width="200" height="200" style="display: block; margin: 0 auto 1rem; border-radius: 8px; background: #fff; padding: 10px;" />
+        <a id="openBtnUpload" class="btn btn-primary" href="#">Open in Pulse app</a>
+        <button id="refreshUpload" class="btn btn-ghost">↻ Generate new pairing link</button>
+        <details>
+          <summary>Link details</summary>
+          <label>Server</label>
+          <p class="mono" id="serverUrl"></p>
+          <label>Artifact ID (session anchor)</label>
+          <p class="mono" id="uploadArtifactId"></p>
+          <label>Deep link</label>
+          <p class="mono" id="deeplinkUpload"></p>
+        </details>
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Activity</p>
+      <div class="panel">
+        <div class="top-row">
+          <h2>Live events</h2>
+          <span class="mono" id="eventCount"></span>
+        </div>
+        <div id="eventList" style="margin-top: 0.5rem;"><p class="mono">Loading…</p></div>
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Recordings</p>
+      <div class="panel">
+        <div class="top-row">
+          <h2 id="pulseCount">Uploads</h2>
+          <button id="refreshPulses" class="btn btn-ghost btn-sm">↻ Refresh</button>
+        </div>
+        <div id="pulseList" style="margin-top: 0.75rem; max-height: 54rem; overflow-y: auto; padding-right: 0.25rem;">
+          <p class="mono">Loading…</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>@mieweb/pulsevault</span>
+      <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>
+    </footer>
+
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "dark" });
+    </script>
     <script>
+      async function loadStatusBar() {
+        const caps = await fetch("/pulsevault/capabilities").then((r) => r.json());
+        window.__caps = caps;
+        renderStatusBar();
+      }
+
+      function renderStatusBar(auth) {
+        const caps = window.__caps;
+        if (!caps) return;
+        const chips = [
+          `<span class="chip"><span class="dot success"></span>Protocol <b>v${caps.protocolVersion}</b></span>`,
+          `<span class="chip">Upload unit <b>${caps.uploadUnit}</b></span>`,
+          window.__storage ? `<span class="chip">Storage <b>${window.__storage}</b></span>` : "",
+          auth
+            ? `<span class="chip"><span class="dot ${auth.authMode ? "success" : "off"}"></span>Auth <b>${auth.authMode ? `capability tokens (${auth.keyId})` : "open"}</b></span>`
+            : "",
+        ].filter(Boolean);
+        document.getElementById("statusBar").innerHTML = chips.join("");
+      }
+
       async function loadDeeplinks() {
         const data = await fetch("/deeplinks").then((r) => r.json());
+        window.__storage = data.storage;
 
         document.getElementById("serverUrl").textContent = window.location.origin;
         document.getElementById("uploadArtifactId").textContent = data.artifactId;
@@ -83,10 +264,17 @@
         document.getElementById("openBtnUpload").href = data.upload;
         document.getElementById("qrUpload").src = data.qrUpload;
 
-        const badge = document.getElementById("authBadge");
-        badge.textContent = data.authMode ? "auth: on" : "auth: off";
-        badge.classList.toggle("on", data.authMode);
-        document.getElementById("authHelp").hidden = !data.authMode;
+        renderStatusBar(data);
+
+        const items = [
+          data.authMode
+            ? `Capability tokens: HMAC-signed by <code>issueCapabilityToken</code>, scoped to this session, expiring in ${Math.round(data.tokenExpiresInSeconds / 60)} min (issuer <code>${data.issuer}</code>). One token covers every beat/caption/manifest via <code>relatedTo</code>.`
+            : `Capability tokens: off — set <code>PULSEVAULT_SECRET</code> to turn on real HMAC-signed, expiring, per-session tokens.`,
+          `Checksum: the app's sha256 is verified server-side before an upload is marked ready (<code>createChecksumValidator</code>).`,
+          `Live activity below is fed by <code>onArtifactEvent</code> — the same hook used for ops metrics + audit logging.`,
+          `Uploads are grouped by <em>pulse</em> (recording session) via the wire protocol's <code>relatedTo</code> field, not listed as unrelated files.`,
+        ];
+        document.getElementById("howItWorksList").innerHTML = items.map((i) => `<li>${i}</li>`).join("");
       }
 
       function formatSize(bytes) {
@@ -96,27 +284,76 @@
         return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
       }
 
-      async function loadVideos() {
-        const list = document.getElementById("videoList");
-        const videos = await fetch("/videos").then((r) => r.json());
-        if (!videos.length) {
+      function pulseCard(p) {
+        const beatVideos = p.beats
+          .map(
+            (b) => `
+              <video src="${b.playbackUrl}" controls preload="metadata">
+                ${b.captions ? `<track kind="subtitles" src="${b.captions.vttUrl}" srclang="en" label="Captions" default>` : ""}
+              </video>`,
+          )
+          .join("");
+
+        const captionsCount = p.beats.filter((b) => b.captions).length + p.unmatchedCaptions.length;
+        const checksumCount = p.beats.filter((b) => b.checksumVerified).length;
+
+        const badges = [
+          `<span class="badge">${p.mode === "beat" ? `${p.beats.length} beat${p.beats.length === 1 ? "" : "s"}` : "merged video"}</span>`,
+          p.manifest ? `<span class="badge">relatedTo-linked</span>` : "",
+          captionsCount ? `<span class="badge">${captionsCount} caption track${captionsCount === 1 ? "" : "s"}</span>` : "",
+          checksumCount ? `<span class="badge on">✓ checksum verified</span>` : "",
+        ].filter(Boolean).join("");
+
+        return `
+          <div class="pulse-card">
+            <div class="beat-row">${beatVideos}</div>
+            <div class="pulse-meta">${badges}</div>
+            <p class="mono" style="margin: 0.5rem 0 0;">
+              ${new Date(p.creation_date).toLocaleString()} · ${p.anchorArtifactId}
+            </p>
+          </div>`;
+      }
+
+      async function loadPulses() {
+        const list = document.getElementById("pulseList");
+        const pulses = await fetch("/pulses").then((r) => r.json());
+        document.getElementById("pulseCount").textContent = pulses.length ? `Uploads (${pulses.length})` : "Uploads";
+        if (!pulses.length) {
           list.innerHTML = '<p class="mono">No uploads yet.</p>';
           return;
         }
-        list.innerHTML = videos.map((v) => `
-          <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid #30363d;">
-            <video src="/pulsevault/artifacts/${v.artifactId}" controls preload="metadata" style="width: 100%; max-height: 26rem; border-radius: 6px; background: #000; display: block; object-fit: contain;"></video>
-            <p class="mono" style="margin: 0.4rem 0 0;">${v.filename}</p>
-            <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${formatSize(v.size)} • ${new Date(v.creation_date).toLocaleString()}</p>
-            <p class="mono" style="margin: 0.15rem 0 0; color: #6e7681;">${v.artifactId}</p>
-          </div>
-        `).join("");
+        list.innerHTML = pulses.map(pulseCard).join("");
       }
 
+      function eventRow(e) {
+        const cls = e.phase === "complete" ? "success" : e.phase === "reject" ? "warning" : "off";
+        const detail = e.reason ? ` — ${e.reason}` : e.size != null ? ` — ${formatSize(e.size)}` : "";
+        return `
+          <div class="event-row">
+            <span class="event-phase"><span class="dot ${cls}"></span>${e.phase}</span>
+            <span class="mono">${e.kind}/${e.artifactId.slice(0, 8)}…${detail}</span>
+            <span class="mono" style="margin-left: auto;">${new Date(e.at).toLocaleTimeString()}</span>
+          </div>`;
+      }
+
+      async function loadEvents() {
+        const events = await fetch("/events").then((r) => r.json());
+        document.getElementById("eventCount").textContent = events.length ? `${events.length} recent` : "";
+        document.getElementById("eventList").innerHTML = events.length
+          ? events.map(eventRow).join("")
+          : '<p class="mono">Nothing yet — pair and upload to see events appear here.</p>';
+      }
+
+      loadStatusBar();
       loadDeeplinks();
-      loadVideos();
+      loadPulses();
+      loadEvents();
       document.getElementById("refreshUpload").addEventListener("click", loadDeeplinks);
-      document.getElementById("refreshVideos").addEventListener("click", loadVideos);
+      document.getElementById("refreshPulses").addEventListener("click", loadPulses);
+      // Live-ish feed: poll rather than hold a socket open, since this is a demo page, not
+      // something that needs to survive a flaky connection.
+      setInterval(loadEvents, 3000);
+      setInterval(loadPulses, 8000);
     </script>
   </body>
 </html>
