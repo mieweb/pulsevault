@@ -16,6 +16,19 @@ export type UploadLinkOptions = {
    * step. Generate with `crypto.randomUUID()`.
    */
   artifactId: string;
+  /**
+   * Per-session override of the deployment-wide `uploadUnit` advertised via
+   * `GET /capabilities` (PROTOCOL.md §8). Omit to let the client fall back to
+   * whatever `/capabilities` reports — the same behavior as before this field
+   * existed. Set this when an operator wants "beat" and "merged" sessions
+   * live at the same time (e.g. different pairing flows, a/b testing, a
+   * gradual rollout) rather than one fixed value for the whole deployment:
+   * `/capabilities` can only ever report one current value, and a client
+   * that reads it separately from opening the link is racing whatever the
+   * server was serving at that moment, not the value this specific session
+   * was paired under.
+   */
+  uploadUnit?: 'beat' | 'merged';
 };
 
 /** Deep-link wire format version. Bump when the param shape changes incompatibly. */
@@ -72,11 +85,16 @@ export function buildUploadLink(opts: UploadLinkOptions): string {
     );
   }
 
+  if (opts.uploadUnit !== undefined && opts.uploadUnit !== 'beat' && opts.uploadUnit !== 'merged') {
+    throw new Error(`buildUploadLink: \`uploadUnit\` must be "beat" or "merged" (got "${opts.uploadUnit}")`);
+  }
+
   const params = new URLSearchParams({
     v: LINK_VERSION,
     artifactId: opts.artifactId,
     server: opts.server,
   });
   if (opts.token) params.set('token', opts.token);
+  if (opts.uploadUnit) params.set('uploadUnit', opts.uploadUnit);
   return `pulsecam://?${params.toString()}`;
 }
