@@ -168,6 +168,20 @@ test("second reserve for same artifactId returns 409", async () => {
   }
 });
 
+test("two truly concurrent reserves for the same artifactId: exactly one 201, one 409", async () => {
+  const ctx = await startApp();
+  try {
+    const [a, b] = await Promise.all([
+      tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: 1024 }),
+      tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: 1024 }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("non-allowed extension is rejected at create", async () => {
   const ctx = await startApp();
   try {
@@ -233,6 +247,137 @@ test("authorize rejection blocks create, GET, and DELETE", async () => {
 
     const del = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
     assert.equal(del.status, 403);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("authorize rejection blocks PATCH and HEAD on an existing upload, and sees the real artifactId", async () => {
+  // Regression test: `authorize` must actually run (with the correct
+  // artifactId) for the patch/head phase, not be silently skipped because the
+  // artifactId couldn't be recovered from the tus URL.
+  const authorizedPhases = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: async (_req, { phase, artifactId }) => {
+        authorizedPhases.push({ phase, artifactId });
+        if (phase === "patch") {
+          throw Object.assign(new Error("no patch"), { statusCode: 403 });
+        }
+      },
+    },
+  });
+  try {
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: 1024,
+    });
+    assert.equal(create.status, 201);
+    const location = create.headers.get("location");
+
+    const patch = await tusPatch(location, 0, makeMp4(1024));
+    assert.equal(patch.status, 403, "authorize must reject the PATCH, not silently allow it");
+
+    const head = await tusHead(location);
+    assert.equal(head.status, 403, "authorize must reject the HEAD too");
+
+    const patchCalls = authorizedPhases.filter((c) => c.phase === "patch");
+    assert.ok(patchCalls.length > 0, "authorize must actually run for the patch phase");
+    for (const call of patchCalls) {
+      assert.equal(call.artifactId, ID1, "authorize must see the real artifactId, not the kind prefix or undefined");
+    }
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a crafted multi-segment PATCH URL cannot smuggle bytes into a different artifact than authorize() checked", async () => {
+  // Regression test for a URL-parsing divergence: `authorize()`'s artifactId
+  // must always be resolved the same way `@tus/server` itself resolves the
+  // file it will actually read/write — the *last* `/`-delimited URL segment,
+  // not the first one after `/upload/`. Fastify's `/upload/*` route accepts
+  // extra trailing segments, so without this, an attacker holding a valid
+  // token for their OWN artifact could append a victim's real (but
+  // ordinarily unguessable-without-the-pairing-link) tus id as a second path
+  // segment: authorize() would see and approve the attacker's own id (first
+  // segment), while the PATCH body actually landed on the victim's file
+  // (the true last segment, per `@tus/server`'s own resolution).
+  const authorizeCalls = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: async (_req, ctx) => {
+        authorizeCalls.push(ctx);
+        if (ctx.phase === "create") return; // simulate two independently-authorized sessions
+        if (ctx.artifactId !== ID1) {
+          throw Object.assign(new Error("forbidden"), { statusCode: 403 });
+        }
+      },
+    },
+  });
+  try {
+    // ID1 = "attacker's own artifact" (authorize approves it); ID2 = "victim's artifact"
+    // (authorize would reject it) — both created via a legitimate POST first.
+    const victimCreate = await tusCreate(ctx.baseUrl, { artifactId: ID2, filename: "clip.mp4", size: 1024 });
+    const attackerCreate = await tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: 1024 });
+    assert.equal(victimCreate.status, 201);
+    assert.equal(attackerCreate.status, 201);
+
+    const attackerSegment = attackerCreate.headers.get("location").split("/upload/")[1];
+    const victimSegment = victimCreate.headers.get("location").split("/upload/")[1];
+    const craftedUrl = `${ctx.baseUrl}${PREFIX}/upload/${attackerSegment}/${victimSegment}`;
+
+    const patch = await tusPatch(craftedUrl, 0, makeMp4(1024));
+    assert.equal(patch.status, 403, "must be rejected, not silently write to the victim's artifact");
+
+    const patchCall = authorizeCalls.find((c) => c.phase === "patch");
+    assert.equal(patchCall.artifactId, ID2, "authorize must see the artifactId @tus/server will actually operate on");
+
+    const victimBytes = await fs.readFile(path.join(ctx.workspaceDir, "video", `${ID2}.mp4`)).catch(() => null);
+    assert.equal(victimBytes.length, 0, "victim's file must be untouched (still 0 bytes from create)");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("createCapabilityAuthorize: PATCH without a valid token is rejected, not silently accepted", async () => {
+  // The artifactId is not secret (it's embedded in the pairing link/QR code
+  // by design) — the token is what's supposed to gate writing bytes into an
+  // upload. This exercises the exact bypass scenario the fix above closes.
+  const secret = "test-secret";
+  const issuer = "https://vault.example.test";
+  const lookupSecret = (kid) => (kid === "k1" ? secret : null);
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: createCapabilityAuthorize(lookupSecret, { issuer }),
+    },
+  });
+  try {
+    const token = issueCapabilityToken(ID1, secret, { keyId: "k1", issuer });
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: 1024,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(create.status, 201);
+    const location = create.headers.get("location");
+
+    // No credential presented at all -> 401 (PROTOCOL.md §5.2), not a silent pass-through.
+    const noToken = await tusPatch(location, 0, makeMp4(1024));
+    assert.equal(noToken.status, 401, "PATCH with no token must be rejected");
+
+    const unrelatedToken = issueCapabilityToken("cccccccc-cccc-4ccc-8ccc-cccccccccccc", secret, {
+      keyId: "k1",
+      issuer,
+    });
+    const wrongToken = await tusPatch(location, 0, makeMp4(1024), {
+      Authorization: `Bearer ${unrelatedToken}`,
+    });
+    assert.equal(wrongToken.status, 403, "PATCH with a token for a different artifact must be rejected");
+
+    const ok = await tusPatch(location, 0, makeMp4(1024), { Authorization: `Bearer ${token}` });
+    assert.equal(ok.status, 204, "PATCH with the legitimate token must still succeed");
   } finally {
     await ctx.teardown();
   }
