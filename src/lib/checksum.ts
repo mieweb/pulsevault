@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { pipeline } from "node:stream/promises";
-import type { S3Storage } from "../storage/s3.js";
-import type { PulseVaultValidatePayload } from "./magic.js";
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import type { S3Storage } from '../storage/s3.js';
+import type { PulseVaultValidatePayload } from './magic.js';
 
-export type ChecksumAlgorithm = "sha256" | "sha1" | "md5";
-const SUPPORTED_ALGORITHMS: readonly ChecksumAlgorithm[] = ["sha256", "sha1", "md5"];
+export type ChecksumAlgorithm = 'sha256' | 'sha1' | 'md5';
+const SUPPORTED_ALGORITHMS: readonly ChecksumAlgorithm[] = ['sha256', 'sha1', 'md5'];
 
 export type ParsedChecksum = { algorithm: ChecksumAlgorithm; digest: string };
 
@@ -17,7 +17,7 @@ export type ParsedChecksum = { algorithm: ChecksumAlgorithm; digest: string };
  */
 export function parseChecksumMetadata(raw: string | undefined | null): ParsedChecksum | null {
   if (!raw) return null;
-  const sep = raw.indexOf(":");
+  const sep = raw.indexOf(':');
   if (sep < 0) return null;
   const algorithm = raw.slice(0, sep).toLowerCase();
   const digest = raw.slice(sep + 1).toLowerCase();
@@ -39,7 +39,7 @@ function isSupportedAlgorithm(value: string): value is ChecksumAlgorithm {
 async function digestLocalFile(path: string, algorithm: ChecksumAlgorithm): Promise<string> {
   const hash = createHash(algorithm);
   await pipeline(createReadStream(path), hash);
-  return hash.digest("hex");
+  return hash.digest('hex');
 }
 
 function checksumError(message: string): Error {
@@ -74,7 +74,7 @@ export function createChecksumValidator(
     if (checksum) {
       if (!ctx.localPath) {
         throw checksumError(
-          "Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage",
+          'Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage',
         );
       }
       const actual = await digestLocalFile(ctx.localPath, checksum.algorithm);

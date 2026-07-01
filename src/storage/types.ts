@@ -1,4 +1,4 @@
-import type { DataStore } from "@tus/server";
+import type { DataStore } from '@tus/server';
 
 /**
  * How the GET route should serve a resolved artifact. Stream means
@@ -7,7 +7,7 @@ import type { DataStore } from "@tus/server";
  */
 export type PulseVaultResolution =
   | {
-      kind: "stream";
+      kind: 'stream';
       /** Root directory `@fastify/send` should jail to. */
       root: string;
       /** Filename relative to `root`. */
@@ -20,13 +20,13 @@ export type PulseVaultResolution =
       contentType?: string;
     }
   | {
-      kind: "redirect";
+      kind: 'redirect';
       url: string;
       /** Defaults to 302. */
       statusCode?: number;
     };
 
-export type UploadKind = "video" | "project" | "captions";
+export type UploadKind = 'video' | 'project' | 'captions';
 
 export type ReserveUploadParams = {
   /** UUID from `Upload-Metadata.artifactId` (or the `videoid`/`projectid` legacy aliases). */

@@ -1,4 +1,4 @@
-import type { IncomingHttpHeaders } from "node:http";
+import type { IncomingHttpHeaders } from 'node:http';
 
 /**
  * Structural request shape the plugin's internals and hooks rely on.

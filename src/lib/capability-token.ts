@@ -1,6 +1,6 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-import type { PulseVaultRequest } from "./request.js";
-import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from "./authorize.js";
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import type { PulseVaultRequest } from './request.js';
+import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from './authorize.js';
 
 /**
  * Claims signed into a capability token. `kid` lets a secret be rotated with
@@ -28,17 +28,17 @@ const DEFAULT_EXPIRY_SECONDS = 1800; // 30 minutes — long enough for one uploa
 const DEFAULT_CLOCK_TOLERANCE_SECONDS = 30;
 
 function base64urlEncode(input: string): string {
-  return Buffer.from(input, "utf8").toString("base64url");
+  return Buffer.from(input, 'utf8').toString('base64url');
 }
 
 function sign(payload: string, secret: string): string {
-  return createHmac("sha256", secret).update(payload).digest("base64url");
+  return createHmac('sha256', secret).update(payload).digest('base64url');
 }
 
 /** Constant-time string comparison, tolerant of mismatched lengths (returns `false` rather than throwing). */
 function timingSafeEqualStrings(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return timingSafeEqual(bufA, bufB);
 }
@@ -100,7 +100,7 @@ export function verifyCapabilityToken(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
 ): { artifactId: string } | null {
-  const dot = token.indexOf(".");
+  const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
   const signature = token.slice(dot + 1);
@@ -108,16 +108,16 @@ export function verifyCapabilityToken(
 
   let claims: Partial<CapabilityTokenClaims>;
   try {
-    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     return null;
   }
   if (
-    typeof claims.artifactId !== "string" ||
-    typeof claims.iat !== "number" ||
-    typeof claims.exp !== "number" ||
-    typeof claims.kid !== "string" ||
-    typeof claims.issuer !== "string"
+    typeof claims.artifactId !== 'string' ||
+    typeof claims.iat !== 'number' ||
+    typeof claims.exp !== 'number' ||
+    typeof claims.kid !== 'string' ||
+    typeof claims.issuer !== 'string'
   ) {
     return null;
   }
@@ -138,11 +138,11 @@ export function verifyCapabilityToken(
 /** Pull a bearer token from the `Authorization` header, falling back to `ctx.token` (the `resolve`-phase query-string forward). */
 function extractToken(
   request: PulseVaultRequest,
-  ctx: Pick<PulseVaultAuthorizeContext, "token">,
+  ctx: Pick<PulseVaultAuthorizeContext, 'token'>,
 ): string | undefined {
   const header = request.headers.authorization;
-  if (typeof header === "string" && header.startsWith("Bearer ")) {
-    return header.slice("Bearer ".length);
+  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length);
   }
   return ctx.token;
 }
@@ -174,14 +174,14 @@ export function createCapabilityAuthorize(
   return async (request, ctx) => {
     const token = extractToken(request, ctx);
     if (!token) {
-      throw Object.assign(new Error("Missing capability token"), { statusCode: 401 });
+      throw Object.assign(new Error('Missing capability token'), { statusCode: 401 });
     }
     const verified = verifyCapabilityToken(token, lookupSecret, opts);
     if (!verified) {
-      throw Object.assign(new Error("Invalid or expired capability token"), { statusCode: 403 });
+      throw Object.assign(new Error('Invalid or expired capability token'), { statusCode: 403 });
     }
     if (ctx.artifactId !== verified.artifactId && ctx.relatedTo !== verified.artifactId) {
-      throw Object.assign(new Error("Token does not authorize this artifact"), { statusCode: 403 });
+      throw Object.assign(new Error('Token does not authorize this artifact'), { statusCode: 403 });
     }
   };
 }

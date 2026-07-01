@@ -1,5 +1,4 @@
-import type { PulseVaultStorage } from "./storage/types.js";
-import type { UploadKind } from "./storage/types.js";
+import type { PulseVaultStorage, UploadKind } from './storage/types.js';
 
 /**
  * Opt-in TypeScript augmentation for the default `pulseVault` decorator and
@@ -31,7 +30,7 @@ import type { UploadKind } from "./storage/types.js";
  * from the wire-format rename — update any code reading
  * `request.pulseVault.videoid` to `request.pulseVault.artifactId`.
  */
-declare module "fastify" {
+declare module 'fastify' {
   interface FastifyInstance {
     pulseVault: PulseVaultStorage;
   }

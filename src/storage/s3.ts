@@ -1,16 +1,16 @@
-import { createHash } from "node:crypto";
-import type { DataStore } from "@tus/server";
+import { createHash } from 'node:crypto';
+import type { DataStore } from '@tus/server';
 // Type-only imports: erased at compile time (verbatimModuleSyntax), so loading
 // this module never pulls in the AWS SDK. The real modules are loaded lazily
 // inside `createS3Storage` so a local-filesystem-only consumer never has to
 // install `@aws-sdk/*` or `@tus/s3-store`.
-import type { S3Client, S3ClientConfig } from "@aws-sdk/client-s3";
+import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
 import type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
-} from "./types.js";
+} from './types.js';
 
 /**
  * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
@@ -32,7 +32,7 @@ type Sidecar = {
    * post-upload validation has passed. `resolve` only serves `"ready"` uploads
    * so an object that exists but failed validation is never handed out.
    */
-  status: "uploading" | "ready";
+  status: 'uploading' | 'ready';
   /** Artifact kind. Optional for back-compat; absent is read as `"video"`. */
   kind?: UploadKind;
   /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
@@ -43,7 +43,7 @@ type Sidecar = {
 
 const SIDECAR_VERSION = 1 as const;
 /** Key prefix inside the bucket that holds the per-upload sidecar objects. */
-const PULSEVAULT_META_PREFIX = ".pulsevault";
+const PULSEVAULT_META_PREFIX = '.pulsevault';
 /** Default presigned playback URL lifetime (15 minutes). */
 const DEFAULT_PRESIGN_TTL_SECONDS = 900;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
@@ -60,11 +60,26 @@ type CachedMeta = {
 /** Map a file extension to the `Content-Type` the playback URL should return. */
 function extToContentType(ext: string): string {
   switch (ext) {
-    case ".mp4": return "video/mp4";
-    case ".zip": return "application/zip";
-    case ".srt": return "application/x-subrip";
-    default: return "application/octet-stream";
+    case '.mp4':
+      return 'video/mp4';
+    case '.zip':
+      return 'application/zip';
+    case '.srt':
+      return 'application/x-subrip';
+    default:
+      return 'application/octet-stream';
   }
+}
+
+/** Project a `Sidecar` into the shape kept in the in-memory cache. */
+function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
+  return {
+    ext: sidecar.ext,
+    ready,
+    kind: sidecar.kind ?? 'video',
+    relatedTo: sidecar.relatedTo,
+    checksum: sidecar.checksum,
+  };
 }
 
 export type S3StorageOptions = {
@@ -149,7 +164,7 @@ export type S3Storage = PulseVaultStorage & {
    * checksum verification never has to hold an entire (potentially
    * multi-gigabyte) object in memory as one `Buffer`.
    */
-  digestAll(artifactId: string, algorithm: "sha256" | "sha1" | "md5"): Promise<string | null>;
+  digestAll(artifactId: string, algorithm: 'sha256' | 'sha1' | 'md5'): Promise<string | null>;
   /** Artifact kind for a known artifactId, or `null`. Satisfies `getKind`. */
   getKind(artifactId: string): Promise<UploadKind | null>;
   /** Satisfies the optional `PulseVaultStorage.getRelatedTo` contract. */
@@ -174,23 +189,21 @@ export type S3Storage = PulseVaultStorage & {
  * await app.register(pulseVault, { storage, prefix: "/pulsevault", maxUploadSize: Infinity });
  * ```
  */
-export async function createS3Storage(
-  opts: S3StorageOptions,
-): Promise<S3Storage> {
-  let s3: typeof import("@aws-sdk/client-s3");
-  let presigner: typeof import("@aws-sdk/s3-request-presigner");
-  let s3store: typeof import("@tus/s3-store");
+export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage> {
+  let s3: typeof import('@aws-sdk/client-s3');
+  let presigner: typeof import('@aws-sdk/s3-request-presigner');
+  let s3store: typeof import('@tus/s3-store');
   try {
     [s3, presigner, s3store] = await Promise.all([
-      import("@aws-sdk/client-s3"),
-      import("@aws-sdk/s3-request-presigner"),
-      import("@tus/s3-store"),
+      import('@aws-sdk/client-s3'),
+      import('@aws-sdk/s3-request-presigner'),
+      import('@tus/s3-store'),
     ]);
   } catch (err) {
     throw new Error(
-      "createS3Storage requires the optional packages `@aws-sdk/client-s3`, " +
-        "`@aws-sdk/s3-request-presigner`, and `@tus/s3-store`. Install them with:\n" +
-        "  npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store\n" +
+      'createS3Storage requires the optional packages `@aws-sdk/client-s3`, ' +
+        '`@aws-sdk/s3-request-presigner`, and `@tus/s3-store`. Install them with:\n' +
+        '  npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store\n' +
         `(original error: ${err instanceof Error ? err.message : String(err)})`,
     );
   }
@@ -212,7 +225,7 @@ export async function createS3Storage(
       : undefined;
 
   const clientConfig: S3ClientConfig = {
-    region: opts.region ?? (opts.endpoint ? "auto" : undefined),
+    region: opts.region ?? (opts.endpoint ? 'auto' : undefined),
     ...(opts.endpoint ? { endpoint: opts.endpoint } : {}),
     forcePathStyle: opts.forcePathStyle ?? Boolean(opts.endpoint),
     ...(credentials ? { credentials } : {}),
@@ -242,22 +255,18 @@ export async function createS3Storage(
     }
   };
 
-  const sidecarKey = (artifactId: string): string =>
-    `${PULSEVAULT_META_PREFIX}/${artifactId}.json`;
+  const sidecarKey = (artifactId: string): string => `${PULSEVAULT_META_PREFIX}/${artifactId}.json`;
   /** Object key for the artifact bytes — also the TUS file id / multipart key. */
   const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
 
-  const writeSidecar = async (
-    artifactId: string,
-    sidecar: Sidecar,
-  ): Promise<void> => {
+  const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     await client.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: sidecarKey(artifactId),
         Body: JSON.stringify(sidecar),
-        ContentType: "application/json",
+        ContentType: 'application/json',
       }),
     );
   };
@@ -268,27 +277,26 @@ export async function createS3Storage(
       const res = await client.send(
         new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
       );
-      raw = (await bodyToBuffer(res.Body)).toString("utf8");
+      raw = (await bodyToBuffer(res.Body)).toString('utf8');
     } catch (err) {
       if (isNotFound(err)) return null;
       throw err;
     }
     try {
       const parsed = JSON.parse(raw) as Partial<Sidecar>;
-      if (typeof parsed.ext !== "string") return null;
-      if (typeof parsed.filename !== "string") return null;
-      const status: Sidecar["status"] =
-        parsed.status === "uploading" ? "uploading" : "ready";
+      if (typeof parsed.ext !== 'string') return null;
+      if (typeof parsed.filename !== 'string') return null;
+      const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
       const kind: UploadKind =
-        parsed.kind === "project" ? "project" : parsed.kind === "captions" ? "captions" : "video";
+        parsed.kind === 'project' ? 'project' : parsed.kind === 'captions' ? 'captions' : 'video';
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
         filename: parsed.filename,
         status,
         kind,
-        relatedTo: typeof parsed.relatedTo === "string" ? parsed.relatedTo : undefined,
-        checksum: typeof parsed.checksum === "string" ? parsed.checksum : undefined,
+        relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
+        checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
       };
     } catch {
       // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
@@ -301,13 +309,7 @@ export async function createS3Storage(
     if (cached) return cached;
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
-    const meta: CachedMeta = {
-      ext: sidecar.ext,
-      ready: sidecar.status === "ready",
-      kind: sidecar.kind ?? "video",
-      relatedTo: sidecar.relatedTo,
-      checksum: sidecar.checksum,
-    };
+    const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
     cacheSet(artifactId, meta);
     return meta;
   };
@@ -324,7 +326,7 @@ export async function createS3Storage(
       version: SIDECAR_VERSION,
       ext,
       filename,
-      status: "uploading",
+      status: 'uploading',
       kind,
       relatedTo,
       checksum,
@@ -353,8 +355,8 @@ export async function createS3Storage(
           Bucket: bucket,
           Key: sidecarKey(artifactId),
           Body: JSON.stringify(sidecar),
-          ContentType: "application/json",
-          IfNoneMatch: "*",
+          ContentType: 'application/json',
+          IfNoneMatch: '*',
         }),
       );
     } catch (err) {
@@ -387,9 +389,7 @@ export async function createS3Storage(
     return artifactKey(artifactId, kind, ext);
   };
 
-  const resolve = async (
-    artifactId: string,
-  ): Promise<PulseVaultResolution | null> => {
+  const resolve = async (artifactId: string): Promise<PulseVaultResolution | null> => {
     const meta = await loadMeta(artifactId);
     // Only serve ready uploads — an object that exists but is mid-upload or
     // failed validation stays hidden.
@@ -406,7 +406,7 @@ export async function createS3Storage(
       }),
       { expiresIn: presignTtl },
     );
-    return { kind: "redirect", url, statusCode: 302 };
+    return { kind: 'redirect', url, statusCode: 302 };
   };
 
   const markReady = async (artifactId: string): Promise<void> => {
@@ -416,19 +416,13 @@ export async function createS3Storage(
         `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
       );
     }
-    const next: CachedMeta = {
-      ext: sidecar.ext,
-      ready: true,
-      kind: sidecar.kind ?? "video",
-      relatedTo: sidecar.relatedTo,
-      checksum: sidecar.checksum,
-    };
-    if (sidecar.status === "ready") {
+    const next = sidecarToCachedMeta(sidecar, true);
+    if (sidecar.status === 'ready') {
       // Idempotent: already ready, just keep the cache consistent.
       cacheSet(artifactId, next);
       return;
     }
-    await writeSidecar(artifactId, { ...sidecar, status: "ready" });
+    await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
     cacheSet(artifactId, next);
   };
 
@@ -448,20 +442,13 @@ export async function createS3Storage(
     // not the multipart abort above already removed some of them.
     await Promise.all([
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
-      client.send(
-        new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` }),
-      ),
-      client.send(
-        new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
-      ),
+      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
+      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
     ]);
     return true;
   };
 
-  const readHeader = async (
-    artifactId: string,
-    n: number,
-  ): Promise<Buffer | null> => {
+  const readHeader = async (artifactId: string, n: number): Promise<Buffer | null> => {
     const meta = await loadMeta(artifactId);
     if (!meta) return null;
     const key = artifactKey(artifactId, meta.kind, meta.ext);
@@ -495,7 +482,7 @@ export async function createS3Storage(
 
   const digestAll = async (
     artifactId: string,
-    algorithm: "sha256" | "sha1" | "md5",
+    algorithm: 'sha256' | 'sha1' | 'md5',
   ): Promise<string | null> => {
     const meta = await loadMeta(artifactId);
     if (!meta) return null;
@@ -545,17 +532,26 @@ export async function createS3Storage(
   };
 }
 
+/**
+ * The two shapes `GetObjectCommandOutput.Body` can take depending on runtime:
+ * a web-stream-backed blob with `transformToByteArray` (Node 18+ AWS SDK v3),
+ * or a plain Node.js `Readable` async iterable.
+ */
+type SdkResponseBody = { transformToByteArray(): Promise<Uint8Array> } | AsyncIterable<Uint8Array>;
+
+function hasTransformToByteArray(
+  body: unknown,
+): body is { transformToByteArray(): Promise<Uint8Array> } {
+  return (
+    !!body &&
+    typeof (body as { transformToByteArray?: unknown }).transformToByteArray === 'function'
+  );
+}
+
 /** Collect an AWS SDK response body into a Buffer. */
-async function bodyToBuffer(body: unknown): Promise<Buffer> {
-  if (
-    body &&
-    typeof (body as { transformToByteArray?: unknown }).transformToByteArray ===
-      "function"
-  ) {
-    const arr = await (
-      body as { transformToByteArray(): Promise<Uint8Array> }
-    ).transformToByteArray();
-    return Buffer.from(arr);
+async function bodyToBuffer(body: SdkResponseBody | undefined): Promise<Buffer> {
+  if (hasTransformToByteArray(body)) {
+    return Buffer.from(await body.transformToByteArray());
   }
   const chunks: Buffer[] = [];
   for await (const chunk of body as AsyncIterable<Uint8Array>) {
@@ -570,25 +566,18 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
  * `bodyToBuffer`, used by `digestAll`.
  */
 async function digestBody(
-  body: unknown,
-  algorithm: "sha256" | "sha1" | "md5",
+  body: SdkResponseBody | undefined,
+  algorithm: 'sha256' | 'sha1' | 'md5',
 ): Promise<string> {
   const hash = createHash(algorithm);
-  if (
-    body &&
-    typeof (body as { transformToByteArray?: unknown }).transformToByteArray ===
-      "function"
-  ) {
-    const arr = await (
-      body as { transformToByteArray(): Promise<Uint8Array> }
-    ).transformToByteArray();
-    hash.update(arr);
-    return hash.digest("hex");
+  if (hasTransformToByteArray(body)) {
+    hash.update(await body.transformToByteArray());
+    return hash.digest('hex');
   }
   for await (const chunk of body as AsyncIterable<Uint8Array>) {
     hash.update(chunk);
   }
-  return hash.digest("hex");
+  return hash.digest('hex');
 }
 
 /** Whether an AWS SDK error represents a missing key/object (404-ish). */
@@ -599,10 +588,10 @@ function isNotFound(err: unknown): boolean {
     $metadata?: { httpStatusCode?: number };
   };
   return (
-    e?.name === "NoSuchKey" ||
-    e?.name === "NotFound" ||
-    e?.Code === "NoSuchKey" ||
-    e?.Code === "NotFound" ||
+    e?.name === 'NoSuchKey' ||
+    e?.name === 'NotFound' ||
+    e?.Code === 'NoSuchKey' ||
+    e?.Code === 'NotFound' ||
     e?.$metadata?.httpStatusCode === 404
   );
 }
@@ -615,13 +604,13 @@ function isPreconditionFailed(err: unknown): boolean {
     $metadata?: { httpStatusCode?: number };
   };
   return (
-    e?.name === "PreconditionFailed" ||
-    e?.Code === "PreconditionFailed" ||
+    e?.name === 'PreconditionFailed' ||
+    e?.Code === 'PreconditionFailed' ||
     e?.$metadata?.httpStatusCode === 412
   );
 }
 
-/** Whether the backend rejected the conditional-write header itself (some S3-compatible stores don't support it), as opposed to the condition failing. */
+/** Whether the backend rejected `IfNoneMatch` itself as unsupported, rather than the condition failing. */
 function isConditionalWriteUnsupported(err: unknown): boolean {
   const e = err as {
     name?: string;
@@ -629,8 +618,8 @@ function isConditionalWriteUnsupported(err: unknown): boolean {
     $metadata?: { httpStatusCode?: number };
   };
   return (
-    e?.name === "NotImplemented" ||
-    e?.Code === "NotImplemented" ||
+    e?.name === 'NotImplemented' ||
+    e?.Code === 'NotImplemented' ||
     e?.$metadata?.httpStatusCode === 501
   );
 }
@@ -649,10 +638,10 @@ function warnAboutConditionalWriteFallbackOnce(): void {
   if (warnedAboutConditionalWriteFallback) return;
   warnedAboutConditionalWriteFallback = true;
   console.warn(
-    "[pulsevault] S3-compatible backend does not support conditional writes (IfNoneMatch); " +
-      "falling back to check-then-write for reserveUpload. This reopens a collision race " +
-      "between concurrent/retried creates for the same artifactId. If this matters for your " +
-      "deployment, use a backend that supports IfNoneMatch, or serialize artifactId creation " +
-      "in front of pulsevault (e.g. in your own /reserve endpoint).",
+    '[pulsevault] S3-compatible backend does not support conditional writes (IfNoneMatch); ' +
+      'falling back to check-then-write for reserveUpload. This reopens a collision race ' +
+      'between concurrent/retried creates for the same artifactId. If this matters for your ' +
+      'deployment, use a backend that supports IfNoneMatch, or serialize artifactId creation ' +
+      'in front of pulsevault (e.g. in your own /reserve endpoint).',
   );
 }

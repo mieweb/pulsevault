@@ -1,11 +1,11 @@
-import { Server } from "@tus/server";
-import { AsyncLocalStorage } from "node:async_hooks";
-import path from "node:path";
-import { isUuid } from "./uuid.js";
-import type { PulseVaultValidatePayload } from "./magic.js";
-import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from "./request.js";
-import type { PulseVaultStorage } from "../storage/types.js";
-import type { UploadKind } from "../storage/types.js";
+import { Server } from '@tus/server';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import path from 'node:path';
+import { isUuid } from './uuid.js';
+import type { PulseVaultValidatePayload } from './magic.js';
+import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
+import type { PulseVaultStorage } from '../storage/types.js';
+import type { UploadKind } from '../storage/types.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -37,15 +37,13 @@ export type PulseVaultOnUploadComplete = (
  * trail without hand-rolling both from the lower-level hooks.
  */
 export type PulseVaultArtifactEvent = {
-  phase: "authorize" | "complete" | "reject";
+  phase: 'authorize' | 'complete' | 'reject';
   artifactId: string;
   kind: UploadKind;
   size?: number;
   reason?: string;
 };
-export type PulseVaultOnArtifactEvent = (
-  event: PulseVaultArtifactEvent,
-) => void | Promise<void>;
+export type PulseVaultOnArtifactEvent = (event: PulseVaultArtifactEvent) => void | Promise<void>;
 
 export type PulsevaultTusOptions = {
   storage: PulseVaultStorage;
@@ -57,7 +55,11 @@ export type PulsevaultTusOptions = {
    * Allowed extensions per kind. Must be pre-normalized to lowercase and
    * include the leading dot.
    */
-  allowedExtensions: { video: readonly string[]; project: readonly string[]; captions: readonly string[] };
+  allowedExtensions: {
+    video: readonly string[];
+    project: readonly string[];
+    captions: readonly string[];
+  };
   /**
    * Optional payload-validation hook, called for every kind with `ctx.kind`
    * set accordingly. Runs after TUS writes the final byte but before
@@ -89,7 +91,7 @@ export function tusError(status: number, body: string): Error {
 
 /** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
 export function artifactIdFromUploadId(id: string): string | undefined {
-  const [, nameWithExt] = id.split("/");
+  const [, nameWithExt] = id.split('/');
   if (!nameWithExt) return undefined;
   const ext = path.extname(nameWithExt);
   const candidate = ext ? nameWithExt.slice(0, -ext.length) : nameWithExt;
@@ -102,9 +104,45 @@ export function artifactIdFromUploadId(id: string): string | undefined {
  */
 function statusCodeOf(err: unknown, fallback: number): number {
   const e = err as { statusCode?: unknown; status_code?: unknown };
-  if (typeof e?.statusCode === "number") return e.statusCode;
-  if (typeof e?.status_code === "number") return e.status_code;
+  if (typeof e?.statusCode === 'number') return e.statusCode;
+  if (typeof e?.status_code === 'number') return e.status_code;
   return fallback;
+}
+
+type ParsedUploadMetadata = {
+  artifactId: string;
+  filename: string;
+  kind: UploadKind;
+  relatedTo?: string;
+  checksum?: string;
+};
+
+/**
+ * Extract and normalize the fields `namingFunction` cares about from raw
+ * `Upload-Metadata`. Doesn't validate — the caller still checks `artifactId`
+ * is a UUID and `filename`'s extension is allowed for `kind`.
+ */
+function parseUploadMetadata(
+  metadata: Record<string, string | null> | undefined,
+): ParsedUploadMetadata {
+  // Accept `artifactId` plus the legacy `videoid`/`projectid` aliases for
+  // back-compat with pre-`artifactId` clients.
+  const artifactId = (
+    metadata?.artifactId ??
+    metadata?.videoid ??
+    metadata?.projectid ??
+    ''
+  ).trim();
+  const filename = (metadata?.filename ?? '').trim();
+  // `kind` defaults to `"video"` so existing clients that don't send the field continue to work unchanged.
+  const rawKind = (metadata?.kind ?? '').trim().toLowerCase();
+  const kind: UploadKind =
+    rawKind === 'project' ? 'project' : rawKind === 'captions' ? 'captions' : 'video';
+  const rawRelatedTo = (metadata?.relatedTo ?? '').trim();
+  const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
+  const checksum = (metadata?.checksum ?? '').trim() || undefined;
+
+  return { artifactId, filename, kind, relatedTo, checksum };
 }
 
 export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
@@ -124,26 +162,10 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     datastore: storage.datastore,
     maxSize,
     namingFunction: async (_req, metadata) => {
-      // Accept `artifactId` plus the legacy `videoid`/`projectid` aliases for
-      // back-compat with pre-`artifactId` clients.
-      const artifactId = (
-        metadata?.artifactId ?? metadata?.videoid ?? metadata?.projectid ?? ""
-      ).trim();
-      const filename = (metadata?.filename ?? "").trim();
-      // `kind` defaults to `"video"` so existing clients that don't send
-      // the field continue to work without any changes.
-      const rawKind = (metadata?.kind ?? "").trim().toLowerCase();
-      const kind: UploadKind =
-        rawKind === "project" ? "project" : rawKind === "captions" ? "captions" : "video";
-      const rawRelatedTo = (metadata?.relatedTo ?? "").trim();
-      const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
-      const checksum = (metadata?.checksum ?? "").trim() || undefined;
+      const { artifactId, filename, kind, relatedTo, checksum } = parseUploadMetadata(metadata);
 
       if (!isUuid(artifactId)) {
-        throw tusError(
-          400,
-          "Upload-Metadata must include a valid `artifactId` UUID.\n",
-        );
+        throw tusError(400, 'Upload-Metadata must include a valid `artifactId` UUID.\n');
       }
 
       const ext = path.extname(filename).toLowerCase();
@@ -151,7 +173,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       if (!ext || !allowed.includes(ext)) {
         throw tusError(
           400,
-          `Upload-Metadata \`filename\` for kind="${kind}" must end with one of: ${allowed.join(", ")}\n`,
+          `Upload-Metadata \`filename\` for kind="${kind}" must end with one of: ${allowed.join(', ')}\n`,
         );
       }
 
@@ -168,14 +190,14 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       return storage.reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum });
     },
     generateUrl(_req, { proto, host, path: tusBasePath, id }) {
-      const encoded = Buffer.from(id, "utf8").toString("base64url");
+      const encoded = Buffer.from(id, 'utf8').toString('base64url');
       return `${proto}://${host}${tusBasePath}/${encoded}`;
     },
     getFileIdFromRequest(_req, lastPath) {
       if (!lastPath) {
         return;
       }
-      return Buffer.from(lastPath, "base64url").toString("utf8");
+      return Buffer.from(lastPath, 'base64url').toString('utf8');
     },
     onUploadFinish: async (_req, upload) => {
       // Completion sequence: validate → markReady → consumer hook. Each step
@@ -221,17 +243,13 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           });
         } catch (err) {
           const status = statusCodeOf(err, 422);
-          const message =
-            err instanceof Error ? err.message : "Payload validation failed";
+          const message = err instanceof Error ? err.message : 'Payload validation failed';
           try {
             await storage.remove?.(artifactId);
           } catch (rmErr) {
-            logger.error(
-              { err: rmErr, artifactId },
-              "pulsevault failed to remove rejected upload",
-            );
+            logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
           }
-          await onArtifactEvent?.({ phase: "reject", artifactId, kind, size, reason: message });
+          await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
           throw tusError(status, `${message}\n`);
         }
       }
@@ -242,8 +260,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       try {
         await storage.markReady?.(artifactId);
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "markReady failed";
+        const message = err instanceof Error ? err.message : 'markReady failed';
         throw tusError(500, `${message}\n`);
       }
 
@@ -257,13 +274,12 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           // success. The artifact is marked ready at this point — consumers
           // who want "all-or-nothing" should `storage.remove` before
           // throwing.
-          const message =
-            err instanceof Error ? err.message : "onUploadComplete failed";
+          const message = err instanceof Error ? err.message : 'onUploadComplete failed';
           throw tusError(500, `${message}\n`);
         }
       }
 
-      await onArtifactEvent?.({ phase: "complete", artifactId, kind, size });
+      await onArtifactEvent?.({ phase: 'complete', artifactId, kind, size });
 
       return {};
     },
@@ -276,14 +292,9 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
  * request's context. Defaults to `"video"` for adapters that don't implement
  * `getKind` or when the artifactId is not found.
  */
-async function resolveKind(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<UploadKind> {
-  const candidate = (storage as { getKind?: unknown }).getKind;
-  if (typeof candidate !== "function") return "video";
-  const result = await (candidate as (id: string) => Promise<UploadKind | null>)(artifactId);
-  return result ?? "video";
+async function resolveKind(storage: PulseVaultStorage, artifactId: string): Promise<UploadKind> {
+  const result = await storage.getKind?.(artifactId);
+  return result ?? 'video';
 }
 
 /**
@@ -296,9 +307,7 @@ async function resolveChecksum(
   storage: PulseVaultStorage,
   artifactId: string,
 ): Promise<string | undefined> {
-  const candidate = (storage as { getChecksum?: unknown }).getChecksum;
-  if (typeof candidate !== "function") return undefined;
-  const result = await (candidate as (id: string) => Promise<string | null>)(artifactId);
+  const result = await storage.getChecksum?.(artifactId);
   return result ?? undefined;
 }
 
@@ -312,10 +321,7 @@ async function resolveLocalPath(
   storage: PulseVaultStorage,
   artifactId: string,
 ): Promise<string | null> {
-  const candidate = (storage as { getLocalPath?: unknown }).getLocalPath;
-  if (typeof candidate !== "function") return null;
-  const result = await (candidate as (id: string) => Promise<string | null>)(
-    artifactId,
-  );
-  return typeof result === "string" ? result : null;
+  const adapter = storage as { getLocalPath?: (artifactId: string) => Promise<string | null> };
+  const result = await adapter.getLocalPath?.(artifactId);
+  return typeof result === 'string' ? result : null;
 }

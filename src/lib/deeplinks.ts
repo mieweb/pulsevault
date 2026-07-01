@@ -19,7 +19,7 @@ export type UploadLinkOptions = {
 };
 
 /** Deep-link wire format version. Bump when the param shape changes incompatibly. */
-const LINK_VERSION = "1";
+const LINK_VERSION = '1';
 
 /**
  * Private/dev origins allowed over plain http — mirrors the Pulse client's
@@ -31,11 +31,11 @@ const LINK_VERSION = "1";
  * internal."
  */
 function isPrivateDevOrigin(url: URL): boolean {
-  if (url.protocol !== "http:") return false;
+  if (url.protocol !== 'http:') return false;
   const host = url.hostname;
   return (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
     /^10\.\d+\.\d+\.\d+$/.test(host) ||
     /^192\.168\.\d+\.\d+$/.test(host) ||
     /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(host) ||
@@ -65,10 +65,10 @@ export function buildUploadLink(opts: UploadLinkOptions): string {
   } catch {
     throw new Error(`buildUploadLink: \`server\` is not a valid URL: ${opts.server}`);
   }
-  if (server.protocol !== "https:" && !isPrivateDevOrigin(server)) {
+  if (server.protocol !== 'https:' && !isPrivateDevOrigin(server)) {
     throw new Error(
       `buildUploadLink: \`server\` must be https:// (got "${opts.server}") — ` +
-        "the only exception is http://localhost or a private IP literal for local development.",
+        'the only exception is http://localhost or a private IP literal for local development.',
     );
   }
 
@@ -77,6 +77,6 @@ export function buildUploadLink(opts: UploadLinkOptions): string {
     artifactId: opts.artifactId,
     server: opts.server,
   });
-  if (opts.token) params.set("token", opts.token);
+  if (opts.token) params.set('token', opts.token);
   return `pulsecam://?${params.toString()}`;
 }
