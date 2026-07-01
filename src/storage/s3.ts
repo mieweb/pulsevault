@@ -13,10 +13,11 @@ import type {
 
 /**
  * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
- * `.pulsevault/<videoid>.json`. This mirrors the local adapter's on-disk
+ * `.pulsevault/<artifactId>.json`. This mirrors the local adapter's on-disk
  * sidecar: it lets `resolve`/`getKind` recover an upload's extension, kind and
- * completion state from the `videoid` alone (the object key needs both `kind`
- * and `ext`, which the bare videoid doesn't carry), and survives a restart.
+ * completion state from the `artifactId` alone (the object key needs both
+ * `kind` and `ext`, which the bare artifactId doesn't carry), and survives a
+ * restart.
  */
 type Sidecar = {
   /** Sidecar schema version. Increment for breaking changes. */
@@ -33,6 +34,10 @@ type Sidecar = {
   status: "uploading" | "ready";
   /** Artifact kind. Optional for back-compat; absent is read as `"video"`. */
   kind?: UploadKind;
+  /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
+  relatedTo?: string;
+  /** Optional client-supplied checksum metadata. See `ReserveUploadParams.checksum`. */
+  checksum?: string;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -40,14 +45,23 @@ const SIDECAR_VERSION = 1 as const;
 const PULSEVAULT_META_PREFIX = ".pulsevault";
 /** Default presigned playback URL lifetime (15 minutes). */
 const DEFAULT_PRESIGN_TTL_SECONDS = 900;
+/** Default cap on the in-memory metadata cache before evicting the oldest entry. */
+const DEFAULT_META_CACHE_LIMIT = 10_000;
 
-type CachedMeta = { ext: string; ready: boolean; kind: UploadKind };
+type CachedMeta = {
+  ext: string;
+  ready: boolean;
+  kind: UploadKind;
+  relatedTo?: string;
+  checksum?: string;
+};
 
 /** Map a file extension to the `Content-Type` the playback URL should return. */
 function extToContentType(ext: string): string {
   switch (ext) {
     case ".mp4": return "video/mp4";
     case ".zip": return "application/zip";
+    case ".srt": return "application/x-subrip";
     default: return "application/octet-stream";
   }
 }
@@ -90,6 +104,13 @@ export type S3StorageOptions = {
    */
   partSize?: number;
   /**
+   * Max number of entries kept in the in-memory metadata cache before the
+   * oldest (by insertion order) is evicted. A cache miss falls back to a
+   * bucket read, so eviction only costs an extra request, not correctness.
+   * Defaults to 10,000.
+   */
+  metaCacheLimit?: number;
+  /**
    * Advanced escape hatch: extra `S3ClientConfig` fields merged into the
    * client used for both playback presigning and the underlying TUS datastore
    * (e.g. checksum flags for S3-compatible stores). Values here win over the
@@ -109,12 +130,23 @@ export type S3Storage = PulseVaultStorage & {
   readonly bucket: string;
   /**
    * Ranged GET of the first `n` bytes of a finalized upload, or `null` if the
-   * videoid is unknown. Used by `createS3Mp4Sniffer` to validate the payload
-   * without downloading the whole object.
+   * artifactId is unknown. Used by `createS3Mp4Sniffer` to validate the
+   * payload without downloading the whole object.
    */
-  readHeader(videoid: string, n: number): Promise<Buffer | null>;
-  /** Artifact kind for a known videoid, or `null`. Satisfies `getKind`. */
-  getKind(videoid: string): Promise<UploadKind | null>;
+  readHeader(artifactId: string, n: number): Promise<Buffer | null>;
+  /**
+   * Full GET of a finalized upload's bytes, or `null` if the artifactId is
+   * unknown. Used by `createS3ChecksumValidator` — unlike `readHeader`, this
+   * downloads the whole object, so it's only worth using for an explicit,
+   * opt-in integrity check, not on every upload by default.
+   */
+  readAll(artifactId: string): Promise<Buffer | null>;
+  /** Artifact kind for a known artifactId, or `null`. Satisfies `getKind`. */
+  getKind(artifactId: string): Promise<UploadKind | null>;
+  /** Satisfies the optional `PulseVaultStorage.getRelatedTo` contract. */
+  getRelatedTo(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.getChecksum` contract. */
+  getChecksum(artifactId: string): Promise<string | null>;
 };
 
 /**
@@ -159,6 +191,7 @@ export async function createS3Storage(
 
   const bucket = opts.bucket;
   const presignTtl = opts.presignTtlSeconds ?? DEFAULT_PRESIGN_TTL_SECONDS;
+  const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
 
   const credentials =
     opts.accessKeyId && opts.secretAccessKey
@@ -185,36 +218,46 @@ export async function createS3Storage(
     s3ClientConfig: { ...clientConfig, bucket },
   }) as unknown as DataStore;
 
-  // Metadata cache keyed by videoid, mirroring the local adapter: populated
+  // Metadata cache keyed by artifactId, mirroring the local adapter: populated
   // eagerly on reserve and lazily from the sidecar on a cache-miss, so the GET
-  // hot path avoids a per-request round-trip to the bucket.
+  // hot path avoids a per-request round-trip to the bucket. Bounded with
+  // simple insertion-order eviction, same rationale as the local adapter.
   const metaCache = new Map<string, CachedMeta>();
 
-  const sidecarKey = (videoid: string): string =>
-    `${PULSEVAULT_META_PREFIX}/${videoid}.json`;
+  const cacheSet = (artifactId: string, meta: CachedMeta): void => {
+    metaCache.delete(artifactId);
+    metaCache.set(artifactId, meta);
+    if (metaCache.size > metaCacheLimit) {
+      const oldest = metaCache.keys().next().value;
+      if (oldest !== undefined) metaCache.delete(oldest);
+    }
+  };
+
+  const sidecarKey = (artifactId: string): string =>
+    `${PULSEVAULT_META_PREFIX}/${artifactId}.json`;
   /** Object key for the artifact bytes — also the TUS file id / multipart key. */
-  const artifactKey = (videoid: string, kind: UploadKind, ext: string): string =>
-    `${kind}/${videoid}${ext}`;
+  const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
+    `${kind}/${artifactId}${ext}`;
 
   const writeSidecar = async (
-    videoid: string,
+    artifactId: string,
     sidecar: Sidecar,
   ): Promise<void> => {
     await client.send(
       new PutObjectCommand({
         Bucket: bucket,
-        Key: sidecarKey(videoid),
+        Key: sidecarKey(artifactId),
         Body: JSON.stringify(sidecar),
         ContentType: "application/json",
       }),
     );
   };
 
-  const readSidecar = async (videoid: string): Promise<Sidecar | null> => {
+  const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
     let raw: string;
     try {
       const res = await client.send(
-        new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(videoid) }),
+        new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
       );
       raw = (await bodyToBuffer(res.Body)).toString("utf8");
     } catch (err) {
@@ -227,13 +270,16 @@ export async function createS3Storage(
       if (typeof parsed.filename !== "string") return null;
       const status: Sidecar["status"] =
         parsed.status === "uploading" ? "uploading" : "ready";
-      const kind: UploadKind = parsed.kind === "project" ? "project" : "video";
+      const kind: UploadKind =
+        parsed.kind === "project" ? "project" : parsed.kind === "captions" ? "captions" : "video";
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
         filename: parsed.filename,
         status,
         kind,
+        relatedTo: typeof parsed.relatedTo === "string" ? parsed.relatedTo : undefined,
+        checksum: typeof parsed.checksum === "string" ? parsed.checksum : undefined,
       };
     } catch {
       // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
@@ -241,59 +287,65 @@ export async function createS3Storage(
     }
   };
 
-  const loadMeta = async (videoid: string): Promise<CachedMeta | null> => {
-    const cached = metaCache.get(videoid);
+  const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
+    const cached = metaCache.get(artifactId);
     if (cached) return cached;
-    const sidecar = await readSidecar(videoid);
+    const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
     const meta: CachedMeta = {
       ext: sidecar.ext,
       ready: sidecar.status === "ready",
       kind: sidecar.kind ?? "video",
+      relatedTo: sidecar.relatedTo,
+      checksum: sidecar.checksum,
     };
-    metaCache.set(videoid, meta);
+    cacheSet(artifactId, meta);
     return meta;
   };
 
   const reserveUpload = async ({
-    videoid,
+    artifactId,
     filename,
     ext,
     kind,
+    relatedTo,
+    checksum,
   }: ReserveUploadParams): Promise<string> => {
     // Collision guard, same contract as the local adapter: refuse a second
-    // upload for a videoid that already has one (in-progress or ready) rather
-    // than letting the datastore silently reset the multipart upload. Surfaces
-    // as HTTP 409 via @tus/server's error path.
-    const meta = await loadMeta(videoid);
+    // upload for an artifactId that already has one (in-progress or ready)
+    // rather than letting the datastore silently reset the multipart upload.
+    // Surfaces as HTTP 409 via @tus/server's error path.
+    const meta = await loadMeta(artifactId);
     if (meta) {
-      throw Object.assign(new Error(`videoid ${videoid} already has an upload`), {
+      throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
         statusCode: 409,
         status_code: 409,
       });
     }
 
-    await writeSidecar(videoid, {
+    await writeSidecar(artifactId, {
       version: SIDECAR_VERSION,
       ext,
       filename,
       status: "uploading",
       kind,
+      relatedTo,
+      checksum,
     });
-    metaCache.set(videoid, { ext, ready: false, kind });
+    cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum });
     // @tus/s3-store uses this as the object key for the multipart upload, so
-    // the finished object lands at `<kind>/<videoid><ext>`.
-    return artifactKey(videoid, kind, ext);
+    // the finished object lands at `<kind>/<artifactId><ext>`.
+    return artifactKey(artifactId, kind, ext);
   };
 
   const resolve = async (
-    videoid: string,
+    artifactId: string,
   ): Promise<PulseVaultResolution | null> => {
-    const meta = await loadMeta(videoid);
+    const meta = await loadMeta(artifactId);
     // Only serve ready uploads — an object that exists but is mid-upload or
     // failed validation stays hidden.
     if (!meta || !meta.ready) return null;
-    const key = artifactKey(videoid, meta.kind, meta.ext);
+    const key = artifactKey(artifactId, meta.kind, meta.ext);
     const url = await getSignedUrl(
       client,
       new GetObjectCommand({
@@ -308,33 +360,35 @@ export async function createS3Storage(
     return { kind: "redirect", url, statusCode: 302 };
   };
 
-  const markReady = async (videoid: string): Promise<void> => {
-    const sidecar = await readSidecar(videoid);
+  const markReady = async (artifactId: string): Promise<void> => {
+    const sidecar = await readSidecar(artifactId);
     if (!sidecar) {
       throw new Error(
-        `markReady: no sidecar for videoid ${videoid} (was reserveUpload called?)`,
+        `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
       );
     }
     const next: CachedMeta = {
       ext: sidecar.ext,
       ready: true,
       kind: sidecar.kind ?? "video",
+      relatedTo: sidecar.relatedTo,
+      checksum: sidecar.checksum,
     };
     if (sidecar.status === "ready") {
       // Idempotent: already ready, just keep the cache consistent.
-      metaCache.set(videoid, next);
+      cacheSet(artifactId, next);
       return;
     }
-    await writeSidecar(videoid, { ...sidecar, status: "ready" });
-    metaCache.set(videoid, next);
+    await writeSidecar(artifactId, { ...sidecar, status: "ready" });
+    cacheSet(artifactId, next);
   };
 
-  const remove = async (videoid: string): Promise<boolean> => {
-    const meta = await loadMeta(videoid);
+  const remove = async (artifactId: string): Promise<boolean> => {
+    const meta = await loadMeta(artifactId);
     // Evict before deleting so a racing `resolve` can't hand back a stale key.
-    metaCache.delete(videoid);
+    metaCache.delete(artifactId);
     if (!meta) return false;
-    const key = artifactKey(videoid, meta.kind, meta.ext);
+    const key = artifactKey(artifactId, meta.kind, meta.ext);
     // Abort any still-in-progress multipart upload (no-op / best-effort once
     // the upload has completed) so we never orphan an open multipart session.
     await Promise.allSettled([
@@ -349,19 +403,19 @@ export async function createS3Storage(
         new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` }),
       ),
       client.send(
-        new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(videoid) }),
+        new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
       ),
     ]);
     return true;
   };
 
   const readHeader = async (
-    videoid: string,
+    artifactId: string,
     n: number,
   ): Promise<Buffer | null> => {
-    const meta = await loadMeta(videoid);
+    const meta = await loadMeta(artifactId);
     if (!meta) return null;
-    const key = artifactKey(videoid, meta.kind, meta.ext);
+    const key = artifactKey(artifactId, meta.kind, meta.ext);
     try {
       const res = await client.send(
         new GetObjectCommand({
@@ -377,9 +431,32 @@ export async function createS3Storage(
     }
   };
 
-  const getKind = async (videoid: string): Promise<UploadKind | null> => {
-    const meta = await loadMeta(videoid);
+  const readAll = async (artifactId: string): Promise<Buffer | null> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) return null;
+    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    try {
+      const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      return await bodyToBuffer(res.Body);
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
+  };
+
+  const getKind = async (artifactId: string): Promise<UploadKind | null> => {
+    const meta = await loadMeta(artifactId);
     return meta ? meta.kind : null;
+  };
+
+  const getRelatedTo = async (artifactId: string): Promise<string | null> => {
+    const meta = await loadMeta(artifactId);
+    return meta?.relatedTo ?? null;
+  };
+
+  const getChecksum = async (artifactId: string): Promise<string | null> => {
+    const meta = await loadMeta(artifactId);
+    return meta?.checksum ?? null;
   };
 
   const shutdown = async (): Promise<void> => {
@@ -394,7 +471,10 @@ export async function createS3Storage(
     markReady,
     remove,
     readHeader,
+    readAll,
     getKind,
+    getRelatedTo,
+    getChecksum,
     shutdown,
   };
 }

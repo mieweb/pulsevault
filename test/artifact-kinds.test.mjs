@@ -1,7 +1,10 @@
-// Tests for kind=project uploads through the TUS endpoint.
-// Covers: happy paths (.pulse / .zip), extension-mismatch rejections,
-// authorize ctx kind, projectid alias, hook dispatch, getKind(), legacy
-// back-compat (sidecars without `kind`).
+// Tests for kind=project and kind=captions uploads through the TUS endpoint
+// and the generic /artifacts/:artifactId route.
+// Covers: happy paths (.pulse / .zip / .srt), extension-mismatch rejections,
+// authorize ctx kind, the artifactId/videoid/projectid metadata aliases,
+// unified hook dispatch (incl. the deprecated per-kind project hooks),
+// relatedTo linking, getKind(), and legacy back-compat (sidecars without
+// `kind`).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -10,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
 import pulseVault, { createLocalStorage } from "../dist/app.js";
+import { makeMp4 } from "./helpers.mjs";
 
 const ID1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const ID2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -19,18 +23,16 @@ function b64(str) {
   return Buffer.from(str, "utf8").toString("base64");
 }
 
-/**
- * Build a TUS Upload-Metadata header supporting kind, id key (videoid or
- * projectid), and filename.
- */
-function buildMetadata({ videoid, idKey = "videoid", filename, kind }) {
-  const parts = [`${idKey} ${b64(videoid)}`, `filename ${b64(filename)}`];
+/** Build a TUS Upload-Metadata header supporting kind, id key, relatedTo, and filename. */
+function buildMetadata({ artifactId, idKey = "artifactId", filename, kind, relatedTo }) {
+  const parts = [`${idKey} ${b64(artifactId)}`, `filename ${b64(filename)}`];
   if (kind) parts.push(`kind ${b64(kind)}`);
+  if (relatedTo) parts.push(`relatedTo ${b64(relatedTo)}`);
   return parts.join(",");
 }
 
 async function startApp(pluginOptions = {}) {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-proj-test-"));
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-kinds-test-"));
   const storage = createLocalStorage({ workspaceDir });
   const app = Fastify({ logger: false });
   await app.register(pulseVault, {
@@ -52,13 +54,13 @@ async function startApp(pluginOptions = {}) {
   };
 }
 
-async function tusCreate(baseUrl, { videoid, idKey = "videoid", filename, size, kind }) {
+async function tusCreate(baseUrl, { artifactId, idKey = "artifactId", filename, size, kind, relatedTo }) {
   return fetch(`${baseUrl}${PREFIX}/upload`, {
     method: "POST",
     headers: {
       "Tus-Resumable": "1.0.0",
       "Upload-Length": String(size),
-      "Upload-Metadata": buildMetadata({ videoid, idKey, filename, kind }),
+      "Upload-Metadata": buildMetadata({ artifactId, idKey, filename, kind, relatedTo }),
     },
   });
 }
@@ -76,13 +78,14 @@ async function tusPatch(url, offset, body) {
 }
 
 /** Do a complete TUS upload in one go. Returns the response bodies. */
-async function uploadFull(ctx, { videoid, idKey = "videoid", filename, kind, payload }) {
+async function uploadFull(ctx, { artifactId, idKey = "artifactId", filename, kind, relatedTo, payload }) {
   const create = await tusCreate(ctx.baseUrl, {
-    videoid,
+    artifactId,
     idKey,
     filename,
     size: payload.length,
     kind,
+    relatedTo,
   });
   assert.equal(create.status, 201, `create ${filename}`);
   const location = create.headers.get("location");
@@ -92,25 +95,25 @@ async function uploadFull(ctx, { videoid, idKey = "videoid", filename, kind, pay
   return { location };
 }
 
-// ---------- tests ----------
+const artifactUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}`;
+
+// ---------- kind=project ----------
 
 test("kind=project .pulse happy path: file under project/ subdir, correct Content-Type", async () => {
   const ctx = await startApp();
   try {
     const payload = Buffer.from(JSON.stringify({ format: "pulse", version: 1 }));
     await uploadFull(ctx, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "draft.pulse",
       kind: "project",
       payload,
     });
 
-    // File must land at <uuid>/project/<uuid>.pulse
     const expectedPath = path.join(ctx.workspaceDir, "project", `${ID1}.pulse`);
     const stat = await fs.stat(expectedPath);
     assert.ok(stat.isFile(), "file exists at project/ subdir");
 
-    // Sidecar must record kind
     const sidecar = JSON.parse(
       await fs.readFile(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`), "utf8"),
     );
@@ -118,8 +121,7 @@ test("kind=project .pulse happy path: file under project/ subdir, correct Conten
     assert.equal(sidecar.ext, ".pulse");
     assert.equal(sidecar.status, "ready");
 
-    // GET must return 200 with application/octet-stream
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
+    const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
     assert.ok(ct?.includes("application/octet-stream"), `content-type was: ${ct}`);
@@ -135,7 +137,7 @@ test("kind=project .zip happy path: file under project/ subdir, Content-Type: ap
   try {
     const payload = Buffer.alloc(512, 0x50); // fake zip bytes
     await uploadFull(ctx, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "diagnostic.zip",
       kind: "project",
       payload,
@@ -145,7 +147,7 @@ test("kind=project .zip happy path: file under project/ subdir, Content-Type: ap
     const stat = await fs.stat(expectedPath);
     assert.ok(stat.isFile(), "zip exists at project/ subdir");
 
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
+    const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
     assert.ok(ct?.includes("application/zip"), `content-type was: ${ct}`);
@@ -158,7 +160,7 @@ test("kind=project with .mp4 extension is rejected at create", async () => {
   const ctx = await startApp();
   try {
     const create = await tusCreate(ctx.baseUrl, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "sneaky.mp4",
       size: 1024,
       kind: "project",
@@ -175,9 +177,8 @@ test("kind=project with .mp4 extension is rejected at create", async () => {
 test("kind=video (default) with .pulse extension is rejected at create", async () => {
   const ctx = await startApp();
   try {
-    // No `kind` in metadata defaults to video; .pulse is not in the video list.
     const create = await tusCreate(ctx.baseUrl, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "draft.pulse",
       size: 1024,
       // kind omitted → defaults to "video"
@@ -201,7 +202,7 @@ test("authorize receives kind='project' on create and resolve", async () => {
   try {
     const payload = Buffer.from("pulse data");
     await uploadFull(ctx, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "draft.pulse",
       kind: "project",
       payload,
@@ -209,62 +210,71 @@ test("authorize receives kind='project' on create and resolve", async () => {
 
     assert.equal(capturedPhases["create"], "project", "kind on create");
 
-    // GET /project/:projectid triggers resolve phase
-    await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
+    await fetch(artifactUrl(ctx, ID1));
     assert.equal(capturedPhases["resolve"], "project", "kind on resolve");
   } finally {
     await ctx.teardown();
   }
 });
 
-test("validateProjectPayload fires for kind=project but not for kind=video", async () => {
+test("validatePayload runs for every kind, with ctx.kind distinguishing them", async () => {
   const calls = [];
   const ctx = await startApp({
-    validateProjectPayload: async (_req, info) => {
-      calls.push({ kind: "project", videoid: info.videoid });
-    },
     validatePayload: async (_req, info) => {
-      calls.push({ kind: "video", videoid: info.videoid });
+      calls.push({ kind: info.kind, artifactId: info.artifactId });
     },
   });
   try {
-    const payload = Buffer.from("pulse data");
-
-    // Upload a video first (no kind in metadata → defaults to video)
-    const mp4Header = Buffer.from([
-      0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70,
-      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
-    ]);
-    const mp4 = Buffer.alloc(1024);
-    mp4Header.copy(mp4, 0);
+    await uploadFull(ctx, { artifactId: ID1, filename: "clip.mp4", payload: makeMp4(1024) });
     await uploadFull(ctx, {
-      videoid: ID1,
-      filename: "clip.mp4",
-      // kind omitted → video
-      payload: mp4,
-    });
-
-    // Upload a project
-    await uploadFull(ctx, {
-      videoid: ID2,
+      artifactId: ID2,
       filename: "draft.pulse",
       kind: "project",
-      payload,
+      payload: Buffer.from("pulse data"),
+    });
+
+    assert.equal(calls.length, 2, "both uploads ran validatePayload");
+    const videoCall = calls.find((c) => c.kind === "video");
+    const projectCall = calls.find((c) => c.kind === "project");
+    assert.ok(videoCall && videoCall.artifactId === ID1);
+    assert.ok(projectCall && projectCall.artifactId === ID2);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("[deprecated] validateProjectPayload still fires for kind=project but not for kind=video", async () => {
+  const calls = [];
+  const ctx = await startApp({
+    validateProjectPayload: async (_req, info) => {
+      calls.push({ kind: "project", artifactId: info.artifactId });
+    },
+    validatePayload: async (_req, info) => {
+      calls.push({ kind: "video", artifactId: info.artifactId });
+    },
+  });
+  try {
+    await uploadFull(ctx, { artifactId: ID1, filename: "clip.mp4", payload: makeMp4(1024) });
+    await uploadFull(ctx, {
+      artifactId: ID2,
+      filename: "draft.pulse",
+      kind: "project",
+      payload: Buffer.from("pulse data"),
     });
 
     assert.equal(calls.length, 2, "both validators fired");
     const videoCall = calls.find((c) => c.kind === "video");
     const projectCall = calls.find((c) => c.kind === "project");
     assert.ok(videoCall, "validatePayload (video) fired");
-    assert.equal(videoCall.videoid, ID1);
+    assert.equal(videoCall.artifactId, ID1);
     assert.ok(projectCall, "validateProjectPayload (project) fired");
-    assert.equal(projectCall.videoid, ID2);
+    assert.equal(projectCall.artifactId, ID2);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("onProjectUploadComplete fires for kind=project but not for kind=video", async () => {
+test("[deprecated] onProjectUploadComplete still fires for kind=project but not for kind=video", async () => {
   const calls = [];
   const ctx = await startApp({
     onProjectUploadComplete: async (_req, info) => {
@@ -275,150 +285,91 @@ test("onProjectUploadComplete fires for kind=project but not for kind=video", as
     },
   });
   try {
-    const mp4Header = Buffer.from([
-      0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70,
-      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
-    ]);
-    const mp4 = Buffer.alloc(1024);
-    mp4Header.copy(mp4, 0);
-    await uploadFull(ctx, { videoid: ID1, filename: "clip.mp4", payload: mp4 });
-
-    const pulse = Buffer.from("pulse data");
+    await uploadFull(ctx, { artifactId: ID1, filename: "clip.mp4", payload: makeMp4(1024) });
     await uploadFull(ctx, {
-      videoid: ID2,
+      artifactId: ID2,
       filename: "draft.pulse",
       kind: "project",
-      payload: pulse,
+      payload: Buffer.from("pulse data"),
     });
 
     assert.equal(calls.length, 2);
     const videoCall = calls.find((c) => c.hook === "video");
     const projectCall = calls.find((c) => c.hook === "project");
     assert.ok(videoCall, "onUploadComplete fired for video");
-    assert.equal(videoCall.videoid, ID1);
+    assert.equal(videoCall.artifactId, ID1);
     assert.ok(projectCall, "onProjectUploadComplete fired for project");
-    assert.equal(projectCall.videoid, ID2);
+    assert.equal(projectCall.artifactId, ID2);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("projectid metadata alias works identically to videoid", async () => {
+test("artifactId/videoid/projectid metadata keys are all accepted as the id alias", async () => {
   const ctx = await startApp();
   try {
-    const payload = Buffer.from("pulse project data");
     await uploadFull(ctx, {
-      videoid: ID1,
-      idKey: "projectid", // use the alias
-      filename: "draft.pulse",
-      kind: "project",
-      payload,
-    });
-
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
-    assert.equal(get.status, 200, "GET succeeds with projectid alias");
-    const ct = get.headers.get("content-type");
-    assert.ok(ct?.includes("application/octet-stream"), `content-type was: ${ct}`);
-  } finally {
-    await ctx.teardown();
-  }
-});
-
-test("getKind returns 'project' for project uploads and 'video' for video uploads", async () => {
-  const ctx = await startApp();
-  try {
-    // Project upload
-    const pulse = Buffer.from("pulse data");
-    await uploadFull(ctx, {
-      videoid: ID1,
-      filename: "draft.pulse",
-      kind: "project",
-      payload: pulse,
-    });
-
-    // Video upload (no kind → defaults to video)
-    const mp4Header = Buffer.from([
-      0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70,
-      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
-    ]);
-    const mp4 = Buffer.alloc(1024);
-    mp4Header.copy(mp4, 0);
-    await uploadFull(ctx, { videoid: ID2, filename: "clip.mp4", payload: mp4 });
-
-    const projectKind = await ctx.storage.getKind(ID1);
-    assert.equal(projectKind, "project");
-
-    const videoKind = await ctx.storage.getKind(ID2);
-    assert.equal(videoKind, "video");
-
-    const unknownKind = await ctx.storage.getKind("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
-    assert.equal(unknownKind, null);
-  } finally {
-    await ctx.teardown();
-  }
-});
-
-test("legacy sidecar without kind field resolves as video and streams correctly", async () => {
-  const ctx = await startApp();
-  try {
-    // Manually write a pre-kind sidecar (as if written by the old plugin version)
-    await fs.mkdir(path.join(ctx.workspaceDir, "video"), { recursive: true });
-    await fs.mkdir(path.join(ctx.workspaceDir, ".pulsevault"), { recursive: true });
-
-    // Write a minimal valid MP4 as the upload bytes
-    const mp4Header = Buffer.from([
-      0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70,
-      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
-    ]);
-    const mp4 = Buffer.alloc(1024);
-    mp4Header.copy(mp4, 0);
-    await fs.writeFile(path.join(ctx.workspaceDir, "video", `${ID1}.mp4`), mp4);
-
-    // Old sidecar format: no `kind` field
-    const legacySidecar = JSON.stringify({
-      version: 1,
-      ext: ".mp4",
+      artifactId: ID1,
+      idKey: "videoid",
       filename: "clip.mp4",
-      status: "ready",
-      // `kind` intentionally absent
+      payload: makeMp4(1024),
     });
-    await fs.writeFile(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`), legacySidecar);
+    const get1 = await fetch(artifactUrl(ctx, ID1));
+    assert.equal(get1.status, 200, "videoid alias works");
 
-    // GET must succeed as a video
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/${ID1}`);
-    assert.equal(get.status, 200, "legacy sidecar resolves as 200");
-    const ct = get.headers.get("content-type");
-    assert.ok(ct?.includes("video/mp4"), `expected video/mp4, got ${ct}`);
-
-    // getKind must default to "video"
-    const kind = await ctx.storage.getKind(ID1);
-    assert.equal(kind, "video", "legacy upload reports kind=video");
+    await uploadFull(ctx, {
+      artifactId: ID2,
+      idKey: "projectid",
+      filename: "draft.pulse",
+      kind: "project",
+      payload: Buffer.from("pulse project data"),
+    });
+    const get2 = await fetch(artifactUrl(ctx, ID2));
+    assert.equal(get2.status, 200, "projectid alias works");
   } finally {
     await ctx.teardown();
   }
 });
 
-test("DELETE works for kind=project", async () => {
+test("getKind returns the right kind for video/project/captions, null for unknown", async () => {
   const ctx = await startApp();
   try {
-    const payload = Buffer.from("pulse data");
     await uploadFull(ctx, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "draft.pulse",
       kind: "project",
-      payload,
+      payload: Buffer.from("pulse data"),
+    });
+    await uploadFull(ctx, { artifactId: ID2, filename: "clip.mp4", payload: makeMp4(1024) });
+
+    assert.equal(await ctx.storage.getKind(ID1), "project");
+    assert.equal(await ctx.storage.getKind(ID2), "video");
+    assert.equal(await ctx.storage.getKind("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"), null);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("DELETE works for kind=project, through the generic route", async () => {
+  const ctx = await startApp();
+  try {
+    await uploadFull(ctx, {
+      artifactId: ID1,
+      filename: "draft.pulse",
+      kind: "project",
+      payload: Buffer.from("pulse data"),
     });
 
-    const preGet = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
+    const preGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(preGet.status, 200);
 
-    const del = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`, { method: "DELETE" });
+    const del = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
     assert.equal(del.status, 204);
 
     const sidecarStat = await fs.stat(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`)).catch(() => null);
     assert.equal(sidecarStat, null, "sidecar removed");
 
-    const postGet = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID1}`);
+    const postGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(postGet.status, 404);
   } finally {
     await ctx.teardown();
@@ -430,9 +381,8 @@ test("allowedExtensions object form: custom video and project extensions", async
     allowedExtensions: { video: [".mp4"], project: [".pulse"] },
   });
   try {
-    // .zip should be rejected (not in the custom project list)
     const zipCreate = await tusCreate(ctx.baseUrl, {
-      videoid: ID1,
+      artifactId: ID1,
       filename: "archive.zip",
       size: 512,
       kind: "project",
@@ -442,16 +392,97 @@ test("allowedExtensions object form: custom video and project extensions", async
       `expected 4xx for .zip, got ${zipCreate.status}`,
     );
 
-    // .pulse should still be allowed
-    const payload = Buffer.from("pulse data");
     await uploadFull(ctx, {
-      videoid: ID2,
+      artifactId: ID2,
       filename: "draft.pulse",
       kind: "project",
-      payload,
+      payload: Buffer.from("pulse data"),
     });
-    const get = await fetch(`${ctx.baseUrl}${PREFIX}/project/${ID2}`);
+    const get = await fetch(artifactUrl(ctx, ID2));
     assert.equal(get.status, 200);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+// ---------- kind=captions ----------
+
+test("kind=captions happy path: .srt under captions/ subdir, sharing a session via relatedTo", async () => {
+  const ctx = await startApp();
+  try {
+    // The video this captions artifact belongs to.
+    await uploadFull(ctx, { artifactId: ID1, filename: "clip.mp4", payload: makeMp4(1024) });
+
+    const srt = Buffer.from("1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+    await uploadFull(ctx, {
+      artifactId: ID2,
+      filename: "clip.srt",
+      kind: "captions",
+      relatedTo: ID1,
+      payload: srt,
+    });
+
+    const expectedPath = path.join(ctx.workspaceDir, "captions", `${ID2}.srt`);
+    const stat = await fs.stat(expectedPath);
+    assert.ok(stat.isFile(), "srt exists at captions/ subdir");
+
+    const get = await fetch(artifactUrl(ctx, ID2));
+    assert.equal(get.status, 200);
+    const ct = get.headers.get("content-type");
+    assert.ok(ct?.includes("application/x-subrip"), `content-type was: ${ct}`);
+
+    assert.equal(await ctx.storage.getKind(ID2), "captions");
+    assert.equal(await ctx.storage.getRelatedTo(ID2), ID1, "relatedTo recorded for the session link");
+    assert.equal(await ctx.storage.getRelatedTo(ID1), null, "the video itself has no relatedTo");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("kind=captions with a non-.srt extension is rejected at create", async () => {
+  const ctx = await startApp();
+  try {
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.vtt",
+      size: 64,
+      kind: "captions",
+    });
+    assert.ok(
+      create.status >= 400 && create.status < 500,
+      `expected 4xx for .vtt under default captions extensions, got ${create.status}`,
+    );
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+// ---------- legacy back-compat ----------
+
+test("legacy sidecar without a kind field resolves as video and streams correctly", async () => {
+  const ctx = await startApp();
+  try {
+    await fs.mkdir(path.join(ctx.workspaceDir, "video"), { recursive: true });
+    await fs.mkdir(path.join(ctx.workspaceDir, ".pulsevault"), { recursive: true });
+    const mp4 = makeMp4(1024);
+    await fs.writeFile(path.join(ctx.workspaceDir, "video", `${ID1}.mp4`), mp4);
+
+    const legacySidecar = JSON.stringify({
+      version: 1,
+      ext: ".mp4",
+      filename: "clip.mp4",
+      status: "ready",
+      // `kind` intentionally absent.
+    });
+    await fs.writeFile(path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`), legacySidecar);
+
+    const get = await fetch(artifactUrl(ctx, ID1));
+    assert.equal(get.status, 200, "legacy sidecar resolves as 200");
+    const ct = get.headers.get("content-type");
+    assert.ok(ct?.includes("video/mp4"), `expected video/mp4, got ${ct}`);
+
+    const kind = await ctx.storage.getKind(ID1);
+    assert.equal(kind, "video", "legacy upload reports kind=video");
   } finally {
     await ctx.teardown();
   }

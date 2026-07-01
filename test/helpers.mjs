@@ -27,26 +27,34 @@ export function makeMp4(size) {
   return body;
 }
 
-export async function tusCreate(baseUrl, prefix, { videoid, filename, size, kind }) {
-  const parts = [`videoid ${b64(videoid)}`, `filename ${b64(filename)}`];
+export async function tusCreate(
+  baseUrl,
+  prefix,
+  { artifactId, idKey = "artifactId", filename, size, kind, relatedTo, checksum, headers = {} },
+) {
+  const parts = [`${idKey} ${b64(artifactId)}`, `filename ${b64(filename)}`];
   if (kind) parts.push(`kind ${b64(kind)}`);
+  if (relatedTo) parts.push(`relatedTo ${b64(relatedTo)}`);
+  if (checksum) parts.push(`checksum ${b64(checksum)}`);
   return fetch(`${baseUrl}${prefix}/upload`, {
     method: "POST",
     headers: {
       "Tus-Resumable": "1.0.0",
       "Upload-Length": String(size),
       "Upload-Metadata": parts.join(","),
+      ...headers,
     },
   });
 }
 
-export async function tusPatch(url, offset, body) {
+export async function tusPatch(url, offset, body, headers = {}) {
   return fetch(url, {
     method: "PATCH",
     headers: {
       "Tus-Resumable": "1.0.0",
       "Upload-Offset": String(offset),
       "Content-Type": "application/offset+octet-stream",
+      ...headers,
     },
     body,
   });
@@ -64,19 +72,22 @@ export async function tusHead(url) {
 export async function uploadFull(
   baseUrl,
   prefix,
-  { videoid, filename = "clip.mp4", size = 1024, kind, body } = {},
+  { artifactId, filename = "clip.mp4", size = 1024, kind, relatedTo, checksum, body, headers } = {},
 ) {
   const payload = body ?? makeMp4(size);
   const create = await tusCreate(baseUrl, prefix, {
-    videoid,
+    artifactId,
     filename,
     size: payload.length,
     kind,
+    relatedTo,
+    checksum,
+    headers,
   });
   assert.equal(create.status, 201, "create");
   const location = create.headers.get("location");
   assert.ok(location, "location header");
-  const patch = await tusPatch(location, 0, payload);
+  const patch = await tusPatch(location, 0, payload, headers);
   assert.equal(patch.status, 204, "patch");
   return { body: payload, location };
 }
