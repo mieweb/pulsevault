@@ -197,7 +197,7 @@ ones.
 ### 5.1 Token transport
 
 A client MUST send the pairing token as `Authorization: Bearer <token>` on
-every `POST`/`PATCH`/`DELETE` request to `{prefix}/upload*`, and SHOULD also
+every `POST`/`PATCH`/`HEAD`/`DELETE` request to `{prefix}/upload*`, and SHOULD also
 send it as `?token=` on `GET` requests to a watch/playback URL (some servers
 validate playback links without requiring a header, e.g. for browser
 playback). See §4.3 for why the resource URL these requests target must

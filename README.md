@@ -317,6 +317,8 @@ Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` i
 
 Optional async hook called before TUS create/patch, before GET resolve, and before DELETE. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
 
+Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers **every other request on the upload routes** — `PATCH` chunks, `HEAD` offset queries, **and the in-flight cancel `DELETE {prefix}/upload/<id>`**; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` fires **only** for the finalized-artifact route `DELETE {prefix}/artifacts/<id>`. If you gate deletion on `phase === "delete"` alone, you are not gating upload cancellation — that arrives as `"patch"`.
+
 ```ts
 type PulseVaultAuthorize = (
   // PulseVaultRequest only requires `.headers` — under the Fastify plugin
