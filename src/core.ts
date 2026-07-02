@@ -350,7 +350,20 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       stashPulseVaultContext(req, { artifactId, kind, relatedTo });
     }
 
-    if (!authorize || !artifactId) {
+    if (!authorize) {
+      return { ok: true, artifactId, kind, relatedTo };
+    }
+
+    if (!artifactId && phase === 'patch') {
+      // PROTOCOL.md §5.2: failing to resolve the artifactId for an in-flight
+      // upload request is an authorization failure — reject, don't fall
+      // through to "no artifactId to check, so allow".
+      logger.info({ url: req.url, phase }, 'pulsevault authorize rejected: unresolvable artifactId');
+      writeJson(res, 403, pulseVaultError('Unable to resolve artifact for authorization'));
+      return { ok: false };
+    }
+
+    if (!artifactId) {
       return { ok: true, artifactId, kind, relatedTo };
     }
 
