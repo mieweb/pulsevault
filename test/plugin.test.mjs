@@ -292,6 +292,38 @@ test("authorize rejection blocks PATCH and HEAD on an existing upload, and sees 
   }
 });
 
+test("PATCH/HEAD with an unresolvable upload id is a hard 403 when authorize is configured (PROTOCOL.md §5.2)", async () => {
+  // Regression test: when the artifactId cannot be recovered from the tus
+  // URL, authorization-context resolution failure must be treated as an
+  // authorization failure — never "no artifactId to check, so allow".
+  const authorizedIds = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: async (_req, { artifactId }) => {
+        authorizedIds.push(artifactId);
+      },
+    },
+  });
+  try {
+    // Valid base64url characters, but decodes to garbage with no UUID inside,
+    // so `artifactIdFromTusUrl` cannot resolve an artifactId for it.
+    const bogus = `${ctx.baseUrl}${PREFIX}/upload/not-a-real-upload-id`;
+
+    const patch = await tusPatch(bogus, 0, makeMp4(1024));
+    assert.equal(patch.status, 403, "unresolvable PATCH target must be rejected, not silently allowed");
+
+    const head = await tusHead(bogus);
+    assert.equal(head.status, 403, "unresolvable HEAD target must be rejected too");
+
+    assert.ok(
+      authorizedIds.every((id) => id !== undefined),
+      "authorize must never be invoked with an undefined artifactId",
+    );
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("a crafted multi-segment PATCH URL cannot smuggle bytes into a different artifact than authorize() checked", async () => {
   // Regression test for a URL-parsing divergence: `authorize()`'s artifactId
   // must always be resolved the same way `@tus/server` itself resolves the
