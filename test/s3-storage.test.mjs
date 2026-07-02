@@ -9,6 +9,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
+// Must precede the s3rver import: grafts the fast-xml-parser v3 API s3rver
+// expects onto the v5 copy the security override in package.json gives it.
+import "./s3rver-fxp-compat.mjs";
 import S3rver from "s3rver";
 import Fastify from "fastify";
 import pulseVault, {
