@@ -82,27 +82,11 @@ app.get("/favicon.png", { schema: { tags: ["demo"], summary: "Favicon (PNG)" } }
 app.post("/reserve", { schema: { tags: ["demo"], summary: "Reserve a new artifactId" } }, async (_req, reply) =>
   reply.send({ artifactId: randomUUID() }));
 
-// Minimal SRT -> WebVTT conversion (same as fastify-auth-demo) — older Pulse apps
-// upload SRT, but browsers only understand WebVTT, whether in a <track> or fetched raw.
-// Newer apps upload WebVTT directly (with word-level cue timestamps) and skip this.
-function srtToVtt(srt) {
-  const body = srt
-    .replace(/\r+/g, "")
-    .replace(/^﻿/, "")
-    .split(/\n\n+/)
-    .filter((block) => block.trim().length > 0)
-    .map((block) => {
-      const lines = block.split("\n");
-      if (/^\d+$/.test(lines[0])) lines.shift(); // SRT's numeric cue index — WebVTT doesn't need it
-      return lines.join("\n");
-    })
-    .join("\n\n");
-  return `WEBVTT\n\n${body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}\n`;
-}
-
-// Serve a subtitles artifact as WebVTT. The wire protocol calls the kind
-// "captions" (PROTOCOL.md), but user-facing they're subtitles — spoken-word
-// transcript, not accessibility captions — so the demo names this route that way.
+// Serve a subtitles artifact as WebVTT — exactly the bytes the app uploaded,
+// word-level cue timestamps (<00:00:01.500>word) and all. The wire protocol
+// calls the kind "captions" (PROTOCOL.md), but user-facing they're subtitles —
+// spoken-word transcript, not accessibility captions — so the demo names this
+// route that way.
 app.get(
   "/subtitles/:artifactId",
   {
@@ -124,18 +108,16 @@ app.get(
     } catch {
       return reply.code(404).send();
     }
-    // Only convert real, finished captions uploads — never hand a video body to text/vtt.
+    // Only serve real, finished captions uploads — never hand a video body to text/vtt.
     if (sidecar.kind !== "captions" || sidecar.status !== "ready") return reply.code(404).send();
-    const ext = sidecar.ext ?? ".srt";
+    const ext = sidecar.ext ?? ".vtt";
     let text;
     try {
       text = await readFile(path.join(dataDir, "captions", `${artifactId}${ext}`), "utf8");
     } catch {
       return reply.code(404).send();
     }
-    // Native VTT passes through untouched — it may carry word-level cue timestamps
-    // (<00:00:01.500>word) that a lossy round-trip would destroy. Only SRT converts.
-    return reply.type("text/vtt").send(ext === ".vtt" ? text : srtToVtt(text));
+    return reply.type("text/vtt").send(text);
   },
 );
 
@@ -195,7 +177,7 @@ app.get("/videos", { schema: { tags: ["demo"], summary: "List finished uploads (
 
   // Pair each video with its subtitles (kind "captions" on the wire) the same
   // way fastify-auth-demo does: within a pulse (shared `relatedTo ?? artifactId`
-  // anchor), the app names a beat's SRT after its video, so matching filename
+  // anchor), the app names a beat's VTT after its video, so matching filename
   // stems pair them. Fallback: a pulse with exactly one video and one subtitles
   // file is an unambiguous pair even if the stems drifted.
   const stem = (filename) => filename.replace(/\.[^.]+$/, "");
@@ -268,9 +250,9 @@ await app.register(pulseVault, {
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit,
   // All three kinds stay enabled — a beat-mode session from the real app
-  // uploads a .pulse ordering manifest and .vtt (or legacy .srt) captions alongside its videos;
+  // uploads a .pulse ordering manifest and .vtt captions alongside its videos;
   // rejecting those would make this a broken pairing target.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
 });
 
 await app.listen({ port, host });

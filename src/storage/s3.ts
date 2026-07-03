@@ -64,8 +64,6 @@ function extToContentType(ext: string): string {
       return 'video/mp4';
     case '.zip':
       return 'application/zip';
-    case '.srt':
-      return 'application/x-subrip';
     case '.vtt':
       return 'text/vtt';
     default:

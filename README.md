@@ -186,7 +186,7 @@ Four runnable example servers live under [`examples/`](examples):
   a Prisma schema holding both the auth tables and an artifact index
   (`onUploadComplete` writes each finished upload once; `/pulses` is one
   query instead of a sidecar crawl), uploads grouped by recording session
-  via `relatedTo`, WebVTT captions (SRT converted on the fly), Swagger UI, and an `onArtifactEvent`
+  via `relatedTo`, WebVTT captions, Swagger UI, and an `onArtifactEvent`
   live feed.
 - [`examples/express-demo`](examples/express-demo) and
   [`examples/meteor-demo`](examples/meteor-demo) — the same demo on
@@ -248,7 +248,7 @@ type PulseVaultPluginOptions = {
   allowedExtensions?:
     | string[]                                                          // legacy — treated as video-only
     | { video?: string[]; project?: string[]; captions?: string[] };    // per-kind (recommended)
-  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] }
+  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] }
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;          // runs for every kind; branch on ctx.kind
@@ -302,13 +302,13 @@ File extensions accepted per artifact kind. Three accepted forms:
 
 ```ts
 // 1. Omit entirely — uses all three defaults:
-//    video: [".mp4"]   project: [".pulse", ".zip"]   captions: [".srt", ".vtt"]
+//    video: [".mp4"]   project: [".pulse", ".zip"]   captions: [".vtt"]
 
 // 2. Flat array (legacy) — video-only; project/captions keep their defaults:
 allowedExtensions: [".mp4"]
 
 // 3. Per-kind object — unset keys fall back to their defaults:
-allowedExtensions: { video: [".mp4"], project: [".pulse"], captions: [".srt", ".vtt"] }
+allowedExtensions: { video: [".mp4"], project: [".pulse"], captions: [".vtt"] }
 ```
 
 All extensions must include the leading dot and are matched case-insensitively. The `kind` field in `Upload-Metadata` determines which list is checked.
@@ -473,7 +473,7 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "maxSupportedVersion": 1,
   "uploadUnit": "beat",
   "kinds": ["video", "project", "captions"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".srt", ".vtt"] },
+  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"] },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }

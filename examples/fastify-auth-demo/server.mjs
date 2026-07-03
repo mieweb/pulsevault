@@ -1,6 +1,6 @@
 // Production-shaped Fastify reference server for @mieweb/pulsevault:
 // capability tokens ALWAYS on (refuses to boot without PULSEVAULT_SECRET),
-// pulse-session grouping via relatedTo, WebVTT captions (SRT converted on the fly), Swagger UI,
+// pulse-session grouping via relatedTo, WebVTT captions, Swagger UI,
 // and a live artifact-event feed. Local filesystem storage.
 // For the smallest possible mount (no auth, no hooks) see
 // ../fastify-demo/server.mjs.
@@ -438,7 +438,7 @@ app.get(
 
 /**
  * Reads a finalized artifact's bytes as text. Used for parsing the ordering
- * manifest (`kind=project`) and for serving captions as WebVTT
+ * manifest (`kind=project`) and for serving WebVTT captions
  * (`kind=captions`) — both small text files, so a full read is fine (unlike
  * video bytes, which the checksum validator/sniffer stream instead of
  * buffering).
@@ -453,30 +453,14 @@ async function readArtifactText(artifactId) {
   }
 }
 
-/** Minimal SRT -> WebVTT conversion for legacy SRT uploads — browsers only understand WebVTT in a <track>, never SRT. Newer Pulse apps upload WebVTT directly. */
-function srtToVtt(srt) {
-  const body = srt
-    .replace(/\r+/g, "")
-    .replace(/^﻿/, "")
-    .split(/\n\n+/)
-    .filter((block) => block.trim().length > 0)
-    .map((block) => {
-      const lines = block.split("\n");
-      if (/^\d+$/.test(lines[0])) lines.shift(); // SRT's numeric cue index — WebVTT doesn't need it
-      return lines.join("\n");
-    })
-    .join("\n\n");
-  return `WEBVTT\n\n${body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}\n`;
-}
-
 app.get(
   "/captions/:artifactId",
   {
     schema: {
       tags: ["demo"],
-      summary: "Fetch a captions artifact as WebVTT",
+      summary: "Fetch a captions artifact (WebVTT)",
       description:
-        "Demo-only convenience route (not part of the pulsevault plugin) that serves a `kind=captions` upload as WebVTT (native VTT passes through; legacy SRT converts) so the gallery's <track> element can render it. Applies the same relatedTo-aware capability-token check as the plugin's own routes (token via `?token=`, like the plugin's resolve phase — NOT a dashboard session, so it works for any client).",
+        "Demo-only convenience route (not part of the pulsevault plugin) that serves a `kind=captions` WebVTT upload — byte-for-byte, word-level cue timestamps intact — so the gallery's <track> element can render it. Applies the same relatedTo-aware capability-token check as the plugin's own routes (token via `?token=`, like the plugin's resolve phase — NOT a dashboard session, so it works for any client).",
       params: {
         type: "object",
         properties: { artifactId: { type: "string", format: "uuid" } },
@@ -497,10 +481,7 @@ app.get(
     if (!authorized) return reply.code(403).send();
     const text = await readArtifactText(artifactId);
     if (text === null) return reply.code(404).send();
-    // Newer Pulse apps upload WebVTT directly (with word-level cue timestamps a lossy
-    // round-trip would destroy) — pass it through; only legacy SRT needs converting.
-    const isVtt = text.replace(/^﻿/, "").startsWith("WEBVTT");
-    return reply.type("text/vtt").send(isVtt ? text : srtToVtt(text));
+    return reply.type("text/vtt").send(text);
   },
 );
 
@@ -793,7 +774,7 @@ const pulseStorage = createLocalStorage({ workspaceDir: dataDir });
 // validatePayload for video uploads: verify the client-supplied checksum
 // first (the Pulse app always sends one), then the MP4 magic-byte sniff —
 // chained per the README's `createChecksumValidator(createMp4Sniffer(storage))`
-// pattern. Composed once here, not per request. Project bundles and SRT
+// pattern. Composed once here, not per request. Project bundles and WebVTT
 // captions get neither: they never start with an ISOBMFF ftyp box, and the
 // app doesn't checksum them.
 const validateVideo = createChecksumValidator(createMp4Sniffer(pulseStorage));
@@ -805,8 +786,8 @@ await app.register(pulseVault, {
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit: uploadUnitDefault,
-  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT/WebVTT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
+  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and WebVTT captions.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
   // validatePayload runs for every kind, with ctx.kind telling you which.
   validatePayload: async (request, ctx) => {
     if (ctx.kind !== "video") return;

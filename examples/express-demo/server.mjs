@@ -175,11 +175,11 @@ const pulseVault = createPulseVaultCore({
   stripBasePath: false,
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT/WebVTT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
+  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and WebVTT captions.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
   // validatePayload now runs for every kind, with ctx.kind telling you which
   // — only apply the MP4 magic-byte sniff to actual videos, since project
-  // bundles and SRT captions never start with an ISOBMFF ftyp box. The S3
+  // bundles and WebVTT captions never start with an ISOBMFF ftyp box. The S3
   // sniffer does a ranged read of the object; the local one reads the file
   // on disk.
   validatePayload: async (request, ctx) => {

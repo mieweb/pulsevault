@@ -159,18 +159,16 @@
       }
 
       // Parse the WebVTT served by /subtitles/:id into cues with per-word timing.
-      // Word timing comes from WebVTT inline cue timestamps when present
+      // Word timing comes from WebVTT inline cue timestamps
       // (`word <00:00:01.500>word` — the karaoke syntax the Pulse app emits from
-      // whisper's word-level output); files converted from line-level SRT have no
-      // tags, so their word boundaries are linearly interpolated across the cue —
-      // an approximation that looks right at demo scale.
+      // whisper's word-level output); cues without tags fall back to linear
+      // interpolation across the cue — an approximation that looks right at demo scale.
       function parseVtt(text) {
         const toSeconds = (h, m, s, ms) => (+h) * 3600 + (+m) * 60 + (+s) + (+ms) / 1000;
         const parseStamp = (stamp) => {
           const [, h, m, s, ms] = stamp.match(/(\d{2}):(\d{2}):(\d{2})[.,](\d{3})/);
           return toSeconds(h, m, s, ms);
         };
-        // Accept both VTT dots and raw SRT commas so the parser survives either input.
         const time = /(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/;
         const cues = [];
         for (const block of text.replace(/\r+/g, "").split(/\n\n+/)) {

@@ -18,9 +18,9 @@ export type PulseVaultAllowedExtensions = {
 
 const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
 const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
-// Both formats: newer Pulse apps upload WebVTT (which can carry word-level cue
-// timestamps for karaoke rendering); older ones upload SRT.
-const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.srt', '.vtt'];
+// WebVTT only — it's what the Pulse app uploads, and it carries word-level
+// inline cue timestamps (`<00:00:01.500>word`) for karaoke rendering.
+const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**

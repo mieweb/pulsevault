@@ -77,13 +77,11 @@ if you've evaluated against an intermediate build.
 
 ### Added
 
-- **`kind: "captions"`** artifact type (default extensions `.srt` and
-  `.vtt`), running through the same generic
-  `validatePayload`/`onUploadComplete` hooks as every other kind. WebVTT is
-  the preferred upload format — it can carry word-level inline cue
-  timestamps (`<00:00:01.500>word`) for karaoke rendering — and both storage
-  adapters serve `.vtt` artifacts with the `text/vtt` content type; SRT
-  stays accepted for older clients.
+- **`kind: "captions"`** artifact type (default extension `.vtt`), running
+  through the same generic `validatePayload`/`onUploadComplete` hooks as
+  every other kind. WebVTT carries word-level inline cue timestamps
+  (`<00:00:01.500>word`) for karaoke rendering, and both storage adapters
+  serve `.vtt` artifacts with the `text/vtt` content type.
 - **`relatedTo`** — an optional `Upload-Metadata` key (and matching
   `ReserveUploadParams`/storage field) linking one artifact to another (e.g.
   a video's captions, or a beat belonging to a pulse manifest's session).
@@ -155,7 +153,7 @@ if you've evaluated against an intermediate build.
   storage, QR pairing; start here) and `examples/fastify-auth-demo`
   (production-shaped reference — capability tokens always on, failing fast at
   boot without `PULSEVAULT_SECRET`, pulse-session grouping via `relatedTo`,
-  SRT→WebVTT captions, Swagger UI, artifact-event feed). Both pairing pages
+  WebVTT captions, Swagger UI, artifact-event feed). Both pairing pages
   are React (pinned ESM CDN builds, no bundler). Both examples are
   local-storage only; S3 wiring is documented in the README's S3 section
   rather than demonstrated in an example. `npm run e2e` now drives
