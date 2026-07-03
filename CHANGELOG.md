@@ -77,9 +77,13 @@ if you've evaluated against an intermediate build.
 
 ### Added
 
-- **`kind: "captions"`** artifact type (default extension `.srt`), running
-  through the same generic `validatePayload`/`onUploadComplete` hooks as
-  every other kind.
+- **`kind: "captions"`** artifact type (default extensions `.srt` and
+  `.vtt`), running through the same generic
+  `validatePayload`/`onUploadComplete` hooks as every other kind. WebVTT is
+  the preferred upload format — it can carry word-level inline cue
+  timestamps (`<00:00:01.500>word`) for karaoke rendering — and both storage
+  adapters serve `.vtt` artifacts with the `text/vtt` content type; SRT
+  stays accepted for older clients.
 - **`relatedTo`** — an optional `Upload-Metadata` key (and matching
   `ReserveUploadParams`/storage field) linking one artifact to another (e.g.
   a video's captions, or a beat belonging to a pulse manifest's session).

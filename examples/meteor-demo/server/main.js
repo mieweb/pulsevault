@@ -185,7 +185,7 @@ const pulseVault = createPulseVaultCore({
   stripBasePath: false,
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
   validatePayload: async (request, ctx) => {
     if (ctx.kind !== "video") return;
     const sniff = useS3 ? createS3Mp4Sniffer(pulseStorage) : createMp4Sniffer(pulseStorage);

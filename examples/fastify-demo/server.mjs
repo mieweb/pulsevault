@@ -19,6 +19,7 @@ import pulseVault, { createLocalStorage, buildUploadLink } from "@mieweb/pulseva
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
+const videosHtml = readFileSync(path.join(__dirname, "public/videos.html"), "utf8");
 const favicon = readFileSync(path.join(__dirname, "public/favicon.png"));
 const dataDir = path.join(__dirname, "data");
 
@@ -68,6 +69,10 @@ await app.register(fastifySwaggerUI, {
 app.get("/", { schema: { tags: ["demo"], summary: "Pairing page (HTML)" } }, (_req, reply) =>
   reply.type("text/html").send(html));
 
+// The uploads live on their own page — /videos is the JSON API, so the page sits at /library.
+app.get("/library", { schema: { tags: ["demo"], summary: "Uploads page (HTML)" } }, (_req, reply) =>
+  reply.type("text/html").send(videosHtml));
+
 // The Pulse app icon, resized — referenced by <link rel="icon"> on the page.
 app.get("/favicon.png", { schema: { tags: ["demo"], summary: "Favicon (PNG)" } }, (_req, reply) =>
   reply.type("image/png").send(favicon));
@@ -76,6 +81,63 @@ app.get("/favicon.png", { schema: { tags: ["demo"], summary: "Favicon (PNG)" } }
 // can later attach auth tokens, quotas, or other server-side state here.
 app.post("/reserve", { schema: { tags: ["demo"], summary: "Reserve a new artifactId" } }, async (_req, reply) =>
   reply.send({ artifactId: randomUUID() }));
+
+// Minimal SRT -> WebVTT conversion (same as fastify-auth-demo) — older Pulse apps
+// upload SRT, but browsers only understand WebVTT, whether in a <track> or fetched raw.
+// Newer apps upload WebVTT directly (with word-level cue timestamps) and skip this.
+function srtToVtt(srt) {
+  const body = srt
+    .replace(/\r+/g, "")
+    .replace(/^﻿/, "")
+    .split(/\n\n+/)
+    .filter((block) => block.trim().length > 0)
+    .map((block) => {
+      const lines = block.split("\n");
+      if (/^\d+$/.test(lines[0])) lines.shift(); // SRT's numeric cue index — WebVTT doesn't need it
+      return lines.join("\n");
+    })
+    .join("\n\n");
+  return `WEBVTT\n\n${body.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")}\n`;
+}
+
+// Serve a subtitles artifact as WebVTT. The wire protocol calls the kind
+// "captions" (PROTOCOL.md), but user-facing they're subtitles — spoken-word
+// transcript, not accessibility captions — so the demo names this route that way.
+app.get(
+  "/subtitles/:artifactId",
+  {
+    schema: {
+      tags: ["demo"],
+      summary: "Fetch a subtitles artifact as WebVTT",
+      params: {
+        type: "object",
+        properties: { artifactId: { type: "string", format: "uuid" } },
+        required: ["artifactId"],
+      },
+    },
+  },
+  async (req, reply) => {
+    const { artifactId } = req.params;
+    let sidecar;
+    try {
+      sidecar = JSON.parse(await readFile(path.join(dataDir, ".pulsevault", `${artifactId}.json`), "utf8"));
+    } catch {
+      return reply.code(404).send();
+    }
+    // Only convert real, finished captions uploads — never hand a video body to text/vtt.
+    if (sidecar.kind !== "captions" || sidecar.status !== "ready") return reply.code(404).send();
+    const ext = sidecar.ext ?? ".srt";
+    let text;
+    try {
+      text = await readFile(path.join(dataDir, "captions", `${artifactId}${ext}`), "utf8");
+    } catch {
+      return reply.code(404).send();
+    }
+    // Native VTT passes through untouched — it may carry word-level cue timestamps
+    // (<00:00:01.500>word) that a lossy round-trip would destroy. Only SRT converts.
+    return reply.type("text/vtt").send(ext === ".vtt" ? text : srtToVtt(text));
+  },
+);
 
 // List all uploads under dataDir. Reads each upload's sidecar to determine
 // kind and subdir rather than hard-coding "video/" — handles video/project/captions.
@@ -119,15 +181,46 @@ app.get("/videos", { schema: { tags: ["demo"], summary: "List finished uploads (
           filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
           ext,
           size: artifactStat.size,
+          // Session anchor this artifact belongs to (beat videos/captions point at their
+          // manifest; a merged video's captions point at the video) — lets the library page
+          // group one pulse's artifacts together instead of listing them flat.
+          relatedTo: sidecar.relatedTo ?? null,
           playbackUrl: `/pulsevault/artifacts/${artifactId}`,
           creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
         };
       }),
   );
 
-  return reply.send(
-    uploads.filter(Boolean).sort((a, b) => b.creation_date.localeCompare(a.creation_date)),
-  );
+  const ready = uploads.filter(Boolean);
+
+  // Pair each video with its subtitles (kind "captions" on the wire) the same
+  // way fastify-auth-demo does: within a pulse (shared `relatedTo ?? artifactId`
+  // anchor), the app names a beat's SRT after its video, so matching filename
+  // stems pair them. Fallback: a pulse with exactly one video and one subtitles
+  // file is an unambiguous pair even if the stems drifted.
+  const stem = (filename) => filename.replace(/\.[^.]+$/, "");
+  const byAnchor = new Map();
+  for (const u of ready) {
+    const anchorId = u.relatedTo ?? u.artifactId;
+    if (!byAnchor.has(anchorId)) byAnchor.set(anchorId, []);
+    byAnchor.get(anchorId).push(u);
+  }
+  for (const group of byAnchor.values()) {
+    const videos = group.filter((u) => u.kind === "video");
+    const subsPool = group.filter((u) => u.kind === "captions");
+    for (const video of videos) {
+      const idx = subsPool.findIndex((s) => stem(s.filename) === stem(video.filename));
+      const matched =
+        idx >= 0
+          ? subsPool.splice(idx, 1)[0]
+          : videos.length === 1 && subsPool.length === 1
+            ? subsPool.pop()
+            : null;
+      video.subtitlesUrl = matched ? `/subtitles/${matched.artifactId}` : null;
+    }
+  }
+
+  return reply.send(ready.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));
 });
 
 // One deeplink + matching QR per request. artifactId is generated server-side
@@ -175,9 +268,9 @@ await app.register(pulseVault, {
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit,
   // All three kinds stay enabled — a beat-mode session from the real app
-  // uploads a .pulse ordering manifest and .srt captions alongside its videos;
+  // uploads a .pulse ordering manifest and .vtt (or legacy .srt) captions alongside its videos;
   // rejecting those would make this a broken pairing target.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
 });
 
 await app.listen({ port, host });

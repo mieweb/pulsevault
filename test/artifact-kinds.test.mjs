@@ -439,7 +439,7 @@ test("kind=captions happy path: .srt under captions/ subdir, sharing a session v
   }
 });
 
-test("kind=captions with a non-.srt extension is rejected at create", async () => {
+test("kind=captions accepts .vtt under default captions extensions", async () => {
   const ctx = await startApp();
   try {
     const create = await tusCreate(ctx.baseUrl, {
@@ -448,9 +448,28 @@ test("kind=captions with a non-.srt extension is rejected at create", async () =
       size: 64,
       kind: "captions",
     });
+    assert.equal(
+      create.status,
+      201,
+      `expected 201 for .vtt under default captions extensions (['.srt', '.vtt']), got ${create.status}`,
+    );
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("kind=captions with an unlisted extension is rejected at create", async () => {
+  const ctx = await startApp();
+  try {
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.txt",
+      size: 64,
+      kind: "captions",
+    });
     assert.ok(
       create.status >= 400 && create.status < 500,
-      `expected 4xx for .vtt under default captions extensions, got ${create.status}`,
+      `expected 4xx for .txt under default captions extensions, got ${create.status}`,
     );
   } finally {
     await ctx.teardown();

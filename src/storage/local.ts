@@ -63,6 +63,8 @@ function extToContentType(ext: string): string {
       return 'application/zip';
     case '.srt':
       return 'application/x-subrip';
+    case '.vtt':
+      return 'text/vtt';
     default:
       return 'application/octet-stream';
   }

@@ -39,7 +39,7 @@ The response body MUST be a JSON object with at least the following fields:
   "maxSupportedVersion": 1,
   "uploadUnit": "beat",
   "kinds": ["video", "project", "captions"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".srt"] },
+  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".srt", ".vtt"] },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
@@ -292,7 +292,9 @@ other.
 Under `uploadUnit: "beat"`, a client uploads each beat under its own
 `artifactId`, plus one manifest artifact (`kind: "project"`, a JSON document
 listing the ordered beat `artifactId`s) and, optionally, per-beat captions
-(`kind: "captions"`). Every non-primary artifact in the session SHOULD
+(`kind: "captions"` — WebVTT preferred, which MAY carry word-level inline cue
+timestamps like `<00:00:01.500>word` for karaoke rendering; SRT remains
+accepted for older clients). Every non-primary artifact in the session SHOULD
 declare `relatedTo` pointing at the session's anchor `artifactId` (the one
 named in the pairing link) so a single capability token can authorize the
 whole session (§5.4).

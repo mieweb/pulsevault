@@ -1,6 +1,6 @@
 // Production-shaped Fastify reference server for @mieweb/pulsevault:
 // capability tokens ALWAYS on (refuses to boot without PULSEVAULT_SECRET),
-// pulse-session grouping via relatedTo, SRT->WebVTT captions, Swagger UI,
+// pulse-session grouping via relatedTo, WebVTT captions (SRT converted on the fly), Swagger UI,
 // and a live artifact-event feed. Local filesystem storage.
 // For the smallest possible mount (no auth, no hooks) see
 // ../fastify-demo/server.mjs.
@@ -438,7 +438,7 @@ app.get(
 
 /**
  * Reads a finalized artifact's bytes as text. Used for parsing the ordering
- * manifest (`kind=project`) and for SRT->WebVTT conversion
+ * manifest (`kind=project`) and for serving captions as WebVTT
  * (`kind=captions`) — both small text files, so a full read is fine (unlike
  * video bytes, which the checksum validator/sniffer stream instead of
  * buffering).
@@ -453,7 +453,7 @@ async function readArtifactText(artifactId) {
   }
 }
 
-/** Minimal SRT -> WebVTT conversion so the gallery's <video> can attach real, playable subtitles — browsers only understand WebVTT in a <track>, never SRT. */
+/** Minimal SRT -> WebVTT conversion for legacy SRT uploads — browsers only understand WebVTT in a <track>, never SRT. Newer Pulse apps upload WebVTT directly. */
 function srtToVtt(srt) {
   const body = srt
     .replace(/\r+/g, "")
@@ -476,7 +476,7 @@ app.get(
       tags: ["demo"],
       summary: "Fetch a captions artifact as WebVTT",
       description:
-        "Demo-only convenience route (not part of the pulsevault plugin) that converts a `kind=captions` SRT upload to WebVTT so the gallery's <track> element can render it. Applies the same relatedTo-aware capability-token check as the plugin's own routes (token via `?token=`, like the plugin's resolve phase — NOT a dashboard session, so it works for any client).",
+        "Demo-only convenience route (not part of the pulsevault plugin) that serves a `kind=captions` upload as WebVTT (native VTT passes through; legacy SRT converts) so the gallery's <track> element can render it. Applies the same relatedTo-aware capability-token check as the plugin's own routes (token via `?token=`, like the plugin's resolve phase — NOT a dashboard session, so it works for any client).",
       params: {
         type: "object",
         properties: { artifactId: { type: "string", format: "uuid" } },
@@ -497,7 +497,10 @@ app.get(
     if (!authorized) return reply.code(403).send();
     const text = await readArtifactText(artifactId);
     if (text === null) return reply.code(404).send();
-    return reply.type("text/vtt").send(srtToVtt(text));
+    // Newer Pulse apps upload WebVTT directly (with word-level cue timestamps a lossy
+    // round-trip would destroy) — pass it through; only legacy SRT needs converting.
+    const isVtt = text.replace(/^﻿/, "").startsWith("WEBVTT");
+    return reply.type("text/vtt").send(isVtt ? text : srtToVtt(text));
   },
 );
 
@@ -802,8 +805,8 @@ await app.register(pulseVault, {
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit: uploadUnitDefault,
-  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
+  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and SRT/WebVTT captions.
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt", ".vtt"] },
   // validatePayload runs for every kind, with ctx.kind telling you which.
   validatePayload: async (request, ctx) => {
     if (ctx.kind !== "video") return;

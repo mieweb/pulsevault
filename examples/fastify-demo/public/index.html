@@ -74,13 +74,6 @@
       label { display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); margin: 0.7rem 0 0.2rem; }
       label:first-of-type { margin-top: 0; }
 
-      .upload-card { padding: 0.9rem 0; border-top: 1px solid var(--border); }
-      .upload-card:first-child { border-top: none; padding-top: 0; }
-      .upload-card video { width: 10.5rem; max-height: 13rem; border-radius: 7px; background: #000; border: 1px solid var(--border); display: block; }
-      .upload-card .card-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 0.6rem; }
-      .btn-danger { background: var(--surface-2); color: #f87171; border-color: var(--border); }
-      .btn-danger:hover { border-color: #f87171; }
-
       footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
       footer a { color: var(--text-3); word-break: break-all; }
     </style>
@@ -164,13 +157,6 @@ graph LR
       // ----------------------------------------------------------------- //
       // Shared helpers                                                    //
       // ----------------------------------------------------------------- //
-
-      function formatSize(bytes) {
-        const units = ["B", "KB", "MB", "GB"];
-        let n = bytes, i = 0;
-        while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-        return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
-      }
 
       let mermaidSeq = 0;
       function MermaidDiagram({ chart }) {
@@ -319,62 +305,33 @@ graph LR
           </section>`;
       }
 
-      function UploadCard({ upload, onDeleted }) {
-        const [deleting, setDeleting] = useState(false);
-        const remove = useCallback(() => {
-          setDeleting(true);
-          // The plugin's own route — kind is resolved server-side from the id.
-          fetch(`/pulsevault/artifacts/${upload.artifactId}`, { method: "DELETE" })
-            .then(() => onDeleted())
-            .finally(() => setDeleting(false));
-        }, [upload.artifactId, onDeleted]);
-
-        return html`
-          <div className="upload-card">
-            <div className="card-row">
-              <div>
-                ${upload.kind === "video" &&
-                html`<video src=${upload.playbackUrl} controls preload="metadata"></video>`}
-                <p className="mono" style=${{ margin: "0.5rem 0 0" }}>
-                  ${upload.kind}/${upload.filename} · ${formatSize(upload.size)} ·${" "}
-                  ${new Date(upload.creation_date).toLocaleString()}
-                </p>
-              </div>
-              <button className="btn btn-danger btn-sm" onClick=${remove} disabled=${deleting}>
-                ${deleting ? "Deleting…" : "✕ Delete"}
-              </button>
-            </div>
-          </div>`;
-      }
-
-      function UploadsPanel() {
-        const [uploads, setUploads] = useState(null);
-        const refresh = useCallback(() => {
-          fetch("/videos").then((r) => r.json()).then(setUploads);
-        }, []);
+      // Live count only — the uploads themselves (playback) moved to their own
+      // page at /library, keeping this one focused on pairing. Rendered as a
+      // header link (next to API Reference) rather than its own section.
+      function UploadsLink() {
+        const [count, setCount] = useState(null);
         useEffect(() => {
+          // Count PULSES (feed items), not raw artifacts — a 6-beat session is six
+          // videos + subtitles + a manifest on the wire, but one item in the feed.
+          // Same grouping as the feed page: one pulse per session anchor
+          // (`relatedTo ?? artifactId`), counted only if it actually has video.
+          const refresh = () =>
+            fetch("/videos")
+              .then((r) => r.json())
+              .then((uploads) => {
+                const anchors = new Set();
+                for (const u of uploads) {
+                  if (u.kind === "video") anchors.add(u.relatedTo ?? u.artifactId);
+                }
+                setCount(anchors.size);
+              })
+              .catch(() => {});
           refresh();
           const id = setInterval(refresh, 8000);
           return () => clearInterval(id);
-        }, [refresh]);
+        }, []);
 
-        return html`
-          <section>
-            <p className="eyebrow">Recordings</p>
-            <div className="panel">
-              <div className="top-row">
-                <h2>Uploads${uploads?.length ? ` (${uploads.length})` : ""}</h2>
-                <button className="btn btn-ghost btn-sm" onClick=${refresh}>↻ Refresh</button>
-              </div>
-              <div style=${{ marginTop: "0.75rem" }}>
-                ${uploads === null
-                  ? html`<p className="mono">Loading…</p>`
-                  : uploads.length === 0
-                    ? html`<p className="mono">No uploads yet — scan the QR above with the Pulse app.</p>`
-                    : uploads.map((u) => html`<${UploadCard} key=${u.artifactId} upload=${u} onDeleted=${refresh} />`)}
-              </div>
-            </div>
-          </section>`;
+        return html`<a href="/library" className="docs-link">View feed${count ? ` (${count})` : ""} ↗</a>`;
       }
 
       function App() {
@@ -392,13 +349,15 @@ graph LR
                 <p className="brand-sub">Minimal demo · Fastify · no auth</p>
               </div>
             </div>
-            <a href="/docs" className="docs-link">API Reference ↗</a>
+            <div style=${{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+              <${UploadsLink} />
+              <a href="/docs" className="docs-link">API Reference ↗</a>
+            </div>
           </div>
           <${StatusBar} caps=${caps} />
           <${HowItWorks} />
           <${ScalingPanel} />
           <${PairPanel} caps=${caps} />
-          <${UploadsPanel} />
           <footer>
             <span>@mieweb/pulsevault</span>
             <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>
