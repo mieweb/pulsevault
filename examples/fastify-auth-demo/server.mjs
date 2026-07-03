@@ -446,8 +446,14 @@ app.get(
 async function readArtifactText(artifactId) {
   const localPath = await pulseStorage.getLocalPath(artifactId);
   if (!localPath) return null;
+  // The storage layer already rejects non-UUID ids before building any path;
+  // this containment check is defense in depth — a resolved path outside the
+  // data directory is never read.
+  const base = path.resolve(dataDir);
+  const resolved = path.resolve(localPath);
+  if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) return null;
   try {
-    return await readFile(localPath, "utf8");
+    return await readFile(resolved, "utf8");
   } catch {
     return null;
   }
@@ -471,6 +477,9 @@ app.get(
         properties: { token: { type: "string", description: "Capability token for this artifact or its relatedTo anchor." } },
       },
     },
+    // On top of the global per-IP limit: this route verifies a token and reads
+    // the filesystem per request, so it gets its own tighter budget.
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   },
   async (req, reply) => {
     const { artifactId } = req.params;

@@ -158,8 +158,21 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   /** Absolute path to the hidden metadata directory. */
   const sidecarDir = (): string => path.join(workspaceRoot, PULSEVAULT_META_DIR);
-  /** Absolute path to the sidecar JSON for a given artifactId. */
-  const sidecarPath = (artifactId: string): string => path.join(sidecarDir(), `${artifactId}.json`);
+  /**
+   * Absolute path to the sidecar JSON for a given artifactId. `readSidecar`
+   * already rejects non-UUID ids before any path is built; the resolve +
+   * containment check here is defense in depth for any future caller that
+   * bypasses that funnel — a path that escapes the metadata directory is a
+   * hard error, never a read.
+   */
+  const sidecarPath = (artifactId: string): string => {
+    const base = path.resolve(sidecarDir());
+    const resolved = path.resolve(base, `${artifactId}.json`);
+    if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
+      throw new Error('artifactId escapes the metadata directory');
+    }
+    return resolved;
+  };
   /** Relative path (from workspaceRoot) to the artifact bytes. */
   const artifactRelPath = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;

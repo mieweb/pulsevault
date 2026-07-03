@@ -18,10 +18,26 @@ import QRCode from "qrcode";
 import pulseVault, { createLocalStorage, buildUploadLink } from "@mieweb/pulsevault";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// The route schema says `format: "uuid"` but Fastify's default Ajv doesn't
+// enforce string formats — routes validate ids explicitly before they touch a
+// filesystem path.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
 const videosHtml = readFileSync(path.join(__dirname, "public/videos.html"), "utf8");
 const favicon = readFileSync(path.join(__dirname, "public/favicon.png"));
 const dataDir = path.join(__dirname, "data");
+
+// Resolve a path under dataDir and refuse anything that escapes it — the
+// belt-and-suspenders companion to the UUID check above for every read that
+// embeds a request-supplied id.
+function insideDataDir(...segments) {
+  const base = path.resolve(dataDir);
+  const resolved = path.resolve(base, ...segments);
+  if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
+    throw new Error("path escapes the data directory");
+  }
+  return resolved;
+}
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
@@ -99,12 +115,16 @@ app.get(
         required: ["artifactId"],
       },
     },
+    // On top of the global per-IP limit: this route does per-request filesystem
+    // reads, so it gets its own tighter budget.
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   },
   async (req, reply) => {
     const { artifactId } = req.params;
+    if (!UUID_RE.test(artifactId)) return reply.code(400).send();
     let sidecar;
     try {
-      sidecar = JSON.parse(await readFile(path.join(dataDir, ".pulsevault", `${artifactId}.json`), "utf8"));
+      sidecar = JSON.parse(await readFile(insideDataDir(".pulsevault", `${artifactId}.json`), "utf8"));
     } catch {
       return reply.code(404).send();
     }
@@ -113,7 +133,7 @@ app.get(
     const ext = sidecar.ext ?? ".vtt";
     let text;
     try {
-      text = await readFile(path.join(dataDir, "captions", `${artifactId}${ext}`), "utf8");
+      text = await readFile(insideDataDir("captions", `${artifactId}${ext}`), "utf8");
     } catch {
       return reply.code(404).send();
     }
@@ -123,7 +143,12 @@ app.get(
 
 // List all uploads under dataDir. Reads each upload's sidecar to determine
 // kind and subdir rather than hard-coding "video/" — handles video/project/captions.
-app.get("/videos", { schema: { tags: ["demo"], summary: "List finished uploads (flat)" } }, async (_req, reply) => {
+app.get("/videos", {
+  schema: { tags: ["demo"], summary: "List finished uploads (flat)" },
+  // Crawls every sidecar on disk per request — tighter per-IP budget than the
+  // global limit (the feed polls this every 8s, so 60/min is still generous).
+  config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+}, async (_req, reply) => {
   const pulsevaultMetaDir = path.join(dataDir, ".pulsevault");
   let entries;
   try {
