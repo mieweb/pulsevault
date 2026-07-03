@@ -166,9 +166,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    * hard error, never a read.
    */
   const sidecarPath = (artifactId: string): string => {
+    // Strictly inside the metadata directory: the sidecar is always a `.json`
+    // file under it, so the resolved path can never equal the directory itself.
     const base = path.resolve(sidecarDir());
     const resolved = path.resolve(base, `${artifactId}.json`);
-    if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) {
+    if (!resolved.startsWith(`${base}${path.sep}`)) {
       throw new Error('artifactId escapes the metadata directory');
     }
     return resolved;

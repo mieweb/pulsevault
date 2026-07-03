@@ -448,10 +448,11 @@ async function readArtifactText(artifactId) {
   if (!localPath) return null;
   // The storage layer already rejects non-UUID ids before building any path;
   // this containment check is defense in depth — a resolved path outside the
-  // data directory is never read.
+  // data directory is never read. (Strictly inside: every artifact path is a
+  // file under a kind subdirectory, so it can never equal the root itself.)
   const base = path.resolve(dataDir);
   const resolved = path.resolve(localPath);
-  if (resolved !== base && !resolved.startsWith(`${base}${path.sep}`)) return null;
+  if (!resolved.startsWith(`${base}${path.sep}`)) return null;
   try {
     return await readFile(resolved, "utf8");
   } catch {
