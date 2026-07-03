@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 import Fastify from "fastify";
+import fastifyRateLimit from "@fastify/rate-limit";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUI from "@fastify/swagger-ui";
 import QRCode from "qrcode";
@@ -33,6 +34,13 @@ const app = Fastify({
   logger: true,
   bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
 });
+
+// Registered before any route so every one of them — the demo's own and the
+// TUS/artifact routes the plugin mounts — is covered by a global per-IP
+// limit (OPERATIONS.md "Rate limiting" recommends exactly this). Generous
+// enough for one phone's normal HEAD/PATCH resume retries, not for a scraper
+// hammering /videos or /pulsevault/artifacts/:id.
+await app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
 
 // Swagger MUST be registered before any route (including the plugin's) so
 // their schemas are picked up — the pulsevault plugin ships full OpenAPI

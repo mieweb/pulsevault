@@ -1,6 +1,7 @@
 import { FileStore } from '@tus/file-store';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { isUuid } from '../lib/uuid.js';
 import type {
   PulseVaultResolution,
   PulseVaultStorage,
@@ -174,6 +175,17 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
+    // Every sidecar/artifact path in this module is built by joining
+    // `artifactId` straight into a filesystem path — reject anything that
+    // isn't a real UUID before it reaches `fs`, the same way `resolve()`
+    // already refuses to serve non-UUID ids, so a stray `../` (or one
+    // smuggled in by a caller that skips the HTTP route layer, e.g. a
+    // direct `getLocalPath`/`getKind` call) can never escape the intended
+    // `.pulsevault`/`<kind>` subdirectories. This is the single funnel
+    // every other method in this file goes through (`loadMeta`), so
+    // gating here covers `getLocalPath`, `getKind`, `getRelatedTo`,
+    // `getChecksum`, `resolve`, `remove`, and `markReady` in one place.
+    if (!isUuid(artifactId)) return null;
     let raw: string;
     try {
       raw = await fs.readFile(sidecarPath(artifactId), 'utf8');
