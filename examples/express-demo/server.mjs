@@ -1,4 +1,4 @@
-// Express counterpart to ../rn-demo/server.mjs — same demo (pairing page, QR
+// Express counterpart to ../fastify-auth-demo/server.mjs — same demo (pairing page, QR
 // codes, upload listing, optional bearer-token auth), but built on
 // @mieweb/pulsevault/core instead of the Fastify plugin, to prove the core
 // needs about the same amount of glue code under a different framework.

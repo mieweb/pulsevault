@@ -1,0 +1,11 @@
+node_modules
+**/node_modules
+**/data
+dist
+.git
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.tgz
+coverage

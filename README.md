@@ -173,14 +173,28 @@ diagnostics — the Fastify plugin always uses `request.log` for these
 automatically, but a non-Fastify host has no equivalent to infer one from,
 so it falls back to `console` when omitted.
 
-See [`examples/express-demo`](examples/express-demo) and
-[`examples/meteor-demo`](examples/meteor-demo) for full runnable servers
-(pairing page, QR codes, auth demo, local/S3 storage) — the Express and
-Meteor counterparts to [`examples/rn-demo`](examples/rn-demo)'s Fastify
-demo, both built on `@mieweb/pulsevault/core` instead of the plugin. Both
-are verified against the real frameworks, not just the test suite —
-`meteor-demo` in particular against a real `meteor create` app, since
-Meteor's bundler needed the compatibility fixes described above.
+Four runnable example servers live under [`examples/`](examples):
+
+- [`examples/fastify-demo`](examples/fastify-demo) — the smallest runnable
+  server: Fastify plugin mount, QR pairing, flat upload listing, no auth,
+  local storage. Start here.
+- [`examples/fastify-auth-demo`](examples/fastify-auth-demo) —
+  production-shaped Fastify reference, run through Docker Compose (server +
+  Postgres, one `docker compose up --build`): capability tokens always on
+  (fails fast at boot without `PULSEVAULT_SECRET`), a [Better
+  Auth](https://better-auth.com)-protected React dashboard (email+password),
+  a Prisma schema holding both the auth tables and an artifact index
+  (`onUploadComplete` writes each finished upload once; `/pulses` is one
+  query instead of a sidecar crawl), uploads grouped by recording session
+  via `relatedTo`, SRT→WebVTT captions, Swagger UI, and an `onArtifactEvent`
+  live feed.
+- [`examples/express-demo`](examples/express-demo) and
+  [`examples/meteor-demo`](examples/meteor-demo) — the same demo on
+  `@mieweb/pulsevault/core` instead of the plugin, proving the core needs
+  about the same amount of glue code under a different framework. Both are
+  verified against the real frameworks, not just the test suite —
+  `meteor-demo` in particular against a real `meteor create` app, since
+  Meteor's bundler needed the compatibility fixes described above.
 
 ## How a pairing + upload session flows
 
@@ -664,7 +678,7 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 | `metaCacheLimit` | `10000` | Caps the in-memory metadata cache before evicting the oldest entry. |
 | `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
 
-> The runnable demo wires these to environment variables — see [`examples/rn-demo/.env.example`](examples/rn-demo/.env.example) for the full list (`STORAGE`, `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, …).
+> A typical deployment wires these to environment variables (e.g. `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) and picks the storage adapter with a `STORAGE=local|s3` switch — the options table above maps one-to-one onto `createS3Storage(...)`.
 
 ### Payload validation on remote storage
 

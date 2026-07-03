@@ -1,0 +1,17 @@
+{
+  "name": "pulsevault-fastify-demo",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Fastify demo for @mieweb/pulsevault — no auth, local storage, QR pairing for the Pulse app",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "dev": "node --env-file-if-exists=.env --watch server.mjs"
+  },
+  "dependencies": {
+    "@fastify/swagger": "^9.7.0",
+    "@fastify/swagger-ui": "^6.0.0",
+    "@mieweb/pulsevault": "file:../..",
+    "fastify": "^5.8.5",
+    "qrcode": "^1.5.4"
+  }
+}

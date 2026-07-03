@@ -144,6 +144,34 @@ if you've evaluated against an intermediate build.
   counterpart to `readAll`, now used internally by
   `createS3ChecksumValidator` (see "Fixed" below).
 
+### Changed
+
+- Replaced `examples/rn-demo` with two focused Fastify examples:
+  `examples/fastify-demo` (the smallest runnable server — no auth, local
+  storage, QR pairing; start here) and `examples/fastify-auth-demo`
+  (production-shaped reference — capability tokens always on, failing fast at
+  boot without `PULSEVAULT_SECRET`, pulse-session grouping via `relatedTo`,
+  SRT→WebVTT captions, Swagger UI, artifact-event feed). Both pairing pages
+  are React (pinned ESM CDN builds, no bundler). Both examples are
+  local-storage only; S3 wiring is documented in the README's S3 section
+  rather than demonstrated in an example. `npm run e2e` now drives
+  `fastify-auth-demo` and additionally asserts the fail-fast boot contract.
+- `examples/fastify-auth-demo` gained a [Better Auth](https://better-auth.com)
+  dashboard layer: the human-facing routes (`/deeplinks`, `/pulses`,
+  `/events`, `/reserve`) require an email+password session, while the vault
+  routes the Pulse app talks to stay capability-token authorized — two auth
+  systems for two audiences, per PROTOCOL.md §5. The demo is Postgres-only,
+  run through Docker Compose (`compose.yaml` + `Dockerfile`; `npm run db:up`
+  + `npm start` for bare-metal dev against the same db), with one Prisma
+  schema (`prisma/schema.prisma`, migrations committed and applied by
+  `npm start`) holding both the auth tables and an **artifact index**:
+  `onUploadComplete` writes each finished upload once, authorized deletes
+  prune it, a boot-time reconcile keeps it honest against the filesystem
+  sidecars (still the source of truth), and `/pulses` becomes one indexed
+  query instead of a per-request sidecar crawl. `npm run e2e` provisions the
+  compose db, applies migrations, and covers the 401 gate plus the
+  sign-up/sign-in flow.
+
 ### Fixed
 
 - `maxUploadSize` enforcement and the in-progress-upload 404 behavior now
