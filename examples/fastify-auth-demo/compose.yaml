@@ -1,0 +1,63 @@
+# PulseVault auth demo — the full stack: Fastify + Better Auth + Postgres.
+#
+# Run (from this directory):
+#   PULSEVAULT_SECRET=$(openssl rand -hex 32) docker compose up --build
+#
+# Then open http://localhost:3002/ and create a dashboard account.
+# For phones on your LAN, also set PULSEVAULT_ISSUER=http://<lan-ip>:3002 —
+# capability tokens are issuer-bound by exact string match (PROTOCOL.md §5.4).
+# Compose also reads these variables from a `.env` file here (see .env.example).
+#
+# Postgres data (`pgdata`) and uploaded videos (`vaultdata`) persist in named
+# volumes across restarts; `docker compose down -v` wipes both.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pulsevault
+      # Demo-only credentials — the DB is only reachable on the compose
+      # network; give it a real password if you ever publish its port.
+      POSTGRES_PASSWORD: pulsevault
+      POSTGRES_DB: pulsevault
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulsevault -d pulsevault"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      # Published (localhost-only, non-default port) for host-side tooling:
+      # `prisma migrate dev`, `npm start` bare-metal dev, and npm run e2e.
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build:
+      # Repo root: the example depends on the library via file:../..
+      context: ../..
+      dockerfile: examples/fastify-auth-demo/Dockerfile
+    ports:
+      - "${PORT:-3002}:3002"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3002
+      DATABASE_URL: postgres://pulsevault:pulsevault@db:5432/pulsevault
+      PULSEVAULT_SECRET: ${PULSEVAULT_SECRET:?required — generate with `openssl rand -hex 32`}
+      PULSEVAULT_KEY_ID: ${PULSEVAULT_KEY_ID:-demo-1}
+      PULSEVAULT_ISSUER: ${PULSEVAULT_ISSUER:-http://localhost:3002}
+      UPLOAD_UNIT: ${UPLOAD_UNIT:-beat}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002/pulsevault/capabilities').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - vaultdata:/app/examples/fastify-auth-demo/data
+
+volumes:
+  pgdata:
+  vaultdata:

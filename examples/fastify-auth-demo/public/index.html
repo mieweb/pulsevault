@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>PulseVault — Reference Server</title>
+    <style>
+      :root {
+        --bg: #0a0e16;
+        --surface: #11161f;
+        --surface-2: #161c28;
+        --border: #232a38;
+        --text: #e7eaf0;
+        --text-2: #9aa4b8;
+        --text-3: #626d82;
+        --accent: #10b981;
+        --accent-soft: rgba(16, 185, 129, 0.14);
+        --success: #34d399;
+        --success-soft: rgba(52, 211, 153, 0.14);
+        --warning: #fbbf24;
+        --warning-soft: rgba(251, 191, 36, 0.14);
+        --danger: #f87171;
+        --danger-soft: rgba(248, 113, 113, 0.14);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      * { box-sizing: border-box; min-width: 0; }
+      html { overflow-x: hidden; }
+      body { max-width: 46rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; line-height: 1.5; overflow-x: hidden; }
+
+      .eyebrow { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 0.6rem; }
+      h1 { font-size: 1.05rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+      h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
+
+      .brand-row { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+      .brand-mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #047857); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; flex: none; }
+      .brand-sub { font-size: 0.75rem; color: var(--text-3); margin: 0.1rem 0 0; }
+      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+
+      /* A sequence diagram with 3 participants routinely renders wider than a phone screen —
+         scroll it horizontally rather than letting it force the whole page to scroll, or
+         shrinking it down to illegible. */
+      .diagram-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 0 0.75rem; }
+      .diagram-wrap .mermaid { min-width: 460px; }
+      .diagram-caption { font-size: 0.72rem; font-weight: 600; color: var(--text-3); margin: 0 0 0.4rem; }
+
+      @media (max-width: 480px) {
+        body { padding: 1.25rem 1rem 3rem; }
+        .brand-mark { width: 1.7rem; height: 1.7rem; font-size: 0.75rem; }
+        h1 { font-size: 0.95rem; }
+        .brand-sub { font-size: 0.68rem; }
+        .docs-link { font-size: 0.68rem; padding: 0.35rem 0.6rem; }
+        .beat-row video { width: 8.5rem; max-height: 11rem; }
+        footer { flex-direction: column; align-items: flex-start; gap: 0.35rem; }
+      }
+
+      .docs-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.4rem 0.75rem; font-size: 0.75rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); border-radius: 6px; text-decoration: none; }
+      .docs-link:hover { border-color: var(--accent); color: var(--text); }
+
+      .status-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
+      .chip { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.7rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--text-2); }
+      .chip b { color: var(--text); font-weight: 600; }
+      .dot { width: 0.45rem; height: 0.45rem; border-radius: 999px; background: var(--text-3); flex: none; }
+      .dot.success { background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+      .dot.warning { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); }
+      .dot.off { background: var(--text-3); }
+
+      section { margin-top: 1.75rem; }
+      .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+
+      .btn { display: block; width: 100%; padding: 0.55rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 7px; text-align: center; text-decoration: none; cursor: pointer; border: 1px solid transparent; }
+      .btn-primary { color: #fff; background: var(--accent); margin-bottom: 0.6rem; }
+      .btn-primary:hover { background: #059669; }
+      .btn-ghost { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+      .btn-ghost:hover { color: var(--text); border-color: var(--accent); }
+      .btn-sm { width: auto; padding: 0.3rem 0.65rem; font-size: 0.72rem; }
+
+      .qr { display: block; margin: 1rem auto 0; border-radius: 8px; background: #fff; padding: 10px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; word-break: break-all; color: var(--text-3); }
+      label { display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); margin: 0.7rem 0 0.2rem; }
+      label:first-of-type { margin-top: 0; }
+
+      .field { display: block; width: 100%; padding: 0.55rem 0.75rem; font-size: 0.85rem; border-radius: 7px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text); }
+      .field:focus { outline: none; border-color: var(--accent); }
+      .auth-error { color: var(--danger); font-size: 0.78rem; margin: 0.5rem 0 0; }
+      .auth-note { font-size: 0.78rem; color: var(--text-2); margin: 0 0 0.8rem; }
+      .chip-btn { background: none; border: none; color: var(--accent); font-size: 0.72rem; font-weight: 600; cursor: pointer; padding: 0; }
+
+      details summary { cursor: pointer; list-style: none; }
+      details summary::-webkit-details-marker { display: none; }
+      details.panel summary { font-weight: 600; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
+      details.panel summary::before { content: "▸"; color: var(--text-3); font-size: 0.7rem; }
+      details.panel[open] summary::before { content: "▾"; }
+      details.panel[open] summary { margin-bottom: 0.9rem; }
+      details:not(.panel) summary { font-size: 0.72rem; color: var(--text-3); font-weight: 600; margin-top: 0.5rem; }
+      details:not(.panel) summary::before { content: "▸ "; }
+      details:not(.panel)[open] summary::before { content: "▾ "; }
+
+      .feature-list { margin: 0; padding: 0; list-style: none; font-size: 0.8rem; color: var(--text-2); }
+      /* Deliberately NOT display:flex — this <li> mixes plain text with inline <code>/<em> tags
+         that need to wrap normally. Flex would treat each text run/tag as its own flex item
+         (stretched to the row's cross-axis height by default), breaking natural text flow into
+         overlapping columns instead of wrapped paragraphs. An absolutely-positioned marker keeps
+         normal inline flow intact. */
+      .feature-list li { position: relative; padding: 0.4rem 0 0.4rem 1.1rem; border-top: 1px solid var(--border); }
+      .feature-list li:first-child { border-top: none; }
+      .feature-list li::before { content: "→"; color: var(--accent); position: absolute; left: 0; top: 0.4rem; }
+      code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; }
+
+      .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
+      .badge.on { background: var(--success-soft); border-color: rgba(52, 211, 153, 0.35); color: var(--success); }
+
+      .pulse-card { padding: 0.9rem 0; border-top: 1px solid var(--border); }
+      .pulse-card:first-child { border-top: none; padding-top: 0; }
+      .beat-row { display: flex; gap: 0.6rem; overflow-x: auto; padding-bottom: 0.4rem; -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity; }
+      .beat-row video { scroll-snap-align: start; }
+      .beat-row video { width: 10.5rem; max-height: 13rem; border-radius: 7px; background: #000; flex: none; border: 1px solid var(--border); }
+      .pulse-meta { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin: 0.6rem 0 0; }
+
+      .event-row { display: flex; gap: 0.6rem; align-items: center; font-size: 0.76rem; padding: 0.35rem 0; border-top: 1px solid var(--border); }
+      .event-row:first-child { border-top: none; }
+      .event-phase { flex: none; width: 5rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; color: var(--text-2); }
+      .event-list { max-height: 12rem; overflow-y: auto; }
+      .event-list::-webkit-scrollbar, .pulse-list::-webkit-scrollbar { width: 6px; }
+      .event-list::-webkit-scrollbar-thumb, .pulse-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+      .pulse-list { margin-top: 0.75rem; max-height: 54rem; overflow-y: auto; padding-right: 0.25rem; }
+
+      footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
+      footer a { color: var(--text-3); word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Real React, no build step: pinned ESM builds served from a CDN, with
+         `htm` providing JSX-like templating in plain JS. Keeps this example a
+         single `npm start` with no bundler while the page itself is a normal
+         React component tree (state, effects, polling). -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.1.0",
+          "react-dom/client": "https://esm.sh/react-dom@19.1.0/client",
+          "htm/react": "https://esm.sh/htm@3.1.1/react?deps=react@19.1.0",
+          "mermaid": "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+        }
+      }
+    </script>
+    <script type="module">
+      import { Fragment, useState, useEffect, useCallback, useRef } from "react";
+      import { createRoot } from "react-dom/client";
+      import { html } from "htm/react";
+      import mermaid from "mermaid";
+
+      mermaid.initialize({ startOnLoad: false, theme: "dark" });
+
+      // ----------------------------------------------------------------- //
+      // Static content                                                    //
+      // ----------------------------------------------------------------- //
+
+      const DEPLOYMENT_DIAGRAM = `
+graph LR
+    subgraph thisOrg ["This server — fully independent"]
+        A1["This Fastify server"] -->|registers| A2["@mieweb/pulsevault"]
+        A1 -->|owns| A3["artifactId minting, token issuance,<br/>TTL policy, secret rotation, revocation"]
+    end
+    subgraph otherOrg ["Any other org — fully independent, no pulsevault required"]
+        B1["Their own server"] -->|implements from spec only| B2["PROTOCOL.md"]
+        B1 -->|owns| B3["its own auth scheme entirely"]
+    end
+    P["Pulse mobile app<br/>multi-tenant client"] -->|pairs + uploads via open contract| A1
+    P -->|pairs + uploads via open contract| B1
+    P -.->|no dependency on either| X[("No central Pulse service")]`;
+
+      const FLOW_DIAGRAM = `
+sequenceDiagram
+    participant Org as This server
+    participant User
+    participant Pulse as Pulse app
+
+    Org->>Org: mint artifactId + issue a token
+    Org->>User: show QR / deep link
+    User->>Pulse: open link
+    Pulse->>Pulse: validate link, show pairing screen
+    User->>Pulse: confirm and choose draft
+    Pulse->>Org: POST upload, Bearer token, kind video, checksum
+    Org->>Pulse: 201 Location
+    Pulse->>Org: PATCH chunks, HEAD before resume
+    Org->>Org: validatePayload, markReady, onUploadComplete
+    Pulse->>Org: POST upload, kind captions, same session
+    Org->>Org: validatePayload, markReady, onUploadComplete
+    Org->>Pulse: ready for playback and captions fetch`;
+
+      const DB_SCHEMA_DIAGRAM = `
+graph TB
+    subgraph pg ["Postgres — one database, one Prisma schema (prisma/schema.prisma)"]
+        T1["user · session · account · verification<br/>(Better Auth dashboard identity)"]
+        T2["artifact index<br/>(id, kind, relatedTo — indexed, size, checksum, created)"]
+    end
+    BA["Better Auth<br/>(prismaAdapter)"] -->|"sign-in sessions"| T1
+    H["onUploadComplete hook"] -->|"one write per finished upload"| T2
+    Boot["boot-time reconcile"] -.->|"sidecars in ./data stay<br/>the source of truth"| T2
+    Q["GET /pulses"] -->|"one indexed query,<br/>grouped by relatedTo"| T2
+    D["authorized DELETE"] -->|"prune row"| T2`;
+
+      const DB_OPT_DIAGRAM = `
+graph LR
+    subgraph before ["without a database (../fastify-demo)"]
+        R1["GET /videos"] -->|"re-reads EVERY sidecar file,<br/>every request — O(uploads), forever"| FS[("./data<br/>sidecar files")]
+    end
+    subgraph after ["with the artifact index (this demo)"]
+        R2["GET /pulses"] -->|"one indexed SQL query"| PG[("Postgres")]
+    end`;
+
+      const PROD_DIAGRAM = `
+graph TB
+    subgraph compose ["docker compose up --build"]
+        APP["app container — Fastify + pulsevault<br/>healthcheck: GET /pulsevault/capabilities"]
+        DB["db container — postgres:17-alpine<br/>healthcheck: pg_isready"]
+        APP -->|"DATABASE_URL over the<br/>private compose network"| DB
+    end
+    ENV[".env / shell:<br/>PULSEVAULT_SECRET (required, no default),<br/>PULSEVAULT_ISSUER, KEY_ID"] --> APP
+    MIG["prisma migrate deploy<br/>(runs before the server boots)"] --> DB
+    V1[("vaultdata volume<br/>upload bytes")] --- APP
+    V2[("pgdata volume<br/>database")] --- DB
+    U["phone / browser :3002"] --> APP`;
+
+      const S3_DIAGRAM = `
+graph LR
+    V["pulsevault plugin —<br/>N instances, no sticky sessions"] -->|multipart TUS| B[("S3 / Cloudflare R2<br/>bucket")]
+    B -.->|"playback: 302 presigned URL,<br/>bytes never proxy through Node"| P["viewer"]`;
+
+      // ----------------------------------------------------------------- //
+      // Shared helpers                                                    //
+      // ----------------------------------------------------------------- //
+
+      function formatSize(bytes) {
+        const units = ["B", "KB", "MB", "GB"];
+        let n = bytes, i = 0;
+        while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+        return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+      }
+
+      /** Fetch a JSON endpoint into state, optionally re-fetching on an interval. */
+      function usePolledJson(url, intervalMs) {
+        const [data, setData] = useState(null);
+        const refresh = useCallback(() => {
+          fetch(url).then((r) => r.json()).then(setData).catch(() => {});
+        }, [url]);
+        useEffect(() => {
+          refresh();
+          if (!intervalMs) return;
+          const id = setInterval(refresh, intervalMs);
+          return () => clearInterval(id);
+        }, [refresh, intervalMs]);
+        return [data, refresh];
+      }
+
+      let mermaidSeq = 0;
+      function MermaidDiagram({ chart }) {
+        const ref = useRef(null);
+        useEffect(() => {
+          let cancelled = false;
+          mermaid
+            .render(`mmd-${++mermaidSeq}`, chart)
+            .then(({ svg }) => {
+              if (!cancelled && ref.current) ref.current.innerHTML = svg;
+            })
+            .catch(() => {});
+          return () => { cancelled = true; };
+        }, [chart]);
+        return html`
+          <div className="diagram-wrap">
+            <div className="mermaid" ref=${ref}></div>
+          </div>`;
+      }
+
+      // ----------------------------------------------------------------- //
+      // Components                                                        //
+      // ----------------------------------------------------------------- //
+
+      function StatusBar({ caps, auth, session, onSignOut }) {
+        if (!caps) return html`<div className="status-bar"></div>`;
+        return html`
+          <div className="status-bar">
+            <span className="chip"><span className="dot success"></span>Protocol <b>v${caps.protocolVersion}</b></span>
+            <span
+              className="chip"
+              title="Deployment-wide default from /pulsevault/capabilities. Fixed at server startup (UPLOAD_UNIT env var) — use the per-link override below to test the other mode without restarting."
+            >Upload unit default <b>${caps.uploadUnit}</b></span>
+            ${auth &&
+            html`<span className="chip"><span className="dot success"></span>Uploads <b>capability tokens (${auth.keyId})</b></span>`}
+            ${session?.user
+              ? html`<span className="chip"><span className="dot success"></span><b>${session.user.email}</b><button className="chip-btn" onClick=${onSignOut}>Sign out</button></span>`
+              : html`<span className="chip"><span className="dot off"></span>Dashboard <b>signed out</b></span>`}
+          </div>`;
+      }
+
+      function AuthPanel({ onSignedIn }) {
+        const [mode, setMode] = useState("signin");
+        const [email, setEmail] = useState("");
+        const [password, setPassword] = useState("");
+        const [name, setName] = useState("");
+        const [error, setError] = useState(null);
+        const [busy, setBusy] = useState(false);
+
+        const submit = async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError(null);
+          const path = mode === "signin" ? "/api/auth/sign-in/email" : "/api/auth/sign-up/email";
+          const body =
+            mode === "signin"
+              ? { email, password }
+              : { email, password, name: name || email.split("@")[0] };
+          try {
+            const res = await fetch(path, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              throw new Error(data?.message || `Could not sign ${mode === "signin" ? "in" : "up"}`);
+            }
+            onSignedIn();
+          } catch (err) {
+            setError(err.message);
+            setBusy(false);
+          }
+        };
+
+        return html`
+          <section>
+            <p className="eyebrow">Dashboard sign-in</p>
+            <div className="panel">
+              <p className="auth-note">
+                Pairing links and the uploads gallery are operator-only, behind Better Auth. The Pulse app
+                itself never signs in — its uploads stay authorized by capability tokens.
+              </p>
+              <form onSubmit=${submit}>
+                ${mode === "signup" &&
+                html`
+                  <label htmlFor="authName">Name</label>
+                  <input id="authName" className="field" value=${name} onChange=${(e) => setName(e.target.value)} placeholder="Ada Lovelace" />`}
+                <label htmlFor="authEmail">Email</label>
+                <input id="authEmail" className="field" type="email" required value=${email} onChange=${(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+                <label htmlFor="authPassword">Password</label>
+                <input id="authPassword" className="field" type="password" required minLength="8" value=${password} onChange=${(e) => setPassword(e.target.value)} placeholder="8+ characters" />
+                ${error && html`<p className="auth-error">${error}</p>`}
+                <button className="btn btn-primary" type="submit" disabled=${busy} style=${{ marginTop: "1rem" }}>
+                  ${busy ? "…" : mode === "signin" ? "Sign in" : "Create account"}
+                </button>
+              </form>
+              <button
+                className="btn btn-ghost"
+                onClick=${() => { setMode(mode === "signin" ? "signup" : "signin"); setError(null); }}
+              >
+                ${mode === "signin" ? "New here? Create an account" : "Have an account? Sign in"}
+              </button>
+            </div>
+          </section>`;
+      }
+
+      function HowItWorks({ auth }) {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>How this works</summary>
+              <p className="diagram-caption">Deployment model — this server is one fully independent "Org", no central Pulse service involved</p>
+              <${MermaidDiagram} chart=${DEPLOYMENT_DIAGRAM} />
+              <p className="diagram-caption">Pairing + upload flow — what happens once you scan the QR below</p>
+              <${MermaidDiagram} chart=${FLOW_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  Two auth systems for two audiences: <b>Better Auth</b> (email + password sessions in
+                  Postgres, via Prisma) guards this human dashboard — pairing links, gallery, events — while
+                  <b> capability tokens</b> guard the vault routes the Pulse app talks to. The app never
+                  signs in; it only redeems the bearer token carried on the pairing link.
+                </li>
+                <li>
+                  Capability tokens: HMAC-signed by <code>issueCapabilityToken</code>, scoped to this session,
+                  expiring in ${auth ? Math.round(auth.tokenExpiresInSeconds / 60) : "…"} min
+                  (issuer <code>${auth ? auth.issuer : "…"}</code>).
+                  One token covers every beat/caption/manifest via <code>relatedTo</code>.
+                </li>
+                <li>Checksum: the app's sha256 is verified server-side before an upload is marked ready (<code>createChecksumValidator</code>).</li>
+                <li>Live activity below is fed by <code>onArtifactEvent</code> — the same hook used for ops metrics + audit logging.</li>
+                <li>Uploads are grouped by <em>pulse</em> (recording session) via the wire protocol's <code>relatedTo</code> field, not listed as unrelated files.</li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function DatabasePanel() {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>Database — what Postgres optimizes here</summary>
+              <p className="diagram-caption">The optimization — listing goes from a per-request filesystem crawl to one indexed query</p>
+              <${MermaidDiagram} chart=${DB_OPT_DIAGRAM} />
+              <p className="diagram-caption">One database, two jobs — dashboard identity and the artifact index, written once by the plugin's hooks</p>
+              <${MermaidDiagram} chart=${DB_SCHEMA_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  <b>Read path:</b> <code>/pulses</code> is a single SQL query over the artifact index
+                  (<code>relatedTo</code> is indexed for the session grouping) instead of re-reading every
+                  sidecar file on every request — the no-auth demo's approach is O(uploads) forever; this
+                  one stays flat as the vault grows.
+                </li>
+                <li>
+                  <b>Write path costs nothing on the upload:</b> <code>onUploadComplete</code> inserts one
+                  row per finished upload, an authorized delete prunes it, and a boot-time reconcile
+                  re-syncs the table from disk — the <code>./data</code> sidecars stay the source of truth,
+                  the table is a disposable index over them.
+                </li>
+                <li>
+                  <b>Durable identity:</b> Better Auth's users/sessions live in the same Postgres via
+                  Prisma, so dashboard sign-ins survive restarts and deploys — nothing auth-critical is
+                  held in process memory.
+                </li>
+                <li>
+                  <b>Room to grow:</b> the same database is the natural home for a durable audit log
+                  (persist <code>onArtifactEvent</code> instead of the in-memory feed below), signing-key
+                  rotation (<code>kid</code> → secret lookup), retention jobs, and per-user quotas.
+                </li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function ProductionPanel() {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>Production setup — the Compose stack</summary>
+              <p className="diagram-caption">Topology — one command brings up the app + Postgres with healthchecks, ordered startup, and persistent volumes</p>
+              <${MermaidDiagram} chart=${PROD_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  <b>One command:</b> <code>PULSEVAULT_SECRET=$(openssl rand -hex 32) docker compose up
+                  --build</code> — the app waits for Postgres's <code>pg_isready</code> healthcheck before
+                  starting, and its own healthcheck probes <code>/pulsevault/capabilities</code>.
+                </li>
+                <li>
+                  <b>Migrations before boot:</b> <code>prisma migrate deploy</code> runs ahead of the server
+                  (both in the container and in <code>npm start</code>), so the schema is always applied —
+                  no drift between what the code expects and what the database has.
+                </li>
+                <li>
+                  <b>State survives restarts:</b> named volumes keep upload bytes
+                  (<code>vaultdata</code>) and the database (<code>pgdata</code>) across
+                  <code>docker compose down</code>/<code>up</code>; <code>down -v</code> is the explicit
+                  wipe.
+                </li>
+                <li>
+                  <b>Secrets are refused, not defaulted:</b> compose declares
+                  <code>PULSEVAULT_SECRET</code> as required (<code>:?required</code>) and the server
+                  exits non-zero without it — the same fail-fast contract <code>npm run e2e</code> asserts.
+                </li>
+                <li>
+                  <b>Bare-metal dev, same database:</b> <code>npm run db:up</code> starts just the compose
+                  Postgres (published on localhost:5433 for host tooling), then <code>npm start</code> runs
+                  the server directly for fast iteration.
+                </li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function ScalingPanel() {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>Scaling further — S3/R2 & multiple instances</summary>
+              <p className="diagram-caption">Storage — this demo writes to local disk; production swaps one call for S3/R2</p>
+              <${MermaidDiagram} chart=${S3_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  <b>S3 / R2:</b> swap <code>createLocalStorage</code> for <code>createS3Storage</code> and
+                  nothing else changes — uploads stream to the bucket via multipart TUS, playback becomes a
+                  <code>302</code> presigned redirect (bytes never proxy through Node), and any number of
+                  server instances can share one bucket with no sticky sessions (see <code>OPERATIONS.md</code>).
+                </li>
+                <li>
+                  <b>Only the local disk pins this to one node:</b> capability tokens are stateless HMAC,
+                  dashboard sessions and the artifact index already live in Postgres — so moving the bytes
+                  to a bucket is the single change between this stack and N load-balanced instances. An
+                  S3/R2-backed working example will be added alongside this one.
+                </li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function PairPanel({ caps, onAuth }) {
+        const [override, setOverride] = useState("");
+        const [link, setLink] = useState(null);
+        const refresh = useCallback(() => {
+          const qs = override ? `?uploadUnit=${override}` : "";
+          fetch(`/deeplinks${qs}`)
+            .then((r) => r.json())
+            .then((data) => {
+              setLink(data);
+              onAuth(data);
+            });
+        }, [override, onAuth]);
+        // Changing the override regenerates immediately — no reason to make the user also hit
+        // "Generate new pairing link" to see the effect of their own selection.
+        useEffect(() => { refresh(); }, [refresh]);
+
+        // Read straight off the generated link rather than trusting `override` blindly — this is
+        // what the link actually carries, i.e. exactly what the app will honor.
+        const linkUploadUnit = link ? new URL(link.upload).searchParams.get("uploadUnit") : null;
+
+        return html`
+          <section>
+            <p className="eyebrow">Pair a device</p>
+            <div className="panel">
+              <label>Deep link</label>
+              <p className="mono">${link ? link.upload : "Loading…"}</p>
+              <label>Artifact ID (session anchor)</label>
+              <p className="mono">${link ? link.artifactId : ""}</p>
+              <label>Upload unit on this link</label>
+              <p className="mono">
+                ${linkUploadUnit
+                  ? `${linkUploadUnit} (per-link override)`
+                  : `${caps ? caps.uploadUnit : "?"} (from /capabilities, no override on this link)`}
+              </p>
+
+              <label htmlFor="uploadUnitOverride">
+                Upload unit for this link${" "}
+                <span
+                  className="mono"
+                  style=${{ textTransform: "none", fontWeight: 400 }}
+                  title="Per-link override — carried on the pairing link itself (PROTOCOL.md §3, §8), independent of the deployment-wide toggle in the status bar above. Lets you pair two devices to 'beat' and 'merged' sessions at the same time."
+                >(overrides the status-bar toggle, this link only)</span>
+              </label>
+              <select
+                id="uploadUnitOverride"
+                className="btn btn-ghost"
+                style=${{ marginBottom: "0.6rem" }}
+                value=${override}
+                onChange=${(e) => setOverride(e.target.value)}
+              >
+                <option value="">Use server default (from /capabilities)</option>
+                <option value="beat">Force "beat" for this link</option>
+                <option value="merged">Force "merged" for this link</option>
+              </select>
+              <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
+
+              ${link && html`<img className="qr" width="200" height="200" src=${link.qrUpload} alt="Pairing QR code" />`}
+              <a className="btn btn-primary" href=${link ? link.upload : "#"} style=${{ marginTop: "1rem" }}>Open in Pulse app</a>
+            </div>
+          </section>`;
+      }
+
+      function EventRow({ event }) {
+        const cls = event.phase === "complete" ? "success" : event.phase === "reject" ? "warning" : "off";
+        const detail = event.reason
+          ? ` — ${event.reason}`
+          : event.size != null
+            ? ` — ${formatSize(event.size)}`
+            : "";
+        return html`
+          <div className="event-row">
+            <span className="event-phase"><span className=${`dot ${cls}`}></span>${event.phase}</span>
+            <span className="mono">${event.kind}/${event.artifactId.slice(0, 8)}…${detail}</span>
+            <span className="mono" style=${{ marginLeft: "auto" }}>${new Date(event.at).toLocaleTimeString()}</span>
+          </div>`;
+      }
+
+      function EventsPanel() {
+        // Live-ish feed: poll rather than hold a socket open, since this is a demo page, not
+        // something that needs to survive a flaky connection.
+        const [events] = usePolledJson("/events", 3000);
+        return html`
+          <section>
+            <p className="eyebrow">Activity</p>
+            <div className="panel">
+              <div className="top-row">
+                <h2>Live events</h2>
+                <span className="mono">${events?.length ? `${events.length} recent` : ""}</span>
+              </div>
+              <div className="event-list" style=${{ marginTop: "0.5rem" }}>
+                ${events === null
+                  ? html`<p className="mono">Loading…</p>`
+                  : events.length === 0
+                    ? html`<p className="mono">Nothing yet — pair and upload to see events appear here.</p>`
+                    : events.map((e, i) => html`<${EventRow} key=${`${e.artifactId}-${e.at}-${i}`} event=${e} />`)}
+              </div>
+            </div>
+          </section>`;
+      }
+
+      function PulseCard({ pulse }) {
+        const captionsCount =
+          pulse.beats.filter((b) => b.captions).length + pulse.unmatchedCaptions.length;
+        const checksumCount = pulse.beats.filter((b) => b.checksumVerified).length;
+
+        return html`
+          <div className="pulse-card">
+            <div className="beat-row">
+              ${pulse.beats.map(
+                (b) => html`
+                  <video key=${b.artifactId} src=${b.playbackUrl} controls preload="metadata">
+                    ${b.captions &&
+                    html`<track kind="subtitles" src=${b.captions.vttUrl} srcLang="en" label="Captions" default />`}
+                  </video>`,
+              )}
+            </div>
+            <div className="pulse-meta">
+              <span className="badge">
+                ${pulse.mode === "beat"
+                  ? `${pulse.beats.length} beat${pulse.beats.length === 1 ? "" : "s"}`
+                  : "merged video"}
+              </span>
+              ${pulse.manifest && html`<span className="badge">relatedTo-linked</span>`}
+              ${captionsCount > 0 &&
+              html`<span className="badge">${captionsCount} caption track${captionsCount === 1 ? "" : "s"}</span>`}
+              ${checksumCount > 0 && html`<span className="badge on">✓ checksum verified</span>`}
+            </div>
+            <p className="mono" style=${{ margin: "0.5rem 0 0" }}>
+              ${new Date(pulse.creation_date).toLocaleString()} · ${pulse.anchorArtifactId}
+            </p>
+          </div>`;
+      }
+
+      function PulsesPanel() {
+        const [pulses, refresh] = usePolledJson("/pulses", 8000);
+        return html`
+          <section>
+            <p className="eyebrow">Recordings</p>
+            <div className="panel">
+              <div className="top-row">
+                <h2>Uploads${pulses?.length ? ` (${pulses.length})` : ""}</h2>
+                <button className="btn btn-ghost btn-sm" onClick=${refresh}>↻ Refresh</button>
+              </div>
+              <div className="pulse-list">
+                ${pulses === null
+                  ? html`<p className="mono">Loading…</p>`
+                  : pulses.length === 0
+                    ? html`<p className="mono">No uploads yet.</p>`
+                    : pulses.map((p) => html`<${PulseCard} key=${p.anchorArtifactId} pulse=${p} />`)}
+              </div>
+            </div>
+          </section>`;
+      }
+
+      function App() {
+        const [caps] = usePolledJson("/pulsevault/capabilities");
+        const [auth, setAuth] = useState(null);
+        // undefined = still checking, null = signed out, object = signed in
+        const [session, setSession] = useState(undefined);
+        const loadSession = useCallback(() => {
+          fetch("/api/auth/get-session")
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => setSession(data?.user ? data : null))
+            .catch(() => setSession(null));
+        }, []);
+        useEffect(() => { loadSession(); }, [loadSession]);
+        const signOut = useCallback(() => {
+          fetch("/api/auth/sign-out", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+          }).then(() => { setAuth(null); setSession(null); });
+        }, []);
+
+        return html`
+          <div className="top-row">
+            <div className="brand-row">
+              <div className="brand-mark">PV</div>
+              <div>
+                <h1>PulseVault</h1>
+                <p className="brand-sub">Reference server · Fastify · Better Auth + capability tokens</p>
+              </div>
+            </div>
+            <a href="/docs" className="docs-link">API Reference ↗</a>
+          </div>
+
+          <${StatusBar} caps=${caps} auth=${auth} session=${session} onSignOut=${signOut} />
+          <${HowItWorks} auth=${auth} />
+          <${DatabasePanel} />
+          <${ProductionPanel} />
+          <${ScalingPanel} />
+          ${session === null && html`<${AuthPanel} onSignedIn=${loadSession} />`}
+          ${session?.user &&
+          html`<${Fragment}>
+            <${PairPanel} caps=${caps} onAuth=${setAuth} />
+            <${EventsPanel} />
+            <${PulsesPanel} />
+          <//>`}
+
+          <footer>
+            <span>@mieweb/pulsevault</span>
+            <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>
+          </footer>`;
+      }
+
+      createRoot(document.getElementById("root")).render(html`<${App} />`);
+    </script>
+  </body>
+</html>

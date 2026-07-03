@@ -1,4 +1,4 @@
-// Meteor counterpart to ../rn-demo/server.mjs and ../express-demo/server.mjs
+// Meteor counterpart to ../fastify-auth-demo/server.mjs and ../express-demo/server.mjs
 // — same demo (pairing page, QR codes, upload listing, optional bearer-token
 // auth), built on @mieweb/pulsevault/core mounted via WebApp.connectHandlers
 // instead of a framework of its own. The pairing page itself is Meteor's
@@ -24,7 +24,7 @@ import {
 
 // Meteor bundles run from a generated build directory, not the source tree
 // (and production bundles don't even ship the source tree) — so, unlike
-// ../rn-demo and ../express-demo, this demo doesn't write uploads next to
+// ../fastify-auth-demo and ../express-demo, this demo does not write uploads next to
 // its own source. Defaults to a tmpdir; set PULSEVAULT_DIR to persist
 // uploads somewhere durable.
 const workspaceDir = process.env.PULSEVAULT_DIR || path.join(os.tmpdir(), "pulsevault-meteor-demo-data");
@@ -185,7 +185,7 @@ const pulseVault = createPulseVaultCore({
   stripBasePath: false,
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] },
+  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
   validatePayload: async (request, ctx) => {
     if (ctx.kind !== "video") return;
     const sniff = useS3 ? createS3Mp4Sniffer(pulseStorage) : createMp4Sniffer(pulseStorage);

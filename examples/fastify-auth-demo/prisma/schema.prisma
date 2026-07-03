@@ -1,0 +1,92 @@
+// Schema for the auth demo's Postgres database:
+//  - Better Auth's core models (user/session/account/verification), the same
+//    shape `npx @better-auth/cli generate` emits for the Prisma adapter
+//  - the demo's artifact index (see "Artifact index" in server.mjs)
+// Applied with `prisma migrate deploy` — wired into `npm start`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id
+  name          String
+  email         String
+  emailVerified Boolean
+  image         String?
+  createdAt     DateTime
+  updatedAt     DateTime
+  sessions      Session[]
+  accounts      Account[]
+
+  @@unique([email])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String
+  createdAt DateTime
+  updatedAt DateTime
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime
+  updatedAt             DateTime
+
+  @@map("account")
+}
+
+model Verification {
+  id         String    @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime?
+  updatedAt  DateTime?
+
+  @@map("verification")
+}
+
+// One row per COMPLETED upload — an index over the filesystem sidecars (which
+// stay the source of truth), so /pulses is one query instead of a directory
+// crawl. Written by onUploadComplete, pruned on authorized deletes,
+// reconciled from disk at boot.
+model Artifact {
+  artifactId       String   @id @map("artifact_id")
+  kind             String
+  filename         String
+  ext              String
+  size             BigInt
+  relatedTo        String?  @map("related_to")
+  checksumVerified Boolean  @default(false) @map("checksum_verified")
+  createdAt        DateTime @map("created_at")
+
+  @@index([relatedTo])
+  @@map("artifact")
+}

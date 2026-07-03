@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Scripted end-to-end smoke test: boots the rn-demo reference server, then
+// Scripted end-to-end smoke test: boots the fastify-auth-demo reference server, then
 // drives a real TUS upload against it with a plain Node script — no mobile
 // app or simulator required. Catches contract drift between this package and
 // its own demo automatically, in CI, rather than only by a human noticing on
@@ -7,7 +7,7 @@
 //
 // Exits non-zero (and prints what failed) on any assertion failure.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const demoDir = path.join(__dirname, "..", "examples", "rn-demo");
+const demoDir = path.join(__dirname, "..", "examples", "fastify-auth-demo");
 
 const PORT = 4173;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -48,7 +48,7 @@ async function waitForReady(child, timeoutMs = 15_000) {
   child.stdout.on("data", onData);
   child.stderr.on("data", onData);
   const deadline = Date.now() + timeoutMs;
-  while (!buffer.includes("PulseVault demo running")) {
+  while (!buffer.includes("PulseVault auth demo running")) {
     if (Date.now() > deadline) {
       throw new Error(`Server did not start within ${timeoutMs}ms. Output so far:\n${buffer}`);
     }
@@ -59,16 +59,48 @@ async function waitForReady(child, timeoutMs = 15_000) {
 }
 
 async function main() {
-  console.log("Starting rn-demo server...");
+  // The auth demo is Postgres-only (Prisma). Bring up its compose db service
+  // (a no-op if it's already running — Docker is required for this e2e) and
+  // apply the schema, exactly as `npm start` would.
+  const DATABASE_URL =
+    process.env.DATABASE_URL || "postgres://pulsevault:pulsevault@127.0.0.1:5433/pulsevault";
+  if (!process.env.DATABASE_URL) {
+    console.log("Starting compose Postgres (docker compose up -d db --wait)...");
+    const dbUp = spawnSync("docker", ["compose", "up", "-d", "db", "--wait"], {
+      cwd: demoDir,
+      env: { ...process.env, PULSEVAULT_SECRET },
+      stdio: "inherit",
+    });
+    assert.equal(dbUp.status, 0, "docker compose up -d db should succeed (Docker is required for e2e)");
+  }
+  const migrate = spawnSync("npx", ["prisma", "migrate", "deploy"], {
+    cwd: demoDir,
+    env: { ...process.env, DATABASE_URL },
+    stdio: "inherit",
+  });
+  assert.equal(migrate.status, 0, "prisma migrate deploy should succeed");
+
+  // 0. The auth demo's fail-fast contract: booting without PULSEVAULT_SECRET
+  // must exit non-zero instead of falling back to an open server.
+  {
+    const env = { ...process.env, PORT: String(PORT), HOST: "127.0.0.1", PULSEVAULT_ISSUER: BASE, DATABASE_URL };
+    delete env.PULSEVAULT_SECRET;
+    const noSecret = spawn(process.execPath, ["server.mjs"], { cwd: demoDir, env, stdio: "ignore" });
+    const [code] = await once(noSecret, "exit");
+    assert.notEqual(code, 0, "booting without PULSEVAULT_SECRET should exit non-zero");
+    console.log("  ✓ refuses to boot without PULSEVAULT_SECRET");
+  }
+
+  console.log("Starting fastify-auth-demo server...");
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: demoDir,
     env: {
       ...process.env,
       PORT: String(PORT),
       HOST: "127.0.0.1",
-      STORAGE: "local",
       PULSEVAULT_SECRET,
       PULSEVAULT_ISSUER: BASE,
+      DATABASE_URL,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -77,7 +109,7 @@ async function main() {
   child.once("exit", (code) => {
     if (!main.done) {
       exitedEarly = true;
-      console.error(`rn-demo server exited early with code ${code}`);
+      console.error(`fastify-auth-demo server exited early with code ${code}`);
     }
   });
 
@@ -95,10 +127,37 @@ async function main() {
     assert.ok(["beat", "merged"].includes(caps.uploadUnit));
     console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
 
-    // 2. Pairing — mints an artifactId + a real HMAC-signed capability token
+    // 2a. Dashboard routes are Better Auth-protected: no session -> 401.
+    const unauthed = await fetch(`${BASE}/deeplinks`);
+    assert.equal(unauthed.status, 401, "GET /deeplinks without a session should be 401");
+
+    // 2b. Create a dashboard account (sign-up signs you in and sets a session
+    // cookie). The auth DB persists across runs, so fall back to sign-in.
+    // Node's fetch sends `Origin: null` on POSTs, which Better Auth's CSRF
+    // check rightly rejects — send the real origin like a browser would.
+    const authHeaders = { "content-type": "application/json", origin: BASE };
+    const credentials = { email: "e2e@example.test", password: "e2e-password-123", name: "E2E" };
+    let authRes = await fetch(`${BASE}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify(credentials),
+    });
+    if (!authRes.ok) {
+      authRes = await fetch(`${BASE}/api/auth/sign-in/email`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ email: credentials.email, password: credentials.password }),
+      });
+    }
+    assert.ok(authRes.ok, `dashboard sign-up/sign-in should succeed, got ${authRes.status}`);
+    const cookie = authRes.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    assert.ok(cookie.length > 0, "sign-in should set a session cookie");
+    console.log("  ✓ dashboard: /deeplinks without a session -> 401; Better Auth sign-in issues one");
+
+    // 2c. Pairing — mints an artifactId + a real HMAC-signed capability token
     // (issueCapabilityToken), carried in the deep link exactly as a real
-    // client would receive it.
-    const linkRes = await fetch(`${BASE}/deeplinks`);
+    // client would receive it. Requires the dashboard session from 2b.
+    const linkRes = await fetch(`${BASE}/deeplinks`, { headers: { cookie } });
     assert.equal(linkRes.status, 200, "GET /deeplinks should be 200");
     const { artifactId, upload: deepLink, authMode } = await linkRes.json();
     assert.ok(artifactId, "deeplinks response should include an artifactId");
@@ -179,7 +238,7 @@ async function main() {
     // silently accepted.
     const noToken = await fetch(`${PREFIX}/artifacts/${artifactId}`);
     assert.equal(noToken.status, 401, "GET with no token should be 401");
-    const other = await fetch(`${BASE}/deeplinks`).then((r) => r.json());
+    const other = await fetch(`${BASE}/deeplinks`, { headers: { cookie } }).then((r) => r.json());
     const otherToken = tokenFromDeepLink(other.upload);
     const wrongToken = await fetch(`${PREFIX}/artifacts/${artifactId}?token=${otherToken}`);
     assert.equal(wrongToken.status, 403, "GET with a token for a different artifact should be 403");

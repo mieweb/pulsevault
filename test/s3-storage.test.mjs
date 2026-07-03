@@ -344,13 +344,13 @@ test("kind=captions lands under captions/ with relatedTo recorded", async () => 
   const captionsId = randomUUID();
   try {
     await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, size: 2048 });
-    const srt = Buffer.from("1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+    const vtt = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
     await uploadFull(ctx.baseUrl, PREFIX, {
       artifactId: captionsId,
-      filename: "clip.srt",
+      filename: "clip.vtt",
       kind: "captions",
       relatedTo: videoId,
-      body: srt,
+      body: vtt,
     });
 
     assert.equal(await ctx.storage.getKind(captionsId), "captions");
@@ -359,7 +359,7 @@ test("kind=captions lands under captions/ with relatedTo recorded", async () => 
     const get = await fetch(artifactUrl(ctx, captionsId), { redirect: "manual" });
     assert.equal(get.status, 302);
     const direct = await fetch(get.headers.get("location"));
-    assert.equal(direct.headers.get("content-type"), "application/x-subrip");
+    assert.equal(direct.headers.get("content-type"), "text/vtt");
   } finally {
     await ctx.teardown();
   }

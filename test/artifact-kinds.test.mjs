@@ -1,6 +1,6 @@
 // Tests for kind=project and kind=captions uploads through the TUS endpoint
 // and the generic /artifacts/:artifactId route.
-// Covers: happy paths (.pulse / .zip / .srt), extension-mismatch rejections,
+// Covers: happy paths (.pulse / .zip / .vtt), extension-mismatch rejections,
 // authorize ctx kind, the artifactId/videoid/projectid metadata aliases,
 // unified hook dispatch (incl. the deprecated per-kind project hooks),
 // relatedTo linking, getKind(), and legacy back-compat (sidecars without
@@ -407,29 +407,29 @@ test("allowedExtensions object form: custom video and project extensions", async
 
 // ---------- kind=captions ----------
 
-test("kind=captions happy path: .srt under captions/ subdir, sharing a session via relatedTo", async () => {
+test("kind=captions happy path: .vtt under captions/ subdir, sharing a session via relatedTo", async () => {
   const ctx = await startApp();
   try {
     // The video this captions artifact belongs to.
     await uploadFull(ctx, { artifactId: ID1, filename: "clip.mp4", payload: makeMp4(1024) });
 
-    const srt = Buffer.from("1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+    const vtt = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
     await uploadFull(ctx, {
       artifactId: ID2,
-      filename: "clip.srt",
+      filename: "clip.vtt",
       kind: "captions",
       relatedTo: ID1,
-      payload: srt,
+      payload: vtt,
     });
 
-    const expectedPath = path.join(ctx.workspaceDir, "captions", `${ID2}.srt`);
+    const expectedPath = path.join(ctx.workspaceDir, "captions", `${ID2}.vtt`);
     const stat = await fs.stat(expectedPath);
-    assert.ok(stat.isFile(), "srt exists at captions/ subdir");
+    assert.ok(stat.isFile(), "vtt exists at captions/ subdir");
 
     const get = await fetch(artifactUrl(ctx, ID2));
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
-    assert.ok(ct?.includes("application/x-subrip"), `content-type was: ${ct}`);
+    assert.ok(ct?.includes("text/vtt"), `content-type was: ${ct}`);
 
     assert.equal(await ctx.storage.getKind(ID2), "captions");
     assert.equal(await ctx.storage.getRelatedTo(ID2), ID1, "relatedTo recorded for the session link");
@@ -439,7 +439,7 @@ test("kind=captions happy path: .srt under captions/ subdir, sharing a session v
   }
 });
 
-test("kind=captions with a non-.srt extension is rejected at create", async () => {
+test("kind=captions accepts .vtt under default captions extensions", async () => {
   const ctx = await startApp();
   try {
     const create = await tusCreate(ctx.baseUrl, {
@@ -448,9 +448,28 @@ test("kind=captions with a non-.srt extension is rejected at create", async () =
       size: 64,
       kind: "captions",
     });
+    assert.equal(
+      create.status,
+      201,
+      `expected 201 for .vtt under default captions extensions (['.vtt']), got ${create.status}`,
+    );
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("kind=captions with an unlisted extension is rejected at create", async () => {
+  const ctx = await startApp();
+  try {
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.txt",
+      size: 64,
+      kind: "captions",
+    });
     assert.ok(
       create.status >= 400 && create.status < 500,
-      `expected 4xx for .vtt under default captions extensions, got ${create.status}`,
+      `expected 4xx for .txt under default captions extensions, got ${create.status}`,
     );
   } finally {
     await ctx.teardown();

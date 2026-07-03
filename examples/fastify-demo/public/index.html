@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>PulseVault — Minimal Fastify Demo</title>
+    <style>
+      :root {
+        --bg: #0a0e16;
+        --surface: #11161f;
+        --surface-2: #161c28;
+        --border: #232a38;
+        --text: #e7eaf0;
+        --text-2: #9aa4b8;
+        --text-3: #626d82;
+        --accent: #10b981;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      * { box-sizing: border-box; min-width: 0; }
+      html { overflow-x: hidden; }
+      body { max-width: 46rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; line-height: 1.5; overflow-x: hidden; }
+
+      .eyebrow { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 0.6rem; }
+      h1 { font-size: 1.05rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+      h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
+
+      .brand-row { display: flex; align-items: center; gap: 0.6rem; }
+      .brand-mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #047857); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; flex: none; }
+      .brand-sub { font-size: 0.75rem; color: var(--text-3); margin: 0.1rem 0 0; }
+      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+
+      .docs-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.4rem 0.75rem; font-size: 0.75rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); border-radius: 6px; text-decoration: none; }
+      .docs-link:hover { border-color: var(--accent); color: var(--text); }
+
+      .status-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
+      .chip { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.7rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--text-2); }
+      .chip b { color: var(--text); font-weight: 600; }
+      .dot { width: 0.45rem; height: 0.45rem; border-radius: 999px; background: #34d399; box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.14); flex: none; }
+
+      /* Diagrams routinely render wider than a phone screen — scroll them
+         horizontally rather than letting them force the whole page to scroll. */
+      .diagram-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 0 0.75rem; }
+      .diagram-wrap .mermaid { min-width: 460px; }
+      .diagram-caption { font-size: 0.72rem; font-weight: 600; color: var(--text-3); margin: 0 0 0.4rem; }
+
+      section { margin-top: 1.75rem; }
+      .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+
+      details summary { cursor: pointer; list-style: none; }
+      details summary::-webkit-details-marker { display: none; }
+      details.panel summary { font-weight: 600; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
+      details.panel summary::before { content: "▸"; color: var(--text-3); font-size: 0.7rem; }
+      details.panel[open] summary::before { content: "▾"; }
+      details.panel[open] summary { margin-bottom: 0.9rem; }
+
+      .feature-list { margin: 0; padding: 0; list-style: none; font-size: 0.8rem; color: var(--text-2); }
+      .feature-list li { position: relative; padding: 0.4rem 0 0.4rem 1.1rem; border-top: 1px solid var(--border); }
+      .feature-list li:first-child { border-top: none; }
+      .feature-list li::before { content: "→"; color: var(--accent); position: absolute; left: 0; top: 0.4rem; }
+      code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; }
+
+      .btn { display: block; width: 100%; padding: 0.55rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 7px; text-align: center; text-decoration: none; cursor: pointer; border: 1px solid transparent; }
+      .btn-primary { color: #fff; background: var(--accent); margin-top: 1rem; }
+      .btn-primary:hover { background: #059669; }
+      .btn-ghost { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+      .btn-ghost:hover { color: var(--text); border-color: var(--accent); }
+      .btn-sm { width: auto; padding: 0.3rem 0.65rem; font-size: 0.72rem; }
+
+      .qr { display: block; margin: 1rem auto 0; border-radius: 8px; background: #fff; padding: 10px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; word-break: break-all; color: var(--text-3); }
+      label { display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); margin: 0.7rem 0 0.2rem; }
+      label:first-of-type { margin-top: 0; }
+
+      footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
+      footer a { color: var(--text-3); word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Real React, no build step: pinned ESM builds served from a CDN, with
+         `htm` providing JSX-like templating in plain JS. Keeps this example a
+         single `npm start` with no bundler while the page itself is a normal
+         React component tree (state, effects, polling). -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.1.0",
+          "react-dom/client": "https://esm.sh/react-dom@19.1.0/client",
+          "htm/react": "https://esm.sh/htm@3.1.1/react?deps=react@19.1.0",
+          "mermaid": "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+        }
+      }
+    </script>
+    <script type="module">
+      import { useState, useEffect, useCallback, useRef } from "react";
+      import { createRoot } from "react-dom/client";
+      import { html } from "htm/react";
+      import mermaid from "mermaid";
+
+      mermaid.initialize({ startOnLoad: false, theme: "dark" });
+
+      // ----------------------------------------------------------------- //
+      // Static content                                                    //
+      // ----------------------------------------------------------------- //
+
+      const SETUP_DIAGRAM = `
+graph TB
+    subgraph demo ["examples/fastify-demo — the ~140 lines this demo owns"]
+        R["this React page (GET /)"]
+        D1["POST /reserve — mint artifactId"]
+        D2["GET /deeplinks — pairing link + QR"]
+        D3["GET /videos — list finished uploads"]
+    end
+    subgraph plugin ["@mieweb/pulsevault plugin — one register() call, mounted at /pulsevault"]
+        P1["GET /capabilities — protocol discovery"]
+        P2["TUS /upload — resumable uploads<br/>(POST create, PATCH chunks, HEAD resume)"]
+        P3["GET + DELETE /artifacts/:id — serve + delete bytes"]
+    end
+    S[("./data<br/>local storage: bytes + sidecars")]
+    App["Pulse app"] -->|scans QR from| D2
+    App -->|uploads via| P2
+    P2 --> S
+    P3 --> S
+    D3 -->|reads sidecars| S`;
+
+      const FLOW_DIAGRAM = `
+sequenceDiagram
+    participant User
+    participant Demo as This demo server
+    participant Vault as pulsevault plugin
+    participant Pulse as Pulse app
+
+    User->>Demo: open this page
+    Demo->>User: QR + pulsecam:// deep link (artifactId minted server-side)
+    User->>Pulse: scan / open link
+    Pulse->>Vault: GET /capabilities (protocol version, upload unit)
+    Pulse->>Vault: POST /upload -> 201 + Location
+    Pulse->>Vault: PATCH chunks, HEAD before resume
+    Vault->>Vault: finished upload marked ready in ./data
+    Demo->>Vault: page lists /videos, plays /artifacts/:id`;
+
+      const S3_DIAGRAM = `
+graph LR
+    V["pulsevault plugin —<br/>N instances, no sticky sessions"] -->|multipart TUS| B[("S3 / Cloudflare R2<br/>bucket")]
+    B -.->|"playback: 302 presigned URL,<br/>bytes never proxy through Node"| P["viewer"]`;
+
+      const DB_DIAGRAM = `
+graph LR
+    H["onUploadComplete +<br/>onArtifactEvent hooks"] -->|index once,<br/>on completion| DB[("artifacts · sessions ·<br/>signing keys (kid) · audit log")]
+    DB -->|one indexed query| L["GET /pulses"]
+    C["retention cron /<br/>key rotation"] --> DB`;
+
+      // ----------------------------------------------------------------- //
+      // Shared helpers                                                    //
+      // ----------------------------------------------------------------- //
+
+      let mermaidSeq = 0;
+      function MermaidDiagram({ chart }) {
+        const ref = useRef(null);
+        useEffect(() => {
+          let cancelled = false;
+          mermaid
+            .render(`mmd-${++mermaidSeq}`, chart)
+            .then(({ svg }) => {
+              if (!cancelled && ref.current) ref.current.innerHTML = svg;
+            })
+            .catch(() => {});
+          return () => { cancelled = true; };
+        }, [chart]);
+        return html`
+          <div className="diagram-wrap">
+            <div className="mermaid" ref=${ref}></div>
+          </div>`;
+      }
+
+      // ----------------------------------------------------------------- //
+      // Components                                                        //
+      // ----------------------------------------------------------------- //
+
+      function StatusBar({ caps }) {
+        if (!caps) return html`<div className="status-bar"></div>`;
+        return html`
+          <div className="status-bar">
+            <span className="chip"><span className="dot"></span>Protocol <b>v${caps.protocolVersion}</b></span>
+            <span className="chip">Upload unit default <b>${caps.uploadUnit}</b></span>
+            <span className="chip">Auth <b>open (no auth)</b></span>
+          </div>`;
+      }
+
+      function HowItWorks() {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>How this works</summary>
+              <p className="diagram-caption">Setup — what this demo owns vs what the pulsevault plugin gives you for free</p>
+              <${MermaidDiagram} chart=${SETUP_DIAGRAM} />
+              <p className="diagram-caption">Pairing + upload flow — what happens once you scan the QR below</p>
+              <${MermaidDiagram} chart=${FLOW_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  <b>pulsevault gives:</b> the whole wire protocol — resumable TUS uploads that survive
+                  signal drops (<code>POST/PATCH/HEAD /upload</code>), protocol discovery
+                  (<code>/capabilities</code>), artifact serving + deletion (<code>/artifacts/:id</code>),
+                  and pluggable storage (local <code>./data</code> here).
+                </li>
+                <li>
+                  <b>this demo adds:</b> artifactId minting (<code>/reserve</code>), the pairing
+                  deep link + QR (<code>/deeplinks</code> via <code>buildUploadLink</code>), the uploads
+                  listing (<code>/videos</code>), and this page — that's the entire integration surface.
+                </li>
+                <li>
+                  <b>deliberately not here:</b> authentication, payload validation, captions, or session
+                  grouping — see <code>../fastify-auth-demo</code> for the production-shaped reference
+                  with capability tokens always on.
+                </li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function ScalingPanel() {
+        return html`
+          <section>
+            <details className="panel">
+              <summary>Scaling this up — database & S3</summary>
+              <p className="diagram-caption">Storage — this demo writes to local disk; production swaps one call for S3/R2</p>
+              <${MermaidDiagram} chart=${S3_DIAGRAM} />
+              <p className="diagram-caption">Metadata — this demo scans sidecar files per request; the auth demo indexes uploads into Postgres via the hooks</p>
+              <${MermaidDiagram} chart=${DB_DIAGRAM} />
+              <ul className="feature-list">
+                <li>
+                  <b>S3 / R2:</b> swap <code>createLocalStorage</code> for <code>createS3Storage</code> and
+                  nothing else changes — uploads stream to the bucket via multipart TUS, playback becomes a
+                  <code>302</code> presigned redirect, and any number of server instances can share one
+                  bucket with no sticky sessions (see <code>OPERATIONS.md</code>).
+                </li>
+                <li>
+                  <b>Database:</b> this demo's <code>/videos</code> re-reads every sidecar file on every
+                  request — fine at this size. The step up is implemented in
+                  <code> ../fastify-auth-demo</code>: one Prisma + Postgres schema holding auth sessions and
+                  an artifact index written once per upload by <code>onUploadComplete</code>, plus Better
+                  Auth, captions, session grouping, and a Docker Compose stack.
+                </li>
+                <li>
+                  <b>Live deployments:</b> the auth example with all of those features is deployed at
+                  <a href="https://pulsevaultauth.os.mieweb.org" target="_blank" rel="noreferrer">pulsevaultauth.os.mieweb.org</a>,
+                  and this no-auth version will be on
+                  <a href="https://pulsevault.os.mieweb.org" target="_blank" rel="noreferrer">pulsevault.os.mieweb.org</a>.
+                </li>
+              </ul>
+            </details>
+          </section>`;
+      }
+
+      function PairPanel({ caps }) {
+        const [override, setOverride] = useState("");
+        const [link, setLink] = useState(null);
+        const serverDefault = caps ? caps.uploadUnit : null;
+        const refresh = useCallback(() => {
+          const qs = override ? `?uploadUnit=${override}` : "";
+          fetch(`/deeplinks${qs}`).then((r) => r.json()).then(setLink);
+        }, [override]);
+        // Changing the selector regenerates the link immediately.
+        useEffect(() => { refresh(); }, [refresh]);
+
+        // Read straight off the generated link — this is what the app will honor.
+        const linkUploadUnit = link ? new URL(link.upload).searchParams.get("uploadUnit") : null;
+
+        return html`
+          <section>
+            <p className="eyebrow">Pair a device</p>
+            <div className="panel">
+              <label>Deep link</label>
+              <p className="mono">${link ? link.upload : "Loading…"}</p>
+              <label>Artifact ID</label>
+              <p className="mono">${link ? link.artifactId : ""}</p>
+              <label>Upload unit on this link</label>
+              <p className="mono">
+                ${linkUploadUnit
+                  ? `${linkUploadUnit} (per-link override)`
+                  : `${serverDefault ?? "?"} (server default, no override on this link)`}
+              </p>
+
+              <label htmlFor="uploadUnitOverride">Upload unit for this link</label>
+              <select
+                id="uploadUnitOverride"
+                className="btn btn-ghost"
+                style=${{ marginBottom: "0.6rem" }}
+                value=${override}
+                onChange=${(e) => setOverride(e.target.value)}
+              >
+                <option value="">Use server default${serverDefault ? ` (${serverDefault})` : ""}</option>
+                <option value="beat">Force "beat" for this link</option>
+                <option value="merged">Force "merged" for this link</option>
+              </select>
+              <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
+
+              ${link && html`<img className="qr" width="200" height="200" src=${link.qrUpload} alt="Pairing QR code" />`}
+              <a className="btn btn-primary" href=${link ? link.upload : "#"}>Open in Pulse app</a>
+            </div>
+          </section>`;
+      }
+
+      // Live count only — the uploads themselves (playback) moved to their own
+      // page at /library, keeping this one focused on pairing. Rendered as a
+      // header link (next to API Reference) rather than its own section.
+      function UploadsLink() {
+        const [count, setCount] = useState(null);
+        useEffect(() => {
+          // Count PULSES (feed items), not raw artifacts — a 6-beat session is six
+          // videos + subtitles + a manifest on the wire, but one item in the feed.
+          // Same grouping as the feed page: one pulse per session anchor
+          // (`relatedTo ?? artifactId`), counted only if it actually has video.
+          const refresh = () =>
+            fetch("/videos")
+              .then((r) => r.json())
+              .then((uploads) => {
+                const anchors = new Set();
+                for (const u of uploads) {
+                  if (u.kind === "video") anchors.add(u.relatedTo ?? u.artifactId);
+                }
+                setCount(anchors.size);
+              })
+              .catch(() => {});
+          refresh();
+          const id = setInterval(refresh, 8000);
+          return () => clearInterval(id);
+        }, []);
+
+        return html`<a href="/library" className="docs-link">View feed${count ? ` (${count})` : ""} ↗</a>`;
+      }
+
+      function App() {
+        const [caps, setCaps] = useState(null);
+        useEffect(() => {
+          fetch("/pulsevault/capabilities").then((r) => r.json()).then(setCaps).catch(() => {});
+        }, []);
+
+        return html`
+          <div className="top-row">
+            <div className="brand-row">
+              <div className="brand-mark">PV</div>
+              <div>
+                <h1>PulseVault</h1>
+                <p className="brand-sub">Minimal demo · Fastify · no auth</p>
+              </div>
+            </div>
+            <div style=${{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+              <${UploadsLink} />
+              <a href="/docs" className="docs-link">API Reference ↗</a>
+            </div>
+          </div>
+          <${StatusBar} caps=${caps} />
+          <${HowItWorks} />
+          <${ScalingPanel} />
+          <${PairPanel} caps=${caps} />
+          <footer>
+            <span>@mieweb/pulsevault</span>
+            <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>
+          </footer>`;
+      }
+
+      createRoot(document.getElementById("root")).render(html`<${App} />`);
+    </script>
+  </body>
+</html>

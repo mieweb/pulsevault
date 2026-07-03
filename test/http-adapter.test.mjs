@@ -408,7 +408,7 @@ test("createCapabilityAuthorize: valid token authorizes its own artifact and a r
 
     const captionsCreate = await tusCreateRaw(ctx.baseUrl, PREFIX, {
       artifactId: ID2,
-      filename: "clip.srt",
+      filename: "clip.vtt",
       size: 10,
       kind: "captions",
       relatedTo: ID1,

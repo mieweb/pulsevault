@@ -690,7 +690,7 @@ test("createCapabilityAuthorize: valid token authorizes its own artifact and a r
     // Authorizes a related artifact (e.g. ID1's captions) via relatedTo.
     const captionsCreate = await tusCreateRaw(ctx.baseUrl, PREFIX, {
       artifactId: ID2,
-      filename: "clip.srt",
+      filename: "clip.vtt",
       size: 10,
       kind: "captions",
       relatedTo: ID1,
