@@ -189,9 +189,12 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
 
       return storage.reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum });
     },
-    generateUrl(_req, { proto, host, path: tusBasePath, id }) {
+    // Relative Location (RFC 7231 §7.1.2) so the upload URL is correct behind
+    // any TLS-terminating proxy without trusting spoofable X-Forwarded-*
+    // headers; clients resolve it against the request URL they already used.
+    generateUrl(_req, { path: tusBasePath, id }) {
       const encoded = Buffer.from(id, 'utf8').toString('base64url');
-      return `${proto}://${host}${tusBasePath}/${encoded}`;
+      return `${tusBasePath}/${encoded}`;
     },
     getFileIdFromRequest(_req, lastPath) {
       if (!lastPath) {

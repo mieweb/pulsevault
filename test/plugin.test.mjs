@@ -121,7 +121,7 @@ test("HEAD + resume PATCH completes the upload", async () => {
       filename: "clip.mp4",
       size: body.length,
     });
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
     const half = body.length / 2;
 
     const p1 = await tusPatch(location, 0, body.subarray(0, half));
@@ -274,7 +274,7 @@ test("authorize rejection blocks PATCH and HEAD on an existing upload, and sees 
       size: 1024,
     });
     assert.equal(create.status, 201);
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, makeMp4(1024));
     assert.equal(patch.status, 403, "authorize must reject the PATCH, not silently allow it");
@@ -393,7 +393,7 @@ test("createCapabilityAuthorize: PATCH without a valid token is rejected, not si
       headers: { Authorization: `Bearer ${token}` },
     });
     assert.equal(create.status, 201);
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
 
     // No credential presented at all -> 401 (PROTOCOL.md §5.2), not a silent pass-through.
     const noToken = await tusPatch(location, 0, makeMp4(1024));
@@ -455,7 +455,7 @@ test("createMp4Sniffer rejects non-MP4 bytes and removes the artifact", async ()
       size: fake.length,
     });
     assert.equal(create.status, 201);
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, fake);
     assert.ok(
@@ -652,7 +652,7 @@ test("checksum validator accepts a matching digest and rejects a mismatched one"
       size: body.length,
       checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     });
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
     const patch = await tusPatch(location, 0, body);
     assert.equal(patch.status, 422, "mismatched checksum is rejected");
 

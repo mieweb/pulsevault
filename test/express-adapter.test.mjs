@@ -63,7 +63,7 @@ test("express: full TUS upload + GET round-trips through app.use(prefix, core.ha
       size: body.length,
     });
     assert.equal(create.status, 201);
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, body);
     assert.equal(patch.status, 204);

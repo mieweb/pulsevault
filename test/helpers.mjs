@@ -85,8 +85,11 @@ export async function uploadFull(
     headers,
   });
   assert.equal(create.status, 201, "create");
-  const location = create.headers.get("location");
-  assert.ok(location, "location header");
+  const rawLocation = create.headers.get("location");
+  assert.ok(rawLocation, "location header");
+  // The server returns a relative Location; resolve it against the base URL
+  // the same way real tus clients resolve it against the request URL.
+  const location = new URL(rawLocation, baseUrl).href;
   const patch = await tusPatch(location, 0, payload, headers);
   assert.equal(patch.status, 204, "patch");
   return { body: payload, location };
