@@ -88,7 +88,7 @@ async function uploadFull(ctx, { artifactId, idKey = "artifactId", filename, kin
     relatedTo,
   });
   assert.equal(create.status, 201, `create ${filename}`);
-  const location = create.headers.get("location");
+  const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
   assert.ok(location, "location header");
   const patch = await tusPatch(location, 0, payload);
   assert.equal(patch.status, 204, `patch ${filename}`);

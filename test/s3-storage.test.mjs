@@ -146,7 +146,7 @@ test("HEAD + resume PATCH completes the multipart upload", async () => {
       filename: "clip.mp4",
       size: body.length,
     });
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
     const half = body.length / 2;
 
     const p1 = await tusPatch(location, 0, body.subarray(0, half));
@@ -217,7 +217,7 @@ test("createS3Mp4Sniffer rejects non-MP4 bytes and removes the object", async ()
       size: fake.length,
     });
     assert.equal(create.status, 201);
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, fake);
     assert.ok(
@@ -282,7 +282,7 @@ test("createS3ChecksumValidator accepts a matching digest and rejects a mismatch
       size: body.length,
       checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     });
-    const location = create.headers.get("location");
+    const location = new URL(create.headers.get("location"), baseUrl).href;
     const patch = await tusPatch(location, 0, body);
     assert.equal(patch.status, 422, "mismatched checksum is rejected");
   } finally {
