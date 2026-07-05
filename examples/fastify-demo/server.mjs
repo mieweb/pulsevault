@@ -56,20 +56,34 @@ const host = process.env.HOST ?? "0.0.0.0";
 const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
 
 const app = Fastify({
-  logger: true,
-  bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
+  // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
+  // -Host). Trust it so `request.ip` is the real client rather than the shared
+  // proxy IP — otherwise every client lands in one rate-limit bucket — and so
+  // forwarded proto/host are honored.
+  trustProxy: true,
+  // `LOG_LEVEL=warn` in production drops the per-request log line, which on a
+  // fast upload (many PATCHes) is real CPU + rootfs write I/O; "info" locally.
+  logger: { level: process.env.LOG_LEVEL ?? "info" },
+  // NOTE: not a TUS chunk cap. The PATCH body is streamed straight to
+  // @tus/server on a hijacked socket, bypassing Fastify body parsing, so this
+  // never sees it. It only bounds a *parsed* body (none in this demo). The real
+  // per-request ceiling is the edge nginx `client_max_body_size` (2G); total
+  // upload size is governed by `maxUploadSize` below.
+  bodyLimit: 16 * 1024 * 1024,
 });
 
 // --- Security & delivery middleware ---
 // All registered before any route so they cover the demo's own routes and the
 // TUS/artifact routes the plugin mounts alike.
 
-// Shed load with a 503 (instead of falling over) when the process is under
-// pressure — the right posture for an upload/ingest server. Also exposes a
-// liveness route at GET /health. Thresholds are generous so normal use never trips.
+// Shed load with a 503 (instead of falling over) when the process is genuinely
+// under pressure. Also exposes a liveness route at GET /health. maxRssBytes is
+// sized to the container (default assumes ~4 GB RAM → 3 GB) — TUS streams chunks
+// to disk so RSS stays low, and a too-low threshold would false-503 uploads.
+// Override MAX_RSS_MB to match the container's allocation.
 await app.register(underPressure, {
   maxEventLoopDelay: 1000,
-  maxRssBytes: 900 * 1024 * 1024,
+  maxRssBytes: Number(process.env.MAX_RSS_MB ?? 3072) * 1024 * 1024,
   maxEventLoopUtilization: 0.98,
   exposeStatusRoute: "/health",
 });
@@ -123,12 +137,22 @@ await app.register(fastifyCompress, { global: true });
 // hook never sees them); this covers the HTML / JSON / VTT routes.
 await app.register(fastifyEtag);
 
-// Registered before any route so every one of them — the demo's own and the
-// TUS/artifact routes the plugin mounts — is covered by a global per-IP
-// limit (OPERATIONS.md "Rate limiting" recommends exactly this). Generous
-// enough for one phone's normal HEAD/PATCH resume retries, not for a scraper
-// hammering /videos or /pulsevault/artifacts/:id.
-await app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
+// Global per-IP limit — meaningful now that trustProxy makes `request.ip` the
+// real client (behind the edge nginx it would otherwise be one shared bucket).
+// The TUS upload path and artifact playback get a much larger budget on purpose:
+// a fast chunked upload is many PATCHes (at 1 MB chunks a flat 300/min would cap
+// throughput to ~5 MB/s), and range-scrubbing a video is many GETs. The tight
+// default still guards the crawl-heavy /videos and /subtitles routes
+// (OPERATIONS.md "Rate limiting"). Tune the ceilings via env for your traffic.
+const UPLOAD_RATE_MAX = Number(process.env.UPLOAD_RATE_MAX ?? 6000);
+const DEFAULT_RATE_MAX = Number(process.env.DEFAULT_RATE_MAX ?? 300);
+await app.register(fastifyRateLimit, {
+  timeWindow: "1 minute",
+  max: (req) =>
+    req.url.startsWith("/pulsevault/upload") || req.url.startsWith("/pulsevault/artifacts")
+      ? UPLOAD_RATE_MAX
+      : DEFAULT_RATE_MAX,
+});
 
 // Swagger MUST be registered before any route (including the plugin's) so
 // their schemas are picked up — the pulsevault plugin ships full OpenAPI
