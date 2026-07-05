@@ -82,10 +82,17 @@ test("createChecksumValidator passes through (no-op) when no checksum metadata i
   assert.equal(nextCalled, true, "chained validator still runs when checksum is absent");
 });
 
-test("createChecksumValidator throws a clear error when checksum is requested but localPath is unavailable", async () => {
+test("createChecksumValidator surfaces a 500 (server misconfig, not 422) when localPath is unavailable", async () => {
   const validator = createChecksumValidator();
-  await assert.rejects(() =>
-    validator({}, { artifactId: "id", size: 0, uploadId: "u1", localPath: null, checksum: "sha256:abcd" }),
+  await assert.rejects(
+    () =>
+      validator({}, { artifactId: "id", size: 0, uploadId: "u1", localPath: null, checksum: "sha256:abcd" }),
+    (err) => {
+      // Wrong validator wired for this adapter is our misconfiguration — it must
+      // not masquerade as a client 422 ("your file was rejected").
+      assert.equal(err.statusCode, 500);
+      return true;
+    },
   );
 });
 

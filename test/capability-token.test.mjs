@@ -10,6 +10,7 @@ import { createHmac } from "node:crypto";
 import {
   issueCapabilityToken,
   verifyCapabilityToken,
+  createCapabilityAuthorize,
 } from "../dist/lib/capability-token.js";
 
 const ARTIFACT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -57,6 +58,25 @@ test("rejects malformed tokens (no dot, truncated, non-JSON payload, missing cla
   assert.equal(verifyCapabilityToken(`${notJson}.sig`, lookupSecret, opts), null);
   const missingClaims = Buffer.from(JSON.stringify({ artifactId: ARTIFACT_ID })).toString("base64url");
   assert.equal(verifyCapabilityToken(`${missingClaims}.sig`, lookupSecret, opts), null);
+  // Valid JSON that isn't an object (the literal `null`) must return null like
+  // every other malformed token — not throw on the claims property access.
+  const nullPayload = Buffer.from(JSON.stringify(null)).toString("base64url");
+  assert.equal(verifyCapabilityToken(`${nullPayload}.sig`, lookupSecret, opts), null);
+});
+
+test("createCapabilityAuthorize accepts the Bearer scheme case-insensitively (RFC 7235)", async () => {
+  const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER });
+  const authorize = createCapabilityAuthorize(lookupSecret, { issuer: ISSUER });
+  for (const scheme of ["Bearer", "bearer", "BEARER", "BeArEr"]) {
+    await assert.doesNotReject(
+      () =>
+        authorize(
+          { headers: { authorization: `${scheme} ${token}` } },
+          { phase: "resolve", artifactId: ARTIFACT_ID },
+        ),
+      `scheme "${scheme}" should be accepted`,
+    );
+  }
 });
 
 test("rejects an unknown kid", () => {

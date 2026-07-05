@@ -509,6 +509,49 @@ test("onUploadComplete fires exactly once with the right ctx", async () => {
   }
 });
 
+test("onUploadComplete failure returns a generic 500 without leaking the internal error", async () => {
+  // A consumer hook error often carries infra detail (DB schema, table names,
+  // paths). It must be logged server-side, never echoed in the client's 5xx body.
+  const secret = "SECRET_pulses_table_password_h4 x0r";
+  const ctx = await startApp({
+    pluginOptions: {
+      onUploadComplete: async () => {
+        throw new Error(secret);
+      },
+    },
+  });
+  try {
+    const body = makeMp4(1024);
+    const create = await tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: body.length });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    const patch = await tusPatch(location, 0, body);
+
+    assert.equal(patch.status, 500);
+    const text = await patch.text();
+    assert.ok(!text.includes(secret), "internal error text must not reach the client");
+    assert.match(text, /Upload completion hook failed/);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test(
+  "storage subdirectories are created without world access (mode 0o750)",
+  { skip: process.platform === "win32" ? "posix mode bits only" : false },
+  async () => {
+    const ctx = await startApp();
+    try {
+      await uploadFullMp4(ctx, ID1); // creates the `video/` kind dir and `.pulsevault/`
+      for (const dir of [".pulsevault", "video"]) {
+        const st = await fs.stat(path.join(ctx.workspaceDir, dir));
+        assert.equal(st.mode & 0o007, 0, `${dir} must not be world-accessible`);
+      }
+    } finally {
+      await ctx.teardown();
+    }
+  },
+);
+
 test("malformed sidecar is treated as absent; reserve rewrites it", async () => {
   const ctx = await startApp();
   try {

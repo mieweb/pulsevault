@@ -106,12 +106,17 @@ export function verifyCapabilityToken(
   const signature = token.slice(dot + 1);
   if (!payload || !signature) return null;
 
-  let claims: Partial<CapabilityTokenClaims>;
+  let parsed: unknown;
   try {
-    claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     return null;
   }
+  // Valid JSON that isn't an object (e.g. the literal `null`, a number, a
+  // string) must fail like every other malformed token — return null rather
+  // than throw on the property access below.
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const claims = parsed as Partial<CapabilityTokenClaims>;
   if (
     typeof claims.artifactId !== 'string' ||
     typeof claims.iat !== 'number' ||
@@ -141,7 +146,9 @@ function extractToken(
   ctx: Pick<PulseVaultAuthorizeContext, 'token'>,
 ): string | undefined {
   const header = request.headers.authorization;
-  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+  // Match the auth scheme case-insensitively per RFC 7235 (clients may send
+  // `bearer `/`BEARER `); the prefix is fixed-length so the slice is unchanged.
+  if (typeof header === 'string' && /^Bearer /i.test(header)) {
     return header.slice('Bearer '.length);
   }
   return ctx.token;
