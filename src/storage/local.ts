@@ -190,7 +190,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     // JSON blob that `loadMeta` would then treat as corrupt.
     const finalPath = sidecarPath(artifactId);
     const tmpPath = `${finalPath}.tmp`;
-    await fs.mkdir(sidecarDir(), { recursive: true });
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
     await fs.writeFile(tmpPath, JSON.stringify(sidecar), 'utf8');
     await fs.rename(tmpPath, finalPath);
   };
@@ -251,7 +251,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   const initialize = async (): Promise<void> => {
-    await fs.mkdir(sidecarDir(), { recursive: true });
+    // Dirs PulseVault creates itself get mode 0o750 directly (mkdir's mode caps
+    // the permission bits — umask only removes more — so this holds even under a
+    // permissive umask; a world-readable upload tree would otherwise leak media).
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
     // @tus/file-store creates `workspaceRoot` with mode 0777 if it doesn't already exist;
     // tighten it so the upload tree isn't world-writable under a permissive umask.
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
@@ -265,8 +268,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     relatedTo,
     checksum,
   }: ReserveUploadParams): Promise<string> => {
-    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true });
-    await fs.mkdir(sidecarDir(), { recursive: true });
+    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
     const sidecar: Sidecar = {
       version: SIDECAR_VERSION,

@@ -9,7 +9,7 @@ import {
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
-import { pulseVaultError } from './lib/errors.js';
+import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
@@ -238,13 +238,6 @@ async function resolveStorageRelatedTo(
   return result ?? undefined;
 }
 
-function extractAuthzStatus(err: unknown): number {
-  const e = err as { statusCode?: unknown; status_code?: unknown };
-  if (typeof e?.statusCode === 'number') return e.statusCode;
-  if (typeof e?.status_code === 'number') return e.status_code;
-  return 403;
-}
-
 function extractAuthzMessage(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
   return 'Forbidden';
@@ -371,7 +364,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await authorize(req, { phase, artifactId, kind, relatedTo });
       return { ok: true, artifactId, kind, relatedTo };
     } catch (err) {
-      const statusCode = extractAuthzStatus(err);
+      const statusCode = statusCodeOf(err, 403);
       const message = extractAuthzMessage(err);
       logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
       if (phase === 'create') {
@@ -382,40 +375,58 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     }
   };
 
+  /**
+   * Fail closed on an unexpected handler error. Host frameworks call these
+   * handlers on a *hijacked* socket (e.g. Fastify's `reply.hijack()`), so a
+   * thrown error is never turned into a response by the framework — without
+   * this the socket would hang until the client/server timeout. If headers are
+   * already on the wire we can only destroy the socket; otherwise emit a 500.
+   */
+  const failClosed = (res: ServerResponse, err: unknown, context: string): void => {
+    logger.error({ err }, `pulsevault ${context} failed`);
+    if (res.headersSent || res.writableEnded) {
+      res.destroy();
+      return;
+    }
+    res.statusCode = 500;
+    res.setHeader('content-type', 'text/plain; charset=utf-8');
+    res.end('Internal Server Error');
+  };
+
   const handleTus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
-    const authz = await runAuthorize(req, res, phase);
-    if (!authz.ok) return;
-
     try {
+      // Inside the try: runAuthorize does storage I/O (kind/relatedTo resolution)
+      // and header writes of its own — an adapter fault or a consumer error with
+      // a bogus statusCode there must fail closed too, not hang the hijacked socket.
+      const authz = await runAuthorize(req, res, phase);
+      if (!authz.ok) return;
+
       await pulseVaultTusContext.run({ request: req, artifactId: authz.artifactId }, () =>
         tusServer.handle(req, res),
       );
     } catch (err) {
-      logger.error({ err }, 'pulsevault tus handler failed');
-      if (res.headersSent || res.writableEnded) {
-        res.destroy();
-        return;
-      }
-      res.statusCode = 500;
-      res.setHeader('content-type', 'text/plain; charset=utf-8');
-      res.end('Internal Server Error');
+      failClosed(res, err, 'tus handler');
     }
   };
 
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
-    writeJson(res, 200, {
-      protocolVersion: PROTOCOL_VERSION,
-      minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
-      maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
-      uploadUnit,
-      kinds: [...UPLOAD_KINDS],
-      allowedExtensions,
-      maxUploadSize,
-      checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
-    });
+    try {
+      writeJson(res, 200, {
+        protocolVersion: PROTOCOL_VERSION,
+        minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
+        maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
+        uploadUnit,
+        kinds: [...UPLOAD_KINDS],
+        allowedExtensions,
+        maxUploadSize,
+        checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
+      });
+    } catch (err) {
+      failClosed(res, err, 'capabilities');
+    }
   };
 
   /**
@@ -446,7 +457,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await authorize(req, { phase, artifactId, kind, relatedTo, token });
       return { kind, relatedTo };
     } catch (err) {
-      const statusCode = extractAuthzStatus(err);
+      const statusCode = statusCodeOf(err, 403);
       const message = extractAuthzMessage(err);
       logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
       await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
@@ -461,21 +472,25 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     artifactId: string,
   ): Promise<void> => {
     stampProtocolVersion(res);
-    const prepared = await prepareArtifactRequest(req, res, artifactId, 'delete');
-    if (!prepared) return;
+    try {
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'delete');
+      if (!prepared) return;
 
-    if (typeof storage.remove !== 'function') {
-      writeJson(res, 501, pulseVaultError('Storage adapter does not support delete'));
-      return;
-    }
+      if (typeof storage.remove !== 'function') {
+        writeJson(res, 501, pulseVaultError('Storage adapter does not support delete'));
+        return;
+      }
 
-    const removed = await storage.remove(artifactId);
-    if (!removed) {
-      writeJson(res, 404, pulseVaultError('Artifact not found'));
-      return;
+      const removed = await storage.remove(artifactId);
+      if (!removed) {
+        writeJson(res, 404, pulseVaultError('Artifact not found'));
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+    } catch (err) {
+      failClosed(res, err, 'artifact delete');
     }
-    res.writeHead(204);
-    res.end();
   };
 
   const handleArtifactGet = async (
@@ -485,37 +500,47 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     token: string | undefined,
   ): Promise<void> => {
     stampProtocolVersion(res);
-    const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
-    if (!prepared) return;
+    try {
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
+      if (!prepared) return;
 
-    const resolved = await storage.resolve(artifactId);
-    if (!resolved) {
-      writeJson(res, 404, pulseVaultError('Artifact not found'));
-      return;
+      const resolved = await storage.resolve(artifactId);
+      if (!resolved) {
+        writeJson(res, 404, pulseVaultError('Artifact not found'));
+        return;
+      }
+
+      if (resolved.kind === 'redirect') {
+        res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
+        res.end();
+        return;
+      }
+
+      const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
+
+      if (result.type === 'error') {
+        writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
+        return;
+      }
+
+      const headers = { ...result.headers };
+      // If the storage adapter provided an explicit content type (e.g. for
+      // non-standard extensions like `.pulse`), override what @fastify/send
+      // would otherwise infer from the filename.
+      if (resolved.contentType) {
+        headers['content-type'] = resolved.contentType;
+      }
+      res.writeHead(result.statusCode, headers);
+      // Headers are on the wire now, so a mid-stream read error (file removed
+      // after stat, disk error) can't become a 500 — destroy the socket instead
+      // of letting an unhandled 'error' crash the process. Destroy the source on
+      // client disconnect so the file descriptor is never leaked.
+      result.stream.on('error', (err) => failClosed(res, err, 'artifact stream'));
+      res.on('close', () => result.stream.destroy());
+      result.stream.pipe(res);
+    } catch (err) {
+      failClosed(res, err, 'artifact get');
     }
-
-    if (resolved.kind === 'redirect') {
-      res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
-      res.end();
-      return;
-    }
-
-    const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
-
-    if (result.type === 'error') {
-      writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
-      return;
-    }
-
-    const headers = { ...result.headers };
-    // If the storage adapter provided an explicit content type (e.g. for
-    // non-standard extensions like `.pulse`), override what @fastify/send
-    // would otherwise infer from the filename.
-    if (resolved.contentType) {
-      headers['content-type'] = resolved.contentType;
-    }
-    res.writeHead(result.statusCode, headers);
-    result.stream.pipe(res);
   };
 
   const handler = async (
@@ -535,7 +560,18 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       res.end('Not Found');
     };
 
-    const url = new URL(req.url ?? '/', 'http://internal');
+    // A raw socket can present a request-target `new URL` refuses to parse
+    // (e.g. an absolute-form or garbage target from a non-HTTP client probing
+    // the port) — that's the client's malformed request, not our 500, and it
+    // must not escape as an uncaught throw on a hijacked/raw response.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://internal');
+    } catch {
+      res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Bad Request');
+      return;
+    }
     let pathname = url.pathname;
     if (stripBasePath && basePath !== '') {
       if (pathname === basePath) {

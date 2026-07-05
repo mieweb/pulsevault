@@ -73,8 +73,14 @@ export function createChecksumValidator(
     const checksum = parseChecksumMetadata(ctx.checksum);
     if (checksum) {
       if (!ctx.localPath) {
-        throw checksumError(
-          'Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage',
+        // Wrong validator wired for this adapter — a server misconfiguration,
+        // not a bad client payload — so surface 500, not 422 (which would tell
+        // the client their file was rejected).
+        throw Object.assign(
+          new Error(
+            'Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage',
+          ),
+          { statusCode: 500 },
         );
       }
       const actual = await digestLocalFile(ctx.localPath, checksum.algorithm);

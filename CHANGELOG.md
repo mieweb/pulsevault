@@ -57,6 +57,13 @@ if you've evaluated against an intermediate build.
   reserve collision guard is now genuinely exercised — a concurrent-reserve
   test that was impossible against s3rver has been added. The `ListParts` shim
   (s3rver never implemented it) is gone too.
+- **5xx responses no longer echo internal error messages.** A `markReady`,
+  `onUploadComplete`, or 5xx-class `validatePayload` failure now logs the real
+  error server-side and returns a generic body, so a consumer's DB/storage error
+  text (schema names, paths, infra detail) can't reach the uploading client. 4xx
+  validation rejections (e.g. checksum mismatch) keep their descriptive messages.
+- **Storage subdirectories are created with mode `0o750`** so the upload tree
+  isn't world-readable under a permissive umask.
 
 ### Breaking
 
@@ -194,6 +201,25 @@ if you've evaluated against an intermediate build.
 
 ### Fixed
 
+- **Artifact `GET`/`DELETE` handlers now fail closed.** They run on a hijacked
+  socket, so a thrown storage error (S3 unreachable, disk fault) previously left
+  the socket hung until timeout; each now emits a `500` (or destroys the socket
+  if headers are already sent), mirroring the TUS handler. `GET` streams also
+  catch a mid-stream read error instead of letting an unhandled `'error'` crash
+  the process, and destroy the source stream on client disconnect so file
+  descriptors aren't leaked. Covered by `test/fail-closed.test.mjs`.
+- A consumer error carrying an out-of-range `statusCode` (e.g. `42`) now degrades
+  to the handler's fallback status instead of crashing `res.writeHead`; a
+  malformed request-target that `URL` can't parse returns `400` instead of an
+  uncaught throw.
+- Checksum verification requested against an adapter with no local path now
+  reports `500` (server misconfiguration) instead of `422` (which wrongly
+  implied the client's file was rejected).
+- `verifyCapabilityToken` no longer throws on a token whose payload is valid
+  JSON but not an object (e.g. the literal `null`) — it returns `null` like
+  every other failure, per its single-failure-shape contract.
+- Bearer-token extraction accepts the auth scheme case-insensitively per
+  RFC 7235 (`bearer`/`BEARER`), not only the canonical `Bearer `.
 - `maxUploadSize` enforcement and the in-progress-upload 404 behavior now
   have explicit test coverage proving bytes are rejected/hidden at the right
   point, not just implied by the implementation.
