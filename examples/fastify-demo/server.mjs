@@ -191,9 +191,10 @@ app.get("/videos", {
           filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
           ext,
           size: artifactStat.size,
-          // Session anchor this artifact belongs to (beat videos/captions point at their
-          // manifest; a merged video's captions point at the video) — lets the library page
-          // group one pulse's artifacts together instead of listing them flat.
+          // Session anchor this artifact belongs to (a segment session's clips point at
+          // their ordering manifest; a merged video's captions/beat manifest/thumbnail
+          // point at the video) — lets the library page group one pulse's artifacts
+          // together instead of listing them flat.
           relatedTo: sidecar.relatedTo ?? null,
           playbackUrl: `/pulsevault/artifacts/${artifactId}`,
           creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
@@ -205,9 +206,11 @@ app.get("/videos", {
 
   // Pair each video with its subtitles (kind "captions" on the wire) the same
   // way fastify-auth-demo does: within a pulse (shared `relatedTo ?? artifactId`
-  // anchor), the app names a beat's VTT after its video, so matching filename
-  // stems pair them. Fallback: a pulse with exactly one video and one subtitles
-  // file is an unambiguous pair even if the stems drifted.
+  // anchor), the app names the merged video's VTT after the video (`<draftId>.mp4`
+  // / `<draftId>.vtt`), so matching filename stems pair them. Fallback: a pulse
+  // with exactly one video and one subtitles file is an unambiguous pair even if
+  // the stems drifted. (Only merged sessions carry captions; segment sessions
+  // upload clips with no captions at all.)
   const stem = (filename) => filename.replace(/\.[^.]+$/, "");
   const byAnchor = new Map();
   for (const u of ready) {
