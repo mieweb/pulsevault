@@ -1,18 +1,11 @@
 // S3 / R2 backend suite for @mieweb/pulsevault. Runs against the built
-// `dist/` and an in-process `s3rver` S3 mock, so CI needs no real cloud
-// credentials. A single s3rver is shared across tests; each test uses a fresh
-// artifactId (the bucket persists between tests).
+// `dist/` and the in-process, zero-dependency `mock-s3.mjs` double, so CI
+// needs no real cloud credentials. A single mock is shared across tests; each
+// test uses a fresh artifactId (the bucket persists between tests).
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
-// Must precede the s3rver import: grafts the fast-xml-parser v3 API s3rver
-// expects onto the v5 copy the security override in package.json gives it.
-import "./s3rver-fxp-compat.mjs";
-import S3rver from "s3rver";
 import Fastify from "fastify";
 import pulseVault, {
   createS3Storage,
@@ -20,36 +13,21 @@ import pulseVault, {
   createS3ChecksumValidator,
 } from "../dist/app.js";
 import { makeMp4, tusCreate, tusPatch, tusHead, uploadFull } from "./helpers.mjs";
-import { installListPartsShim } from "./s3rver-listparts.mjs";
+import { startMockS3 } from "./mock-s3.mjs";
 
 const PREFIX = "/pulsevault";
 const BUCKET = "pulse-test";
 
-let s3rverInstance;
-let s3Dir;
+let mockS3;
 let endpoint;
 
 before(async () => {
-  s3Dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-s3rver-"));
-  s3rverInstance = new S3rver({
-    address: "127.0.0.1",
-    port: 0,
-    silent: true,
-    directory: s3Dir,
-    // Presigned URLs from the SDK and modern checksum behavior don't always
-    // match s3rver's SigV4 expectations byte-for-byte; accept them.
-    allowMismatchedSignatures: true,
-    configureBuckets: [{ name: BUCKET }],
-  });
-  // s3rver lacks ListParts, which @tus/s3-store needs on every write.
-  installListPartsShim(s3rverInstance);
-  const { port } = await s3rverInstance.run();
-  endpoint = `http://127.0.0.1:${port}`;
+  mockS3 = await startMockS3({ buckets: [BUCKET] });
+  endpoint = mockS3.endpoint;
 });
 
 after(async () => {
-  if (s3rverInstance) await s3rverInstance.close();
-  if (s3Dir) await fs.rm(s3Dir, { recursive: true, force: true });
+  if (mockS3) await mockS3.close();
 });
 
 async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
@@ -57,10 +35,11 @@ async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
     bucket: BUCKET,
     endpoint,
     region: "us-east-1",
-    accessKeyId: "S3RVER",
-    secretAccessKey: "S3RVER",
+    accessKeyId: "MOCKS3",
+    secretAccessKey: "MOCKS3",
     forcePathStyle: true,
-    // s3rver does not implement the SDK's default integrity checksums.
+    // Keep the SDK from adding integrity-checksum headers/trailers (which would
+    // switch bodies to aws-chunked framing) — the mock verifies bytes, not sums.
     clientConfig: {
       requestChecksumCalculation: "WHEN_REQUIRED",
       responseChecksumValidation: "WHEN_REQUIRED",
@@ -195,15 +174,24 @@ test("second reserve for same artifactId returns 409", async () => {
   }
 });
 
-// No genuinely-concurrent equivalent of `plugin.test.mjs`'s "two truly concurrent
-// reserves" test here: `reserveUpload`'s collision guard uses `PutObjectCommand`'s
-// `IfNoneMatch: "*"` to close the race atomically, but `s3rver` (this suite's local S3
-// double) doesn't enforce conditional writes — it silently accepts both concurrent puts,
-// so a test written the same way would pass against real AWS S3/R2 but fail here for a
-// reason unrelated to the code under test. The local-filesystem adapter's equivalent test
-// (`plugin.test.mjs`) exercises the same technique (atomic create-if-absent) against a
-// primitive (`fs.writeFile` with the `wx` flag) that this test runner's environment does
-// enforce, and is the real regression check for the underlying race.
+// Mirrors `plugin.test.mjs`'s concurrent-reserve test. `reserveUpload`'s collision guard
+// uses `PutObjectCommand`'s `IfNoneMatch: "*"` to close the race atomically; `mock-s3.mjs`
+// enforces conditional writes (412 on existing object) like real AWS S3/R2 does — the old
+// `s3rver` double silently accepted both puts, so this couldn't be tested here before.
+test("two truly concurrent reserves for the same artifactId: exactly one 201, one 409", async () => {
+  const ctx = await startApp();
+  const id = randomUUID();
+  try {
+    const [a, b] = await Promise.all([
+      tusCreate(ctx.baseUrl, PREFIX, { artifactId: id, filename: "clip.mp4", size: 1024 }),
+      tusCreate(ctx.baseUrl, PREFIX, { artifactId: id, filename: "clip.mp4", size: 1024 }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+  } finally {
+    await ctx.teardown();
+  }
+});
 
 test("createS3Mp4Sniffer rejects non-MP4 bytes and removes the object", async () => {
   const ctx = await startApp({ withSniffer: true });

@@ -47,6 +47,16 @@ if you've evaluated against an intermediate build.
   requirement on server implementations generally, not just this package).
 - Both are covered by new regression tests in `test/plugin.test.mjs` that
   fail against the pre-fix code and pass against the fix.
+- **Removed `s3rver`** (unmaintained) from the dev/test toolchain, clearing
+  its open `npm audit` findings: its dependency chain carried high-severity
+  advisories (`busboy`/`dicer`) and forced pinning `fast-xml-parser` via an
+  `overrides` entry plus a hand-written API-compat shim. The S3 suite now runs
+  against `test/mock-s3.mjs`, a zero-dependency in-memory S3 double
+  implementing exactly the eleven operations the code under test uses. Unlike
+  s3rver it enforces `If-None-Match: "*"` (412), so the adapter's atomic
+  reserve collision guard is now genuinely exercised — a concurrent-reserve
+  test that was impossible against s3rver has been added. The `ListParts` shim
+  (s3rver never implemented it) is gone too.
 
 ### Breaking
 
@@ -213,8 +223,8 @@ if you've evaluated against an intermediate build.
 - **Silent TOCTOU on S3-compatible backends without `IfNoneMatch` support.**
   `reserveUpload`'s conditional-write collision guard falls back to a
   weaker check-then-write on backends that reject `IfNoneMatch` (some
-  S3-compatible stores, and the `s3rver` mock this repo's own test suite
-  runs against) — this reopens the race between concurrent/retried creates
+  S3-compatible stores) — this reopens the race between concurrent/retried
+  creates
   for the same artifactId. There's no way to close it without an external
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
