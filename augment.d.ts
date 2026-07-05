@@ -1,1 +1,1 @@
-export * from "./dist/augment.js";
+export * from './dist/augment.js';

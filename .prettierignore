@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+package-lock.json
+examples/**/node_modules
+examples/**/dist
+# Runtime workspaces (uploaded artifacts) and Meteor's generated build output —
+# never source, never formatted.
+examples/**/data
+examples/meteor-demo/.meteor/local
+# Demo HTML embeds whitespace-sensitive content (mermaid diagrams) that
+# prettier's HTML formatter re-indents non-idempotently — leave it hand-formatted.
+examples/**/public/*.html

@@ -5,14 +5,14 @@
 // There's no Swagger/OpenAPI UI here (that's a Fastify-ecosystem plugin) —
 // everything else has full feature parity.
 
-import path from "node:path";
-import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import path from 'node:path';
+import { readFileSync } from 'node:fs';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
-import express from "express";
-import QRCode from "qrcode";
+import express from 'express';
+import QRCode from 'qrcode';
 import {
   createPulseVaultCore,
   createLocalStorage,
@@ -20,66 +20,66 @@ import {
   createS3Storage,
   createS3Mp4Sniffer,
   buildUploadLink,
-} from "@mieweb/pulsevault/core";
+} from '@mieweb/pulsevault/core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
-const dataDir = path.join(__dirname, "data");
+const html = readFileSync(path.join(__dirname, 'public/index.html'), 'utf8');
+const dataDir = path.join(__dirname, 'data');
 
 // Set DEMO_TOKEN to enable the auth demo: every upload + watch is verified
 // against this token. Leave unset for an open demo with no authentication.
 const DEMO_TOKEN = process.env.DEMO_TOKEN || null;
 
 const app = express();
-app.disable("x-powered-by");
+app.disable('x-powered-by');
 
 // Serve pairing page before the plugin so it isn't swallowed by /pulsevault/artifacts/:artifactId
-app.get("/", (_req, res) => {
-  res.type("html").send(html);
+app.get('/', (_req, res) => {
+  res.type('html').send(html);
 });
 
 // Reserve an artifactId for an upload. The server owns ID generation so it
 // can later attach auth tokens, quotas, or other server-side state here.
-app.post("/reserve", (_req, res) => {
+app.post('/reserve', (_req, res) => {
   res.json({ artifactId: randomUUID() });
 });
 
 // List all uploads under dataDir. Reads each upload's sidecar to determine
 // kind and subdir rather than hard-coding "video/" — handles video/project/captions.
-app.get("/videos", async (_req, res) => {
-  const pulsevaultMetaDir = path.join(dataDir, ".pulsevault");
+app.get('/videos', async (_req, res) => {
+  const pulsevaultMetaDir = path.join(dataDir, '.pulsevault');
   let entries;
   try {
     entries = await readdir(pulsevaultMetaDir, { withFileTypes: true });
   } catch (err) {
-    if (err.code === "ENOENT") return res.json([]);
+    if (err.code === 'ENOENT') return res.json([]);
     throw err;
   }
 
   const uploads = await Promise.all(
     entries
-      .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
+      .filter((e) => e.isFile() && e.name.endsWith('.json') && !e.name.endsWith('.tmp'))
       .map(async (e) => {
-        const artifactId = e.name.slice(0, -".json".length);
+        const artifactId = e.name.slice(0, -'.json'.length);
         const sidecarFilePath = path.join(pulsevaultMetaDir, e.name);
         let sidecar;
         try {
-          sidecar = JSON.parse(await readFile(sidecarFilePath, "utf8"));
+          sidecar = JSON.parse(await readFile(sidecarFilePath, 'utf8'));
         } catch {
           return null;
         }
         // Only list ready uploads; skip in-progress ones.
-        if (sidecar.status !== "ready") return null;
+        if (sidecar.status !== 'ready') return null;
 
-        const kind = sidecar.kind ?? "video";
-        const ext = sidecar.ext ?? ".mp4";
+        const kind = sidecar.kind ?? 'video';
+        const ext = sidecar.ext ?? '.mp4';
         const artifactFile = `${artifactId}${ext}`;
         const artifactPath = path.join(dataDir, kind, artifactFile);
         const tusJsonPath = `${artifactPath}.json`;
 
         const [artifactStat, tusMeta] = await Promise.all([
           stat(artifactPath).catch(() => null),
-          readFile(tusJsonPath, "utf8")
+          readFile(tusJsonPath, 'utf8')
             .then(JSON.parse)
             .catch(() => null),
         ]);
@@ -91,26 +91,21 @@ app.get("/videos", async (_req, res) => {
           filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
           ext,
           size: artifactStat.size,
-          creation_date:
-            tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
+          creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
         };
       }),
   );
 
-  res.json(
-    uploads
-      .filter(Boolean)
-      .sort((a, b) => b.creation_date.localeCompare(a.creation_date)),
-  );
+  res.json(uploads.filter(Boolean).sort((a, b) => b.creation_date.localeCompare(a.creation_date)));
 });
 
 // One deeplink + matching QR per request. artifactId is generated server-side
 // so it stays the source of truth. `server` must include the plugin's
 // `basePath` ("/pulsevault") — the client builds every request as
 // `${server}/<path>` with no prefix concept of its own.
-app.get("/deeplinks", async (req, res) => {
-  const proto = req.headers["x-forwarded-proto"] ?? "http";
-  const host = req.headers["x-forwarded-host"] ?? req.headers.host;
+app.get('/deeplinks', async (req, res) => {
+  const proto = req.headers['x-forwarded-proto'] ?? 'http';
+  const host = req.headers['x-forwarded-host'] ?? req.headers.host;
   const server = `${proto}://${host}/pulsevault`;
   const artifactId = randomUUID();
 
@@ -123,7 +118,7 @@ app.get("/deeplinks", async (req, res) => {
   const qrUpload = await QRCode.toDataURL(upload, {
     width: 224,
     margin: 1,
-    color: { dark: "#000000", light: "#ffffff" },
+    color: { dark: '#000000', light: '#ffffff' },
   });
 
   res.json({
@@ -140,7 +135,7 @@ app.get("/deeplinks", async (req, res) => {
 // (`@aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store`) and the
 // S3_*/AWS_* env vars below — see `.env.example`. Note: the demo's GET /videos
 // route lists local sidecars only, so it returns [] in S3 mode.
-const useS3 = (process.env.STORAGE || "local").toLowerCase() === "s3";
+const useS3 = (process.env.STORAGE || 'local').toLowerCase() === 's3';
 const pulseStorage = useS3
   ? await createS3Storage({
       bucket: process.env.S3_BUCKET,
@@ -154,14 +149,12 @@ const pulseStorage = useS3
       sessionToken: process.env.S3_SESSION_TOKEN,
       // Advanced (all optional): override path-style, presigned URL TTL, part size.
       ...(process.env.S3_FORCE_PATH_STYLE
-        ? { forcePathStyle: process.env.S3_FORCE_PATH_STYLE === "true" }
+        ? { forcePathStyle: process.env.S3_FORCE_PATH_STYLE === 'true' }
         : {}),
       ...(process.env.S3_PRESIGN_TTL_SECONDS
         ? { presignTtlSeconds: Number(process.env.S3_PRESIGN_TTL_SECONDS) }
         : {}),
-      ...(process.env.S3_PART_SIZE
-        ? { partSize: Number(process.env.S3_PART_SIZE) }
-        : {}),
+      ...(process.env.S3_PART_SIZE ? { partSize: Number(process.env.S3_PART_SIZE) } : {}),
     })
   : createLocalStorage({ workspaceDir: dataDir });
 
@@ -171,19 +164,19 @@ const pulseStorage = useS3
 // ...) already strips the mount prefix from req.url before calling the
 // handler; basePath is still used to build the tus Location header.
 const pulseVault = createPulseVaultCore({
-  basePath: "/pulsevault",
+  basePath: '/pulsevault',
   stripBasePath: false,
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and WebVTT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
+  allowedExtensions: { video: ['.mp4'], project: ['.pulse', '.zip'], captions: ['.vtt'] },
   // validatePayload now runs for every kind, with ctx.kind telling you which
   // — only apply the MP4 magic-byte sniff to actual videos, since project
   // bundles and WebVTT captions never start with an ISOBMFF ftyp box. The S3
   // sniffer does a ranged read of the object; the local one reads the file
   // on disk.
   validatePayload: async (request, ctx) => {
-    if (ctx.kind !== "video") return;
+    if (ctx.kind !== 'video') return;
     const sniff = useS3 ? createS3Mp4Sniffer(pulseStorage) : createMp4Sniffer(pulseStorage);
     await sniff(request, ctx);
   },
@@ -191,7 +184,7 @@ const pulseVault = createPulseVaultCore({
   // uploading. The bytes are opaque to the plugin — index them, relay them,
   // or leave them for a later request.
   onUploadComplete: async (_req, { artifactId, kind, size }) => {
-    console.log("pulsevault upload complete", { artifactId, kind, size });
+    console.log('pulsevault upload complete', { artifactId, kind, size });
   },
   /**
    * authorize hook — the demo's auth proof-of-concept.
@@ -206,22 +199,22 @@ const pulseVault = createPulseVaultCore({
     if (!DEMO_TOKEN) return;
 
     const supplied =
-      ctx.phase === "resolve"
+      ctx.phase === 'resolve'
         ? ctx.token
-        : (request.headers.authorization || "").replace(/^Bearer\s+/i, "");
+        : (request.headers.authorization || '').replace(/^Bearer\s+/i, '');
 
     if (supplied !== DEMO_TOKEN) {
-      throw Object.assign(new Error("Forbidden: invalid demo token"), { statusCode: 403 });
+      throw Object.assign(new Error('Forbidden: invalid demo token'), { statusCode: 403 });
     }
   },
 });
 
-app.use("/pulsevault", (req, res, next) => {
+app.use('/pulsevault', (req, res, next) => {
   pulseVault.handler(req, res, next).catch(next);
 });
 
 const port = Number(process.env.PORT ?? 3001);
-const host = process.env.HOST ?? "0.0.0.0";
+const host = process.env.HOST ?? '0.0.0.0';
 
 app.listen(port, host, () => {
   console.log(`\nPulseVault Express demo running on http://localhost:${port}/`);
@@ -232,7 +225,7 @@ app.listen(port, host, () => {
   }
 });
 
-process.on("SIGINT", async () => {
+process.on('SIGINT', async () => {
   await pulseVault.shutdown();
   process.exit(0);
 });

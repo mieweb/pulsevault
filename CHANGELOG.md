@@ -7,6 +7,81 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Artifact `GET`/`DELETE`/`capabilities` handlers now fail closed.** They run
+  on a hijacked socket (e.g. Fastify's `reply.hijack()`), so a thrown storage
+  error (S3 unreachable, disk error) previously left the socket hung until
+  timeout; each handler now emits a `500` (or destroys the socket if headers are
+  already sent), mirroring the TUS handler.
+- **Artifact `GET` streams handle read errors.** A mid-stream read error
+  (file removed after `stat`, disk error) is caught instead of surfacing as an
+  unhandled `'error'` that could crash the process; the source stream is also
+  destroyed on client disconnect so file descriptors aren't leaked.
+- Checksum verification requested against an adapter with no local path now
+  reports `500` (server misconfiguration) instead of `422` (which wrongly
+  implied the client's file was rejected).
+- Bearer-token extraction accepts the auth scheme case-insensitively per RFC 7235.
+- `verifyCapabilityToken` no longer throws on a token whose payload is valid
+  JSON but not an object (e.g. the literal `null`) — it returns `null` like
+  every other failure, per its documented single-failure-shape contract.
+- Consumer errors carrying an out-of-range `statusCode` (e.g. `42`) degrade to
+  the handler's fallback status instead of crashing `res.writeHead`; malformed
+  request-targets on raw sockets get a `400` instead of an uncaught URL-parse
+  throw; and the TUS authorize step now fails closed like the rest of the
+  hijacked-socket handlers.
+- Storage subdirectories PulseVault creates are made with mode `0o750` so the
+  upload tree isn't world-accessible under a permissive umask.
+
+### Security
+
+- **Capability tokens gained an optional `scope` claim** limiting which request
+  phases (`create`/`patch`/`resolve`/`delete`) a token authorizes, enforced by
+  `createCapabilityAuthorize`. Mint playback URLs with `scope: ['resolve']` and
+  upload sessions with `scope: ['create', 'patch']` so a watch link that leaks
+  via access logs, browser history, or `Referer` can no longer be replayed as
+  upload/delete capability. Tokens without `scope` keep authorizing every
+  phase, so outstanding tokens stay valid; a present-but-malformed `scope`
+  fails closed. `verifyCapabilityToken` now returns `{ artifactId, scope }`
+  (breaking only for callers deep-equal-asserting its old return shape).
+  PROTOCOL.md §5.4 documents the claim plus query-token hygiene (short TTLs,
+  log scrubbing) and per-session quota guidance.
+- **5xx responses no longer echo internal error messages.** `markReady`,
+  `onUploadComplete`, and 5xx-class `validatePayload` failures now log the
+  real error server-side and return a generic body — a consumer's DB/storage
+  error text (schema names, paths, infra detail) no longer reaches the
+  uploading client. 4xx validation rejections (e.g. checksum mismatch) keep
+  their descriptive messages.
+- **Removed `s3rver`** (unmaintained) and with it every open `npm audit` finding:
+  its dependency chain carried high-severity advisories (`busboy`/`dicer`) and
+  required pinning `fast-xml-parser` — a package with its own history of
+  high/critical CVEs — via an `overrides` entry plus a hand-written API-compat
+  shim. The S3 test suite now runs against `test/mock-s3.mjs`, a zero-dependency
+  in-memory S3 double implementing exactly the eleven operations the code under
+  test uses. Unlike s3rver it enforces `If-None-Match: "*"` (412), so the
+  adapter's atomic reserve collision guard is now genuinely exercised — a
+  concurrent-reserve test that was previously impossible against s3rver has been
+  added. The `ListParts` shim (s3rver never implemented it) is gone too.
+
+### Changed
+
+- **`engines.node` raised from `>=18` to `>=20.19.0`** (required by
+  `@tus/server` 2.4; Node 18 is end-of-life). Verified against current Node
+  releases.
+- Dependencies updated: `@tus/server` 2.0.0 → ^2.4.1, `@tus/file-store`
+  2.0.0 → ^2.1.0 (exact pins relaxed to carets), `fastify-plugin` ^5 → ^6.
+  The full test suite — including the authorize/parser-agreement and
+  URL-smuggling regression tests that guard the `@tus/server` internals this
+  library mirrors — passes against the new versions.
+
+### Internal
+
+- Added Prettier + ESLint (typescript-eslint, sorted imports, single type-import
+  form) with `lint`/`format` scripts; renamed `lib/pulsevaultTus.ts` →
+  `lib/pulsevault-tus.ts` for filename consistency.
+
+## [0.1.0] - 2026-07-05
+
 This release reworks the upload contract for genuine multi-tenant use — any
 third party can implement a compatible server from `PROTOCOL.md` alone, not
 just by reading this package's source. It bundles several breaking changes
@@ -58,10 +133,10 @@ if you've evaluated against an intermediate build.
   rename, since it's the published type surface, not the HTTP contract), and
   the deep-link query parameter built by `buildUploadLink`. `videoid`/
   `projectid` remain accepted as legacy aliases in `Upload-Metadata` — only
-  the *primary* name changed, not backward compatibility for existing
+  the _primary_ name changed, not backward compatibility for existing
   clients' requests.
 - **Collapsed the per-kind routes into one generic route.** `GET/DELETE
-  /:videoid` and `GET/DELETE /project/:projectid` are gone; replaced by
+/:videoid` and `GET/DELETE /project/:projectid` are gone; replaced by
   `GET/DELETE /artifacts/:artifactId`, which resolves the kind from storage
   rather than the URL. This also means `kind=captions` artifacts (new, see
   below) don't need a third route pair.
@@ -88,7 +163,7 @@ if you've evaluated against an intermediate build.
   segment ordering manifest's session).
   Storage adapters expose it via the new optional `getRelatedTo` method.
 - **`checksum`** — an optional `Upload-Metadata` key (`<algorithm>:<hex
-  digest>`) verified post-upload via the new `createChecksumValidator`
+digest>`) verified post-upload via the new `createChecksumValidator`
   (local storage) / `createS3ChecksumValidator` (S3/R2) helpers, chainable
   with `createMp4Sniffer`. This is at-rest integrity verification on the
   finished file, not a per-chunk check — `@tus/server`'s installed version
@@ -172,15 +247,15 @@ if you've evaluated against an intermediate build.
   routes the Pulse app talks to stay capability-token authorized — two auth
   systems for two audiences, per PROTOCOL.md §5. The demo is Postgres-only,
   run through Docker Compose (`compose.yaml` + `Dockerfile`; `npm run db:up`
-  + `npm start` for bare-metal dev against the same db), with one Prisma
-  schema (`prisma/schema.prisma`, migrations committed and applied by
-  `npm start`) holding both the auth tables and an **artifact index**:
-  `onUploadComplete` writes each finished upload once, authorized deletes
-  prune it, a boot-time reconcile keeps it honest against the filesystem
-  sidecars (still the source of truth), and `/pulses` becomes one indexed
-  query instead of a per-request sidecar crawl. `npm run e2e` provisions the
-  compose db, applies migrations, and covers the 401 gate plus the
-  sign-up/sign-in flow.
+  - `npm start` for bare-metal dev against the same db), with one Prisma
+    schema (`prisma/schema.prisma`, migrations committed and applied by
+    `npm start`) holding both the auth tables and an **artifact index**:
+    `onUploadComplete` writes each finished upload once, authorized deletes
+    prune it, a boot-time reconcile keeps it honest against the filesystem
+    sidecars (still the source of truth), and `/pulses` becomes one indexed
+    query instead of a per-request sidecar crawl. `npm run e2e` provisions the
+    compose db, applies migrations, and covers the 401 gate plus the
+    sign-up/sign-in flow.
 
 ### Fixed
 
@@ -190,7 +265,7 @@ if you've evaluated against an intermediate build.
 - **Meteor compatibility.** Meteor's bundler doesn't resolve `package.json`
   `"exports"` subpath maps, which broke both this package's own `"./core"`
   entry and, transitively, `@tus/server`'s dependency on `srvx` (which as of
-  `@tus/server@2.1.0` ships *only* subpath exports, no legacy `main`
+  `@tus/server@2.1.0` ships _only_ subpath exports, no legacy `main`
   fallback). Fixed two ways: `@tus/server`/`@tus/file-store` are pinned to
   `2.0.0` (the last release before the `srvx` migration — everything added
   in `2.1.0`–`2.4.1` was either the `srvx` migration itself, follow-up
@@ -205,7 +280,7 @@ if you've evaluated against an intermediate build.
 - **Unbounded memory use during checksum validation.** `createChecksumValidator`
   read the whole finalized file into a single `Buffer` via `fs.readFile`
   before hashing; combined with the documented-supported `maxUploadSize:
-  Infinity`, a large upload could exhaust process memory just to verify its
+Infinity`, a large upload could exhaust process memory just to verify its
   checksum. Now streams the file through the hash via `createReadStream` +
   a stream pipeline. `createS3ChecksumValidator` had the same issue via
   `S3Storage.readAll`'s full-object buffer — now uses the new streaming
@@ -219,4 +294,5 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/mieweb/pulsevault/compare/v0.0.1...v0.1.0

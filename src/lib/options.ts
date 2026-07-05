@@ -1,5 +1,5 @@
 import type { PulseVaultValidatePayload } from './magic.js';
-import type { PulseVaultOnUploadComplete } from './pulsevaultTus.js';
+import type { PulseVaultOnUploadComplete } from './pulsevault-tus.js';
 
 /** Per-kind form of `PulseVaultAllowedExtensionsInput`, named once so it isn't re-declared at every use site. */
 type AllowedExtensionsByKind = {

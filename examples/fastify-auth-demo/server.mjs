@@ -5,21 +5,21 @@
 // For the smallest possible mount (no auth, no hooks) see
 // ../fastify-demo/server.mjs.
 
-import path from "node:path";
-import os from "node:os";
-import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import path from 'node:path';
+import os from 'node:os';
+import { readFileSync } from 'node:fs';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
-import Fastify from "fastify";
-import fastifyRateLimit from "@fastify/rate-limit";
-import fastifySwagger from "@fastify/swagger";
-import fastifySwaggerUI from "@fastify/swagger-ui";
-import QRCode from "qrcode";
-import { PrismaClient } from "@prisma/client";
-import { betterAuth } from "better-auth";
-import { prismaAdapter } from "better-auth/adapters/prisma";
+import Fastify from 'fastify';
+import fastifyRateLimit from '@fastify/rate-limit';
+import fastifySwagger from '@fastify/swagger';
+import fastifySwaggerUI from '@fastify/swagger-ui';
+import QRCode from 'qrcode';
+import { PrismaClient } from '@prisma/client';
+import { betterAuth } from 'better-auth';
+import { prismaAdapter } from 'better-auth/adapters/prisma';
 import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
@@ -28,15 +28,15 @@ import pulseVault, {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
-} from "@mieweb/pulsevault";
+} from '@mieweb/pulsevault';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
-const favicon = readFileSync(path.join(__dirname, "public/favicon.png"));
-const dataDir = path.join(__dirname, "data");
+const html = readFileSync(path.join(__dirname, 'public/index.html'), 'utf8');
+const favicon = readFileSync(path.join(__dirname, 'public/favicon.png'));
+const dataDir = path.join(__dirname, 'data');
 
 const port = Number(process.env.PORT ?? 3002);
-const host = process.env.HOST ?? "0.0.0.0";
+const host = process.env.HOST ?? '0.0.0.0';
 
 // ---------------------------------------------------------------------------
 // Capability-token auth (the library's secure-by-default option — see
@@ -50,9 +50,11 @@ const host = process.env.HOST ?? "0.0.0.0";
 // ---------------------------------------------------------------------------
 const PULSEVAULT_SECRET = process.env.PULSEVAULT_SECRET;
 if (!PULSEVAULT_SECRET) {
-  console.error("PULSEVAULT_SECRET is required — this demo runs with capability tokens always on.");
-  console.error("Generate one with:  openssl rand -hex 32");
-  console.error("Then:               docker compose up --build   (compose reads .env — see .env.example)");
+  console.error('PULSEVAULT_SECRET is required — this demo runs with capability tokens always on.');
+  console.error('Generate one with:  openssl rand -hex 32');
+  console.error(
+    'Then:               docker compose up --build   (compose reads .env — see .env.example)',
+  );
   process.exit(1);
 }
 
@@ -61,12 +63,16 @@ if (!PULSEVAULT_SECRET) {
 // DATABASE_URL to the bundled Postgres). Schema is owned by
 // prisma/schema.prisma and applied by `prisma migrate deploy` (npm start).
 if (!process.env.DATABASE_URL) {
-  console.error("DATABASE_URL is required — this demo keeps users/sessions and the artifact index in Postgres.");
-  console.error("Run the full stack:  docker compose up --build   (see compose.yaml)");
-  console.error("Bare-metal dev:      npm run db:up  then  npm start   (uses .env — see .env.example)");
+  console.error(
+    'DATABASE_URL is required — this demo keeps users/sessions and the artifact index in Postgres.',
+  );
+  console.error('Run the full stack:  docker compose up --build   (see compose.yaml)');
+  console.error(
+    'Bare-metal dev:      npm run db:up  then  npm start   (uses .env — see .env.example)',
+  );
   process.exit(1);
 }
-const PULSEVAULT_KEY_ID = process.env.PULSEVAULT_KEY_ID || "demo-1";
+const PULSEVAULT_KEY_ID = process.env.PULSEVAULT_KEY_ID || 'demo-1';
 const TOKEN_TTL_SECONDS = 30 * 60; // 30 minutes — long enough for one upload session
 const WATCH_TOKEN_TTL_SECONDS = 5 * 60; // short-lived — minted fresh per gallery load, never persisted
 
@@ -83,7 +89,7 @@ function detectLanIPv4s() {
   const addrs = [];
   for (const ifaces of Object.values(os.networkInterfaces())) {
     for (const iface of ifaces ?? []) {
-      if (iface.family === "IPv4" && !iface.internal) addrs.push(iface.address);
+      if (iface.family === 'IPv4' && !iface.internal) addrs.push(iface.address);
     }
   }
   return addrs;
@@ -92,16 +98,14 @@ function detectLanIPv4s() {
 let ISSUER = process.env.PULSEVAULT_ISSUER || null;
 if (!ISSUER) {
   ISSUER = `http://localhost:${port}`;
-  console.warn(
-    `\nPULSEVAULT_ISSUER is not set — tokens will be issued for ${ISSUER}.`,
-  );
-  console.warn("That only works from a browser/phone on this same machine.");
+  console.warn(`\nPULSEVAULT_ISSUER is not set — tokens will be issued for ${ISSUER}.`);
+  console.warn('That only works from a browser/phone on this same machine.');
   const lan = detectLanIPv4s();
   if (lan.length) {
-    console.warn("For phones on your LAN, restart with one of:");
+    console.warn('For phones on your LAN, restart with one of:');
     for (const ip of lan) console.warn(`  PULSEVAULT_ISSUER=http://${ip}:${port}`);
   }
-  console.warn("");
+  console.warn('');
 }
 
 function lookupSecret(kid) {
@@ -127,7 +131,7 @@ const auth = betterAuth({
   baseURL: ISSUER,
   // Reuses the (required) vault secret unless a dedicated one is provided.
   secret: process.env.BETTER_AUTH_SECRET || PULSEVAULT_SECRET,
-  database: prismaAdapter(prismaClient, { provider: "postgresql" }),
+  database: prismaAdapter(prismaClient, { provider: 'postgresql' }),
   emailAndPassword: { enabled: true },
   // The dashboard may be reached via the LAN issuer or plain localhost.
   trustedOrigins: [ISSUER, `http://localhost:${port}`, `http://127.0.0.1:${port}`],
@@ -175,18 +179,22 @@ const artifactIndex = {
 async function readArtifactFromDisk(artifactId) {
   let sidecar;
   try {
-    sidecar = JSON.parse(await readFile(path.join(dataDir, ".pulsevault", `${artifactId}.json`), "utf8"));
+    sidecar = JSON.parse(
+      await readFile(path.join(dataDir, '.pulsevault', `${artifactId}.json`), 'utf8'),
+    );
   } catch {
     return null;
   }
-  if (sidecar.status !== "ready") return null;
+  if (sidecar.status !== 'ready') return null;
 
-  const kind = sidecar.kind ?? "video";
-  const ext = sidecar.ext ?? ".mp4";
+  const kind = sidecar.kind ?? 'video';
+  const ext = sidecar.ext ?? '.mp4';
   const artifactPath = path.join(dataDir, kind, `${artifactId}${ext}`);
   const [artifactStat, tusMeta] = await Promise.all([
     stat(artifactPath).catch(() => null),
-    readFile(`${artifactPath}.json`, "utf8").then(JSON.parse).catch(() => null),
+    readFile(`${artifactPath}.json`, 'utf8')
+      .then(JSON.parse)
+      .catch(() => null),
   ]);
   if (!artifactStat || artifactStat.size === 0) return null;
 
@@ -204,18 +212,18 @@ async function readArtifactFromDisk(artifactId) {
 
 /** Boot-time reconcile: index sidecars the table doesn't know, drop rows whose files are gone. */
 async function reconcileArtifactIndex() {
-  const metaDir = path.join(dataDir, ".pulsevault");
+  const metaDir = path.join(dataDir, '.pulsevault');
   let entries = [];
   try {
     entries = await readdir(metaDir, { withFileTypes: true });
   } catch (err) {
-    if (err.code !== "ENOENT") throw err;
+    if (err.code !== 'ENOENT') throw err;
   }
   const onDisk = (
     await Promise.all(
       entries
-        .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-        .map((e) => readArtifactFromDisk(e.name.slice(0, -".json".length))),
+        .filter((e) => e.isFile() && e.name.endsWith('.json') && !e.name.endsWith('.tmp'))
+        .map((e) => readArtifactFromDisk(e.name.slice(0, -'.json'.length))),
     )
   ).filter(Boolean);
 
@@ -240,7 +248,7 @@ function toWebHeaders(nodeHeaders) {
 /** preHandler guarding dashboard routes: 401 with the protocol's error shape when not signed in. */
 async function requireSignIn(req, reply) {
   const session = await auth.api.getSession({ headers: toWebHeaders(req.headers) });
-  if (!session) return reply.code(401).send({ ok: false, error: "Sign in required" });
+  if (!session) return reply.code(401).send({ ok: false, error: 'Sign in required' });
   req.session = session;
 }
 
@@ -270,7 +278,7 @@ function recordEvent(event) {
 // override on `GET /deeplinks` / `buildUploadLink` instead (PROTOCOL.md §3,
 // §8) — the pairing page's "Upload unit for this link" selector drives it.
 // ---------------------------------------------------------------------------
-const uploadUnitDefault = process.env.UPLOAD_UNIT === "merged" ? "merged" : "beat";
+const uploadUnitDefault = process.env.UPLOAD_UNIT === 'merged' ? 'merged' : 'beat';
 
 const app = Fastify({
   logger: true,
@@ -283,32 +291,32 @@ const app = Fastify({
 // per-IP limit (OPERATIONS.md "Rate limiting" recommends exactly this).
 // Generous enough for one phone's normal HEAD/PATCH resume retries, not for
 // a scraper hammering an authorized route.
-await app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
+await app.register(fastifyRateLimit, { max: 300, timeWindow: '1 minute' });
 
 // Swagger MUST be registered before any route (including the plugin's) so
 // their schemas are picked up for the generated OpenAPI spec.
 await app.register(fastifySwagger, {
   openapi: {
-    openapi: "3.0.3",
+    openapi: '3.0.3',
     info: {
-      title: "PulseVault Fastify (auth demo)",
+      title: 'PulseVault Fastify (auth demo)',
       description:
-        "Production-shaped reference server pairing the Pulse app with `@mieweb/pulsevault` — capability tokens always on.",
-      version: "0.0.1",
+        'Production-shaped reference server pairing the Pulse app with `@mieweb/pulsevault` — capability tokens always on.',
+      version: '0.0.1',
     },
     tags: [
-      { name: "demo", description: "Demo server endpoints" },
+      { name: 'demo', description: 'Demo server endpoints' },
       {
-        name: "pulsevault",
-        description: "Routes contributed by the `@mieweb/pulsevault` plugin",
+        name: 'pulsevault',
+        description: 'Routes contributed by the `@mieweb/pulsevault` plugin',
       },
     ],
   },
 });
 
 await app.register(fastifySwaggerUI, {
-  routePrefix: "/docs",
-  uiConfig: { docExpansion: "list", deepLinking: false },
+  routePrefix: '/docs',
+  uiConfig: { docExpansion: 'list', deepLinking: false },
 });
 
 // Better Auth owns everything under /api/auth/* (sign-up, sign-in, session,
@@ -316,13 +324,13 @@ await app.register(fastifySwaggerUI, {
 // thin Node<->WHATWG bridge — the same shape as its documented Fastify
 // integration.
 app.route({
-  method: ["GET", "POST"],
-  url: "/api/auth/*",
+  method: ['GET', 'POST'],
+  url: '/api/auth/*',
   schema: {
-    tags: ["demo"],
-    summary: "Better Auth dashboard sign-in API",
+    tags: ['demo'],
+    summary: 'Better Auth dashboard sign-in API',
     description:
-      "Email+password auth for the HUMAN dashboard (sign-up, sign-in, get-session, sign-out — see better-auth.com for the route catalog). The Pulse app never calls these: uploads stay authorized by capability tokens.",
+      'Email+password auth for the HUMAN dashboard (sign-up, sign-in, get-session, sign-out — see better-auth.com for the route catalog). The Pulse app never calls these: uploads stay authorized by capability tokens.',
   },
   handler: async (req, reply) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -334,66 +342,66 @@ app.route({
     const response = await auth.handler(request);
     reply.status(response.status);
     for (const [key, value] of response.headers.entries()) {
-      if (key !== "set-cookie") reply.header(key, value);
+      if (key !== 'set-cookie') reply.header(key, value);
     }
     const setCookies = response.headers.getSetCookie();
-    if (setCookies.length) reply.header("set-cookie", setCookies);
+    if (setCookies.length) reply.header('set-cookie', setCookies);
     return reply.send(response.body ? Buffer.from(await response.arrayBuffer()) : null);
   },
 });
 
 // Serve pairing page before the plugin so it isn't swallowed by /pulsevault/artifacts/:artifactId
 app.get(
-  "/",
+  '/',
   {
     schema: {
-      tags: ["demo"],
-      summary: "Pairing page (HTML)",
+      tags: ['demo'],
+      summary: 'Pairing page (HTML)',
       description:
-        "Returns the static pairing UI that renders the upload QR code, a live artifact-event feed, and the uploads gallery.",
+        'Returns the static pairing UI that renders the upload QR code, a live artifact-event feed, and the uploads gallery.',
       response: {
         200: {
-          description: "HTML pairing page.",
-          type: "string",
+          description: 'HTML pairing page.',
+          type: 'string',
         },
       },
     },
   },
-  (_req, reply) => reply.type("text/html").send(html),
+  (_req, reply) => reply.type('text/html').send(html),
 );
 
 // The Pulse app icon, resized — referenced by <link rel="icon"> on the page.
 app.get(
-  "/favicon.png",
+  '/favicon.png',
   {
     schema: {
-      tags: ["demo"],
-      summary: "Favicon (PNG)",
-      description: "The Pulse app icon, served for the pairing page's <link rel=\"icon\">.",
+      tags: ['demo'],
+      summary: 'Favicon (PNG)',
+      description: 'The Pulse app icon, served for the pairing page\'s <link rel="icon">.',
     },
   },
-  (_req, reply) => reply.type("image/png").send(favicon),
+  (_req, reply) => reply.type('image/png').send(favicon),
 );
 
 // Reserve an artifactId for an upload. The server owns ID generation so it
 // can later attach auth tokens, quotas, or other server-side state here.
 app.post(
-  "/reserve",
+  '/reserve',
   {
     preHandler: requireSignIn,
     schema: {
-      tags: ["demo"],
-      summary: "Reserve a new artifactId",
+      tags: ['demo'],
+      summary: 'Reserve a new artifactId',
       description:
-        "Generates a fresh UUID for the client to use as the `artifactId` metadata entry on its TUS upload.",
+        'Generates a fresh UUID for the client to use as the `artifactId` metadata entry on its TUS upload.',
       response: {
         200: {
-          description: "A newly minted artifactId.",
-          type: "object",
+          description: 'A newly minted artifactId.',
+          type: 'object',
           properties: {
-            artifactId: { type: "string", format: "uuid" },
+            artifactId: { type: 'string', format: 'uuid' },
           },
-          required: ["artifactId"],
+          required: ['artifactId'],
         },
       },
     },
@@ -405,29 +413,29 @@ app.post(
 );
 
 app.get(
-  "/events",
+  '/events',
   {
     preHandler: requireSignIn,
     schema: {
-      tags: ["demo"],
-      summary: "Recent artifact events",
+      tags: ['demo'],
+      summary: 'Recent artifact events',
       description:
-        "The last `onArtifactEvent` firings (authorize rejections, upload completions, validation rejections) — an in-memory feed for the pairing page, not a durable audit log.",
+        'The last `onArtifactEvent` firings (authorize rejections, upload completions, validation rejections) — an in-memory feed for the pairing page, not a durable audit log.',
       response: {
         200: {
-          description: "Newest-first ring buffer of artifact events.",
-          type: "array",
+          description: 'Newest-first ring buffer of artifact events.',
+          type: 'array',
           items: {
-            type: "object",
+            type: 'object',
             properties: {
-              phase: { type: "string", enum: ["authorize", "complete", "reject"] },
-              artifactId: { type: "string", format: "uuid" },
-              kind: { type: "string", enum: ["video", "project", "captions"] },
-              size: { type: "number" },
-              reason: { type: "string" },
-              at: { type: "string", format: "date-time" },
+              phase: { type: 'string', enum: ['authorize', 'complete', 'reject'] },
+              artifactId: { type: 'string', format: 'uuid' },
+              kind: { type: 'string', enum: ['video', 'project', 'captions'] },
+              size: { type: 'number' },
+              reason: { type: 'string' },
+              at: { type: 'string', format: 'date-time' },
             },
-            required: ["phase", "artifactId", "kind", "at"],
+            required: ['phase', 'artifactId', 'kind', 'at'],
           },
         },
       },
@@ -454,44 +462,50 @@ async function readArtifactText(artifactId) {
   const resolved = path.resolve(localPath);
   if (!resolved.startsWith(`${base}${path.sep}`)) return null;
   try {
-    return await readFile(resolved, "utf8");
+    return await readFile(resolved, 'utf8');
   } catch {
     return null;
   }
 }
 
 app.get(
-  "/captions/:artifactId",
+  '/captions/:artifactId',
   {
     schema: {
-      tags: ["demo"],
-      summary: "Fetch a captions artifact (WebVTT)",
+      tags: ['demo'],
+      summary: 'Fetch a captions artifact (WebVTT)',
       description:
         "Demo-only convenience route (not part of the pulsevault plugin) that serves a `kind=captions` WebVTT upload — byte-for-byte, word-level cue timestamps intact — so the gallery's <track> element can render it. Applies the same relatedTo-aware capability-token check as the plugin's own routes (token via `?token=`, like the plugin's resolve phase — NOT a dashboard session, so it works for any client).",
       params: {
-        type: "object",
-        properties: { artifactId: { type: "string", format: "uuid" } },
-        required: ["artifactId"],
+        type: 'object',
+        properties: { artifactId: { type: 'string', format: 'uuid' } },
+        required: ['artifactId'],
       },
       querystring: {
-        type: "object",
-        properties: { token: { type: "string", description: "Capability token for this artifact or its relatedTo anchor." } },
+        type: 'object',
+        properties: {
+          token: {
+            type: 'string',
+            description: 'Capability token for this artifact or its relatedTo anchor.',
+          },
+        },
       },
     },
     // On top of the global per-IP limit: this route verifies a token and reads
     // the filesystem per request, so it gets its own tighter budget.
-    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+    config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
   },
   async (req, reply) => {
     const { artifactId } = req.params;
-    const token = req.query?.token ?? "";
+    const token = req.query?.token ?? '';
     const verified = token ? verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }) : null;
     const relatedTo = (await pulseStorage.getRelatedTo?.(artifactId)) ?? null;
-    const authorized = verified && (verified.artifactId === artifactId || verified.artifactId === relatedTo);
+    const authorized =
+      verified && (verified.artifactId === artifactId || verified.artifactId === relatedTo);
     if (!authorized) return reply.code(403).send();
     const text = await readArtifactText(artifactId);
     if (text === null) return reply.code(404).send();
-    return reply.type("text/vtt").send(text);
+    return reply.type('text/vtt').send(text);
   },
 );
 
@@ -512,69 +526,76 @@ app.get(
  * describes for uploads, exercised here for playback too.
  */
 app.get(
-  "/pulses",
+  '/pulses',
   {
     preHandler: requireSignIn,
     schema: {
-      tags: ["demo"],
-      summary: "List uploads grouped by pulse (recording session)",
+      tags: ['demo'],
+      summary: 'List uploads grouped by pulse (recording session)',
       description:
-        "Groups beats + manifest + captions via `relatedTo` instead of listing every artifact as an unrelated flat entry. Playback/caption URLs carry a fresh short-lived watch token per pulse.",
+        'Groups beats + manifest + captions via `relatedTo` instead of listing every artifact as an unrelated flat entry. Playback/caption URLs carry a fresh short-lived watch token per pulse.',
       response: {
         200: {
-          description: "Pulses, newest first.",
-          type: "array",
+          description: 'Pulses, newest first.',
+          type: 'array',
           items: {
-            type: "object",
+            type: 'object',
             properties: {
-              anchorArtifactId: { type: "string", format: "uuid" },
-              mode: { type: "string", enum: ["beat", "merged"] },
+              anchorArtifactId: { type: 'string', format: 'uuid' },
+              mode: { type: 'string', enum: ['beat', 'merged'] },
               manifest: {
-                type: ["object", "null"],
+                type: ['object', 'null'],
                 properties: {
-                  artifactId: { type: "string", format: "uuid" },
-                  size: { type: "number" },
+                  artifactId: { type: 'string', format: 'uuid' },
+                  size: { type: 'number' },
                 },
-                required: ["artifactId", "size"],
+                required: ['artifactId', 'size'],
               },
               beats: {
-                type: "array",
+                type: 'array',
                 items: {
-                  type: "object",
+                  type: 'object',
                   properties: {
-                    artifactId: { type: "string", format: "uuid" },
-                    filename: { type: "string" },
-                    size: { type: "number" },
-                    order: { type: "number" },
-                    checksumVerified: { type: "boolean" },
-                    playbackUrl: { type: "string" },
+                    artifactId: { type: 'string', format: 'uuid' },
+                    filename: { type: 'string' },
+                    size: { type: 'number' },
+                    order: { type: 'number' },
+                    checksumVerified: { type: 'boolean' },
+                    playbackUrl: { type: 'string' },
                     captions: {
-                      type: ["object", "null"],
+                      type: ['object', 'null'],
                       properties: {
-                        artifactId: { type: "string", format: "uuid" },
-                        vttUrl: { type: "string" },
+                        artifactId: { type: 'string', format: 'uuid' },
+                        vttUrl: { type: 'string' },
                       },
-                      required: ["artifactId", "vttUrl"],
+                      required: ['artifactId', 'vttUrl'],
                     },
                   },
-                  required: ["artifactId", "filename", "size", "order", "checksumVerified", "playbackUrl"],
+                  required: [
+                    'artifactId',
+                    'filename',
+                    'size',
+                    'order',
+                    'checksumVerified',
+                    'playbackUrl',
+                  ],
                 },
               },
               unmatchedCaptions: {
-                type: "array",
+                type: 'array',
                 items: {
-                  type: "object",
+                  type: 'object',
                   properties: {
-                    artifactId: { type: "string", format: "uuid" },
-                    filename: { type: "string" },
-                    vttUrl: { type: "string" },
+                    artifactId: { type: 'string', format: 'uuid' },
+                    filename: { type: 'string' },
+                    vttUrl: { type: 'string' },
                   },
-                  required: ["artifactId", "filename", "vttUrl"],
+                  required: ['artifactId', 'filename', 'vttUrl'],
                 },
               },
-              creation_date: { type: "string" },
+              creation_date: { type: 'string' },
             },
-            required: ["anchorArtifactId", "mode", "beats", "unmatchedCaptions", "creation_date"],
+            required: ['anchorArtifactId', 'mode', 'beats', 'unmatchedCaptions', 'creation_date'],
           },
         },
       },
@@ -593,21 +614,24 @@ app.get(
       childrenByAnchor.get(s.relatedTo).push(s);
     }
 
-    const filenameStem = (filename) => filename.replace(/\.[^.]+$/, "");
+    const filenameStem = (filename) => filename.replace(/\.[^.]+$/, '');
 
     const pulses = await Promise.all(
       anchors.map(async (anchor) => {
         const children = childrenByAnchor.get(anchor.artifactId) ?? [];
-        const captionsPool = children.filter((c) => c.kind === "captions");
-        const videoChildren = children.filter((c) => c.kind === "video");
+        const captionsPool = children.filter((c) => c.kind === 'captions');
+        const videoChildren = children.filter((c) => c.kind === 'video');
 
         // One token per pulse (not per artifact) — demonstrates relatedTo-based
         // session authorization from PROTOCOL.md §5.4 for playback, exactly as
-        // it's used for uploads.
+        // it's used for uploads. Scoped to `resolve` only: these tokens travel
+        // as `?token=` on watch URLs (log / history / Referer exposure), so a
+        // leaked one must not double as upload or delete capability.
         const pulseToken = issueCapabilityToken(anchor.artifactId, PULSEVAULT_SECRET, {
           keyId: PULSEVAULT_KEY_ID,
           issuer: ISSUER,
           expirySeconds: WATCH_TOKEN_TTL_SECONDS,
+          scope: ['resolve'],
         });
         const withToken = (url) => `${url}?token=${pulseToken}`;
 
@@ -616,15 +640,18 @@ app.get(
           const idx = captionsPool.findIndex((c) => filenameStem(c.filename) === stem);
           if (idx < 0) return null;
           const [captions] = captionsPool.splice(idx, 1);
-          return { artifactId: captions.artifactId, vttUrl: withToken(`/captions/${captions.artifactId}`) };
+          return {
+            artifactId: captions.artifactId,
+            vttUrl: withToken(`/captions/${captions.artifactId}`),
+          };
         };
 
         let mode;
         let manifest = null;
         let beats;
 
-        if (anchor.kind === "project") {
-          mode = "beat";
+        if (anchor.kind === 'project') {
+          mode = 'beat';
           manifest = { artifactId: anchor.artifactId, size: anchor.size };
           let order = null;
           try {
@@ -649,7 +676,7 @@ app.get(
           ordered.push(...videoByArtifactId.values());
           beats = ordered;
         } else {
-          mode = "merged";
+          mode = 'merged';
           beats = [anchor];
         }
 
@@ -704,38 +731,46 @@ app.get(
 // carries no override, and the client falls back to whatever `/capabilities`
 // reports.
 app.get(
-  "/deeplinks",
+  '/deeplinks',
   {
     preHandler: requireSignIn,
     schema: {
-      tags: ["demo"],
-      summary: "Mint a pairing deep link + QR code",
+      tags: ['demo'],
+      summary: 'Mint a pairing deep link + QR code',
       description:
-        "Generates a fresh artifactId, issues a session-scoped capability token, and returns the `pulsecam://` deep link (plus a QR data URL) the Pulse app pairs with.",
+        'Generates a fresh artifactId, issues a session-scoped capability token, and returns the `pulsecam://` deep link (plus a QR data URL) the Pulse app pairs with.',
       querystring: {
-        type: "object",
+        type: 'object',
         properties: {
           uploadUnit: {
-            type: "string",
-            enum: ["beat", "merged"],
-            description: "Per-link override of the deployment-wide upload-unit default.",
+            type: 'string',
+            enum: ['beat', 'merged'],
+            description: 'Per-link override of the deployment-wide upload-unit default.',
           },
         },
       },
       response: {
         200: {
-          description: "One pairing link and its QR code.",
-          type: "object",
+          description: 'One pairing link and its QR code.',
+          type: 'object',
           properties: {
-            upload: { type: "string", description: "pulsecam:// deep link" },
-            artifactId: { type: "string", format: "uuid" },
-            qrUpload: { type: "string", description: "QR code as a data: URL" },
-            authMode: { type: "boolean" },
-            keyId: { type: "string" },
-            issuer: { type: "string" },
-            tokenExpiresInSeconds: { type: "number" },
+            upload: { type: 'string', description: 'pulsecam:// deep link' },
+            artifactId: { type: 'string', format: 'uuid' },
+            qrUpload: { type: 'string', description: 'QR code as a data: URL' },
+            authMode: { type: 'boolean' },
+            keyId: { type: 'string' },
+            issuer: { type: 'string' },
+            tokenExpiresInSeconds: { type: 'number' },
           },
-          required: ["upload", "artifactId", "qrUpload", "authMode", "keyId", "issuer", "tokenExpiresInSeconds"],
+          required: [
+            'upload',
+            'artifactId',
+            'qrUpload',
+            'authMode',
+            'keyId',
+            'issuer',
+            'tokenExpiresInSeconds',
+          ],
         },
       },
     },
@@ -745,10 +780,15 @@ app.get(
     const artifactId = randomUUID();
     const requestedUploadUnit = req.query?.uploadUnit;
 
+    // Upload capability only (create + patch; tus HEAD/PATCH/DELETE on the
+    // resumable-upload route all authorize under the `patch` phase). The token
+    // deliberately can't resolve (play back) or delete finished artifacts —
+    // least privilege for the credential that leaves this server via QR code.
     const token = issueCapabilityToken(artifactId, PULSEVAULT_SECRET, {
       keyId: PULSEVAULT_KEY_ID,
       issuer: ISSUER,
       expirySeconds: TOKEN_TTL_SECONDS,
+      scope: ['create', 'patch'],
     });
 
     const upload = buildUploadLink({
@@ -761,7 +801,7 @@ app.get(
     const qrUpload = await QRCode.toDataURL(upload, {
       width: 224,
       margin: 1,
-      color: { dark: "#000000", light: "#ffffff" },
+      color: { dark: '#000000', light: '#ffffff' },
     });
 
     return reply.send({
@@ -792,22 +832,22 @@ const validateVideo = createChecksumValidator(createMp4Sniffer(pulseStorage));
 // Mount plugin under /pulsevault so TUS is at POST /pulsevault/upload and
 // artifact GET is at /pulsevault/artifacts/:artifactId.
 await app.register(pulseVault, {
-  prefix: "/pulsevault",
+  prefix: '/pulsevault',
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit: uploadUnitDefault,
   // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and WebVTT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
+  allowedExtensions: { video: ['.mp4'], project: ['.pulse', '.zip'], captions: ['.vtt'] },
   // validatePayload runs for every kind, with ctx.kind telling you which.
   validatePayload: async (request, ctx) => {
-    if (ctx.kind !== "video") return;
+    if (ctx.kind !== 'video') return;
     await validateVideo(request, ctx);
   },
   // Fired once any artifact (video, project bundle, or captions) finishes
   // uploading. This is where the artifact index gets its rows — one write
   // per completed upload, so /pulses never has to crawl the filesystem.
   onUploadComplete: async (_req, { artifactId, kind, size }) => {
-    app.log.info({ artifactId, kind, size }, "pulsevault upload complete");
+    app.log.info({ artifactId, kind, size }, 'pulsevault upload complete');
     const row = await readArtifactFromDisk(artifactId);
     if (row) await artifactIndex.upsert(row);
   },
@@ -815,7 +855,7 @@ await app.register(pulseVault, {
   // OPERATIONS.md "Monitoring and audit logging") — fed straight into the
   // in-memory feed `/events` exposes to the pairing page.
   onArtifactEvent: (event) => {
-    app.log.info(event, "pulsevault artifact event");
+    app.log.info(event, 'pulsevault artifact event');
     recordEvent(event);
   },
   // `createCapabilityAuthorize` — the library's secure-by-default auth
@@ -832,7 +872,7 @@ await app.register(pulseVault, {
     const capabilityAuthorize = createCapabilityAuthorize(lookupSecret, { issuer: ISSUER });
     return async (request, ctx) => {
       await capabilityAuthorize(request, ctx);
-      if (ctx.phase === "delete") await artifactIndex.remove(ctx.artifactId);
+      if (ctx.phase === 'delete') await artifactIndex.remove(ctx.artifactId);
     };
   })(),
 });
@@ -846,4 +886,4 @@ await app.listen({ port, host });
 console.log(`\nPulseVault auth demo running on http://localhost:${port}/`);
 console.log(`Swagger UI:                   http://localhost:${port}/docs`);
 console.log(`Capability tokens:            ON  (kid=${PULSEVAULT_KEY_ID}, issuer=${ISSUER})`);
-console.log("Dashboard + artifact index:   Better Auth + Prisma on Postgres");
+console.log('Dashboard + artifact index:   Better Auth + Prisma on Postgres');

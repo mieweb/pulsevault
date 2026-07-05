@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import type { DataStore } from '@tus/server';
 // Type-only imports: erased at compile time (verbatimModuleSyntax), so loading
 // this module never pulls in the AWS SDK. The real modules are loaded lazily
 // inside `createS3Storage` so a local-filesystem-only consumer never has to
 // install `@aws-sdk/*` or `@tus/s3-store`.
 import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
+
 import type {
   PulseVaultResolution,
   PulseVaultStorage,
@@ -209,8 +209,8 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     throw new Error(
       'createS3Storage requires the optional packages `@aws-sdk/client-s3`, ' +
         '`@aws-sdk/s3-request-presigner`, and `@tus/s3-store`. Install them with:\n' +
-        '  npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store\n' +
-        `(original error: ${err instanceof Error ? err.message : String(err)})`,
+        '  npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store',
+      { cause: err },
     );
   }
   const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = s3;
@@ -244,7 +244,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   const datastore = new S3Store({
     ...(opts.partSize ? { partSize: opts.partSize } : {}),
     s3ClientConfig: { ...clientConfig, bucket },
-  }) as unknown as DataStore;
+  });
 
   // Metadata cache keyed by artifactId, mirroring the local adapter: populated
   // eagerly on reserve and lazily from the sidecar on a cache-miss, so the GET
@@ -341,7 +341,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     // requests can both observe no existing meta before either writes) — the conditional
     // write below closes that race on backends that support it — but it's also the only
     // enforcement on S3-compatible backends that silently ignore `IfNoneMatch` instead of
-    // erroring (e.g. the `s3rver` mock this repo's own test suite runs against).
+    // erroring.
     const existing = await loadMeta(artifactId);
     if (existing) {
       throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {

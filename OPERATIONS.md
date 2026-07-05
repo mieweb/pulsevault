@@ -13,17 +13,17 @@ id as a field inside the sidecar JSON — the id is the filename — so existing
 uploaded artifacts are immediately readable through the new
 `GET /artifacts/:artifactId` route with zero changes to the files on disk.
 
-What *does* need updating:
+What _does_ need updating:
 
 - Any of your own code calling the old routes directly (`GET/DELETE
-  /:videoid`, `GET/DELETE /project/:projectid`) must move to `GET/DELETE
-  /artifacts/:artifactId` — the old routes return `404`, not a redirect.
+/:videoid`, `GET/DELETE /project/:projectid`) must move to `GET/DELETE
+/artifacts/:artifactId` — the old routes return `404`, not a redirect.
 - Any code reading `request.pulseVault.videoid` (if you imported
   `@mieweb/pulsevault/augment`) must read `.artifactId` instead.
 - If you use `validateProjectPayload`/`onProjectUploadComplete`, you'll see a
   one-time `DeprecationWarning` at startup. They still work this release —
   migrate to `validatePayload`/`onUploadComplete` with a `ctx.kind ===
-  "project"` branch when convenient, before a future major version removes
+"project"` branch when convenient, before a future major version removes
   the deprecated options.
 - Clients still sending `Upload-Metadata: videoid ...` (instead of
   `artifactId`) keep working — the alias is accepted indefinitely for
@@ -66,8 +66,8 @@ you have a specific reason to use local disk.
 `reserveUpload`'s collision guard normally uses `PutObjectCommand`'s
 `IfNoneMatch: "*"` to atomically reject a second create for an artifactId
 that already has an upload. Some S3-compatible backends (older/less-complete
-implementations; the `s3rver` mock this package's own test suite runs
-against) don't support conditional writes and reject that header outright.
+implementations) don't support conditional writes and reject that header
+outright.
 On those backends, `reserveUpload` falls back to a weaker check-then-write —
 functionally the same guard, but with the original race reopened: two
 truly concurrent (or retried) creates for the same artifactId can both pass
@@ -90,14 +90,14 @@ A minimal example using `@fastify/rate-limit`, scoped to just the upload
 routes:
 
 ```ts
-import rateLimit from "@fastify/rate-limit";
+import rateLimit from '@fastify/rate-limit';
 
 await app.register(rateLimit, {
   max: 20,
-  timeWindow: "1 minute",
+  timeWindow: '1 minute',
   // Scope to the pulsevault prefix only — don't rate-limit your whole app
   // with upload-sized limits.
-  allowList: (req) => !req.url.startsWith("/pulsevault/upload"),
+  allowList: (req) => !req.url.startsWith('/pulsevault/upload'),
 });
 ```
 
@@ -169,29 +169,29 @@ cron script for the local adapter, deleting artifacts whose sidecar has been
 than a retention window (compliance-driven deletion):
 
 ```ts
-import { readdir, readFile, stat } from "node:fs/promises";
-import path from "node:path";
-import { createLocalStorage } from "@mieweb/pulsevault";
+import { readdir, readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { createLocalStorage } from '@mieweb/pulsevault';
 
-const storage = createLocalStorage({ workspaceDir: "./data" });
-const sidecarDir = path.join(storage.workspaceRoot, ".pulsevault");
+const storage = createLocalStorage({ workspaceDir: './data' });
+const sidecarDir = path.join(storage.workspaceRoot, '.pulsevault');
 const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000; // 24h stuck "uploading"
 const RETAIN_FOR_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
 for (const file of await readdir(sidecarDir)) {
-  if (!file.endsWith(".json")) continue;
-  const artifactId = file.slice(0, -".json".length);
+  if (!file.endsWith('.json')) continue;
+  const artifactId = file.slice(0, -'.json'.length);
   const sidecarPath = path.join(sidecarDir, file);
   const [sidecar, stats] = await Promise.all([
-    readFile(sidecarPath, "utf8").then(JSON.parse),
+    readFile(sidecarPath, 'utf8').then(JSON.parse),
     stat(sidecarPath),
   ]);
   const ageMs = Date.now() - stats.mtimeMs;
-  const stuckUploading = sidecar.status === "uploading" && ageMs > ABANDONED_AFTER_MS;
-  const pastRetention = sidecar.status === "ready" && ageMs > RETAIN_FOR_MS;
+  const stuckUploading = sidecar.status === 'uploading' && ageMs > ABANDONED_AFTER_MS;
+  const pastRetention = sidecar.status === 'ready' && ageMs > RETAIN_FOR_MS;
   if (stuckUploading || pastRetention) {
     await storage.remove(artifactId);
-    console.log(`removed ${artifactId} (${stuckUploading ? "abandoned" : "retention"})`);
+    console.log(`removed ${artifactId} (${stuckUploading ? 'abandoned' : 'retention'})`);
   }
 }
 ```
@@ -208,7 +208,7 @@ environment variable is fine. For production, read from your organization's
 actual secrets manager instead of a raw env var — e.g.:
 
 ```ts
-import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
 const client = new SecretsManagerClient({});
 const keys: Record<string, string> = {};

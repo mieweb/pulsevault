@@ -39,7 +39,10 @@
     "prepublishOnly": "npm run build",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
-    "e2e": "npm run build && node scripts/e2e-tus.mjs"
+    "e2e": "npm run build && node scripts/e2e-tus.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "keywords": [
     "fastify",
@@ -71,33 +74,34 @@
     "registry": "https://registry.npmjs.org/"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.19.0"
   },
   "peerDependencies": {
     "fastify": "^5.8.5"
   },
   "dependencies": {
     "@fastify/send": "^4.1.0",
-    "@tus/file-store": "2.0.0",
-    "@tus/server": "2.0.0",
-    "fastify-plugin": "^5.1.0"
+    "@tus/file-store": "^2.1.0",
+    "@tus/server": "^2.4.1",
+    "fastify-plugin": "^6.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.6",
-    "@types/node": "^25.6.0",
+    "@types/node": "^26.1.0",
+    "eslint": "^10.6.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-simple-import-sort": "^13.0.0",
     "express": "^5.2.1",
     "fastify": "^5.8.5",
-    "s3rver": "^3.7.1",
-    "typescript": "^6.0.2"
+    "globals": "^17.7.0",
+    "prettier": "^3.9.4",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.62.1"
   },
   "optionalDependencies": {
     "@aws-sdk/client-s3": "^3.1074.0",
     "@aws-sdk/s3-request-presigner": "^3.1074.0",
     "@tus/s3-store": "^2.0.4"
-  },
-  "overrides": {
-    "s3rver": {
-      "fast-xml-parser": "^5.9.3"
-    }
   }
 }

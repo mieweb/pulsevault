@@ -1,12 +1,14 @@
-import { Server } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
-import { isUuid } from './uuid.js';
-import type { PulseVaultValidatePayload } from './magic.js';
-import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
+import { Server } from '@tus/server';
+
 import type { PulseVaultStorage } from '../storage/types.js';
 import type { UploadKind } from '../storage/types.js';
 import { parseUploadKind } from '../storage/types.js';
+import { statusCodeOf } from './errors.js';
+import type { PulseVaultValidatePayload } from './magic.js';
+import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
+import { isUuid } from './uuid.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -100,17 +102,6 @@ export function artifactIdFromUploadId(id: string): string | undefined {
   return isUuid(candidate) ? candidate : undefined;
 }
 
-/**
- * Extract a numeric HTTP status from a thrown error, honoring both
- * `statusCode` (Fastify) and `status_code` (tus).
- */
-function statusCodeOf(err: unknown, fallback: number): number {
-  const e = err as { statusCode?: unknown; status_code?: unknown };
-  if (typeof e?.statusCode === 'number') return e.statusCode;
-  if (typeof e?.status_code === 'number') return e.status_code;
-  return fallback;
-}
-
 type ParsedUploadMetadata = {
   artifactId: string;
   filename: string;
@@ -145,7 +136,7 @@ function parseUploadMetadata(
   return { artifactId, filename, kind, relatedTo, checksum };
 }
 
-export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
+export function createPulsevaultTusServer(options: PulsevaultTusOptions): Server {
   const {
     storage,
     tusPath,
@@ -253,6 +244,14 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
             logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
           }
           await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
+          // 4xx rejection reasons are the client's business (e.g. "Checksum
+          // mismatch: …"); 5xx means *our* side broke — log the real error and
+          // return a generic body so internals (adapter wiring, stack detail)
+          // never reach the client.
+          if (status >= 500) {
+            logger.error({ err, artifactId, kind }, 'pulsevault payload validation errored');
+            throw tusError(status, 'Payload validation failed\n');
+          }
           throw tusError(status, `${message}\n`);
         }
       }
@@ -263,8 +262,10 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       try {
         await storage.markReady?.(artifactId);
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'markReady failed';
-        throw tusError(500, `${message}\n`);
+        // Internal failure — log the real error server-side, return a generic
+        // body (a storage error message can leak paths/config to the client).
+        logger.error({ err, artifactId, kind }, 'pulsevault markReady failed');
+        throw tusError(500, 'Upload finalization failed\n');
       }
 
       // 3. Consumer hook — business logic (DB writes, queue jobs).
@@ -276,9 +277,10 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           // distinguish "bytes stored but completion hook failed" from
           // success. The artifact is marked ready at this point — consumers
           // who want "all-or-nothing" should `storage.remove` before
-          // throwing.
-          const message = err instanceof Error ? err.message : 'onUploadComplete failed';
-          throw tusError(500, `${message}\n`);
+          // throwing. The real error (often a consumer DB failure whose
+          // message can leak schema/infra detail) stays in the server log.
+          logger.error({ err, artifactId, kind }, 'pulsevault onUploadComplete failed');
+          throw tusError(500, 'Upload completion hook failed\n');
         }
       }
 

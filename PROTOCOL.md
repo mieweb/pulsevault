@@ -39,7 +39,12 @@ The response body MUST be a JSON object with at least the following fields:
   "maxSupportedVersion": 1,
   "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
+  "allowedExtensions": {
+    "video": [".mp4"],
+    "project": [".pulse", ".zip"],
+    "captions": [".vtt"],
+    "thumbnail": [".jpg", ".jpeg", ".png"]
+  },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
@@ -119,12 +124,12 @@ be able to see and decline.
 Upload transport MUST be [TUS v1](https://tus.io/protocols/resumable-upload)
 core protocol (creation + core resumable upload). A server MUST mount:
 
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `{prefix}/upload` | Create a resumable upload |
-| `PATCH` | `{prefix}/upload/<id>` | Append a chunk at `Upload-Offset` |
-| `HEAD` | `{prefix}/upload/<id>` | Query the current offset |
-| `DELETE` | `{prefix}/upload/<id>` | Cancel an in-flight upload |
+| Method   | Path                   | Purpose                           |
+| -------- | ---------------------- | --------------------------------- |
+| `POST`   | `{prefix}/upload`      | Create a resumable upload         |
+| `PATCH`  | `{prefix}/upload/<id>` | Append a chunk at `Upload-Offset` |
+| `HEAD`   | `{prefix}/upload/<id>` | Query the current offset          |
+| `DELETE` | `{prefix}/upload/<id>` | Cancel an in-flight upload        |
 
 `PATCH` bodies MUST be the raw bytes for that offset
 (`Content-Type: application/offset+octet-stream`) — never base64-encoded or
@@ -135,13 +140,13 @@ wrapped in another envelope.
 The TUS `Upload-Metadata` header (comma-separated `<key> <base64(value)>`
 pairs) MUST be parsed for at least:
 
-| Key | Required | Description |
-|---|---|---|
-| `artifactId` | Yes (or a legacy `videoid`/`projectid` alias) | UUID for this artifact. |
-| `filename` | Yes | Original filename; extension validated against `kind`'s allowed list. |
-| `kind` | No, defaults to `video` | `video`, `project`, `captions`, or `thumbnail`. |
-| `relatedTo` | No | UUID of another artifact this one belongs to (§8). |
-| `checksum` | No | `<algorithm>:<hex digest>` of the finished file (§6.3). |
+| Key          | Required                                      | Description                                                           |
+| ------------ | --------------------------------------------- | --------------------------------------------------------------------- |
+| `artifactId` | Yes (or a legacy `videoid`/`projectid` alias) | UUID for this artifact.                                               |
+| `filename`   | Yes                                           | Original filename; extension validated against `kind`'s allowed list. |
+| `kind`       | No, defaults to `video`                       | `video`, `project`, `captions`, or `thumbnail`.                       |
+| `relatedTo`  | No                                            | UUID of another artifact this one belongs to (§8).                    |
+| `checksum`   | No                                            | `<algorithm>:<hex digest>` of the finished file (§6.3).               |
 
 A client MUST always send `artifactId` (not only the legacy aliases) on new
 uploads. A server MUST continue accepting `videoid`/`projectid` as aliases
@@ -230,7 +235,14 @@ Servers that don't already have an auth scheme are encouraged (not required)
 to use a stateless, HMAC-signed token with at least:
 
 ```json
-{ "artifactId": "<uuid>", "iat": 1234567890, "exp": 1234569690, "kid": "2026-06", "issuer": "https://vault.example.org" }
+{
+  "artifactId": "<uuid>",
+  "iat": 1234567890,
+  "exp": 1234569690,
+  "kid": "2026-06",
+  "issuer": "https://vault.example.org",
+  "scope": ["create", "patch"]
+}
 ```
 
 `kid` lets a secret rotate with an overlap window instead of instantly
@@ -243,6 +255,23 @@ the token's `artifactId` as its `relatedTo` (§8) — this lets one token cover
 an entire upload session (a merged video plus its captions, beat manifest and
 thumbnail, or every clip plus the ordering manifest under
 `uploadUnit: "segment"`) rather than requiring one token per artifact.
+
+`scope` (optional) lists the request phases (`create`/`patch`/`resolve`/
+`delete`) the token authorizes; a token without `scope` authorizes every
+phase. Servers SHOULD mint playback tokens with `["resolve"]` and
+upload-session tokens with `["create", "patch"]`: playback tokens commonly
+travel as `?token=` query parameters (video `src` URLs can't carry an
+`Authorization` header), which exposes them to access logs, browser history,
+and `Referer` leakage — a leaked watch URL must not double as upload or
+delete capability. For the same reason, query-string tokens SHOULD be
+short-lived (minutes, not the default upload TTL) and access-log pipelines
+SHOULD scrub the `token` parameter.
+
+The token authorizes an artifact family and (optionally) phases, but not a
+volume of traffic: nothing in this scheme caps how many related artifacts or
+aggregate bytes one session token can create. Servers SHOULD enforce
+per-session quotas in their `authorize`/`onUploadComplete` hooks where abuse
+is a concern.
 
 This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
@@ -292,7 +321,7 @@ session via the pairing link's `uploadUnit` param (§3); this document does not
 prefer one over the other.
 
 > **Terminology:** a **segment** is a recorded clip (the source unit). A
-> **beat** is a *timecode range on the merged timeline* — one recorded
+> **beat** is a _timecode range on the merged timeline_ — one recorded
 > segment's start/end within the merged video — carried only in the merged
 > mode's beat manifest below. (Earlier revisions used "beat" for what is now
 > called the `segment` upload unit; that meaning is retired.)
@@ -304,7 +333,7 @@ ordered segment `artifactId`s). Segmented mode carries **no** captions and
 **no** thumbnail.
 
 ```json
-{ "version": 1, "segments": [ { "artifactId": "<uuid>", "order": 0 } ] }
+{ "version": 1, "segments": [{ "artifactId": "<uuid>", "order": 0 }] }
 ```
 
 Under `uploadUnit: "merged"`, a client uploads one pre-merged video as the
@@ -322,8 +351,12 @@ session anchor, plus (all as related artifacts):
   frame.
 
 ```json
-{ "version": 1, "type": "beat-manifest", "durationMs": 47320,
-  "beats": [ { "segmentId": "<local id>", "order": 0, "startMs": 0, "endMs": 4210 } ] }
+{
+  "version": 1,
+  "type": "beat-manifest",
+  "durationMs": 47320,
+  "beats": [{ "segmentId": "<local id>", "order": 0, "startMs": 0, "endMs": 4210 }]
+}
 ```
 
 Every non-anchor artifact in either session SHOULD declare `relatedTo` pointing

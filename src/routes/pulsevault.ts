@@ -5,15 +5,16 @@ import type {
   FastifyRequest,
   FastifySchema,
 } from 'fastify';
+
 import type { PulseVaultCacheOptions } from '../app.js';
 import { createPulseVaultCore, PROTOCOL_VERSION } from '../core.js';
-import type {
-  PulseVaultOnUploadComplete,
-  PulseVaultOnArtifactEvent,
-} from '../lib/pulsevaultTus.js';
-import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import { type PulseVaultAuthorize } from '../lib/authorize.js';
+import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import type { PulseVaultAllowedExtensions } from '../lib/options.js';
+import type {
+  PulseVaultOnArtifactEvent,
+  PulseVaultOnUploadComplete,
+} from '../lib/pulsevault-tus.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
 export type {

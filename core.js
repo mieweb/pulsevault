@@ -4,4 +4,4 @@
 // exists only for resolvers that don't understand "exports" subpath maps
 // (e.g. Meteor's bundler as of Meteor 3.4 / modules@0.20.3), which fall back
 // to plain relative-path resolution and need a real file at this path.
-export * from "./dist/core.js";
+export * from './dist/core.js';

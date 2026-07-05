@@ -2,17 +2,31 @@
 // helper takes an explicit `baseUrl` + `prefix` so the same code drives the
 // local-filesystem tests and the S3/R2 tests.
 
-import assert from "node:assert/strict";
+import assert from 'node:assert/strict';
 
 export function b64(str) {
-  return Buffer.from(str, "utf8").toString("base64");
+  return Buffer.from(str, 'utf8').toString('base64');
 }
 
 // Minimal ISOBMFF header: "ftyp" box with brand "isom". Enough bytes for the
 // MP4 sniffers to accept and for realistic-looking upload sizes.
 export const MP4_HEADER = Buffer.from([
-  0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // box size + "ftyp"
-  0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // brand "isom" + version
+  0x00,
+  0x00,
+  0x00,
+  0x20,
+  0x66,
+  0x74,
+  0x79,
+  0x70, // box size + "ftyp"
+  0x69,
+  0x73,
+  0x6f,
+  0x6d,
+  0x00,
+  0x00,
+  0x02,
+  0x00, // brand "isom" + version
 ]);
 
 export function makeMp4(size) {
@@ -30,18 +44,18 @@ export function makeMp4(size) {
 export async function tusCreate(
   baseUrl,
   prefix,
-  { artifactId, idKey = "artifactId", filename, size, kind, relatedTo, checksum, headers = {} },
+  { artifactId, idKey = 'artifactId', filename, size, kind, relatedTo, checksum, headers = {} },
 ) {
   const parts = [`${idKey} ${b64(artifactId)}`, `filename ${b64(filename)}`];
   if (kind) parts.push(`kind ${b64(kind)}`);
   if (relatedTo) parts.push(`relatedTo ${b64(relatedTo)}`);
   if (checksum) parts.push(`checksum ${b64(checksum)}`);
   return fetch(`${baseUrl}${prefix}/upload`, {
-    method: "POST",
+    method: 'POST',
     headers: {
-      "Tus-Resumable": "1.0.0",
-      "Upload-Length": String(size),
-      "Upload-Metadata": parts.join(","),
+      'Tus-Resumable': '1.0.0',
+      'Upload-Length': String(size),
+      'Upload-Metadata': parts.join(','),
       ...headers,
     },
   });
@@ -49,11 +63,11 @@ export async function tusCreate(
 
 export async function tusPatch(url, offset, body, headers = {}) {
   return fetch(url, {
-    method: "PATCH",
+    method: 'PATCH',
     headers: {
-      "Tus-Resumable": "1.0.0",
-      "Upload-Offset": String(offset),
-      "Content-Type": "application/offset+octet-stream",
+      'Tus-Resumable': '1.0.0',
+      'Upload-Offset': String(offset),
+      'Content-Type': 'application/offset+octet-stream',
       ...headers,
     },
     body,
@@ -62,8 +76,8 @@ export async function tusPatch(url, offset, body, headers = {}) {
 
 export async function tusHead(url) {
   return fetch(url, {
-    method: "HEAD",
-    headers: { "Tus-Resumable": "1.0.0" },
+    method: 'HEAD',
+    headers: { 'Tus-Resumable': '1.0.0' },
   });
 }
 
@@ -72,7 +86,7 @@ export async function tusHead(url) {
 export async function uploadFull(
   baseUrl,
   prefix,
-  { artifactId, filename = "clip.mp4", size = 1024, kind, relatedTo, checksum, body, headers } = {},
+  { artifactId, filename = 'clip.mp4', size = 1024, kind, relatedTo, checksum, body, headers } = {},
 ) {
   const payload = body ?? makeMp4(size);
   const create = await tusCreate(baseUrl, prefix, {
@@ -84,13 +98,13 @@ export async function uploadFull(
     checksum,
     headers,
   });
-  assert.equal(create.status, 201, "create");
-  const rawLocation = create.headers.get("location");
-  assert.ok(rawLocation, "location header");
+  assert.equal(create.status, 201, 'create');
+  const rawLocation = create.headers.get('location');
+  assert.ok(rawLocation, 'location header');
   // The server returns a relative Location; resolve it against the base URL
   // the same way real tus clients resolve it against the request URL.
   const location = new URL(rawLocation, baseUrl).href;
   const patch = await tusPatch(location, 0, payload, headers);
-  assert.equal(patch.status, 204, "patch");
+  assert.equal(patch.status, 204, 'patch');
   return { body: payload, location };
 }

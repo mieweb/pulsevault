@@ -1,19 +1,24 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
-import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
+
 import type { PulseVaultValidatePayload } from './lib/magic.js';
-import type { PulseVaultStorage } from './storage/types.js';
 import {
+  composeOnUploadComplete,
+  composeValidatePayload,
   normalizeAllowedExtensions,
+  type PulseVaultAllowedExtensionsInput,
+  validateAllowedExtensions,
   validateBasePath,
   validateMaxUploadSize,
   validateUploadUnit,
-  validateAllowedExtensions,
   warnIfUsingDeprecatedProjectHooks,
-  composeValidatePayload,
-  composeOnUploadComplete,
 } from './lib/options.js';
+import type {
+  PulseVaultOnArtifactEvent,
+  PulseVaultOnUploadComplete,
+} from './lib/pulsevault-tus.js';
+import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
+import type { PulseVaultStorage } from './storage/types.js';
 
 /**
  * Subset of `@fastify/send`'s cache-related options forwarded to the GET
@@ -76,18 +81,16 @@ export type PulseVaultPluginOptions = {
   decoratorName?: string;
   /**
    * File extensions allowed per artifact kind. Accepts:
-   * - A flat array (`[".mp4"]`) — treated as video-only; project/captions
-   *   default. This is the legacy form for back-compat.
-   * - An object with optional `video`/`project`/`captions` keys; unset keys
-   *   fall back to their defaults.
-   * - Omitted entirely — defaults to
-   *   `{ video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] }`.
+   * - A flat array (`[".mp4"]`) — treated as video-only; project/captions/
+   *   thumbnail default. This is the legacy form for back-compat.
+   * - An object with optional `video`/`project`/`captions`/`thumbnail` keys;
+   *   unset keys fall back to their defaults.
+   * - Omitted entirely — defaults to `{ video: [".mp4"], project: [".pulse",
+   *   ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] }`.
    *
    * All extensions must include the leading dot and are matched case-insensitively.
    */
-  allowedExtensions?:
-    | readonly string[]
-    | { video?: readonly string[]; project?: readonly string[]; captions?: readonly string[] };
+  allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /**
    * Cache-control options forwarded to `@fastify/send` for the GET route.
    * When omitted, `@fastify/send`'s defaults apply (`Cache-Control: public,
@@ -203,45 +206,45 @@ export default fp(app, {
   fastify: '5.x',
 });
 
-export { createLocalStorage } from './storage/local.js';
+export type {
+  CapabilityTokenClaims,
+  IssueCapabilityTokenOptions,
+  LookupSecret,
+  VerifyCapabilityTokenOptions,
+} from './lib/capability-token.js';
+export {
+  createCapabilityAuthorize,
+  issueCapabilityToken,
+  verifyCapabilityToken,
+} from './lib/capability-token.js';
+export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
+export {
+  createChecksumValidator,
+  createS3ChecksumValidator,
+  parseChecksumMetadata,
+} from './lib/checksum.js';
+export type { UploadLinkOptions } from './lib/deeplinks.js';
+export { buildUploadLink } from './lib/deeplinks.js';
+export type { PulseVaultValidatePayload } from './lib/magic.js';
+export { createMp4Sniffer, createS3Mp4Sniffer, sniffMp4 } from './lib/magic.js';
+export type {
+  PulseVaultArtifactEvent,
+  PulseVaultOnArtifactEvent,
+  PulseVaultOnUploadComplete,
+} from './lib/pulsevault-tus.js';
+export type { PulseVaultLogger, PulseVaultRequest } from './lib/request.js';
+export type {
+  PulseVaultAuthorize,
+  PulseVaultAuthorizeContext,
+  PulseVaultAuthorizePhase,
+} from './routes/pulsevault.js';
 export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
-export { createS3Storage } from './storage/s3.js';
+export { createLocalStorage } from './storage/local.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
+export { createS3Storage } from './storage/s3.js';
 export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './storage/types.js';
-export type {
-  PulseVaultAuthorize,
-  PulseVaultAuthorizeContext,
-  PulseVaultAuthorizePhase,
-} from './routes/pulsevault.js';
-export type {
-  PulseVaultOnUploadComplete,
-  PulseVaultOnArtifactEvent,
-  PulseVaultArtifactEvent,
-} from './lib/pulsevaultTus.js';
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
-export type { PulseVaultValidatePayload } from './lib/magic.js';
-export { buildUploadLink } from './lib/deeplinks.js';
-export type { UploadLinkOptions } from './lib/deeplinks.js';
-export {
-  issueCapabilityToken,
-  verifyCapabilityToken,
-  createCapabilityAuthorize,
-} from './lib/capability-token.js';
-export type {
-  CapabilityTokenClaims,
-  IssueCapabilityTokenOptions,
-  VerifyCapabilityTokenOptions,
-  LookupSecret,
-} from './lib/capability-token.js';
-export {
-  createChecksumValidator,
-  createS3ChecksumValidator,
-  parseChecksumMetadata,
-} from './lib/checksum.js';
-export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
-export type { PulseVaultRequest, PulseVaultLogger } from './lib/request.js';

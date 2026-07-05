@@ -1,8 +1,9 @@
 import fs from 'node:fs/promises';
-import type { PulseVaultRequest } from './request.js';
+
 import type { LocalStorage } from '../storage/local.js';
 import type { S3Storage } from '../storage/s3.js';
 import type { UploadKind } from '../storage/types.js';
+import type { PulseVaultRequest } from './request.js';
 
 /**
  * Optional plugin-level hook: after TUS writes the final byte but before the

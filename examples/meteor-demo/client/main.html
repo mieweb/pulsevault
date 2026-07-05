@@ -1,13 +1,13 @@
 <head>
   <title>PulseVault demo (Meteor)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 </head>
 
 <body>
   <div class="top-row">
     <h1>PulseVault demo (Meteor)</h1>
   </div>
-  <p style="font-size: 0.9rem; color: #8b949e;">
+  <p style="font-size: 0.9rem; color: #8b949e">
     <span id="authBadge" class="auth-badge">auth: off</span>
     Pair the Pulse app with this demo server and upload a video. Same demo as
     <code>../fastify-auth-demo</code> and <code>../express-demo</code>, running on
@@ -16,12 +16,22 @@
 
   <div class="card">
     <strong>Upload</strong>
-    <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
-      Each scan opens the chooser in the Pulse app: record a new video, or
-      pick an existing draft to upload to this server.
+    <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0">
+      Each scan opens the chooser in the Pulse app: record a new video, or pick an existing draft to
+      upload to this server.
     </p>
 
-    <img id="qrUpload" width="224" height="224" style="display: block; margin: 1.25rem auto; border-radius: 8px; background: #fff; padding: 10px;" />
+    <img
+      id="qrUpload"
+      width="224"
+      height="224"
+      style="
+        display: block;
+        margin: 1.25rem auto;
+        border-radius: 8px;
+        background: #fff;
+        padding: 10px;
+      " />
 
     <a id="openBtnUpload" class="open-btn" href="#">Open in Pulse app</a>
     <button id="refreshUpload" class="ghost-btn">↻ New QR</button>
@@ -38,21 +48,27 @@
 
   <div id="authHelp" class="card" hidden>
     <strong>Auth demo enabled</strong>
-    <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0;">
-      This server requires a bearer token for every upload and watch request.
-      The QR above embeds it, so the Pulse app handles auth automatically.
-      Tampering with the token in the deeplink should produce a 403 from
-      <code>authorize</code>. To disable, restart the server without
-      <code>DEMO_TOKEN</code> set.
+    <p style="font-size: 0.875rem; color: #8b949e; margin: 0.5rem 0 0">
+      This server requires a bearer token for every upload and watch request. The QR above embeds
+      it, so the Pulse app handles auth automatically. Tampering with the token in the deeplink
+      should produce a 403 from
+      <code>authorize</code>. To disable, restart the server without <code>DEMO_TOKEN</code> set.
     </p>
   </div>
 
   <div class="card">
     <div class="top-row">
       <strong>Uploads</strong>
-      <button id="refreshVideos" class="ghost-btn" style="width: auto; margin: 0; padding: 0.3rem 0.7rem;">↻ Refresh</button>
+      <button
+        id="refreshVideos"
+        class="ghost-btn"
+        style="width: auto; margin: 0; padding: 0.3rem 0.7rem">
+        ↻ Refresh
+      </button>
     </div>
-    <div id="videoList" style="margin-top: 0.75rem; max-height: 48rem; overflow-y: auto; padding-right: 0.25rem;">
+    <div
+      id="videoList"
+      style="margin-top: 0.75rem; max-height: 48rem; overflow-y: auto; padding-right: 0.25rem">
       <p class="mono">Loading…</p>
     </div>
   </div>

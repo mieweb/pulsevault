@@ -1,11 +1,22 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+
 import type { S3Storage } from '../storage/s3.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 
 export type ChecksumAlgorithm = 'sha256' | 'sha1' | 'md5';
-const SUPPORTED_ALGORITHMS: readonly ChecksumAlgorithm[] = ['sha256', 'sha1', 'md5'];
+
+/**
+ * The digest algorithms PulseVault accepts in `Upload-Metadata.checksum`. This
+ * is the single source of truth — the `/capabilities` payload advertises this
+ * exact list, so what's advertised can never drift from what's accepted.
+ */
+export const SUPPORTED_CHECKSUM_ALGORITHMS: readonly ChecksumAlgorithm[] = [
+  'sha256',
+  'sha1',
+  'md5',
+];
 
 export type ParsedChecksum = { algorithm: ChecksumAlgorithm; digest: string };
 
@@ -22,12 +33,17 @@ export function parseChecksumMetadata(raw: string | undefined | null): ParsedChe
   const algorithm = raw.slice(0, sep).toLowerCase();
   const digest = raw.slice(sep + 1).toLowerCase();
   if (!isSupportedAlgorithm(algorithm)) return null;
-  if (!/^[0-9a-f]+$/.test(digest) || digest.length === 0) return null;
+  // Any non-empty lowercase-hex digest is accepted here regardless of length (the
+  // `+` quantifier already rejects empty): in the validator a `null` parse means
+  // "client opted out", so rejecting a wrong-length digest at parse time would
+  // silently skip verification instead of failing it. A length mismatch therefore
+  // falls through to the digest comparison and 422s there.
+  if (!/^[0-9a-f]+$/.test(digest)) return null;
   return { algorithm, digest };
 }
 
 function isSupportedAlgorithm(value: string): value is ChecksumAlgorithm {
-  return (SUPPORTED_ALGORITHMS as readonly string[]).includes(value);
+  return (SUPPORTED_CHECKSUM_ALGORITHMS as readonly string[]).includes(value);
 }
 
 /**
@@ -73,8 +89,14 @@ export function createChecksumValidator(
     const checksum = parseChecksumMetadata(ctx.checksum);
     if (checksum) {
       if (!ctx.localPath) {
-        throw checksumError(
-          'Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage',
+        // Wrong validator wired for this adapter — a server misconfiguration,
+        // not a bad client payload — so surface 500, not 422 (which would tell
+        // the client their file was rejected).
+        throw Object.assign(
+          new Error(
+            'Checksum verification requested but this storage adapter has no local path — use createS3ChecksumValidator for S3/R2 storage',
+          ),
+          { statusCode: 500 },
         );
       }
       const actual = await digestLocalFile(ctx.localPath, checksum.algorithm);

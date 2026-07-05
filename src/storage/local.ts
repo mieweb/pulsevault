@@ -1,6 +1,7 @@
-import { FileStore } from '@tus/file-store';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { FileStore } from '@tus/file-store';
+
 import { isUuid } from '../lib/uuid.js';
 import type {
   PulseVaultResolution,
@@ -110,6 +111,8 @@ export type LocalStorageOptions = {
  *   project/<artifactId><ext>.json  # @tus/file-store offset/metadata sidecar
  *   captions/<artifactId><ext>      # finalized captions bytes
  *   captions/<artifactId><ext>.json # @tus/file-store offset/metadata sidecar
+ *   thumbnail/<artifactId><ext>     # finalized thumbnail bytes (merged-mode poster frame)
+ *   thumbnail/<artifactId><ext>.json # @tus/file-store offset/metadata sidecar
  * ```
  *
  * `workspaceRoot` is exposed so consumers can layer post-processing (e.g.
@@ -251,9 +254,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   const initialize = async (): Promise<void> => {
-    await fs.mkdir(sidecarDir(), { recursive: true });
+    // Dirs PulseVault creates itself get mode 0o750 directly (mkdir's mode caps the
+    // permission bits — umask only removes more — so this holds even under a permissive umask).
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
     // @tus/file-store creates `workspaceRoot` with mode 0777 if it doesn't already exist;
-    // tighten it so the upload tree isn't world-writable under a permissive umask.
+    // we don't create it, so tighten it after the fact.
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
@@ -265,8 +270,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     relatedTo,
     checksum,
   }: ReserveUploadParams): Promise<string> => {
-    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true });
-    await fs.mkdir(sidecarDir(), { recursive: true });
+    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
     const sidecar: Sidecar = {
       version: SIDECAR_VERSION,

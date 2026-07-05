@@ -1,6 +1,22 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+
+import type {
+  PulseVaultAuthorize,
+  PulseVaultAuthorizeContext,
+  PulseVaultAuthorizePhase,
+} from './authorize.js';
 import type { PulseVaultRequest } from './request.js';
-import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from './authorize.js';
+
+// Derived through a Record so adding a phase to `PulseVaultAuthorizePhase` is a
+// compile error here — a hand-written array would drift silently, and tokens
+// scoped to the new phase would then fail verification with no build-time signal.
+const AUTHORIZE_PHASE_SET: Record<PulseVaultAuthorizePhase, true> = {
+  create: true,
+  patch: true,
+  resolve: true,
+  delete: true,
+};
+const AUTHORIZE_PHASES = Object.keys(AUTHORIZE_PHASE_SET) as readonly PulseVaultAuthorizePhase[];
 
 /**
  * Claims signed into a capability token. `kid` lets a secret be rotated with
@@ -9,7 +25,9 @@ import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from './authoriz
  * signing only `exp` would let a slow server clock accept an already-expired
  * token; `issuer` binds the token to the issuing deployment's identity so a
  * secret accidentally shared between two independent orgs can't be replayed
- * across them.
+ * across them; `scope` (optional) limits which request phases the token
+ * authorizes so a leaked playback URL can't be turned into upload/delete
+ * capability.
  */
 export type CapabilityTokenClaims = {
   /** The artifact (or session-anchor artifact — see `relatedTo`) this token authorizes. */
@@ -22,6 +40,15 @@ export type CapabilityTokenClaims = {
   kid: string;
   /** Issuing deployment's identity, e.g. `"https://vault.acme-hospital.org"`. */
   issuer: string;
+  /**
+   * Request phases this token authorizes. Omitted = every phase (the
+   * pre-`scope` behavior, kept so outstanding tokens stay valid). Mint
+   * playback tokens with `['resolve']` and upload-session tokens with
+   * `['create', 'patch']` so each URL carries only the capability it needs —
+   * a watch link that leaks via logs/history/Referer must not double as
+   * upload or delete authority.
+   */
+  scope?: readonly PulseVaultAuthorizePhase[];
 };
 
 const DEFAULT_EXPIRY_SECONDS = 1800; // 30 minutes — long enough for one upload session.
@@ -50,6 +77,12 @@ export type IssueCapabilityTokenOptions = {
   issuer: string;
   /** Token lifetime in seconds. Defaults to 1800 (30 minutes). */
   expirySeconds?: number;
+  /**
+   * Request phases this token authorizes (see `CapabilityTokenClaims.scope`).
+   * Omit for an unrestricted token; prefer `['resolve']` for playback URLs and
+   * `['create', 'patch']` for upload sessions.
+   */
+  scope?: readonly PulseVaultAuthorizePhase[];
 };
 
 /**
@@ -72,6 +105,7 @@ export function issueCapabilityToken(
     exp: now + (opts.expirySeconds ?? DEFAULT_EXPIRY_SECONDS),
     kid: opts.keyId,
     issuer: opts.issuer,
+    ...(opts.scope ? { scope: opts.scope } : {}),
   };
   const payload = base64urlEncode(JSON.stringify(claims));
   return `${payload}.${sign(payload, secret)}`;
@@ -87,31 +121,41 @@ export type VerifyCapabilityTokenOptions = {
   clockToleranceSeconds?: number;
 };
 
+function isAuthorizePhase(value: unknown): value is PulseVaultAuthorizePhase {
+  return (AUTHORIZE_PHASES as readonly unknown[]).includes(value);
+}
+
 /**
  * Verify a token minted by `issueCapabilityToken`. Returns the authorized
- * `artifactId` on success, or `null` for any failure (malformed token,
- * unknown `kid`, bad signature, expired, issued too far in the future, or
- * issuer mismatch) — deliberately collapsed to one failure shape so callers
- * can't accidentally branch on *why* a token failed and leak which part was
- * wrong to an attacker.
+ * `artifactId` (plus the token's `scope`, `null` when unrestricted) on
+ * success, or `null` for any failure (malformed token, unknown `kid`, bad
+ * signature, expired, issued too far in the future, issuer mismatch, or a
+ * malformed `scope` claim) — deliberately collapsed to one failure shape so
+ * callers can't accidentally branch on *why* a token failed and leak which
+ * part was wrong to an attacker.
  */
 export function verifyCapabilityToken(
   token: string,
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
-): { artifactId: string } | null {
+): { artifactId: string; scope: readonly PulseVaultAuthorizePhase[] | null } | null {
   const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
   const signature = token.slice(dot + 1);
   if (!payload || !signature) return null;
 
-  let claims: Partial<CapabilityTokenClaims>;
+  let parsed: unknown;
   try {
-    claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     return null;
   }
+  // Guard the JSON *type* before property access: a payload of `null`, `42`, or
+  // `"str"` is valid JSON, and reading `.artifactId` off `null` would throw —
+  // violating the "returns null for any failure" contract above.
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const claims = parsed as Partial<CapabilityTokenClaims>;
   if (
     typeof claims.artifactId !== 'string' ||
     typeof claims.iat !== 'number' ||
@@ -120,6 +164,12 @@ export function verifyCapabilityToken(
     typeof claims.issuer !== 'string'
   ) {
     return null;
+  }
+  // `scope` is optional (absent = unrestricted, the pre-scope contract), but a
+  // *present* scope must be a well-formed phase list — fail closed on anything
+  // else rather than guessing what a malformed claim meant.
+  if (claims.scope !== undefined) {
+    if (!Array.isArray(claims.scope) || !claims.scope.every(isAuthorizePhase)) return null;
   }
 
   const secret = lookupSecret(claims.kid);
@@ -132,7 +182,7 @@ export function verifyCapabilityToken(
   if (claims.exp < now - tolerance) return null;
   if (claims.issuer !== opts.issuer) return null;
 
-  return { artifactId: claims.artifactId };
+  return { artifactId: claims.artifactId, scope: claims.scope ?? null };
 }
 
 /** Pull a bearer token from the `Authorization` header, falling back to `ctx.token` (the `resolve`-phase query-string forward). */
@@ -141,7 +191,9 @@ function extractToken(
   ctx: Pick<PulseVaultAuthorizeContext, 'token'>,
 ): string | undefined {
   const header = request.headers.authorization;
-  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+  // RFC 7235: the auth-scheme token is case-insensitive, so accept `bearer`/`BEARER`
+  // too rather than only the canonical `Bearer ` some clients happen to send.
+  if (typeof header === 'string' && /^Bearer /i.test(header)) {
     return header.slice('Bearer '.length);
   }
   return ctx.token;
@@ -166,6 +218,17 @@ function extractToken(
  * so one token issued for a video also covers its captions/manifest/thumbnail
  * and (under `uploadUnit: "segment"`) every clip and the ordering manifest
  * uploaded in the same session, without minting a token per artifact.
+ *
+ * When the token carries a `scope` claim, the request's phase must be listed
+ * in it — a `['resolve']` playback token is rejected for create/patch/delete
+ * even though its `artifactId` matches. Tokens without `scope` authorize
+ * every phase (the pre-scope contract, so outstanding tokens stay valid).
+ *
+ * Security note for `lookupSecret` implementations: `kid` is attacker-
+ * controlled input. Back the lookup with a `Map`, a null-prototype object, or
+ * an explicit comparison — a bare `keys[kid]` on a plain object resolves
+ * prototype keys like `"constructor"` to functions/objects rather than
+ * `undefined`.
  */
 export function createCapabilityAuthorize(
   lookupSecret: LookupSecret,
@@ -182,6 +245,11 @@ export function createCapabilityAuthorize(
     }
     if (ctx.artifactId !== verified.artifactId && ctx.relatedTo !== verified.artifactId) {
       throw Object.assign(new Error('Token does not authorize this artifact'), { statusCode: 403 });
+    }
+    if (verified.scope && !verified.scope.includes(ctx.phase)) {
+      throw Object.assign(new Error('Token does not authorize this operation'), {
+        statusCode: 403,
+      });
     }
   };
 }

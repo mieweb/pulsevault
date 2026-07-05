@@ -1,5 +1,5 @@
-import type { PulseVaultRequest } from './request.js';
 import type { UploadKind } from '../storage/types.js';
+import type { PulseVaultRequest } from './request.js';
 
 export type PulseVaultAuthorizePhase = 'create' | 'patch' | 'resolve' | 'delete';
 

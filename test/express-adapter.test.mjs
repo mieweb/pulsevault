@@ -3,20 +3,20 @@
 // http-adapter.test.mjs for that), just confirmation that Express's own
 // request pipeline (its router, body handling, etc.) doesn't interfere.
 
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import express from "express";
-import { createPulseVaultCore, createLocalStorage } from "../dist/core.js";
-import { makeMp4, tusCreate as tusCreateRaw, tusPatch } from "./helpers.mjs";
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import express from 'express';
+import { createPulseVaultCore, createLocalStorage } from '../dist/core.js';
+import { makeMp4, tusCreate as tusCreateRaw, tusPatch } from './helpers.mjs';
 
-const ID1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const PREFIX = "/pulsevault";
+const ID1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const PREFIX = '/pulsevault';
 
 async function startApp() {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-express-test-"));
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pv-express-test-'));
   const storage = createLocalStorage({ workspaceDir });
   // `basePath` must still be the full external prefix — the core uses it to
   // build the tus `Location` header clients PATCH against. But Express's
@@ -36,10 +36,10 @@ async function startApp() {
   app.use(PREFIX, (req, res, next) => {
     core.handler(req, res, next).catch(next);
   });
-  app.get("/healthz", (_req, res) => res.send("ok"));
+  app.get('/healthz', (_req, res) => res.send('ok'));
 
   const server = await new Promise((resolve) => {
-    const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
   const { port } = server.address();
   return {
@@ -53,24 +53,24 @@ async function startApp() {
   };
 }
 
-test("express: full TUS upload + GET round-trips through app.use(prefix, core.handler)", async () => {
+test('express: full TUS upload + GET round-trips through app.use(prefix, core.handler)', async () => {
   const ctx = await startApp();
   try {
     const body = makeMp4(2048);
     const create = await tusCreateRaw(ctx.baseUrl, PREFIX, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: body.length,
     });
     assert.equal(create.status, 201);
-    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    const location = new URL(create.headers.get('location'), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, body);
     assert.equal(patch.status, 204);
 
     const get = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${ID1}`);
     assert.equal(get.status, 200);
-    assert.equal(get.headers.get("protocol-version"), "1");
+    assert.equal(get.headers.get('protocol-version'), '1');
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(Buffer.compare(bytes, body), 0);
   } finally {
@@ -83,13 +83,13 @@ test("express: routes outside the mounted prefix still reach Express's own handl
   try {
     const res = await fetch(`${ctx.baseUrl}/healthz`);
     assert.equal(res.status, 200);
-    assert.equal(await res.text(), "ok");
+    assert.equal(await res.text(), 'ok');
   } finally {
     await ctx.teardown();
   }
 });
 
-test("express: GET /capabilities is reachable through the mounted router", async () => {
+test('express: GET /capabilities is reachable through the mounted router', async () => {
   const ctx = await startApp();
   try {
     const res = await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`);

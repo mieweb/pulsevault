@@ -2,7 +2,7 @@
 
 Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. Ships as a Fastify plugin (`@mieweb/pulsevault`) and as a framework-agnostic core (`@mieweb/pulsevault/core`) for Express, Meteor, or plain `http.createServer` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
-See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server *without* this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
+See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server _without_ this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
 
 Self-hosted video capture for places that can't ship recordings to a vendor. Pulse records the walkthrough on the phone; Pulsevault receives it inside the backend you already run, behind your auth, on your storage. Pair a device by QR code and upload over TUS so two-minute captures from the floor survive signal drops and device restarts.
 
@@ -42,20 +42,20 @@ npm install @mieweb/pulsevault
 ## Quick start
 
 ```ts
-import Fastify from "fastify";
-import { randomUUID } from "node:crypto";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import Fastify from 'fastify';
+import { randomUUID } from 'node:crypto';
+import pulseVault, { createLocalStorage } from '@mieweb/pulsevault';
 
 const app = Fastify();
 
 await app.register(pulseVault, {
-  prefix: "/pulsevault",
-  storage: createLocalStorage({ workspaceDir: "./data" }),
+  prefix: '/pulsevault',
+  storage: createLocalStorage({ workspaceDir: './data' }),
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
 });
 
 // Your server owns artifactId creation — attach auth, DB records, quotas here.
-app.post("/reserve", async (_req, reply) => {
+app.post('/reserve', async (_req, reply) => {
   return reply.send({ artifactId: randomUUID() });
 });
 
@@ -81,23 +81,23 @@ you can mount directly:
 
 ```ts
 // Express
-import express from "express";
-import { randomUUID } from "node:crypto";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import express from 'express';
+import { randomUUID } from 'node:crypto';
+import { createPulseVaultCore, createLocalStorage } from '@mieweb/pulsevault/core';
 
 const app = express();
 const pulseVault = createPulseVaultCore({
-  basePath: "/pulsevault",
+  basePath: '/pulsevault',
   // Express's app.use(prefix, ...) already strips the mount prefix from
   // req.url before calling the middleware, so tell the core not to also
   // match/strip it — basePath is still used for the tus Location header.
   stripBasePath: false,
-  storage: createLocalStorage({ workspaceDir: "./data" }),
+  storage: createLocalStorage({ workspaceDir: './data' }),
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
 });
-app.use("/pulsevault", (req, res, next) => pulseVault.handler(req, res, next).catch(next));
+app.use('/pulsevault', (req, res, next) => pulseVault.handler(req, res, next).catch(next));
 
-app.post("/reserve", express.json(), (_req, res) => {
+app.post('/reserve', express.json(), (_req, res) => {
   res.json({ artifactId: randomUUID() });
 });
 
@@ -106,16 +106,16 @@ app.listen(3030);
 
 ```ts
 // Meteor (server-only module)
-import { WebApp } from "meteor/webapp";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { WebApp } from 'meteor/webapp';
+import { createPulseVaultCore, createLocalStorage } from '@mieweb/pulsevault/core';
 
 const pulseVault = createPulseVaultCore({
-  basePath: "/pulsevault",
+  basePath: '/pulsevault',
   stripBasePath: false, // WebApp.connectHandlers strips the mount prefix too
   storage: createLocalStorage({ workspaceDir: process.env.PULSEVAULT_DIR }),
   maxUploadSize: 5 * 1024 * 1024 * 1024,
 });
-WebApp.connectHandlers.use("/pulsevault", (req, res, next) => {
+WebApp.connectHandlers.use('/pulsevault', (req, res, next) => {
   pulseVault.handler(req, res, next).catch(next);
 });
 ```
@@ -125,7 +125,7 @@ is the right integration point (it's `connect`, the same shape as Express),
 but Meteor's bundler (tested: Meteor 3.4, `modules@0.20.3`) doesn't resolve
 `package.json` `"exports"` subpath maps — neither this package's own
 `"./core"` entry, nor (transitively, until this release) `@tus/server`'s
-own dependency on `srvx`, which shipped *only* subpath exports with no
+own dependency on `srvx`, which shipped _only_ subpath exports with no
 legacy `main` fallback. Both are worked around: this package pins
 `@tus/server`/`@tus/file-store` to `2.0.0` (the last release before the
 `srvx` migration — see `CHANGELOG.md`) and ships plain root-level
@@ -140,20 +140,22 @@ request's full, unmodified URL instead of pre-stripping a mount prefix),
 leave `stripBasePath` at its default (`true`):
 
 ```ts
-import http from "node:http";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import http from 'node:http';
+import { createPulseVaultCore, createLocalStorage } from '@mieweb/pulsevault/core';
 
 const pulseVault = createPulseVaultCore({
-  basePath: "/pulsevault",
-  storage: createLocalStorage({ workspaceDir: "./data" }),
+  basePath: '/pulsevault',
+  storage: createLocalStorage({ workspaceDir: './data' }),
   maxUploadSize: 5 * 1024 * 1024 * 1024,
 });
-http.createServer((req, res) => {
-  pulseVault.handler(req, res).catch((err) => {
-    res.writeHead(500);
-    res.end(String(err));
-  });
-}).listen(3030);
+http
+  .createServer((req, res) => {
+    pulseVault.handler(req, res).catch((err) => {
+      res.writeHead(500);
+      res.end(String(err));
+    });
+  })
+  .listen(3030);
 ```
 
 `@mieweb/pulsevault/core` re-exports everything the Fastify entry point does
@@ -222,19 +224,19 @@ sequenceDiagram
 
 The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core` mounts the identical set under `basePath` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http)):
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, `uploadUnit`, allowed extensions, limits |
-| `POST` | `/pulsevault/upload` | Create a TUS upload session |
-| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
-| `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
-| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
+| Method                         | Path                                | Description                                                                           |
+| ------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------- |
+| `GET`                          | `/pulsevault/capabilities`          | Unauthenticated discovery: protocol version, `uploadUnit`, allowed extensions, limits |
+| `POST`                         | `/pulsevault/upload`                | Create a TUS upload session                                                           |
+| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id`            | Upload chunks, probe offset, cancel upload (TUS)                                      |
+| `GET`                          | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind)                                |
+| `DELETE`                       | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar)                                           |
 
 \* `DELETE /pulsevault/upload/:id` is TUS's own "cancel in-flight upload" — distinct from `DELETE /pulsevault/artifacts/:artifactId`, which removes a finalized artifact.
 
 > `POST /reserve` is **not** part of the plugin. Your server implements it so you control auth, ownership, and any business logic tied to artifact creation.
 
-`GET /pulsevault/artifacts/:artifactId` only serves uploads whose adapter has been told to mark them ready. With the built-in local adapter, that means the final PATCH has landed _and_ `validatePayload` (if configured) accepted the bytes. In-progress uploads return 404. The artifact's kind (`video`/`project`/`captions`) is resolved from storage, not the URL — there's one route for every kind.
+`GET /pulsevault/artifacts/:artifactId` only serves uploads whose adapter has been told to mark them ready. With the built-in local adapter, that means the final PATCH has landed _and_ `validatePayload` (if configured) accepted the bytes. In-progress uploads return 404. The artifact's kind (`video`/`project`/`captions`/`thumbnail`) is resolved from storage, not the URL — there's one route for every kind.
 
 ## Plugin options
 
@@ -243,17 +245,17 @@ type PulseVaultPluginOptions = {
   storage: PulseVaultStorage;
   prefix: string;
   maxUploadSize: number;
-  uploadUnit?: "segment" | "merged";           // default: "segment" — see "Upload unit"
-  decoratorName?: string;                      // default: "pulseVault"
+  uploadUnit?: 'segment' | 'merged'; // default: "segment" — see "Upload unit"
+  decoratorName?: string; // default: "pulseVault"
   allowedExtensions?:
-    | string[]                                                                              // legacy — treated as video-only
-    | { video?: string[]; project?: string[]; captions?: string[]; thumbnail?: string[] };  // per-kind (recommended)
+    | string[] // legacy — treated as video-only
+    | { video?: string[]; project?: string[]; captions?: string[]; thumbnail?: string[] }; // per-kind (recommended)
   // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] }
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
-  validatePayload?: PulseVaultValidatePayload;          // runs for every kind; branch on ctx.kind
-  onUploadComplete?: PulseVaultOnUploadComplete;        // runs for every kind; branch on ctx.kind
-  onArtifactEvent?: PulseVaultOnArtifactEvent;          // low-frequency hook for metrics + audit logging
+  validatePayload?: PulseVaultValidatePayload; // runs for every kind; branch on ctx.kind
+  onUploadComplete?: PulseVaultOnUploadComplete; // runs for every kind; branch on ctx.kind
+  onArtifactEvent?: PulseVaultOnArtifactEvent; // low-frequency hook for metrics + audit logging
   /** @deprecated use validatePayload + ctx.kind === "project" */
   validateProjectPayload?: PulseVaultValidatePayload;
   /** @deprecated use onUploadComplete + ctx.kind === "project" */
@@ -295,7 +297,7 @@ Name of the Fastify decorator that exposes the storage adapter on the instance. 
 For TypeScript access to the default decorator, add a side-effect import once in your app:
 
 ```ts
-import "@mieweb/pulsevault/augment";
+import '@mieweb/pulsevault/augment';
 ```
 
 ### `allowedExtensions`
@@ -303,14 +305,14 @@ import "@mieweb/pulsevault/augment";
 File extensions accepted per artifact kind. Three accepted forms:
 
 ```ts
-// 1. Omit entirely — uses all three defaults:
-//    video: [".mp4"]   project: [".pulse", ".zip"]   captions: [".vtt"]
+// 1. Omit entirely — uses all four defaults:
+//    video: [".mp4"]   project: [".pulse", ".zip"]   captions: [".vtt"]   thumbnail: [".jpg", ".jpeg", ".png"]
 
-// 2. Flat array (legacy) — video-only; project/captions keep their defaults:
+// 2. Flat array (legacy) — video-only; project/captions/thumbnail keep their defaults:
 allowedExtensions: [".mp4"]
 
 // 3. Per-kind object — unset keys fall back to their defaults:
-allowedExtensions: { video: [".mp4"], project: [".pulse"], captions: [".vtt"] }
+allowedExtensions: { video: [".mp4"], project: [".pulse"], captions: [".vtt"], thumbnail: [".png"] }
 ```
 
 All extensions must include the leading dot and are matched case-insensitively. The `kind` field in `Upload-Metadata` determines which list is checked.
@@ -344,11 +346,11 @@ type PulseVaultAuthorize = (
   // `http.IncomingMessage`, etc.) — the same hook works under either.
   request: PulseVaultRequest,
   ctx: {
-    phase: "create" | "patch" | "resolve" | "delete";
+    phase: 'create' | 'patch' | 'resolve' | 'delete';
     artifactId: string;
-    kind: "video" | "project" | "captions";  // artifact kind; always present
-    token?: string;             // only on "resolve" phase
-    relatedTo?: string;         // the session-anchor artifact this one belongs to, if any
+    kind: 'video' | 'project' | 'captions' | 'thumbnail'; // artifact kind; always present
+    token?: string; // only on "resolve" phase
+    relatedTo?: string; // the session-anchor artifact this one belongs to, if any
   },
 ) => void | Promise<void>;
 ```
@@ -357,9 +359,9 @@ type PulseVaultAuthorize = (
 await app.register(pulseVault, {
   // ...
   authorize: async (request, { phase, artifactId, kind }) => {
-    const token = request.headers.authorization?.replace("Bearer ", "");
+    const token = request.headers.authorization?.replace('Bearer ', '');
     if (!isValid(token, artifactId)) {
-      throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+      throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
     }
   },
 });
@@ -378,7 +380,7 @@ type PulseVaultValidatePayload = (
     artifactId: string;
     size: number;
     uploadId: string;
-    kind: "video" | "project" | "captions";
+    kind: 'video' | 'project' | 'captions' | 'thumbnail';
     /** Absolute path to finalized bytes for adapters that expose `getLocalPath`. */
     localPath: string | null;
     /** Client-supplied `<algorithm>:<hex>` digest, if `Upload-Metadata.checksum` was sent. */
@@ -394,9 +396,9 @@ import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
   createChecksumValidator,
-} from "@mieweb/pulsevault";
+} from '@mieweb/pulsevault';
 
-const storage = createLocalStorage({ workspaceDir: "./data" });
+const storage = createLocalStorage({ workspaceDir: './data' });
 
 await app.register(pulseVault, {
   // ...
@@ -426,7 +428,12 @@ Optional async hook fired once the final byte is written, `validatePayload` has 
 ```ts
 type PulseVaultOnUploadComplete = (
   request: PulseVaultRequest, // see the note under `authorize` above
-  ctx: { artifactId: string; kind: "video" | "project" | "captions"; size: number; uploadId: string },
+  ctx: {
+    artifactId: string;
+    kind: 'video' | 'project' | 'captions' | 'thumbnail';
+    size: number;
+    uploadId: string;
+  },
 ) => void | Promise<void>;
 ```
 
@@ -438,7 +445,7 @@ Optional low-frequency hook — fired on authorize rejection (`create`/`delete`/
 type PulseVaultArtifactEvent = {
   phase: "authorize" | "complete" | "reject";
   artifactId: string;
-  kind: "video" | "project" | "captions";
+  kind: "video" | "project" | "captions" | "thumbnail";
   size?: number;
   reason?: string; // present for "authorize" and "reject"
 };
@@ -475,7 +482,12 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "maxSupportedVersion": 1,
   "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
+  "allowedExtensions": {
+    "video": [".mp4"],
+    "project": [".pulse", ".zip"],
+    "captions": [".vtt"],
+    "thumbnail": [".jpg", ".jpeg", ".png"]
+  },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
@@ -495,47 +507,62 @@ import pulseVault, {
   createCapabilityAuthorize,
   issueCapabilityToken,
   buildUploadLink,
-} from "@mieweb/pulsevault";
-import { randomUUID } from "node:crypto";
+} from '@mieweb/pulsevault';
+import { randomUUID } from 'node:crypto';
 
-const keys = { "2026-06": process.env.PULSEVAULT_KEY_2026_06! }; // add the previous key during rotation
-const issuer = "https://vault.example.org"; // identity claim — no path, just who issued the token
-const prefix = "/pulsevault";
+const keys = { '2026-06': process.env.PULSEVAULT_KEY_2026_06! }; // add the previous key during rotation
+const issuer = 'https://vault.example.org'; // identity claim — no path, just who issued the token
+const prefix = '/pulsevault';
 
 await app.register(pulseVault, {
   prefix,
-  storage: createLocalStorage({ workspaceDir: "./data" }),
+  storage: createLocalStorage({ workspaceDir: './data' }),
   maxUploadSize: 5 * 1024 * 1024 * 1024,
   authorize: createCapabilityAuthorize((kid) => keys[kid] ?? null, { issuer }),
 });
 
-app.post("/pair", async (_req, reply) => {
+app.post('/pair', async (_req, reply) => {
   const artifactId = randomUUID();
-  const token = issueCapabilityToken(artifactId, keys["2026-06"], {
-    keyId: "2026-06",
+  const token = issueCapabilityToken(artifactId, keys['2026-06'], {
+    keyId: '2026-06',
     issuer,
     expirySeconds: 1800, // 30 minutes — long enough for one upload session
+    scope: ['create', 'patch'], // upload capability only — can't resolve or delete
   });
   // `server` is the full base URL the client uploads to — origin *plus* the
   // plugin's prefix — not just `issuer`'s bare origin.
   return reply.send({ link: buildUploadLink({ server: `${issuer}${prefix}`, artifactId, token }) });
 });
+
+// Playback URLs (e.g. a <video src>) carry the token as `?token=` because they
+// can't set an Authorization header. Scope those tokens to `resolve` only and
+// keep them short-lived: query strings end up in access logs, browser history,
+// and Referer headers, and a leaked watch URL must not double as upload/delete
+// capability.
+const watchToken = issueCapabilityToken(artifactId, keys['2026-06'], {
+  keyId: '2026-06',
+  issuer,
+  expirySeconds: 300, // minutes, not the upload TTL
+  scope: ['resolve'],
+});
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a merged video also covers its captions, beat manifest and thumbnail (or, under `uploadUnit: "segment"`, every clip and the ordering manifest) in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a merged video also covers its captions, beat manifest and thumbnail (or, under `uploadUnit: "segment"`, every clip and the ordering manifest) in the same session, without minting a token per artifact. The optional `scope` claim limits which phases (`create`/`patch`/`resolve`/`delete`) the token authorizes; tokens without `scope` authorize every phase (pre-`scope` tokens keep working). See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`scope`) and rationale.
+
+Two operational notes: back `lookupSecret` with a `Map`, null-prototype object, or explicit comparison — `kid` is attacker-controlled, and a bare `keys[kid]` on a plain object resolves prototype keys like `"constructor"`. And a session token caps _which_ artifacts a client may touch, not _how much_ it may upload — enforce per-session count/byte quotas in `authorize`/`onUploadComplete` if abuse is a concern.
 
 ## Upload-Metadata protocol
 
 The TUS `Upload-Metadata` header is a comma-separated list of `<key> <base64>` pairs. PulseVault reads the following keys on `POST /upload`:
 
-| Key | Required | Description |
-|---|---|---|
-| `artifactId` | Yes (or `videoid`/`projectid`) | Server-generated UUID for this upload. |
-| `videoid` / `projectid` | Legacy aliases for `artifactId` | Accepted as synonyms indefinitely (protocol v1). Use `artifactId` for new code. |
-| `filename` | Yes | Original filename. The extension is validated against the kind's allowed list. |
-| `kind` | No | `video` (default), `project`, or `captions`. Determines the storage subdir and which hooks fire. |
-| `relatedTo` | No | UUID of another artifact this one belongs to (e.g. a video's captions). Lets one capability token authorize a whole session. |
-| `checksum` | No | `<algorithm>:<hex digest>` of the finished file, verified by `createChecksumValidator`/`createS3ChecksumValidator` if configured. |
+| Key                     | Required                        | Description                                                                                                                       |
+| ----------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `artifactId`            | Yes (or `videoid`/`projectid`)  | Server-generated UUID for this upload.                                                                                            |
+| `videoid` / `projectid` | Legacy aliases for `artifactId` | Accepted as synonyms indefinitely (protocol v1). Use `artifactId` for new code.                                                   |
+| `filename`              | Yes                             | Original filename. The extension is validated against the kind's allowed list.                                                    |
+| `kind`                  | No                              | `video` (default), `project`, `captions`, or `thumbnail`. Determines the storage subdir and which hooks fire.                     |
+| `relatedTo`             | No                              | UUID of another artifact this one belongs to (e.g. a video's captions). Lets one capability token authorize a whole session.      |
+| `checksum`              | No                              | `<algorithm>:<hex digest>` of the finished file, verified by `createChecksumValidator`/`createS3ChecksumValidator` if configured. |
 
 Example (`kind=captions`, linked to a video):
 
@@ -546,11 +573,11 @@ Upload-Metadata: artifactId <base64(uuid)>, filename <base64("clip.vtt")>, kind 
 ## Local storage
 
 ```ts
-import { createLocalStorage } from "@mieweb/pulsevault";
+import { createLocalStorage } from '@mieweb/pulsevault';
 
 const storage = createLocalStorage({
-  workspaceDir: "./data",   // directory for uploads; created if absent
-  metaCacheLimit: 10_000,   // optional — bounds the in-memory metadata cache
+  workspaceDir: './data', // directory for uploads; created if absent
+  metaCacheLimit: 10_000, // optional — bounds the in-memory metadata cache
 });
 ```
 
@@ -567,11 +594,13 @@ The local adapter writes uploads into flat kind-scoped subdirectories. Downstrea
   project/<id><ext>.json          # @tus/file-store offset/metadata sidecar
   captions/<id><ext>              # captions bytes        (kind="captions")
   captions/<id><ext>.json         # @tus/file-store offset/metadata sidecar
+  thumbnail/<id><ext>             # thumbnail bytes       (kind="thumbnail")
+  thumbnail/<id><ext>.json        # @tus/file-store offset/metadata sidecar
 ```
 
 `status` is `"uploading"` between `reserveUpload` and the successful final PATCH; `"ready"` thereafter. `GET /artifacts/:id` only serves `"ready"` uploads. `kind` defaults to `"video"` when absent (back-compat with pre-kind sidecars).
 
-The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-resource paths without re-implementing the layout. `storage.getKind(id)` returns `"video" | "project" | "captions" | null`; `storage.getRelatedTo(id)` and `storage.getChecksum(id)` return the corresponding sidecar fields, each `null` if absent/unknown.
+The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-resource paths without re-implementing the layout. `storage.getKind(id)` returns `"video" | "project" | "captions" | "thumbnail" | null`; `storage.getRelatedTo(id)` and `storage.getChecksum(id)` return the corresponding sidecar fields, each `null` if absent/unknown.
 
 **Horizontal scaling**: this adapter requires sticky-session routing or a shared filesystem across instances — see `OPERATIONS.md`.
 
@@ -580,21 +609,21 @@ The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceD
 The filesystem layout is the integration surface. Use the `onUploadComplete` hook as your trigger. For example, to hydrate an [ArtiPod](https://github.com/mieweb/artipod) with the video plus sibling artifact directories:
 
 ```ts
-import path from "node:path";
-import { ArtiPod, ArtiMount } from "@mieweb/artipod";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import path from 'node:path';
+import { ArtiPod, ArtiMount } from '@mieweb/artipod';
+import pulseVault, { createLocalStorage } from '@mieweb/pulsevault';
 
-const storage = createLocalStorage({ workspaceDir: "./data" });
+const storage = createLocalStorage({ workspaceDir: './data' });
 
 await app.register(pulseVault, {
-  prefix: "/pulsevault",
+  prefix: '/pulsevault',
   storage,
   maxUploadSize: 5 * 1024 * 1024 * 1024,
   onUploadComplete: async (_req, { artifactId, kind }) => {
-    if (kind !== "video") return;
-    const videoDir = path.join(storage.workspaceRoot, "video");
+    if (kind !== 'video') return;
+    const videoDir = path.join(storage.workspaceRoot, 'video');
     const pod = new ArtiPod({ id: artifactId, useMainMount: false });
-    pod.addMount(new ArtiMount("video", videoDir));
+    pod.addMount(new ArtiMount('video', videoDir));
     // Create these lazily as your pipeline produces artifacts:
     // pod.addMount(new ArtiMount("transcripts", path.join(root, "transcripts")));
     // pod.addMount(new ArtiMount("frames", path.join(root, "frames")));
@@ -622,17 +651,17 @@ npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store
 **Cloudflare R2:**
 
 ```ts
-import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault";
+import pulseVault, { createS3Storage, createS3Mp4Sniffer } from '@mieweb/pulsevault';
 
 const storage = await createS3Storage({
-  bucket: "pulse-videos",
+  bucket: 'pulse-videos',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   accessKeyId: process.env.R2_ACCESS_KEY,
   secretAccessKey: process.env.R2_SECRET_KEY,
 });
 
 await app.register(pulseVault, {
-  prefix: "/pulsevault",
+  prefix: '/pulsevault',
   storage,
   maxUploadSize: 5 * 1024 * 1024 * 1024,
   validatePayload: createS3Mp4Sniffer(storage), // ranged-read MP4 sniff
@@ -643,8 +672,8 @@ await app.register(pulseVault, {
 
 ```ts
 const storage = await createS3Storage({
-  bucket: "pulse-videos",
-  region: "us-east-1",
+  bucket: 'pulse-videos',
+  region: 'us-east-1',
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
@@ -660,6 +689,7 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
   video/<id><ext>         # finalized video object    (kind="video")
   project/<id><ext>       # finalized project object  (kind="project")
   captions/<id><ext>      # finalized captions object (kind="captions")
+  thumbnail/<id><ext>     # finalized thumbnail object (kind="thumbnail")
   <key>.info              # @tus/s3-store multipart bookkeeping (transient)
 ```
 
@@ -667,18 +697,18 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 
 ### Options
 
-| Option | Default | Notes |
-| --- | --- | --- |
-| `bucket` | — | Required. Must already exist. |
-| `endpoint` | — | Custom S3 endpoint (set for R2). Omit for AWS S3. |
-| `region` | `"auto"` when `endpoint` is set | Required for AWS S3. |
-| `accessKeyId` / `secretAccessKey` | SDK default chain | Optional; omit both to use env/IAM credentials. |
-| `sessionToken` | — | Optional STS session token for temporary credentials. |
-| `forcePathStyle` | `true` when `endpoint` is set | R2 and most S3-compatible stores need path-style. |
-| `presignTtlSeconds` | `900` | Lifetime of the playback presigned URL. |
-| `partSize` | computed | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
-| `metaCacheLimit` | `10000` | Caps the in-memory metadata cache before evicting the oldest entry. |
-| `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
+| Option                            | Default                         | Notes                                                                  |
+| --------------------------------- | ------------------------------- | ---------------------------------------------------------------------- |
+| `bucket`                          | —                               | Required. Must already exist.                                          |
+| `endpoint`                        | —                               | Custom S3 endpoint (set for R2). Omit for AWS S3.                      |
+| `region`                          | `"auto"` when `endpoint` is set | Required for AWS S3.                                                   |
+| `accessKeyId` / `secretAccessKey` | SDK default chain               | Optional; omit both to use env/IAM credentials.                        |
+| `sessionToken`                    | —                               | Optional STS session token for temporary credentials.                  |
+| `forcePathStyle`                  | `true` when `endpoint` is set   | R2 and most S3-compatible stores need path-style.                      |
+| `presignTtlSeconds`               | `900`                           | Lifetime of the playback presigned URL.                                |
+| `partSize`                        | computed                        | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `metaCacheLimit`                  | `10000`                         | Caps the in-memory metadata cache before evicting the oldest entry.    |
+| `clientConfig`                    | —                               | Advanced: extra `S3ClientConfig` merged into the client.               |
 
 > A typical deployment wires these to environment variables (e.g. `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) and picks the storage adapter with a `STORAGE=local|s3` switch — the options table above maps one-to-one onto `createS3Storage(...)`.
 
@@ -695,10 +725,7 @@ Because playback is a 302 redirect to a presigned URL, a browser fetching it goe
 Implement `PulseVaultStorage` to back uploads with any system (S3, GCS, database, etc.):
 
 ```ts
-import type {
-  PulseVaultStorage,
-  PulseVaultResolution,
-} from "@mieweb/pulsevault";
+import type { PulseVaultStorage, PulseVaultResolution } from '@mieweb/pulsevault';
 
 const storage: PulseVaultStorage = {
   datastore, // @tus/server DataStore instance
@@ -710,14 +737,21 @@ const storage: PulseVaultStorage = {
   },
   async reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum }) {
     // Called by the TUS naming function. Return the file id for the datastore.
-    await db.createArtifact({ artifactId, filename, kind, relatedTo, checksum, status: "uploading" });
+    await db.createArtifact({
+      artifactId,
+      filename,
+      kind,
+      relatedTo,
+      checksum,
+      status: 'uploading',
+    });
     return `${kind}/${artifactId}${ext}`;
   },
   async resolve(artifactId): Promise<PulseVaultResolution | null> {
     const artifact = await db.findArtifact(artifactId);
-    if (!artifact || artifact.status !== "ready") return null;
+    if (!artifact || artifact.status !== 'ready') return null;
     // Stream from local disk:
-    return { kind: "stream", root: "/uploads", filename: artifact.filename };
+    return { kind: 'stream', root: '/uploads', filename: artifact.filename };
     // Or redirect to a CDN / presigned URL:
     // return { kind: "redirect", url: artifact.signedUrl, statusCode: 302 };
   },
@@ -725,7 +759,7 @@ const storage: PulseVaultStorage = {
     // Called after `validatePayload` (if any) accepts the bytes. Flip your
     // state so `resolve` starts returning non-null. Omit this method if
     // your backend can't distinguish in-progress from finalized uploads.
-    await db.updateArtifact(artifactId, { status: "ready" });
+    await db.updateArtifact(artifactId, { status: 'ready' });
   },
   async remove(artifactId) {
     // Called from DELETE /artifacts/:artifactId and from the plugin's
@@ -735,9 +769,15 @@ const storage: PulseVaultStorage = {
     return result.deleted;
   },
   // Optional — only needed if you use relatedTo/checksum-aware hooks/validators:
-  async getKind(artifactId) { return (await db.findArtifact(artifactId))?.kind ?? null; },
-  async getRelatedTo(artifactId) { return (await db.findArtifact(artifactId))?.relatedTo ?? null; },
-  async getChecksum(artifactId) { return (await db.findArtifact(artifactId))?.checksum ?? null; },
+  async getKind(artifactId) {
+    return (await db.findArtifact(artifactId))?.kind ?? null;
+  },
+  async getRelatedTo(artifactId) {
+    return (await db.findArtifact(artifactId))?.relatedTo ?? null;
+  },
+  async getChecksum(artifactId) {
+    return (await db.findArtifact(artifactId))?.checksum ?? null;
+  },
 };
 ```
 
@@ -746,17 +786,17 @@ const storage: PulseVaultStorage = {
 Use this to generate a `pulsecam://` deep link for pairing the Pulse mobile app with your server. Typically encoded as a QR code on a pairing page.
 
 ```ts
-import { buildUploadLink } from "@mieweb/pulsevault";
-import { randomUUID } from "node:crypto";
+import { buildUploadLink } from '@mieweb/pulsevault';
+import { randomUUID } from 'node:crypto';
 
 // Opens the app directly on the upload screen for a specific artifact.
 // `server` must include your `prefix` — e.g. "https://example.com/pulsevault",
 // not just the bare origin — the client has no separate notion of a prefix.
 const uploadLink = buildUploadLink({
-  server: "https://example.com/pulsevault",
+  server: 'https://example.com/pulsevault',
   artifactId: randomUUID(), // generate server-side; skip POST /reserve on the app
-  token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
-  uploadUnit: "merged", // optional — see "Upload unit" below
+  token: 'secret', // optional — forwarded to your authorize hook; see Capability tokens
+  uploadUnit: 'merged', // optional — see "Upload unit" below
 });
 // pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret&uploadUnit=merged
 ```
@@ -786,7 +826,7 @@ Runs a Node `--test` suite against the built plugin. Coverage includes:
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
 - `GET /capabilities`
-- S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, run against an in-process [s3rver](https://github.com/jamhall/s3rver) mock (no cloud credentials needed)
+- S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, concurrent-reserve atomicity (`IfNoneMatch: "*"` → 412), run against the in-process, zero-dependency S3 double in `test/mock-s3.mjs` (no cloud credentials needed)
 - `@mieweb/pulsevault/core` (the framework-agnostic entry point): the same protocol suite re-run against a bare `http.createServer` wrapping `core.handler`, plus an Express-specific smoke test proving `app.use(prefix, handler)` composition
 
 ## Accessing storage outside the plugin routes
@@ -794,9 +834,9 @@ Runs a Node `--test` suite against the built plugin. Coverage includes:
 The storage adapter is exposed as a Fastify decorator, so you can use it in your own routes:
 
 ```ts
-import "@mieweb/pulsevault/augment"; // once, for TypeScript types
+import '@mieweb/pulsevault/augment'; // once, for TypeScript types
 
-app.get("/admin/artifact/:id", async (req, reply) => {
+app.get('/admin/artifact/:id', async (req, reply) => {
   const resolved = await app.pulseVault.resolve(req.params.id);
   if (!resolved) return reply.code(404).send();
   // custom logic...
