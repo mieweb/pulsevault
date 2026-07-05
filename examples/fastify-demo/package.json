@@ -5,7 +5,8 @@
   "description": "Minimal Fastify demo for @mieweb/pulsevault — no auth, local storage, QR pairing for the Pulse app",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
-    "dev": "node --env-file-if-exists=.env --watch server.mjs"
+    "dev": "node --env-file-if-exists=.env --watch server.mjs",
+    "bench": "node scripts/upload-benchmark.mjs"
   },
   "dependencies": {
     "@fastify/compress": "^9.0.0",
