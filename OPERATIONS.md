@@ -153,8 +153,8 @@ upload routes.
 ## Backup and restore (local storage)
 
 The entire state of the local adapter lives under `workspaceDir`:
-`.pulsevault/` (sidecars), `video/`, `project/`, `captions/` (bytes). Back it
-up as a normal filesystem tree — there's no separate database to keep in
+`.pulsevault/` (sidecars), `video/`, `project/`, `captions/`, `thumbnail/`
+(bytes). Back it up as a normal filesystem tree — there's no separate database to keep in
 sync. To restore, copy the tree back and restart; in-progress uploads at
 backup time will resume correctly via the normal TUS `HEAD`-then-resume path
 once the client retries, or will simply sit as abandoned partial uploads

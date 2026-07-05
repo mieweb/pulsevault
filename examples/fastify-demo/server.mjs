@@ -43,9 +43,12 @@ const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 
 // Deployment-wide default advertised via GET /pulsevault/capabilities — purely
-// advisory; the plugin never enforces "beat" vs "merged", it just reports
+// advisory; the plugin never enforces "segment" vs "merged", it just reports
 // whichever value this server passes at registration (README "Upload unit").
-const uploadUnit = process.env.UPLOAD_UNIT === "merged" ? "merged" : "beat";
+// Default "merged" here so this demo exercises the full merged pipeline
+// (video + captions + beat manifest + thumbnail); set UPLOAD_UNIT=segment to
+// test per-clip uploads instead.
+const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
 
 const app = Fastify({
   logger: true,
@@ -237,7 +240,7 @@ app.get("/videos", {
 // no issuer to stay consistent with, so deriving `server` from request
 // headers is fine here.
 //
-// `?uploadUnit=beat|merged` lets this *one* pairing link override the
+// `?uploadUnit=segment|merged` lets this *one* pairing link override the
 // deployment-wide default set above (PROTOCOL.md §3, §8) — handy for testing
 // both modes without restarting the server. Omit it and the link carries no
 // override; the client falls back to whatever `/capabilities` reports.
@@ -248,8 +251,8 @@ app.get("/deeplinks", { schema: { tags: ["demo"], summary: "Mint a pairing deep 
   const artifactId = randomUUID();
 
   const requestedUploadUnit = req.query?.uploadUnit;
-  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "beat" && requestedUploadUnit !== "merged") {
-    return reply.code(400).send({ error: '`uploadUnit` query param must be "beat" or "merged"' });
+  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "segment" && requestedUploadUnit !== "merged") {
+    return reply.code(400).send({ error: '`uploadUnit` query param must be "segment" or "merged"' });
   }
 
   const upload = buildUploadLink({
@@ -274,10 +277,16 @@ await app.register(pulseVault, {
   storage: createLocalStorage({ workspaceDir: dataDir }),
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit,
-  // All three kinds stay enabled — a beat-mode session from the real app
-  // uploads a .pulse ordering manifest and .vtt captions alongside its videos;
-  // rejecting those would make this a broken pairing target.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
+  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
+  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
+  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
+  // those would make this a broken pairing target.
+  allowedExtensions: {
+    video: [".mp4"],
+    project: [".pulse", ".zip"],
+    captions: [".vtt"],
+    thumbnail: [".jpg", ".jpeg", ".png"],
+  },
 });
 
 await app.listen({ port, host });

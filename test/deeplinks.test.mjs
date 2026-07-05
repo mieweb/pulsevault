@@ -78,7 +78,7 @@ test("includes uploadUnit when provided, omits it when not", () => {
 });
 
 test("accepts both uploadUnit values", () => {
-  for (const uploadUnit of ["beat", "merged"]) {
+  for (const uploadUnit of ["segment", "merged"]) {
     const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, uploadUnit });
     assert.equal(new URLSearchParams(link.split("?")[1]).get("uploadUnit"), uploadUnit);
   }

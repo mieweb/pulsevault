@@ -6,6 +6,7 @@ type AllowedExtensionsByKind = {
   video?: readonly string[];
   project?: readonly string[];
   captions?: readonly string[];
+  thumbnail?: readonly string[];
 };
 
 export type PulseVaultAllowedExtensionsInput = readonly string[] | AllowedExtensionsByKind;
@@ -14,6 +15,7 @@ export type PulseVaultAllowedExtensions = {
   video: readonly string[];
   project: readonly string[];
   captions: readonly string[];
+  thumbnail: readonly string[];
 };
 
 const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
@@ -21,6 +23,8 @@ const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
 // WebVTT only — it's what the Pulse app uploads, and it carries word-level
 // inline cue timestamps (`<00:00:01.500>word`) for karaoke rendering.
 const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
+// The merged-mode poster frame (the draft's first-clip thumbnail).
+const DEFAULT_THUMBNAIL_EXTENSIONS: readonly string[] = ['.jpg', '.jpeg', '.png'];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**
@@ -36,14 +40,16 @@ export function normalizeAllowedExtensions(
       video: DEFAULT_VIDEO_EXTENSIONS,
       project: DEFAULT_PROJECT_EXTENSIONS,
       captions: DEFAULT_CAPTIONS_EXTENSIONS,
+      thumbnail: DEFAULT_THUMBNAIL_EXTENSIONS,
     };
   }
   if (Array.isArray(raw)) {
-    // Legacy flat array: treat as video-only, project/captions keep their defaults.
+    // Legacy flat array: treat as video-only, project/captions/thumbnail keep their defaults.
     return {
       video: (raw as readonly string[]).map((ext) => ext.toLowerCase()),
       project: DEFAULT_PROJECT_EXTENSIONS,
       captions: DEFAULT_CAPTIONS_EXTENSIONS,
+      thumbnail: DEFAULT_THUMBNAIL_EXTENSIONS,
     };
   }
   const byKind = raw as AllowedExtensionsByKind;
@@ -51,6 +57,7 @@ export function normalizeAllowedExtensions(
     video: (byKind.video ?? DEFAULT_VIDEO_EXTENSIONS).map((ext) => ext.toLowerCase()),
     project: (byKind.project ?? DEFAULT_PROJECT_EXTENSIONS).map((ext) => ext.toLowerCase()),
     captions: (byKind.captions ?? DEFAULT_CAPTIONS_EXTENSIONS).map((ext) => ext.toLowerCase()),
+    thumbnail: (byKind.thumbnail ?? DEFAULT_THUMBNAIL_EXTENSIONS).map((ext) => ext.toLowerCase()),
   };
 }
 
@@ -69,9 +76,9 @@ export function validateMaxUploadSize(maxUploadSize: number): void {
   }
 }
 
-export function validateUploadUnit(uploadUnit: 'beat' | 'merged' | undefined): void {
-  if (uploadUnit && uploadUnit !== 'beat' && uploadUnit !== 'merged') {
-    throw new TypeError('`uploadUnit` must be "beat" or "merged"');
+export function validateUploadUnit(uploadUnit: 'segment' | 'merged' | undefined): void {
+  if (uploadUnit && uploadUnit !== 'segment' && uploadUnit !== 'merged') {
+    throw new TypeError('`uploadUnit` must be "segment" or "merged"');
   }
 }
 
@@ -85,6 +92,7 @@ export function validateAllowedExtensions(
         ...((allowedExtensions as AllowedExtensionsByKind).video ?? []),
         ...((allowedExtensions as AllowedExtensionsByKind).project ?? []),
         ...((allowedExtensions as AllowedExtensionsByKind).captions ?? []),
+        ...((allowedExtensions as AllowedExtensionsByKind).thumbnail ?? []),
       ];
   for (const ext of exts) {
     if (!EXTENSION_REGEX.test(ext)) {

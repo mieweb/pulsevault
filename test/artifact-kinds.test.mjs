@@ -439,6 +439,47 @@ test("kind=captions happy path: .vtt under captions/ subdir, sharing a session v
   }
 });
 
+// ---------- kind=thumbnail ----------
+
+test("kind=thumbnail happy path: .jpg under thumbnail/ subdir, image/jpeg content-type, correct kind at create", async () => {
+  const capturedPhases = {};
+  const ctx = await startApp({
+    authorize: async (_req, ctx) => {
+      capturedPhases[ctx.phase] = ctx.kind;
+    },
+  });
+  try {
+    // The merged video this thumbnail belongs to.
+    await uploadFull(ctx, { artifactId: ID1, filename: "pulse.mp4", payload: makeMp4(1024) });
+
+    const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]); // minimal JPEG-ish bytes
+    await uploadFull(ctx, {
+      artifactId: ID2,
+      filename: "pulse.jpg",
+      kind: "thumbnail",
+      relatedTo: ID1,
+      payload: jpg,
+    });
+
+    // Regression guard for the second (create-phase) metadata parser: authorize must see the real
+    // kind, not a coerced 'video'.
+    assert.equal(capturedPhases["create"], "thumbnail", "authorize sees kind=thumbnail at create");
+
+    const expectedPath = path.join(ctx.workspaceDir, "thumbnail", `${ID2}.jpg`);
+    assert.ok((await fs.stat(expectedPath)).isFile(), "jpg exists at thumbnail/ subdir");
+
+    const get = await fetch(artifactUrl(ctx, ID2));
+    assert.equal(get.status, 200);
+    const ct = get.headers.get("content-type");
+    assert.ok(ct?.includes("image/jpeg"), `content-type was: ${ct}`);
+
+    assert.equal(await ctx.storage.getKind(ID2), "thumbnail");
+    assert.equal(await ctx.storage.getRelatedTo(ID2), ID1);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("kind=captions accepts .vtt under default captions extensions", async () => {
   const ctx = await startApp();
   try {

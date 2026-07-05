@@ -26,7 +26,22 @@ export type PulseVaultResolution =
       statusCode?: number;
     };
 
-export type UploadKind = 'video' | 'project' | 'captions';
+/** Every artifact kind the server understands. Single source of truth for the union, the
+ * `/capabilities` `kinds` list, and `parseUploadKind`. Add a new kind here and every switch that
+ * routes on kind stays in lockstep. */
+export const UPLOAD_KINDS = ['video', 'project', 'captions', 'thumbnail'] as const;
+
+export type UploadKind = (typeof UPLOAD_KINDS)[number];
+
+/**
+ * Coerce a raw metadata/sidecar `kind` string to a known `UploadKind`, defaulting to `"video"`
+ * (so pre-`kind` clients and older sidecars keep working). Use this everywhere a kind is parsed —
+ * do NOT hand-write per-kind ternaries, which drift out of sync when a kind is added.
+ */
+export function parseUploadKind(raw: string | null | undefined): UploadKind {
+  const lower = (raw ?? '').trim().toLowerCase();
+  return (UPLOAD_KINDS as readonly string[]).includes(lower) ? (lower as UploadKind) : 'video';
+}
 
 export type ReserveUploadParams = {
   /** UUID from `Upload-Metadata.artifactId` (or the `videoid`/`projectid` legacy aliases). */
@@ -41,8 +56,9 @@ export type ReserveUploadParams = {
    * Optional UUID of another artifact this one belongs to, from
    * `Upload-Metadata.relatedTo`. Lets a single capability token scoped to one
    * "session" artifact (e.g. a video) authorize related artifacts uploaded in
-   * the same session (its captions, or — under `uploadUnit: "beat"` — each
-   * beat plus the pulse manifest) without minting a token per artifact.
+   * the same session (a merged video's captions, beat manifest and thumbnail,
+   * or — under `uploadUnit: "segment"` — each clip plus the ordering manifest)
+   * without minting a token per artifact.
    * The storage layer itself only stores and returns this value — it does not
    * validate that the referenced artifact exists or was created by the same
    * caller. The actual authorization check lives in `createCapabilityAuthorize`

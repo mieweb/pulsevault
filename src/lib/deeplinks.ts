@@ -20,7 +20,7 @@ export type UploadLinkOptions = {
    * Per-session override of the deployment-wide `uploadUnit` advertised via
    * `GET /capabilities` (PROTOCOL.md §8). Omit to let the client fall back to
    * whatever `/capabilities` reports — the same behavior as before this field
-   * existed. Set this when an operator wants "beat" and "merged" sessions
+   * existed. Set this when an operator wants "segment" and "merged" sessions
    * live at the same time (e.g. different pairing flows, a/b testing, a
    * gradual rollout) rather than one fixed value for the whole deployment:
    * `/capabilities` can only ever report one current value, and a client
@@ -28,7 +28,7 @@ export type UploadLinkOptions = {
    * server was serving at that moment, not the value this specific session
    * was paired under.
    */
-  uploadUnit?: 'beat' | 'merged';
+  uploadUnit?: 'segment' | 'merged';
 };
 
 /** Deep-link wire format version. Bump when the param shape changes incompatibly. */
@@ -85,8 +85,8 @@ export function buildUploadLink(opts: UploadLinkOptions): string {
     );
   }
 
-  if (opts.uploadUnit !== undefined && opts.uploadUnit !== 'beat' && opts.uploadUnit !== 'merged') {
-    throw new Error(`buildUploadLink: \`uploadUnit\` must be "beat" or "merged" (got "${opts.uploadUnit}")`);
+  if (opts.uploadUnit !== undefined && opts.uploadUnit !== 'segment' && opts.uploadUnit !== 'merged') {
+    throw new Error(`buildUploadLink: \`uploadUnit\` must be "segment" or "merged" (got "${opts.uploadUnit}")`);
   }
 
   const params = new URLSearchParams({

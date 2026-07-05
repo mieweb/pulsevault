@@ -11,6 +11,7 @@ import type {
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
+import { parseUploadKind } from './types.js';
 
 /**
  * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
@@ -66,6 +67,11 @@ function extToContentType(ext: string): string {
       return 'application/zip';
     case '.vtt':
       return 'text/vtt';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.png':
+      return 'image/png';
     default:
       return 'application/octet-stream';
   }
@@ -287,8 +293,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       if (typeof parsed.ext !== 'string') return null;
       if (typeof parsed.filename !== 'string') return null;
       const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
-      const kind: UploadKind =
-        parsed.kind === 'project' ? 'project' : parsed.kind === 'captions' ? 'captions' : 'video';
+      const kind = parseUploadKind(parsed.kind);
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,

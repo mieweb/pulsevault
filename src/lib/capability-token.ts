@@ -163,9 +163,9 @@ function extractToken(
  *
  * Authorizes the request if the token's `artifactId` matches either the
  * artifact being acted on, or that artifact's `relatedTo` session anchor —
- * so one token issued for a video also covers its captions and (under
- * `uploadUnit: "beat"`) every beat and the pulse manifest uploaded in the
- * same session, without minting a token per artifact.
+ * so one token issued for a video also covers its captions/manifest/thumbnail
+ * and (under `uploadUnit: "segment"`) every clip and the ordering manifest
+ * uploaded in the same session, without minting a token per artifact.
  */
 export function createCapabilityAuthorize(
   lookupSecret: LookupSecret,

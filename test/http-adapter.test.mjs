@@ -346,7 +346,7 @@ test("GET /capabilities is unauthenticated and reports the configured uploadUnit
     const body = await res.json();
     assert.equal(body.protocolVersion, 1);
     assert.equal(body.uploadUnit, "merged");
-    assert.deepEqual(body.kinds.sort(), ["captions", "project", "video"]);
+    assert.deepEqual(body.kinds.sort(), ["captions", "project", "thumbnail", "video"]);
     assert.equal(body.maxUploadSize, 10 * 1024 * 1024);
     assert.ok(Array.isArray(body.checksum.algorithms));
     assert.equal(authorizeCalls.length, 0, "capabilities must not run authorize");

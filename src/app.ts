@@ -53,13 +53,14 @@ export type PulseVaultPluginOptions = {
    */
   maxUploadSize: number;
   /**
-   * Which upload strategy this deployment expects: `"beat"` uploads each
+   * Which upload strategy this deployment expects: `"segment"` uploads each
    * clip individually (no client-side merge/re-encode pass) plus a manifest
    * artifact for ordering, while `"merged"` expects one pre-merged video per
-   * pulse. Purely advertised via `GET /capabilities` for the client to branch
-   * on — `pulsevault` doesn't enforce either. Defaults to `"beat"`.
+   * pulse (plus its captions, beat manifest and thumbnail). Purely advertised
+   * via `GET /capabilities` for the client to branch on — `pulsevault` doesn't
+   * enforce either. Defaults to `"segment"`.
    */
-  uploadUnit?: 'beat' | 'merged';
+  uploadUnit?: 'segment' | 'merged';
   /**
    * Fastify instance decorator name under which the storage adapter is
    * exposed. Defaults to `"pulseVault"`. Override when registering this
@@ -187,7 +188,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     prefix: opts.prefix,
     storage: opts.storage,
     maxUploadSize: opts.maxUploadSize,
-    uploadUnit: opts.uploadUnit ?? 'beat',
+    uploadUnit: opts.uploadUnit ?? 'segment',
     allowedExtensions,
     cache: opts.cache,
     authorize: opts.authorize,
