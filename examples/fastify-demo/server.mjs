@@ -14,6 +14,12 @@ import Fastify from "fastify";
 import fastifyRateLimit from "@fastify/rate-limit";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUI from "@fastify/swagger-ui";
+import fastifyStatic from "@fastify/static";
+import fastifyCors from "@fastify/cors";
+import fastifyHelmet from "@fastify/helmet";
+import fastifyCompress from "@fastify/compress";
+import fastifyEtag from "@fastify/etag";
+import underPressure from "@fastify/under-pressure";
 import QRCode from "qrcode";
 import pulseVault, { createLocalStorage, buildUploadLink } from "@mieweb/pulsevault";
 
@@ -24,7 +30,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
 const videosHtml = readFileSync(path.join(__dirname, "public/videos.html"), "utf8");
-const favicon = readFileSync(path.join(__dirname, "public/favicon.png"));
 const dataDir = path.join(__dirname, "data");
 
 // Resolve a path under dataDir and refuse anything that escapes it — the
@@ -55,6 +60,69 @@ const app = Fastify({
   bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
 });
 
+// --- Security & delivery middleware ---
+// All registered before any route so they cover the demo's own routes and the
+// TUS/artifact routes the plugin mounts alike.
+
+// Shed load with a 503 (instead of falling over) when the process is under
+// pressure — the right posture for an upload/ingest server. Also exposes a
+// liveness route at GET /health. Thresholds are generous so normal use never trips.
+await app.register(underPressure, {
+  maxEventLoopDelay: 1000,
+  maxRssBytes: 900 * 1024 * 1024,
+  maxEventLoopUtilization: 0.98,
+  exposeStatusRoute: "/health",
+});
+
+// Standard security headers. The CSP is tailored to what the demo pages
+// actually load — React/htm from esm.sh and mermaid from jsdelivr (as inline
+// module scripts) plus inline <style>. `crossOriginResourcePolicy` is relaxed
+// to "cross-origin" so, once CORS (below) allows it, a page on another origin
+// can embed /pulsevault/artifacts/:id as a <video>.
+await app.register(fastifyHelmet, {
+  contentSecurityPolicy: {
+    directives: {
+      "default-src": ["'self'"],
+      "script-src": ["'self'", "'unsafe-inline'", "https://esm.sh", "https://cdn.jsdelivr.net"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+      "img-src": ["'self'", "data:"],
+      "media-src": ["'self'"],
+      "connect-src": ["'self'", "https://esm.sh", "https://cdn.jsdelivr.net"],
+    },
+  },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+});
+
+// CORS so a browser client / the Pulse app on another origin can drive the TUS
+// upload + playback flow. `exposedHeaders` is the load-bearing part: without it
+// the browser can't read Location/Upload-Offset and resumable uploads break.
+// Open by default for demo ease; set CORS_ORIGIN to lock it down for a deployment.
+await app.register(fastifyCors, {
+  origin: process.env.CORS_ORIGIN ?? true,
+  methods: ["GET", "POST", "PATCH", "HEAD", "DELETE", "OPTIONS"],
+  exposedHeaders: [
+    "Location",
+    "Tus-Resumable",
+    "Upload-Offset",
+    "Upload-Length",
+    "Upload-Metadata",
+    "Tus-Version",
+    "Tus-Extension",
+    "Tus-Max-Size",
+    "Upload-Expires",
+  ],
+});
+
+// gzip/br for text responses (the /videos JSON, HTML pages, /subtitles VTT).
+// Artifact bytes are streamed on a hijacked socket by the plugin, so they
+// bypass this onSend hook entirely — video is never re-compressed here.
+await app.register(fastifyCompress, { global: true });
+
+// ETag + conditional-GET (304) for the demo's own responses. Artifact bytes
+// already get ETag/range via @fastify/send inside the plugin (hijacked, so this
+// hook never sees them); this covers the HTML / JSON / VTT routes.
+await app.register(fastifyEtag);
+
 // Registered before any route so every one of them — the demo's own and the
 // TUS/artifact routes the plugin mounts — is covered by a global per-IP
 // limit (OPERATIONS.md "Rate limiting" recommends exactly this). Generous
@@ -84,6 +152,15 @@ await app.register(fastifySwaggerUI, {
   uiConfig: { docExpansion: "list", deepLinking: false },
 });
 
+// Serve everything under public/ (favicon today, any CSS/JS/assets you add
+// later) with correct content-types + caching. `index: false` so it doesn't
+// register its own GET / and collide with the explicit pairing-page route below.
+await app.register(fastifyStatic, {
+  root: path.join(__dirname, "public"),
+  prefix: "/",
+  index: false,
+});
+
 // Serve pairing page before the plugin so it isn't swallowed by /pulsevault/artifacts/:artifactId
 app.get("/", { schema: { tags: ["demo"], summary: "Pairing page (HTML)" } }, (_req, reply) =>
   reply.type("text/html").send(html));
@@ -92,9 +169,8 @@ app.get("/", { schema: { tags: ["demo"], summary: "Pairing page (HTML)" } }, (_r
 app.get("/library", { schema: { tags: ["demo"], summary: "Uploads page (HTML)" } }, (_req, reply) =>
   reply.type("text/html").send(videosHtml));
 
-// The Pulse app icon, resized — referenced by <link rel="icon"> on the page.
-app.get("/favicon.png", { schema: { tags: ["demo"], summary: "Favicon (PNG)" } }, (_req, reply) =>
-  reply.type("image/png").send(favicon));
+// The Pulse app icon (referenced by <link rel="icon"> on the pages) is now
+// served straight from public/favicon.png by @fastify/static above.
 
 // Reserve an artifactId for an upload. The server owns ID generation so it
 // can later attach auth tokens, quotas, or other server-side state here.
