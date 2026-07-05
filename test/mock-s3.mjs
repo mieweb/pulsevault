@@ -219,7 +219,7 @@ export async function startMockS3({ buckets = [] } = {}) {
         sendXml(
           res,
           200,
-          `<ListPartsResult><Bucket>${xmlEscape(bucket)}</Bucket><Key>${xmlEscape(key)}</Key><UploadId>${q.get('uploadId')}</UploadId><IsTruncated>false</IsTruncated>${parts}</ListPartsResult>`,
+          `<ListPartsResult><Bucket>${xmlEscape(bucket)}</Bucket><Key>${xmlEscape(key)}</Key><UploadId>${xmlEscape(q.get('uploadId') ?? '')}</UploadId><IsTruncated>false</IsTruncated>${parts}</ListPartsResult>`,
         );
         return;
       }
@@ -369,7 +369,11 @@ export async function startMockS3({ buckets = [] } = {}) {
 
       sendError(res, 400, 'InvalidRequest', `Unsupported: ${req.method} ${req.url}`);
     } catch (err) {
-      sendError(res, 500, 'InternalError', err instanceof Error ? err.message : String(err));
+      // Never reflect raw exception text into the response body — it's an XSS sink
+      // here (and would be an info leak against real S3). Log it server-side (it
+      // still surfaces in test output) and return a generic body.
+      console.error('[mock-s3] request handler error:', err);
+      sendError(res, 500, 'InternalError', 'Internal error');
     }
   });
 
