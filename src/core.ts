@@ -13,6 +13,7 @@ import { pulseVaultError } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
+import { parseUploadKind, UPLOAD_KINDS } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -62,8 +63,8 @@ export type PulseVaultCoreOptions = {
   stripBasePath?: boolean;
   /** Max TUS upload size in bytes. Required — consumers must choose an explicit cap. Use `Infinity` for no cap. */
   maxUploadSize: number;
-  /** Which upload strategy this deployment expects. Purely advertised via `GET /capabilities`. Defaults to `"beat"`. */
-  uploadUnit?: 'beat' | 'merged';
+  /** Which upload strategy this deployment expects. Purely advertised via `GET /capabilities`. Defaults to `"segment"`. */
+  uploadUnit?: 'segment' | 'merged';
   /** File extensions allowed per artifact kind. See the Fastify plugin's `allowedExtensions` for the full shape. */
   allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /** Cache-control options forwarded to `@fastify/send` for the GET route. */
@@ -156,8 +157,7 @@ function parseUploadMetadata(header: string): {
       } else if (key === 'projectid') {
         projectidRaw ??= decoded;
       } else if (key === 'kind') {
-        const lower = decoded.trim().toLowerCase();
-        kind = lower === 'project' ? 'project' : lower === 'captions' ? 'captions' : 'video';
+        kind = parseUploadKind(decoded);
       } else if (key === 'relatedTo' && !relatedTo) {
         relatedTo = isUuid(decoded) ? decoded : undefined;
       }
@@ -293,7 +293,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
   const stripBasePath = options.stripBasePath ?? true;
-  const uploadUnit = options.uploadUnit ?? 'beat';
+  const uploadUnit = options.uploadUnit ?? 'segment';
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   const validatePayload = composeValidatePayload(
     options.validatePayload,
@@ -411,7 +411,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
       maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
       uploadUnit,
-      kinds: ['video', 'project', 'captions'],
+      kinds: [...UPLOAD_KINDS],
       allowedExtensions,
       maxUploadSize,
       checksum: { algorithms: ['sha256', 'sha1', 'md5'] },

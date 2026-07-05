@@ -8,6 +8,7 @@ import type {
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
+import { parseUploadKind } from './types.js';
 
 /**
  * Per-artifact metadata sidecar written at
@@ -63,6 +64,11 @@ function extToContentType(ext: string): string {
       return 'application/zip';
     case '.vtt':
       return 'text/vtt';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.png':
+      return 'image/png';
     default:
       return 'application/octet-stream';
   }
@@ -217,8 +223,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // `status` field explicitly.
       const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
       // Older sidecars without `kind` default to `"video"` — no migration.
-      const kind: UploadKind =
-        parsed.kind === 'project' ? 'project' : parsed.kind === 'captions' ? 'captions' : 'video';
+      const kind = parseUploadKind(parsed.kind);
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,

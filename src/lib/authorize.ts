@@ -6,7 +6,7 @@ export type PulseVaultAuthorizePhase = 'create' | 'patch' | 'resolve' | 'delete'
 export type PulseVaultAuthorizeContext = {
   phase: PulseVaultAuthorizePhase;
   artifactId: string;
-  /** Artifact kind: `"video"`, `"project"`, or `"captions"`. Always present. */
+  /** Artifact kind: `"video"`, `"project"`, `"captions"`, or `"thumbnail"`. Always present. */
   kind: UploadKind;
   /** Bearer / query-string token forwarded from the watch URL, if present. Only populated during the `"resolve"` phase. */
   token?: string;

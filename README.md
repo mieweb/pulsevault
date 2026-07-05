@@ -243,12 +243,12 @@ type PulseVaultPluginOptions = {
   storage: PulseVaultStorage;
   prefix: string;
   maxUploadSize: number;
-  uploadUnit?: "beat" | "merged";              // default: "beat" — see "Upload unit"
+  uploadUnit?: "segment" | "merged";           // default: "segment" — see "Upload unit"
   decoratorName?: string;                      // default: "pulseVault"
   allowedExtensions?:
-    | string[]                                                          // legacy — treated as video-only
-    | { video?: string[]; project?: string[]; captions?: string[] };    // per-kind (recommended)
-  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] }
+    | string[]                                                                              // legacy — treated as video-only
+    | { video?: string[]; project?: string[]; captions?: string[]; thumbnail?: string[] };  // per-kind (recommended)
+  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] }
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;          // runs for every kind; branch on ctx.kind
@@ -277,12 +277,14 @@ Maximum upload size in bytes. Use `Infinity` for no cap.
 
 ### Upload unit
 
-`uploadUnit: "beat" | "merged"` — purely advertised via `GET /pulsevault/capabilities`; **the plugin doesn't enforce either.** It tells the client which upload strategy this deployment expects:
+`uploadUnit: "segment" | "merged"` — purely advertised via `GET /pulsevault/capabilities`; **the plugin doesn't enforce either.** It tells the client which upload strategy this deployment expects:
 
-- `"beat"` (default): the client uploads each clip individually (no merge/re-encode pass), plus a `kind=project` manifest artifact for ordering. Lower client-side cost, finer-grained resumability.
-- `"merged"`: the client pre-merges a pulse's clips into one video before uploading. Simpler server-side mental model (one artifact per pulse), more client-side work.
+- `"segment"` (default): the client uploads each recorded clip individually (no merge/re-encode pass), plus one `kind=project` ordering manifest (`<draftId>-segments.pulse`). No captions or thumbnail. Lower client-side cost, finer-grained resumability.
+- `"merged"`: the client pre-merges a pulse's clips into one video before uploading, alongside its captions (`kind=captions`), a beat-timecode manifest (`kind=project`, `<draftId>-beats.pulse` — per-segment `startMs`/`endMs` on the merged timeline), and a poster `kind=thumbnail`. Simpler server-side mental model (one primary artifact per pulse), more client-side work.
 
-A client reads this at pairing time, before doing any merge or upload work, and branches accordingly. See `PROTOCOL.md` §8 for the full contract.
+(A "beat" is a timecode range on the merged timeline — one recorded segment's placement within the merged video — not an upload unit. The old `"beat"` upload unit was renamed to `"segment"`.)
+
+A client reads `uploadUnit` at pairing time, before doing any merge or upload work, and branches accordingly. See `PROTOCOL.md` §8 for the full contract.
 
 Need both strategies live at once instead of one fixed value for the whole deployment? Pass `uploadUnit` to [`buildUploadLink`](#deep-link-helper) per session — it overrides `/capabilities` for that pairing only, with no server-side option to change.
 
@@ -471,9 +473,9 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "protocolVersion": 1,
   "minSupportedVersion": 1,
   "maxSupportedVersion": 1,
-  "uploadUnit": "beat",
-  "kinds": ["video", "project", "captions"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"] },
+  "uploadUnit": "segment",
+  "kinds": ["video", "project", "captions", "thumbnail"],
+  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }
@@ -520,7 +522,7 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a video also covers its captions and (under `uploadUnit: "beat"`) every beat and the manifest in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a merged video also covers its captions, beat manifest and thumbnail (or, under `uploadUnit: "segment"`, every clip and the ordering manifest) in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
 
 ## Upload-Metadata protocol
 
@@ -759,7 +761,7 @@ const uploadLink = buildUploadLink({
 // pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret&uploadUnit=merged
 ```
 
-`uploadUnit` on the link is a **per-session override** of whatever `GET /capabilities` currently reports (PROTOCOL.md §3, §8). Omit it and nothing changes — the client falls back to `/capabilities` exactly as before. Set it when you want "beat" and "merged" sessions live at the same time (staged rollout, A/B test, per-tenant policy) instead of one fixed value for the whole deployment — `/capabilities` can only ever report one current value, and a client reading it separately from opening the link is racing whatever the server happened to be serving at that moment, not the value this specific session was paired under.
+`uploadUnit` on the link is a **per-session override** of whatever `GET /capabilities` currently reports (PROTOCOL.md §3, §8). Omit it and nothing changes — the client falls back to `/capabilities` exactly as before. Set it when you want "segment" and "merged" sessions live at the same time (staged rollout, A/B test, per-tenant policy) instead of one fixed value for the whole deployment — `/capabilities` can only ever report one current value, and a client reading it separately from opening the link is racing whatever the server happened to be serving at that moment, not the value this specific session was paired under.
 
 ## Tests
 

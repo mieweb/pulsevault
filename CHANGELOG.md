@@ -84,7 +84,8 @@ if you've evaluated against an intermediate build.
   serve `.vtt` artifacts with the `text/vtt` content type.
 - **`relatedTo`** — an optional `Upload-Metadata` key (and matching
   `ReserveUploadParams`/storage field) linking one artifact to another (e.g.
-  a video's captions, or a beat belonging to a pulse manifest's session).
+  a merged video's captions/beat-manifest/thumbnail, or a clip belonging to a
+  segment ordering manifest's session).
   Storage adapters expose it via the new optional `getRelatedTo` method.
 - **`checksum`** — an optional `Upload-Metadata` key (`<algorithm>:<hex
   digest>`) verified post-upload via the new `createChecksumValidator`
@@ -104,14 +105,21 @@ if you've evaluated against an intermediate build.
   `uploadUnit`, `kinds`, `allowedExtensions`, `maxUploadSize`, and supported
   checksum algorithms. Lets independently-versioned deployments and clients
   detect compatibility before pairing.
-- **`uploadUnit` plugin option** (`"beat" | "merged"`, default `"beat"`) —
+- **`uploadUnit` plugin option** (`"segment" | "merged"`, default `"segment"`) —
   purely advertised via `/capabilities`; the operator declares which upload
   strategy this deployment expects, the client branches on it. Not enforced
-  by the plugin.
+  by the plugin. `"segment"` uploads each recorded clip plus an ordering
+  manifest; `"merged"` uploads one pre-merged video plus its captions, a
+  beat-timecode manifest, and a thumbnail. (A "beat" is a timecode range on
+  the merged timeline, not an upload unit.)
+- **`kind: "thumbnail"`** artifact type (default extensions `.jpg`/`.jpeg`/
+  `.png`) — the pulse poster frame uploaded alongside a merged video, running
+  through the same generic `validatePayload`/`onUploadComplete` hooks and a
+  `thumbnail/` storage subdir like every other kind.
 - **`buildUploadLink({ uploadUnit })`** (PROTOCOL.md §3, §8) — optional
   per-session override of the deployment-wide `uploadUnit`, carried on the
   pairing link itself instead of only `/capabilities`. Lets an operator run
-  `"beat"` and `"merged"` sessions concurrently (staged rollout, A/B test,
+  `"segment"` and `"merged"` sessions concurrently (staged rollout, A/B test,
   per-tenant policy) without racing a client's separate `/capabilities` fetch
   against a single, deployment-wide value. Fully backward compatible: omit it
   and a client falls back to `/capabilities` exactly as before.

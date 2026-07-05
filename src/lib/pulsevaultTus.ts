@@ -6,6 +6,7 @@ import type { PulseVaultValidatePayload } from './magic.js';
 import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
 import type { PulseVaultStorage } from '../storage/types.js';
 import type { UploadKind } from '../storage/types.js';
+import { parseUploadKind } from '../storage/types.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -59,6 +60,7 @@ export type PulsevaultTusOptions = {
     video: readonly string[];
     project: readonly string[];
     captions: readonly string[];
+    thumbnail: readonly string[];
   };
   /**
    * Optional payload-validation hook, called for every kind with `ctx.kind`
@@ -135,9 +137,7 @@ function parseUploadMetadata(
   ).trim();
   const filename = (metadata?.filename ?? '').trim();
   // `kind` defaults to `"video"` so existing clients that don't send the field continue to work unchanged.
-  const rawKind = (metadata?.kind ?? '').trim().toLowerCase();
-  const kind: UploadKind =
-    rawKind === 'project' ? 'project' : rawKind === 'captions' ? 'captions' : 'video';
+  const kind = parseUploadKind(metadata?.kind);
   const rawRelatedTo = (metadata?.relatedTo ?? '').trim();
   const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
   const checksum = (metadata?.checksum ?? '').trim() || undefined;
