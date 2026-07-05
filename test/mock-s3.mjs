@@ -37,12 +37,12 @@ function md5Hex(buf) {
   return createHash('md5').update(buf).digest('hex');
 }
 
+const XML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+// Single global-regex replace over the full set of XML metacharacters (including
+// the apostrophe) so every interpolated value is completely escaped in one pass.
 function xmlEscape(s) {
-  return String(s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+  return String(s).replace(/[&<>"']/g, (ch) => XML_ESCAPES[ch]);
 }
 
 function xmlUnescape(s) {
