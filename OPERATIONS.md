@@ -66,8 +66,8 @@ you have a specific reason to use local disk.
 `reserveUpload`'s collision guard normally uses `PutObjectCommand`'s
 `IfNoneMatch: "*"` to atomically reject a second create for an artifactId
 that already has an upload. Some S3-compatible backends (older/less-complete
-implementations; the `s3rver` mock this package's own test suite runs
-against) don't support conditional writes and reject that header outright.
+implementations) don't support conditional writes and reject that header
+outright.
 On those backends, `reserveUpload` falls back to a weaker check-then-write —
 functionally the same guard, but with the original race reopened: two
 truly concurrent (or retried) creates for the same artifactId can both pass
