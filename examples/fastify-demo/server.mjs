@@ -102,6 +102,14 @@ await app.register(fastifyHelmet, {
       "img-src": ["'self'", "data:"],
       "media-src": ["'self'"],
       "connect-src": ["'self'", "https://esm.sh", "https://cdn.jsdelivr.net"],
+      // Helmet turns on `upgrade-insecure-requests` by default, which makes the
+      // browser upgrade same-origin fetches to HTTPS. Browsers exempt localhost,
+      // but over a LAN IP (http://<ip>:3000) it upgrades /deeplinks, /videos, etc.
+      // to https://<ip>:3000 — which has no TLS — so those requests fail and the
+      // page never renders the pairing QR. Disable it so the demo works over plain
+      // HTTP on a LAN. In prod the TLS-terminating edge serves everything over
+      // HTTPS anyway, so nothing is lost.
+      "upgrade-insecure-requests": null,
     },
   },
   crossOriginResourcePolicy: { policy: "cross-origin" },
