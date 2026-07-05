@@ -1,0 +1,26 @@
+[Unit]
+Description=PulseVault Fastify demo (pulsevaultdemo)
+Documentation=https://github.com/mieweb/pulsevault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point this at wherever you cloned pulsevault inside the LXC container.
+WorkingDirectory=/opt/pulsevault/examples/fastify-demo
+ExecStart=/usr/bin/env node server.mjs
+# The container's HTTP service maps internal :3000 -> pulsevaultdemo.os.mieweb.org.
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
+# Drop the per-request log line on hot upload paths (CPU + rootfs write I/O).
+Environment=LOG_LEVEL=warn
+# Match the container's RAM allocation (4 GB -> ~3 GB RSS ceiling for load-shedding).
+Environment=MAX_RSS_MB=3072
+# Optional: lock CORS to a single origin instead of reflecting any.
+# Environment=CORS_ORIGIN=https://pulsevaultdemo.os.mieweb.org
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
