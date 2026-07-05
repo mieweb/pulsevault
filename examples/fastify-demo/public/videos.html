@@ -56,7 +56,7 @@
       .pair-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.7rem; font-size: 0.75rem; font-weight: 600; background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.18); color: var(--text); border-radius: 999px; text-decoration: none; backdrop-filter: blur(6px); }
       .pair-link:hover { border-color: var(--accent); }
 
-      /* IG-story style progress: one segment per beat. */
+      /* IG-story style progress: one bar per clip. */
       .progress-row { position: absolute; top: 0.35rem; left: 0.75rem; right: 0.75rem; z-index: 4; display: flex; gap: 0.25rem; }
       .progress-seg { flex: 1; height: 3px; border-radius: 999px; background: rgba(255, 255, 255, 0.3); overflow: hidden; }
       .progress-fill { height: 100%; background: #fff; border-radius: 999px; }
@@ -86,6 +86,12 @@
       }
       .badge { display: inline-block; padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; background: rgba(255, 255, 255, 0.14); border: 1px solid rgba(255, 255, 255, 0.2); color: var(--text); }
       .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.68rem; word-break: break-all; color: var(--text-2); }
+
+      /* The uploaded `kind: "thumbnail"` artifact (merged mode only), shown as a
+         small labeled preview so the demo visibly exercises the poster kind. */
+      .thumb { display: inline-flex; flex-direction: column; gap: 0.2rem; margin: 0 0 0.5rem; }
+      .thumb-label { font-size: 0.55rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); }
+      .thumb img { width: 3.4rem; height: 4.4rem; object-fit: cover; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.25); background: #000; display: block; }
 
       .rail { position: absolute; right: 0.6rem; bottom: 4.5rem; z-index: 3; display: flex; flex-direction: column; gap: 0.7rem; align-items: center; }
       .rail-btn {
@@ -138,10 +144,10 @@
         return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
       }
 
-      // One pulse = every artifact sharing a session anchor. Beat sessions upload each clip
-      // under its own artifactId with `relatedTo` pointing at the session's manifest
-      // (kind "project"); a merged session is one video whose subtitles point at it. Anchoring
-      // on `relatedTo ?? artifactId` puts each artifact in exactly one group either way.
+      // One pulse = every artifact sharing a session anchor. Segment sessions upload each clip
+      // under its own artifactId with `relatedTo` pointing at the session's ordering manifest
+      // (kind "project"); a merged session is one video whose captions/thumbnail point at it.
+      // Anchoring on `relatedTo ?? artifactId` puts each artifact in exactly one group either way.
       function groupUploads(uploads) {
         const groups = new Map();
         for (const u of uploads) {
@@ -234,25 +240,32 @@
           </div>`;
       }
 
-      // ── The smart player: one <video> per pulse that plays its beats back to
-      // back (manifest order), swaps subtitles per beat, and reports progress. ──
+      // ── The smart player: one <video> per pulse that plays its clips back to
+      // back (manifest order), swaps subtitles per clip, and reports progress.
+      // Segment sessions have many clips; a merged session is one looping video. ──
       function SmartPlayer({ pulse, active, near, muted, onToggleMute }) {
         const { anchorId, items } = pulse;
         const videos = items.filter((u) => u.kind === "video");
         const manifest = items.find((u) => u.kind === "project");
+        const poster = items.find((u) => u.kind === "thumbnail"); // merged-mode poster frame
         const subtitlesCount = items.filter((u) => u.kind === "captions").length; // "captions" is the wire kind
-        const isBeats = !!manifest || videos.length > 1;
+        // A merged session is a single video (it also ships a beat manifest + thumbnail, so
+        // "has a manifest" can't tell the modes apart); >1 video means a segment session.
+        const isSegmented = videos.length > 1;
         const totalSize = items.reduce((sum, u) => sum + u.size, 0);
 
         const videoRef = useRef(null);
-        const [beatIndex, setBeatIndex] = useState(0);
+        const [clipIndex, setClipIndex] = useState(0);
         const [progress, setProgress] = useState(0);
         const [halted, setHalted] = useState(false); // user-paused OR autoplay blocked
         const [cues, setCues] = useState(null);
         const [cuePos, setCuePos] = useState(null); // { cueIdx, wordIdx }
 
-        // Beat order comes from the session's manifest (`{ beats: [{ artifactId, order }] }`) —
-        // authoritative; upload timestamps are only the fallback while/if it's missing.
+        // Clip order comes from a segment session's ordering manifest
+        // (`{ segments: [{ artifactId, order }] }`) — authoritative; upload timestamps are
+        // only the fallback while/if it's missing. (A merged session's `-beats.pulse` is a
+        // timecode manifest keyed by local segmentId, not an ordering, and it has a single
+        // video anyway — so `m.segments` is absent there and order stays null, which is fine.)
         const [order, setOrder] = useState(null);
         useEffect(() => {
           if (!manifest) return;
@@ -260,44 +273,44 @@
           fetch(manifest.playbackUrl)
             .then((r) => r.json())
             .then((m) => {
-              if (cancelled || !Array.isArray(m?.beats)) return;
-              setOrder(new Map(m.beats.map((b) => [b.artifactId, b.order])));
+              if (cancelled || !Array.isArray(m?.segments)) return;
+              setOrder(new Map(m.segments.map((s) => [s.artifactId, s.order])));
             })
             .catch(() => {});
           return () => { cancelled = true; };
         }, [manifest?.artifactId]);
 
-        const beats = [...videos].sort((a, b) =>
+        const clips = [...videos].sort((a, b) =>
           order
             ? (order.get(a.artifactId) ?? 0) - (order.get(b.artifactId) ?? 0)
             : a.creation_date.localeCompare(b.creation_date),
         );
-        const beat = beats[Math.min(beatIndex, beats.length - 1)];
-        const beatCount = beats.length;
-        const beatCountRef = useRef(beatCount);
-        beatCountRef.current = beatCount;
+        const clip = clips[Math.min(clipIndex, clips.length - 1)];
+        const clipCount = clips.length;
+        const clipCountRef = useRef(clipCount);
+        clipCountRef.current = clipCount;
 
         // The <video>'s src is managed imperatively, never as a React prop — the
         // 8s feed poll can re-render this component without touching playback.
         useEffect(() => {
           const video = videoRef.current;
-          if (!video || !beat) return;
+          if (!video || !clip) return;
           if (!near) {
             // Off-screen slides release their network/decoder resources.
             if (video.src) { video.removeAttribute("src"); video.load(); }
             return;
           }
-          const src = new URL(beat.playbackUrl, location.origin).href;
+          const src = new URL(clip.playbackUrl, location.origin).href;
           if (video.src !== src) {
             video.src = src;
             video.preload = "auto";
-            // A single merged video loops natively; beat sessions advance on `ended`.
-            video.loop = beatCount === 1;
+            // A single merged video loops natively; segment sessions advance on `ended`.
+            video.loop = clipCount === 1;
             if (active && !halted) video.play().catch(() => setHalted(true));
           }
-        }, [beat?.playbackUrl, near, beatCount]);
+        }, [clip?.playbackUrl, near, clipCount]);
 
-        // Play when snapped into view; pause + rewind to beat 1 when scrolled away
+        // Play when snapped into view; pause + rewind to clip 1 when scrolled away
         // (matches Reels: re-entering a slide starts the pulse over).
         useEffect(() => {
           const video = videoRef.current;
@@ -308,7 +321,7 @@
           } else {
             video.pause();
             video.currentTime = 0;
-            setBeatIndex(0);
+            setClipIndex(0);
             setProgress(0);
             setCuePos(null);
           }
@@ -318,28 +331,29 @@
           if (videoRef.current) videoRef.current.muted = muted;
         }, [muted]);
 
-        // Sequential beats: when one clip ends, the next starts (wrap to beat 1).
+        // Sequential clips: when one ends, the next starts (wrap to clip 1).
         useEffect(() => {
           const video = videoRef.current;
           if (!video) return;
-          const onEnded = () => setBeatIndex((i) => (i + 1) % beatCountRef.current);
+          const onEnded = () => setClipIndex((i) => (i + 1) % clipCountRef.current);
           video.addEventListener("ended", onEnded);
           return () => video.removeEventListener("ended", onEnded);
         }, []);
 
-        // Each beat carries its own subtitles starting at 0:00, so the cue set
-        // swaps wholesale with the beat — no timeline offset math needed.
+        // The merged video carries its captions starting at 0:00 (segment clips carry
+        // none), so the cue set swaps wholesale when the active clip changes — no
+        // timeline offset math needed.
         useEffect(() => {
           setCues(null);
           setCuePos(null);
-          if (!beat?.subtitlesUrl) return;
+          if (!clip?.subtitlesUrl) return;
           let cancelled = false;
-          fetch(beat.subtitlesUrl)
+          fetch(clip.subtitlesUrl)
             .then((r) => r.text())
             .then((text) => { if (!cancelled) setCues(parseVtt(text)); })
             .catch(() => {});
           return () => { cancelled = true; };
-        }, [beat?.subtitlesUrl]);
+        }, [clip?.subtitlesUrl]);
 
         // One rAF loop while active drives both the segment bar and the karaoke
         // highlight. setState is change-gated so 60fps polling ≠ 60fps renders.
@@ -383,13 +397,18 @@
 
         return html`
           <div style=${{ position: "absolute", inset: 0 }} onClick=${togglePlay}>
-            <video ref=${videoRef} muted playsInline></video>
-            <${SegmentProgress} count=${beatCount} current=${Math.min(beatIndex, beatCount - 1)} progress=${progress} />
+            <video ref=${videoRef} muted playsInline poster=${poster?.playbackUrl ?? undefined}></video>
+            <${SegmentProgress} count=${clipCount} current=${Math.min(clipIndex, clipCount - 1)} progress=${progress} />
             <${SubtitleOverlay} cue=${activeCue} wordIdx=${cuePos?.wordIdx ?? 0} />
             ${halted && html`<div className="play-glyph">▶</div>`}
             <div className="info-overlay">
+              ${poster && html`
+                <div className="thumb">
+                  <span className="thumb-label">Thumbnail</span>
+                  <img src=${poster.playbackUrl} alt="Pulse thumbnail" />
+                </div>`}
               <p style=${{ margin: "0 0 0.4rem" }}>
-                <span className="badge">${isBeats ? `pulse · ${beatCount} beats` : "merged"}</span>
+                <span className="badge">${isSegmented ? `pulse · ${clipCount} segments` : "merged"}</span>
               </p>
               <p className="mono" style=${{ margin: 0 }}>
                 ${formatSize(totalSize)} · ${new Date(pulse.newest).toLocaleString()}

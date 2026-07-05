@@ -294,7 +294,7 @@ graph LR
                 onChange=${(e) => setOverride(e.target.value)}
               >
                 <option value="">Use server default${serverDefault ? ` (${serverDefault})` : ""}</option>
-                <option value="beat">Force "beat" for this link</option>
+                <option value="segment">Force "segment" for this link</option>
                 <option value="merged">Force "merged" for this link</option>
               </select>
               <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
@@ -311,8 +311,8 @@ graph LR
       function UploadsLink() {
         const [count, setCount] = useState(null);
         useEffect(() => {
-          // Count PULSES (feed items), not raw artifacts — a 6-beat session is six
-          // videos + subtitles + a manifest on the wire, but one item in the feed.
+          // Count PULSES (feed items), not raw artifacts — a 6-segment session is six
+          // clip videos + an ordering manifest on the wire, but one item in the feed.
           // Same grouping as the feed page: one pulse per session anchor
           // (`relatedTo ?? artifactId`), counted only if it actually has video.
           const refresh = () =>
