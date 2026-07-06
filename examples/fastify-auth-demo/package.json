@@ -5,6 +5,7 @@
   "description": "Production-shaped Fastify demo for @mieweb/pulsevault — Better Auth dashboard, Prisma + Postgres, capability tokens always on, Docker Compose stack",
   "scripts": {
     "start": "prisma migrate deploy && node --env-file-if-exists=.env server.mjs",
+    "start:cluster": "prisma migrate deploy && node --env-file-if-exists=.env cluster.mjs",
     "dev": "prisma migrate deploy && node --env-file-if-exists=.env --watch server.mjs",
     "db:up": "docker compose up -d db --wait"
   },

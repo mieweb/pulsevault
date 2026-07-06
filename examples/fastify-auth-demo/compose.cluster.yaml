@@ -1,0 +1,39 @@
+# PulseVault auth demo — OPT-IN clustering override.
+#
+# Layer this over compose.yaml to run the app under Node's `cluster` module
+# (one worker per core) instead of the single-process default. This demo
+# re-hashes every finished video (full-file SHA-256) before markReady, which is
+# CPU-bound and otherwise serializes on one core; clustering hashes N videos in
+# parallel. See cluster.mjs for the full rationale and per-worker caveats.
+#
+# Run (from this directory):
+#   PULSEVAULT_SECRET=$(openssl rand -hex 32) \
+#     docker compose -f compose.yaml -f compose.cluster.yaml up --build
+#
+# It stays a separate file, not the default, because clustering only pays off
+# on a CPU-bound single-box deploy and needs two things the single-process
+# default doesn't: a bounded Prisma pool per worker and an explicit worker
+# count (both set below). Plain `docker compose up` stays single-process.
+
+services:
+  app:
+    # `exec node` makes node PID 1, so Docker's SIGTERM reaches the cluster
+    # primary directly and cluster.mjs can drain in-flight uploads before its
+    # workers die (a plain `npm run` wrapper would swallow the signal). The
+    # migration still runs ONCE, in this shell, before any worker forks — never
+    # inside a worker. prisma is a runtime dependency, so it survives the
+    # image's `--omit=dev` and resolves at node_modules/.bin.
+    command: ["sh", "-c", "node_modules/.bin/prisma migrate deploy && exec node cluster.mjs"]
+    environment:
+      # Each worker opens its OWN Prisma pool (default num_cpus*2+1). Without a
+      # cap, N workers blow past Postgres's default max_connections (100). Keep
+      # connection_limit × WEB_CONCURRENCY under that, or raise max_connections.
+      DATABASE_URL: postgres://pulsevault:pulsevault@db:5432/pulsevault?connection_limit=5
+      # Workers to fork. Pin it explicitly: os.availableParallelism() reads the
+      # CPU affinity mask, NOT a cgroup CPU quota, so an unpinned count over-
+      # forks under `deploy.resources.limits.cpus`. 4 is a safe demo default.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      # Whole-box RSS budget; cluster.mjs splits it across workers into each
+      # worker's under-pressure MAX_RSS_MB (overriding the inherited per-process
+      # value). Size it to the container, not to one worker.
+      TOTAL_RSS_MB: ${TOTAL_RSS_MB:-3072}
