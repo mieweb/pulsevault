@@ -74,7 +74,7 @@ model Verification {
 }
 
 // One row per COMPLETED upload — an index over the filesystem sidecars (which
-// stay the source of truth), so /pulses is one query instead of a directory
+// stay the source of truth), so /videos is one query instead of a directory
 // crawl. Written by onUploadComplete, pruned on authorized deletes,
 // reconciled from disk at boot.
 model Artifact {

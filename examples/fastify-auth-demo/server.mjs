@@ -16,6 +16,12 @@ import Fastify from "fastify";
 import fastifyRateLimit from "@fastify/rate-limit";
 import fastifySwagger from "@fastify/swagger";
 import fastifySwaggerUI from "@fastify/swagger-ui";
+import fastifyStatic from "@fastify/static";
+import fastifyCors from "@fastify/cors";
+import fastifyHelmet from "@fastify/helmet";
+import fastifyCompress from "@fastify/compress";
+import fastifyEtag from "@fastify/etag";
+import underPressure from "@fastify/under-pressure";
 import QRCode from "qrcode";
 import { PrismaClient } from "@prisma/client";
 import { betterAuth } from "better-auth";
@@ -32,7 +38,10 @@ import pulseVault, {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
-const favicon = readFileSync(path.join(__dirname, "public/favicon.png"));
+// The uploads feed lives on its own page (the Shorts/Reels-style vertical
+// pager) at /library — everything else under public/ (favicon, assets) is
+// served by @fastify/static below.
+const libraryHtml = readFileSync(path.join(__dirname, "public/library.html"), "utf8");
 const dataDir = path.join(__dirname, "data");
 
 const port = Number(process.env.PORT ?? 3002);
@@ -135,7 +144,7 @@ const auth = betterAuth({
 
 // ---------------------------------------------------------------------------
 // Artifact index — the same database also indexes completed uploads, so
-// /pulses is one query instead of re-reading every filesystem sidecar on
+// /videos is one query instead of re-reading every filesystem sidecar on
 // every request (O(uploads), forever). Rows are written once by
 // `onUploadComplete`, pruned when a delete is authorized, and reconciled
 // from disk at boot — the sidecars stay the source of truth; the table is a
@@ -260,30 +269,132 @@ function recordEvent(event) {
 
 // ---------------------------------------------------------------------------
 // Upload-unit deployment default (README "Upload unit") — purely advisory
-// via `GET /pulsevault/capabilities`; the plugin never enforces "beat" vs
+// via `GET /pulsevault/capabilities`; the plugin never enforces "segment" vs
 // "merged", it just reports whichever value this server passes at
 // registration. The plugin bakes this in as a fixed option captured once at
 // `register()` time — there's no live setter for it, so changing this
 // deployment-wide default means restarting with a different env var
-// (`UPLOAD_UNIT=merged npm start`), not a runtime toggle. To test both
-// "beat" and "merged" without restarting, use the per-link `uploadUnit`
+// (`UPLOAD_UNIT=segment npm start`), not a runtime toggle. To test both
+// "segment" and "merged" without restarting, use the per-link `uploadUnit`
 // override on `GET /deeplinks` / `buildUploadLink` instead (PROTOCOL.md §3,
 // §8) — the pairing page's "Upload unit for this link" selector drives it.
+//
+// Default "merged" here (mirrors ../fastify-demo) so this demo exercises the
+// full merged pipeline — video + captions + beat manifest + thumbnail; set
+// UPLOAD_UNIT=segment to test per-clip uploads instead.
 // ---------------------------------------------------------------------------
-const uploadUnitDefault = process.env.UPLOAD_UNIT === "merged" ? "merged" : "beat";
+const uploadUnitDefault = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
 
 const app = Fastify({
-  logger: true,
-  bodyLimit: 16 * 1024 * 1024, // max single PATCH chunk (RN app sends 1 MB chunks)
+  // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
+  // -Host). Trust it so `request.ip` is the real client rather than the shared
+  // proxy IP — otherwise every client lands in one rate-limit bucket — and so
+  // forwarded proto/host are honored.
+  trustProxy: true,
+  // `LOG_LEVEL=warn` in production drops the per-request log line, which on a
+  // fast upload (many PATCHes) is real CPU + rootfs write I/O; "info" locally.
+  logger: { level: process.env.LOG_LEVEL ?? "info" },
+  // NOTE: not a TUS chunk cap. The PATCH body is streamed straight to
+  // @tus/server on a hijacked socket, bypassing Fastify body parsing, so this
+  // never sees it. It only bounds a *parsed* body (the Better Auth JSON posts).
+  // The real per-request ceiling for uploads is the edge nginx
+  // `client_max_body_size`; total upload size is governed by `maxUploadSize`.
+  bodyLimit: 16 * 1024 * 1024,
 });
 
-// Registered before any route so every one of them — the dashboard's own
-// (including the auth-protected /deeplinks, /pulses, /events, /captions)
-// and the TUS/artifact routes the plugin mounts — is covered by a global
-// per-IP limit (OPERATIONS.md "Rate limiting" recommends exactly this).
-// Generous enough for one phone's normal HEAD/PATCH resume retries, not for
-// a scraper hammering an authorized route.
-await app.register(fastifyRateLimit, { max: 300, timeWindow: "1 minute" });
+// --- Security & delivery middleware ---
+// All registered before any route so they cover the demo's own routes (the
+// dashboard, the auth-protected /deeplinks, /videos, /events, /captions) and
+// the TUS/artifact routes the plugin mounts alike. Mirrors ../fastify-demo.
+
+// Shed load with a 503 (instead of falling over) when the process is genuinely
+// under pressure. Also exposes a liveness route at GET /health. maxRssBytes is
+// sized to the container (default assumes ~4 GB RAM → 3 GB) — TUS streams chunks
+// to disk so RSS stays low, and a too-low threshold would false-503 uploads.
+// Override MAX_RSS_MB to match the container's allocation.
+await app.register(underPressure, {
+  maxEventLoopDelay: 1000,
+  maxRssBytes: Number(process.env.MAX_RSS_MB ?? 3072) * 1024 * 1024,
+  maxEventLoopUtilization: 0.98,
+  exposeStatusRoute: "/health",
+});
+
+// Standard security headers. The CSP is tailored to what the demo pages
+// actually load — React/htm from esm.sh and mermaid from jsdelivr (as inline
+// module scripts) plus inline <style>. `crossOriginResourcePolicy` is relaxed
+// to "cross-origin" so, once CORS (below) allows it, a page on another origin
+// can embed /pulsevault/artifacts/:id as a <video>.
+await app.register(fastifyHelmet, {
+  contentSecurityPolicy: {
+    directives: {
+      "default-src": ["'self'"],
+      "script-src": ["'self'", "'unsafe-inline'", "https://esm.sh", "https://cdn.jsdelivr.net"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+      "img-src": ["'self'", "data:"],
+      "media-src": ["'self'"],
+      "connect-src": ["'self'", "https://esm.sh", "https://cdn.jsdelivr.net"],
+      // Helmet turns on `upgrade-insecure-requests` by default, which makes the
+      // browser upgrade same-origin fetches to HTTPS. Browsers exempt localhost,
+      // but over a LAN IP (http://<ip>:3002) it upgrades /deeplinks, /videos, etc.
+      // to https://<ip>:3002 — which has no TLS — so those requests fail and the
+      // page never renders. Disable it so the demo works over plain HTTP on a
+      // LAN. In prod the TLS-terminating edge serves everything over HTTPS
+      // anyway, so nothing is lost.
+      "upgrade-insecure-requests": null,
+    },
+  },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+});
+
+// CORS so a browser client / the Pulse app on another origin can drive the TUS
+// upload + playback flow. `exposedHeaders` is the load-bearing part: without it
+// the browser can't read Location/Upload-Offset and resumable uploads break.
+// Open by default for demo ease; set CORS_ORIGIN to lock it down for a deployment.
+// `|| true` (not `??`) so an empty CORS_ORIGIN — which compose passes when the var
+// is unset — reads as "open", not as the invalid empty-string origin @fastify/cors
+// rejects.
+await app.register(fastifyCors, {
+  origin: process.env.CORS_ORIGIN || true,
+  methods: ["GET", "POST", "PATCH", "HEAD", "DELETE", "OPTIONS"],
+  exposedHeaders: [
+    "Location",
+    "Tus-Resumable",
+    "Upload-Offset",
+    "Upload-Length",
+    "Upload-Metadata",
+    "Tus-Version",
+    "Tus-Extension",
+    "Tus-Max-Size",
+    "Upload-Expires",
+  ],
+});
+
+// gzip/br for text responses (the /videos JSON, HTML pages, /captions VTT).
+// Artifact bytes are streamed on a hijacked socket by the plugin, so they
+// bypass this onSend hook entirely — video is never re-compressed here.
+await app.register(fastifyCompress, { global: true });
+
+// ETag + conditional-GET (304) for the demo's own responses. Artifact bytes
+// already get ETag/range via @fastify/send inside the plugin (hijacked, so this
+// hook never sees them); this covers the HTML / JSON / VTT routes.
+await app.register(fastifyEtag);
+
+// Global per-IP limit — meaningful now that trustProxy makes `request.ip` the
+// real client (behind the edge nginx it would otherwise be one shared bucket).
+// The TUS upload path and artifact playback get a much larger budget on purpose:
+// a fast chunked upload is many PATCHes (at 1 MB chunks a flat 300/min would cap
+// throughput to ~5 MB/s), and range-scrubbing a video is many GETs. The tight
+// default still guards the crawl-heavy dashboard routes (OPERATIONS.md "Rate
+// limiting"). Tune the ceilings via env for your traffic.
+const UPLOAD_RATE_MAX = Number(process.env.UPLOAD_RATE_MAX ?? 6000);
+const DEFAULT_RATE_MAX = Number(process.env.DEFAULT_RATE_MAX ?? 300);
+await app.register(fastifyRateLimit, {
+  timeWindow: "1 minute",
+  max: (req) =>
+    req.url.startsWith("/pulsevault/upload") || req.url.startsWith("/pulsevault/artifacts")
+      ? UPLOAD_RATE_MAX
+      : DEFAULT_RATE_MAX,
+});
 
 // Swagger MUST be registered before any route (including the plugin's) so
 // their schemas are picked up for the generated OpenAPI spec.
@@ -309,6 +420,15 @@ await app.register(fastifySwagger, {
 await app.register(fastifySwaggerUI, {
   routePrefix: "/docs",
   uiConfig: { docExpansion: "list", deepLinking: false },
+});
+
+// Serve everything under public/ (favicon, and any CSS/JS/assets you add later)
+// with correct content-types + caching. `index: false` so it doesn't register
+// its own GET / and collide with the explicit pairing-page route below.
+await app.register(fastifyStatic, {
+  root: path.join(__dirname, "public"),
+  prefix: "/",
+  index: false,
 });
 
 // Better Auth owns everything under /api/auth/* (sign-up, sign-in, session,
@@ -350,7 +470,7 @@ app.get(
       tags: ["demo"],
       summary: "Pairing page (HTML)",
       description:
-        "Returns the static pairing UI that renders the upload QR code, a live artifact-event feed, and the uploads gallery.",
+        "Returns the static dashboard UI that renders the upload QR code and a live artifact-event feed. The uploads themselves play on the /library feed.",
       response: {
         200: {
           description: "HTML pairing page.",
@@ -362,18 +482,16 @@ app.get(
   (_req, reply) => reply.type("text/html").send(html),
 );
 
-// The Pulse app icon, resized — referenced by <link rel="icon"> on the page.
+// The uploads live on their own page — /videos is the JSON API, so the feed
+// (a Shorts/Reels-style vertical pager) sits at /library.
 app.get(
-  "/favicon.png",
-  {
-    schema: {
-      tags: ["demo"],
-      summary: "Favicon (PNG)",
-      description: "The Pulse app icon, served for the pairing page's <link rel=\"icon\">.",
-    },
-  },
-  (_req, reply) => reply.type("image/png").send(favicon),
+  "/library",
+  { schema: { tags: ["demo"], summary: "Uploads feed (HTML)" } },
+  (_req, reply) => reply.type("text/html").send(libraryHtml),
 );
+
+// The Pulse app icon (referenced by <link rel="icon"> on the pages) is now
+// served straight from public/favicon.png by @fastify/static above.
 
 // Reserve an artifactId for an upload. The server owns ID generation so it
 // can later attach auth tokens, quotas, or other server-side state here.
@@ -422,7 +540,7 @@ app.get(
             properties: {
               phase: { type: "string", enum: ["authorize", "complete", "reject"] },
               artifactId: { type: "string", format: "uuid" },
-              kind: { type: "string", enum: ["video", "project", "captions"] },
+              kind: { type: "string", enum: ["video", "project", "captions", "thumbnail"] },
               size: { type: "number" },
               reason: { type: "string" },
               at: { type: "string", format: "date-time" },
@@ -496,194 +614,123 @@ app.get(
 );
 
 /**
- * List uploads grouped by *pulse* (the recording session a phone actually
- * produces), not as a flat list of unrelated files. Reconstructs the
- * grouping the wire protocol already encodes (`PROTOCOL.md` §8):
+ * List finished uploads as a flat array — the same shape ../fastify-demo's
+ * GET /videos returns, so the /library feed groups them into pulses
+ * client-side the identical way. Two auth-demo deltas over the no-auth demo:
  *
- * - "beat" mode: a `kind=project` manifest (no `relatedTo` — it IS the
- *   session anchor) lists its beats' artifactIds in order; every beat
- *   video and caption declares `relatedTo` pointing at the manifest.
- * - "merged" mode: the single video itself has no `relatedTo` (it's its own
- *   anchor); any captions declare `relatedTo` pointing at it.
- *
- * Mints exactly ONE short-lived token per pulse (scoped to the anchor
- * artifactId) and reuses it for every beat's and caption's playback URL —
- * the same `relatedTo`-based session authorization `PROTOCOL.md` §5.4
- * describes for uploads, exercised here for playback too.
+ *  1. Source: reads the Postgres artifact index (one query) instead of
+ *     crawling every sidecar on disk per request.
+ *  2. Auth: every playbackUrl / subtitlesUrl carries a short-lived capability
+ *     token. Exactly ONE token is minted per pulse (scoped to the session
+ *     anchor = `relatedTo ?? artifactId`) and reused for every artifact in
+ *     that pulse — `createCapabilityAuthorize` accepts an anchor-scoped token
+ *     for any child via `relatedTo` (PROTOCOL.md §5.4), the same session
+ *     authorization uploads use, exercised here for playback too.
  */
 app.get(
-  "/pulses",
+  "/videos",
   {
     preHandler: requireSignIn,
     schema: {
       tags: ["demo"],
-      summary: "List uploads grouped by pulse (recording session)",
+      summary: "List finished uploads (flat), with tokenized playback URLs",
       description:
-        "Groups beats + manifest + captions via `relatedTo` instead of listing every artifact as an unrelated flat entry. Playback/caption URLs carry a fresh short-lived watch token per pulse.",
+        "Flat list of ready artifacts (one indexed query over the Postgres artifact index). Every playbackUrl and subtitlesUrl carries a fresh short-lived capability token, minted once per pulse (session anchor) and reused across it. The /library feed groups these into pulses client-side.",
       response: {
         200: {
-          description: "Pulses, newest first.",
+          description: "Ready uploads, newest first.",
           type: "array",
           items: {
             type: "object",
             properties: {
-              anchorArtifactId: { type: "string", format: "uuid" },
-              mode: { type: "string", enum: ["beat", "merged"] },
-              manifest: {
-                type: ["object", "null"],
-                properties: {
-                  artifactId: { type: "string", format: "uuid" },
-                  size: { type: "number" },
-                },
-                required: ["artifactId", "size"],
-              },
-              beats: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    artifactId: { type: "string", format: "uuid" },
-                    filename: { type: "string" },
-                    size: { type: "number" },
-                    order: { type: "number" },
-                    checksumVerified: { type: "boolean" },
-                    playbackUrl: { type: "string" },
-                    captions: {
-                      type: ["object", "null"],
-                      properties: {
-                        artifactId: { type: "string", format: "uuid" },
-                        vttUrl: { type: "string" },
-                      },
-                      required: ["artifactId", "vttUrl"],
-                    },
-                  },
-                  required: ["artifactId", "filename", "size", "order", "checksumVerified", "playbackUrl"],
-                },
-              },
-              unmatchedCaptions: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    artifactId: { type: "string", format: "uuid" },
-                    filename: { type: "string" },
-                    vttUrl: { type: "string" },
-                  },
-                  required: ["artifactId", "filename", "vttUrl"],
-                },
-              },
+              artifactId: { type: "string", format: "uuid" },
+              kind: { type: "string", enum: ["video", "project", "captions", "thumbnail"] },
+              filename: { type: "string" },
+              ext: { type: "string" },
+              size: { type: "number" },
+              relatedTo: { type: ["string", "null"] },
+              playbackUrl: { type: "string" },
+              subtitlesUrl: { type: ["string", "null"] },
               creation_date: { type: "string" },
             },
-            required: ["anchorArtifactId", "mode", "beats", "unmatchedCaptions", "creation_date"],
+            required: ["artifactId", "kind", "filename", "size", "playbackUrl", "creation_date"],
           },
         },
       },
     },
+    // On top of the global per-IP limit: this route mints tokens per request —
+    // a tighter budget (the feed polls it every 8s, so 60/min is still generous).
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   },
   async (_req, reply) => {
-    // One indexed query — the artifact table replaces the per-request
-    // sidecar crawl this route shipped with (see "Artifact index" above).
+    // One indexed query — the artifact table replaces the per-request sidecar
+    // crawl the no-auth demo does (see "Artifact index" above).
     const artifacts = await artifactIndex.all();
 
-    const anchors = artifacts.filter((s) => !s.relatedTo);
-    const childrenByAnchor = new Map();
-    for (const s of artifacts) {
-      if (!s.relatedTo) continue;
-      if (!childrenByAnchor.has(s.relatedTo)) childrenByAnchor.set(s.relatedTo, []);
-      childrenByAnchor.get(s.relatedTo).push(s);
-    }
-
-    const filenameStem = (filename) => filename.replace(/\.[^.]+$/, "");
-
-    const pulses = await Promise.all(
-      anchors.map(async (anchor) => {
-        const children = childrenByAnchor.get(anchor.artifactId) ?? [];
-        const captionsPool = children.filter((c) => c.kind === "captions");
-        const videoChildren = children.filter((c) => c.kind === "video");
-
-        // One token per pulse (not per artifact) — demonstrates relatedTo-based
-        // session authorization from PROTOCOL.md §5.4 for playback, exactly as
-        // it's used for uploads.
-        const pulseToken = issueCapabilityToken(anchor.artifactId, PULSEVAULT_SECRET, {
+    // One watch token per pulse (session anchor = `relatedTo ?? artifactId`),
+    // reused for every artifact in that pulse. createCapabilityAuthorize accepts
+    // an anchor-scoped token for any child via relatedTo (PROTOCOL.md §5.4).
+    const tokenByAnchor = new Map();
+    const tokenFor = (anchorId) => {
+      let token = tokenByAnchor.get(anchorId);
+      if (!token) {
+        token = issueCapabilityToken(anchorId, PULSEVAULT_SECRET, {
           keyId: PULSEVAULT_KEY_ID,
           issuer: ISSUER,
           expirySeconds: WATCH_TOKEN_TTL_SECONDS,
         });
-        const withToken = (url) => `${url}?token=${pulseToken}`;
+        tokenByAnchor.set(anchorId, token);
+      }
+      return token;
+    };
 
-        const attachCaptions = (videoLike) => {
-          const stem = filenameStem(videoLike.filename);
-          const idx = captionsPool.findIndex((c) => filenameStem(c.filename) === stem);
-          if (idx < 0) return null;
-          const [captions] = captionsPool.splice(idx, 1);
-          return { artifactId: captions.artifactId, vttUrl: withToken(`/captions/${captions.artifactId}`) };
-        };
+    const items = artifacts.map((a) => {
+      const anchorId = a.relatedTo ?? a.artifactId;
+      return {
+        artifactId: a.artifactId,
+        kind: a.kind,
+        filename: a.filename,
+        ext: a.ext,
+        size: a.size,
+        relatedTo: a.relatedTo ?? null,
+        playbackUrl: `/pulsevault/artifacts/${a.artifactId}?token=${tokenFor(anchorId)}`,
+        creation_date: a.creation_date,
+      };
+    });
 
-        let mode;
-        let manifest = null;
-        let beats;
+    // Pair each video with its subtitles (kind "captions" on the wire) exactly
+    // as ../fastify-demo does: within a pulse (shared `relatedTo ?? artifactId`
+    // anchor), the app names the merged video's VTT after the video, so matching
+    // filename stems pair them. Fallback: a pulse with exactly one video and one
+    // subtitles file is an unambiguous pair even if the stems drifted. The
+    // caption URL carries the same anchor token — /captions authorizes it via
+    // the caption's relatedTo.
+    const stem = (filename) => filename.replace(/\.[^.]+$/, "");
+    const byAnchor = new Map();
+    for (const u of items) {
+      const anchorId = u.relatedTo ?? u.artifactId;
+      if (!byAnchor.has(anchorId)) byAnchor.set(anchorId, []);
+      byAnchor.get(anchorId).push(u);
+    }
+    for (const group of byAnchor.values()) {
+      const videos = group.filter((u) => u.kind === "video");
+      const subsPool = group.filter((u) => u.kind === "captions");
+      for (const video of videos) {
+        const idx = subsPool.findIndex((s) => stem(s.filename) === stem(video.filename));
+        const matched =
+          idx >= 0
+            ? subsPool.splice(idx, 1)[0]
+            : videos.length === 1 && subsPool.length === 1
+              ? subsPool.pop()
+              : null;
+        const anchorId = video.relatedTo ?? video.artifactId;
+        video.subtitlesUrl = matched
+          ? `/captions/${matched.artifactId}?token=${tokenFor(anchorId)}`
+          : null;
+      }
+    }
 
-        if (anchor.kind === "project") {
-          mode = "beat";
-          manifest = { artifactId: anchor.artifactId, size: anchor.size };
-          let order = null;
-          try {
-            const parsed = JSON.parse(await readArtifactText(anchor.artifactId));
-            order = Array.isArray(parsed?.beats) ? parsed.beats : null;
-          } catch {
-            order = null;
-          }
-          const videoByArtifactId = new Map(videoChildren.map((v) => [v.artifactId, v]));
-          const ordered = [];
-          if (order) {
-            for (const b of order) {
-              const v = videoByArtifactId.get(b.artifactId);
-              if (v) {
-                ordered.push(v);
-                videoByArtifactId.delete(b.artifactId);
-              }
-            }
-          }
-          // Any beat not listed in the manifest (shouldn't normally happen) — keep it
-          // visible rather than silently dropping an uploaded video.
-          ordered.push(...videoByArtifactId.values());
-          beats = ordered;
-        } else {
-          mode = "merged";
-          beats = [anchor];
-        }
-
-        const beatViews = beats.map((v, i) => ({
-          artifactId: v.artifactId,
-          filename: v.filename,
-          size: v.size,
-          order: i,
-          checksumVerified: v.checksumVerified,
-          playbackUrl: withToken(`/pulsevault/artifacts/${v.artifactId}`),
-          captions: attachCaptions(v),
-        }));
-
-        const creation_date = [anchor, ...children].reduce(
-          (latest, s) => (s.creation_date > latest ? s.creation_date : latest),
-          anchor.creation_date,
-        );
-
-        return {
-          anchorArtifactId: anchor.artifactId,
-          mode,
-          manifest,
-          beats: beatViews,
-          unmatchedCaptions: captionsPool.map((c) => ({
-            artifactId: c.artifactId,
-            filename: c.filename,
-            vttUrl: withToken(`/captions/${c.artifactId}`),
-          })),
-          creation_date,
-        };
-      }),
-    );
-
-    return reply.send(pulses.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));
+    return reply.send(items.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));
   },
 );
 
@@ -697,8 +744,8 @@ app.get(
 // would fail for every request that didn't happen to arrive on the exact
 // host header the token was issued under.
 //
-// `?uploadUnit=beat|merged` lets this *one* pairing link override the
-// deployment-wide default set above — demonstrates running "beat" and
+// `?uploadUnit=segment|merged` lets this *one* pairing link override the
+// deployment-wide default set above — demonstrates running "segment" and
 // "merged" sessions concurrently (README "Upload unit") instead of one fixed
 // value for every pairing. Omit it and behavior is unchanged: the link
 // carries no override, and the client falls back to whatever `/capabilities`
@@ -717,7 +764,7 @@ app.get(
         properties: {
           uploadUnit: {
             type: "string",
-            enum: ["beat", "merged"],
+            enum: ["segment", "merged"],
             description: "Per-link override of the deployment-wide upload-unit default.",
           },
         },
@@ -796,16 +843,24 @@ await app.register(pulseVault, {
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit: uploadUnitDefault,
-  // Accept MP4 videos, Pulse draft bundles (.pulse) + diagnostic zips, and WebVTT captions.
-  allowedExtensions: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"] },
+  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
+  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
+  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
+  // those would make this a broken pairing target. Mirrors ../fastify-demo.
+  allowedExtensions: {
+    video: [".mp4"],
+    project: [".pulse", ".zip"],
+    captions: [".vtt"],
+    thumbnail: [".jpg", ".jpeg", ".png"],
+  },
   // validatePayload runs for every kind, with ctx.kind telling you which.
   validatePayload: async (request, ctx) => {
     if (ctx.kind !== "video") return;
     await validateVideo(request, ctx);
   },
-  // Fired once any artifact (video, project bundle, or captions) finishes
-  // uploading. This is where the artifact index gets its rows — one write
-  // per completed upload, so /pulses never has to crawl the filesystem.
+  // Fired once any artifact (video, project bundle, captions or thumbnail)
+  // finishes uploading. This is where the artifact index gets its rows — one
+  // write per completed upload, so /videos never has to crawl the filesystem.
   onUploadComplete: async (_req, { artifactId, kind, size }) => {
     app.log.info({ artifactId, kind, size }, "pulsevault upload complete");
     const row = await readArtifactFromDisk(artifactId);
