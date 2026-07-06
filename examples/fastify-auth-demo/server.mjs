@@ -44,7 +44,7 @@ const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
 const libraryHtml = readFileSync(path.join(__dirname, "public/library.html"), "utf8");
 const dataDir = path.join(__dirname, "data");
 
-const port = Number(process.env.PORT ?? 3002);
+const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 
 // ---------------------------------------------------------------------------
@@ -335,8 +335,8 @@ await app.register(fastifyHelmet, {
       "connect-src": ["'self'", "https://esm.sh", "https://cdn.jsdelivr.net"],
       // Helmet turns on `upgrade-insecure-requests` by default, which makes the
       // browser upgrade same-origin fetches to HTTPS. Browsers exempt localhost,
-      // but over a LAN IP (http://<ip>:3002) it upgrades /deeplinks, /videos, etc.
-      // to https://<ip>:3002 — which has no TLS — so those requests fail and the
+      // but over a LAN IP (http://<ip>:3000) it upgrades /deeplinks, /videos, etc.
+      // to https://<ip>:3000 — which has no TLS — so those requests fail and the
       // page never renders. Disable it so the demo works over plain HTTP on a
       // LAN. In prod the TLS-terminating edge serves everything over HTTPS
       // anyway, so nothing is lost.
