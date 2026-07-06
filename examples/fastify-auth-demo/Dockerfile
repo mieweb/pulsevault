@@ -27,7 +27,7 @@ COPY --chown=node:node examples/fastify-auth-demo/public ./public
 # Uploaded videos land here; a named volume mounts over it.
 RUN mkdir -p data && chown -R node:node /app/examples/fastify-auth-demo
 USER node
-EXPOSE 3002
+EXPOSE 3000
 # npm start = `prisma migrate deploy && node server.mjs` — the schema is
 # applied against the compose Postgres before the server boots.
 CMD ["npm", "start"]
