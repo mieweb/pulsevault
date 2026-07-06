@@ -52,7 +52,6 @@
         h1 { font-size: 0.95rem; }
         .brand-sub { font-size: 0.68rem; }
         .docs-link { font-size: 0.68rem; padding: 0.35rem 0.6rem; }
-        .beat-row video { width: 8.5rem; max-height: 11rem; }
         footer { flex-direction: column; align-items: flex-start; gap: 0.35rem; }
       }
 
@@ -109,23 +108,12 @@
       .feature-list li::before { content: "→"; color: var(--accent); position: absolute; left: 0; top: 0.4rem; }
       code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; }
 
-      .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.68rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
-      .badge.on { background: var(--success-soft); border-color: rgba(52, 211, 153, 0.35); color: var(--success); }
-
-      .pulse-card { padding: 0.9rem 0; border-top: 1px solid var(--border); }
-      .pulse-card:first-child { border-top: none; padding-top: 0; }
-      .beat-row { display: flex; gap: 0.6rem; overflow-x: auto; padding-bottom: 0.4rem; -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity; }
-      .beat-row video { scroll-snap-align: start; }
-      .beat-row video { width: 10.5rem; max-height: 13rem; border-radius: 7px; background: #000; flex: none; border: 1px solid var(--border); }
-      .pulse-meta { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin: 0.6rem 0 0; }
-
       .event-row { display: flex; gap: 0.6rem; align-items: center; font-size: 0.76rem; padding: 0.35rem 0; border-top: 1px solid var(--border); }
       .event-row:first-child { border-top: none; }
       .event-phase { flex: none; width: 5rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; color: var(--text-2); }
       .event-list { max-height: 12rem; overflow-y: auto; }
-      .event-list::-webkit-scrollbar, .pulse-list::-webkit-scrollbar { width: 6px; }
-      .event-list::-webkit-scrollbar-thumb, .pulse-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-      .pulse-list { margin-top: 0.75rem; max-height: 54rem; overflow-y: auto; padding-right: 0.25rem; }
+      .event-list::-webkit-scrollbar { width: 6px; }
+      .event-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
       footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
       footer a { color: var(--text-3); word-break: break-all; }
@@ -202,7 +190,7 @@ graph TB
     BA["Better Auth<br/>(prismaAdapter)"] -->|"sign-in sessions"| T1
     H["onUploadComplete hook"] -->|"one write per finished upload"| T2
     Boot["boot-time reconcile"] -.->|"sidecars in ./data stay<br/>the source of truth"| T2
-    Q["GET /pulses"] -->|"one indexed query,<br/>grouped by relatedTo"| T2
+    Q["GET /videos"] -->|"one indexed query,<br/>relatedTo scopes the tokens"| T2
     D["authorized DELETE"] -->|"prune row"| T2`;
 
       const DB_OPT_DIAGRAM = `
@@ -211,7 +199,7 @@ graph LR
         R1["GET /videos"] -->|"re-reads EVERY sidecar file,<br/>every request — O(uploads), forever"| FS[("./data<br/>sidecar files")]
     end
     subgraph after ["with the artifact index (this demo)"]
-        R2["GET /pulses"] -->|"one indexed SQL query"| PG[("Postgres")]
+        R2["GET /videos"] -->|"one indexed SQL query"| PG[("Postgres")]
     end`;
 
       const PROD_DIAGRAM = `
@@ -384,7 +372,7 @@ graph LR
                   Capability tokens: HMAC-signed by <code>issueCapabilityToken</code>, scoped to this session,
                   expiring in ${auth ? Math.round(auth.tokenExpiresInSeconds / 60) : "…"} min
                   (issuer <code>${auth ? auth.issuer : "…"}</code>).
-                  One token covers every beat/caption/manifest via <code>relatedTo</code>.
+                  One token covers every segment/caption/manifest via <code>relatedTo</code>.
                 </li>
                 <li>Checksum: the app's sha256 is verified server-side before an upload is marked ready (<code>createChecksumValidator</code>).</li>
                 <li>Live activity below is fed by <code>onArtifactEvent</code> — the same hook used for ops metrics + audit logging.</li>
@@ -405,10 +393,10 @@ graph LR
               <${MermaidDiagram} chart=${DB_SCHEMA_DIAGRAM} />
               <ul className="feature-list">
                 <li>
-                  <b>Read path:</b> <code>/pulses</code> is a single SQL query over the artifact index
-                  (<code>relatedTo</code> is indexed for the session grouping) instead of re-reading every
-                  sidecar file on every request — the no-auth demo's approach is O(uploads) forever; this
-                  one stays flat as the vault grows.
+                  <b>Read path:</b> <code>/videos</code> is a single SQL query over the artifact index
+                  (<code>relatedTo</code> is indexed — it scopes the per-pulse watch tokens and the feed's
+                  client-side grouping) instead of re-reading every sidecar file on every request — the
+                  no-auth demo's approach is O(uploads) forever; this one stays flat as the vault grows.
                 </li>
                 <li>
                   <b>Write path costs nothing on the upload:</b> <code>onUploadComplete</code> inserts one
@@ -535,7 +523,7 @@ graph LR
                 <span
                   className="mono"
                   style=${{ textTransform: "none", fontWeight: 400 }}
-                  title="Per-link override — carried on the pairing link itself (PROTOCOL.md §3, §8), independent of the deployment-wide toggle in the status bar above. Lets you pair two devices to 'beat' and 'merged' sessions at the same time."
+                  title="Per-link override — carried on the pairing link itself (PROTOCOL.md §3, §8), independent of the deployment-wide toggle in the status bar above. Lets you pair two devices to 'segment' and 'merged' sessions at the same time."
                 >(overrides the status-bar toggle, this link only)</span>
               </label>
               <select
@@ -546,7 +534,7 @@ graph LR
                 onChange=${(e) => setOverride(e.target.value)}
               >
                 <option value="">Use server default (from /capabilities)</option>
-                <option value="beat">Force "beat" for this link</option>
+                <option value="segment">Force "segment" for this link</option>
                 <option value="merged">Force "merged" for this link</option>
               </select>
               <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
@@ -595,58 +583,36 @@ graph LR
           </section>`;
       }
 
-      function PulseCard({ pulse }) {
-        const captionsCount =
-          pulse.beats.filter((b) => b.captions).length + pulse.unmatchedCaptions.length;
-        const checksumCount = pulse.beats.filter((b) => b.checksumVerified).length;
+      // Live pulse count + link to the /library feed (the Shorts/Reels-style
+      // player — the uploads gallery lives on its own page, same as
+      // ../fastify-demo). /videos is dashboard-gated, so this only polls (and
+      // only shows a count) once signed in.
+      function FeedLink({ session }) {
+        const [count, setCount] = useState(null);
+        useEffect(() => {
+          if (!session?.user) { setCount(null); return; }
+          // Count PULSES (feed items), not raw artifacts — a 6-segment session is
+          // six clip videos + an ordering manifest on the wire, but one feed item.
+          // Same grouping as the feed page: one pulse per session anchor
+          // (`relatedTo ?? artifactId`), counted only if it actually has video.
+          const refresh = () =>
+            fetch("/videos")
+              .then((r) => (r.ok ? r.json() : null))
+              .then((uploads) => {
+                if (!uploads) return;
+                const anchors = new Set();
+                for (const u of uploads) {
+                  if (u.kind === "video") anchors.add(u.relatedTo ?? u.artifactId);
+                }
+                setCount(anchors.size);
+              })
+              .catch(() => {});
+          refresh();
+          const id = setInterval(refresh, 8000);
+          return () => clearInterval(id);
+        }, [session]);
 
-        return html`
-          <div className="pulse-card">
-            <div className="beat-row">
-              ${pulse.beats.map(
-                (b) => html`
-                  <video key=${b.artifactId} src=${b.playbackUrl} controls preload="metadata">
-                    ${b.captions &&
-                    html`<track kind="subtitles" src=${b.captions.vttUrl} srcLang="en" label="Captions" default />`}
-                  </video>`,
-              )}
-            </div>
-            <div className="pulse-meta">
-              <span className="badge">
-                ${pulse.mode === "beat"
-                  ? `${pulse.beats.length} beat${pulse.beats.length === 1 ? "" : "s"}`
-                  : "merged video"}
-              </span>
-              ${pulse.manifest && html`<span className="badge">relatedTo-linked</span>`}
-              ${captionsCount > 0 &&
-              html`<span className="badge">${captionsCount} caption track${captionsCount === 1 ? "" : "s"}</span>`}
-              ${checksumCount > 0 && html`<span className="badge on">✓ checksum verified</span>`}
-            </div>
-            <p className="mono" style=${{ margin: "0.5rem 0 0" }}>
-              ${new Date(pulse.creation_date).toLocaleString()} · ${pulse.anchorArtifactId}
-            </p>
-          </div>`;
-      }
-
-      function PulsesPanel() {
-        const [pulses, refresh] = usePolledJson("/pulses", 8000);
-        return html`
-          <section>
-            <p className="eyebrow">Recordings</p>
-            <div className="panel">
-              <div className="top-row">
-                <h2>Uploads${pulses?.length ? ` (${pulses.length})` : ""}</h2>
-                <button className="btn btn-ghost btn-sm" onClick=${refresh}>↻ Refresh</button>
-              </div>
-              <div className="pulse-list">
-                ${pulses === null
-                  ? html`<p className="mono">Loading…</p>`
-                  : pulses.length === 0
-                    ? html`<p className="mono">No uploads yet.</p>`
-                    : pulses.map((p) => html`<${PulseCard} key=${p.anchorArtifactId} pulse=${p} />`)}
-              </div>
-            </div>
-          </section>`;
+        return html`<a href="/library" className="docs-link">View feed${count ? ` (${count})` : ""} ↗</a>`;
       }
 
       function App() {
@@ -678,7 +644,10 @@ graph LR
                 <p className="brand-sub">Reference server · Fastify · Better Auth + capability tokens</p>
               </div>
             </div>
-            <a href="/docs" className="docs-link">API Reference ↗</a>
+            <div style=${{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+              <${FeedLink} session=${session} />
+              <a href="/docs" className="docs-link">API Reference ↗</a>
+            </div>
           </div>
 
           <${StatusBar} caps=${caps} auth=${auth} session=${session} onSignOut=${signOut} />
@@ -691,7 +660,6 @@ graph LR
           html`<${Fragment}>
             <${PairPanel} caps=${caps} onAuth=${setAuth} />
             <${EventsPanel} />
-            <${PulsesPanel} />
           <//>`}
 
           <footer>

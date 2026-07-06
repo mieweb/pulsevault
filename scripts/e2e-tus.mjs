@@ -124,7 +124,7 @@ async function main() {
     assert.equal(typeof caps.protocolVersion, "number");
     assert.ok(caps.minSupportedVersion <= caps.protocolVersion);
     assert.ok(caps.protocolVersion <= caps.maxSupportedVersion);
-    assert.ok(["beat", "merged"].includes(caps.uploadUnit));
+    assert.ok(["segment", "merged"].includes(caps.uploadUnit));
     console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
 
     // 2a. Dashboard routes are Better Auth-protected: no session -> 401.
