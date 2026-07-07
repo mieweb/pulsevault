@@ -10,6 +10,10 @@
 #
 # Postgres data (`pgdata`) and uploaded videos (`vaultdata`) persist in named
 # volumes across restarts; `docker compose down -v` wipes both.
+#
+# This runs one single-threaded Node process (one core). To use all cores on a
+# CPU-bound box, layer the opt-in clustering override on top:
+#   docker compose -f compose.yaml -f compose.cluster.yaml up --build
 
 services:
   db:
