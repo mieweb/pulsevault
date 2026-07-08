@@ -395,6 +395,16 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const handleTus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
+    // A client that drops the connection mid-request — a mobile app killed during a PATCH, a
+    // network reset, a cancelled upload — makes Node emit an 'error' ('aborted' / ECONNRESET) on
+    // the raw request (and sometimes response) stream. Node treats an unhandled 'error' event as
+    // fatal: with no listener it re-throws and crashes the whole process, killing every other
+    // in-flight upload. It fires from the socket-close handler on a later tick, so the try/catch
+    // below never sees it. Attach no-op listeners so an aborted connection is just a dropped
+    // request: @tus/server sees the truncated body, the stored offset simply doesn't advance, and
+    // the client resumes from the last persisted byte on its next PATCH.
+    req.on('error', () => {});
+    res.on('error', () => {});
     const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
     try {
       // Inside the try: runAuthorize does storage I/O (kind/relatedTo resolution)
@@ -536,6 +546,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       // of letting an unhandled 'error' crash the process. Destroy the source on
       // client disconnect so the file descriptor is never leaked.
       result.stream.on('error', (err) => failClosed(res, err, 'artifact stream'));
+      // A client that aborts mid-download makes the *response* stream emit its own
+      // 'error' (ECONNRESET / EPIPE). `.pipe` doesn't forward that, and an unhandled
+      // 'error' on `res` is fatal to the process — so swallow it (the 'close' handler
+      // above already tears down the source and reclaims the fd).
+      res.on('error', () => {});
       res.on('close', () => result.stream.destroy());
       result.stream.pipe(res);
     } catch (err) {
