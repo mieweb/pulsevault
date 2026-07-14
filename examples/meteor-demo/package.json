@@ -1,7 +1,7 @@
 {
   "name": "pulsevault-meteor-demo",
   "private": true,
-  "description": "Meteor demo server for the Pulse React Native app — same demo as ../fastify-auth-demo and ../express-demo, but on @mieweb/pulsevault/core mounted via WebApp.connectHandlers",
+  "description": "Minimal Meteor demo server for the Pulse React Native app — no auth, local storage, same as ../fastify-demo but on @mieweb/pulsevault/core mounted via WebApp.connectHandlers",
   "scripts": {
     "start": "meteor run",
     "test": "meteor test --once --driver-package meteortesting:mocha",
