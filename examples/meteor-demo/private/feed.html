@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>Feed — PulseVault Minimal Meteor Demo</title>
+    <style>
+      :root {
+        --bg: #000;
+        --border: #232a38;
+        --text: #e7eaf0;
+        --text-2: #9aa4b8;
+        --text-3: #626d82;
+        --accent: #10b981;
+        /* Pulse app's Accent (src/constants/theme.ts) — the karaoke highlight color. */
+        --accent-red: #ff383c;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      * { box-sizing: border-box; min-width: 0; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); }
+
+      /* ── The feed: full-viewport vertical pager (Shorts/Reels style). CSS
+         scroll-snap does all the paging — JS only decides who plays. ── */
+      .feed { height: 100dvh; overflow-y: auto; scroll-snap-type: y mandatory; scrollbar-width: none; }
+      .feed::-webkit-scrollbar { display: none; }
+      .slide {
+        height: 100dvh;
+        scroll-snap-align: start;
+        scroll-snap-stop: always; /* a fast flick can't skip past a pulse */
+        position: relative;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .slide video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+      /* ── Chrome overlaid on the video ── */
+      .top-bar {
+        /* Fixed, not absolute: it lives inside the scrolling feed but must stay
+           put while slides snap underneath it. */
+        position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 0.9rem 1rem 2.2rem;
+        background: linear-gradient(rgba(0, 0, 0, 0.55), transparent);
+        pointer-events: none;
+      }
+      .top-bar a { pointer-events: auto; }
+      .brand-row { display: flex; align-items: center; gap: 0.55rem; }
+      .brand-mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #047857); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; flex: none; }
+      .brand-row h1 { font-size: 1rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+      .brand-sub { font-size: 0.7rem; color: var(--text-2); margin: 0.05rem 0 0; }
+      .pair-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.7rem; font-size: 0.75rem; font-weight: 600; background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.18); color: var(--text); border-radius: 999px; text-decoration: none; backdrop-filter: blur(6px); }
+      .pair-link:hover { border-color: var(--accent); }
+
+      /* IG-story style progress: one bar per clip. */
+      .progress-row { position: absolute; top: 0.35rem; left: 0.75rem; right: 0.75rem; z-index: 4; display: flex; gap: 0.25rem; }
+      .progress-seg { flex: 1; height: 3px; border-radius: 999px; background: rgba(255, 255, 255, 0.3); overflow: hidden; }
+      .progress-fill { height: 100%; background: #fff; border-radius: 999px; }
+
+      /* The subtitle pill — mirrors the app's CaptionOverlay: translucent black
+         pill, spoken words white, future words dim, active word Pulse red. */
+      .subtitle-overlay {
+        position: absolute; left: 0; right: 0; bottom: 17%; z-index: 2;
+        display: flex; justify-content: center; padding: 0 1rem;
+        pointer-events: none; /* taps fall through to the video */
+      }
+      .subtitle-pill {
+        max-width: 85%; padding: 0.3em 0.6em; border-radius: 0.5em;
+        background: rgba(0, 0, 0, 0.6);
+        font-size: clamp(1rem, 2.6vmin, 1.25rem); font-weight: 700; line-height: 1.35;
+        text-align: center; text-wrap: balance;
+      }
+      .word-spoken { color: #fff; }
+      .word-active { color: var(--accent-red); }
+      .word-future { color: rgba(255, 255, 255, 0.45); }
+
+      .info-overlay {
+        position: absolute; left: 0; right: 4.5rem; bottom: 0; z-index: 2;
+        padding: 2.5rem 1rem 1.1rem;
+        background: linear-gradient(transparent, rgba(0, 0, 0, 0.6));
+        pointer-events: none;
+      }
+      .badge { display: inline-block; padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; background: rgba(255, 255, 255, 0.14); border: 1px solid rgba(255, 255, 255, 0.2); color: var(--text); }
+      .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.68rem; word-break: break-all; color: var(--text-2); }
+
+      /* The uploaded `kind: "thumbnail"` artifact (merged mode only), shown as a
+         small labeled preview so the demo visibly exercises the poster kind. */
+      .thumb { display: inline-flex; flex-direction: column; gap: 0.2rem; margin: 0 0 0.5rem; }
+      .thumb-label { font-size: 0.55rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); }
+      .thumb img { width: 3.4rem; height: 4.4rem; object-fit: cover; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.25); background: #000; display: block; }
+
+      .rail { position: absolute; right: 0.6rem; bottom: 4.5rem; z-index: 3; display: flex; flex-direction: column; gap: 0.7rem; align-items: center; }
+      .rail-btn {
+        width: 2.9rem; height: 2.9rem; border-radius: 50%;
+        background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.18);
+        color: var(--text); font-size: 1.15rem; cursor: pointer; backdrop-filter: blur(6px);
+        display: flex; align-items: center; justify-content: center;
+      }
+      .rail-btn:hover { border-color: var(--accent); }
+
+      /* Big center glyph shown when paused or when the browser blocked autoplay. */
+      .play-glyph {
+        position: absolute; inset: 0; z-index: 2;
+        display: flex; align-items: center; justify-content: center;
+        pointer-events: none; font-size: 3.5rem; color: rgba(255, 255, 255, 0.85);
+        text-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
+      }
+
+      /* Empty / loading state fills the viewport like a slide. */
+      .placeholder { height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.9rem; text-align: center; padding: 1.5rem; }
+      .placeholder p { margin: 0; color: var(--text-2); font-size: 0.9rem; max-width: 24rem; }
+      .placeholder a { color: var(--accent); }
+      .placeholder .credit { font-size: 0.7rem; color: var(--text-3); }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Same no-build React setup as the pairing page (index.html): pinned ESM
+         builds + `htm` templating. Each page is its own tiny React app — no
+         router, the server just serves a different file per route. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.1.0",
+          "react-dom/client": "https://esm.sh/react-dom@19.1.0/client",
+          "htm/react": "https://esm.sh/htm@3.1.1/react?deps=react@19.1.0"
+        }
+      }
+    </script>
+    <script type="module">
+      import { useState, useEffect, useRef, useCallback } from "react";
+      import { createRoot } from "react-dom/client";
+      import { html } from "htm/react";
+
+      function formatSize(bytes) {
+        const units = ["B", "KB", "MB", "GB"];
+        let n = bytes, i = 0;
+        while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+        return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+      }
+
+      // One pulse = every artifact sharing a session anchor. Segment sessions upload each clip
+      // under its own artifactId with `relatedTo` pointing at the session's ordering manifest
+      // (kind "project"); a merged session is one video whose captions/thumbnail point at it.
+      // Anchoring on `relatedTo ?? artifactId` puts each artifact in exactly one group either way.
+      function groupUploads(uploads) {
+        const groups = new Map();
+        for (const u of uploads) {
+          const anchorId = u.relatedTo ?? u.artifactId;
+          if (!groups.has(anchorId)) groups.set(anchorId, []);
+          groups.get(anchorId).push(u);
+        }
+        return [...groups.entries()]
+          .map(([anchorId, items]) => ({
+            anchorId,
+            items,
+            newest: items.reduce((m, i) => (i.creation_date > m ? i.creation_date : m), ""),
+          }))
+          .sort((a, b) => b.newest.localeCompare(a.newest));
+      }
+
+      // Parse the WebVTT served by /subtitles/:id into cues with per-word timing.
+      // Word timing comes from WebVTT inline cue timestamps
+      // (`word <00:00:01.500>word` — the karaoke syntax the Pulse app emits from
+      // whisper's word-level output); cues without tags fall back to linear
+      // interpolation across the cue — an approximation that looks right at demo scale.
+      function parseVtt(text) {
+        const toSeconds = (h, m, s, ms) => (+h) * 3600 + (+m) * 60 + (+s) + (+ms) / 1000;
+        const parseStamp = (stamp) => {
+          const [, h, m, s, ms] = stamp.match(/(\d{2}):(\d{2}):(\d{2})[.,](\d{3})/);
+          return toSeconds(h, m, s, ms);
+        };
+        const time = /(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})/;
+        const cues = [];
+        for (const block of text.replace(/\r+/g, "").split(/\n\n+/)) {
+          const lines = block.split("\n").filter((l) => l.trim().length > 0);
+          const timingIdx = lines.findIndex((l) => time.test(l));
+          if (timingIdx < 0) continue; // WEBVTT header / NOTE blocks
+          const [, startStamp, endStamp] = lines[timingIdx].match(time);
+          const start = parseStamp(startStamp);
+          const end = parseStamp(endStamp);
+          if (end <= start) continue;
+          const raw = lines.slice(timingIdx + 1).join(" ");
+
+          let words;
+          if (/<\d{2}:\d{2}:\d{2}[.,]\d{3}>/.test(raw)) {
+            // Real word timing: split on the tags — even-index chunks are text, each
+            // preceded (except the first) by the timestamp it starts at.
+            const parts = raw.split(/<(\d{2}:\d{2}:\d{2}[.,]\d{3})>/);
+            words = [];
+            let t = start;
+            for (let i = 0; i < parts.length; i += 2) {
+              if (i > 0) t = parseStamp(parts[i - 1]);
+              for (const w of parts[i].trim().split(/\s+/).filter(Boolean)) {
+                words.push({ text: w, start: t });
+              }
+            }
+          } else {
+            const wordsRaw = raw.split(/\s+/).filter(Boolean);
+            const slice = (end - start) / wordsRaw.length;
+            words = wordsRaw.map((w, i) => ({ text: w, start: start + i * slice }));
+          }
+          if (words.length) cues.push({ start, end, words });
+        }
+        return cues;
+      }
+
+      // ── Pure overlay pieces ────────────────────────────────────────────────
+
+      function SegmentProgress({ count, current, progress }) {
+        return html`
+          <div className="progress-row">
+            ${Array.from({ length: count }, (_, i) => html`
+              <div className="progress-seg" key=${i}>
+                <div
+                  className="progress-fill"
+                  style=${{ width: i < current ? "100%" : i === current ? `${progress * 100}%` : "0%" }}
+                ></div>
+              </div>`)}
+          </div>`;
+      }
+
+      // Mirrors the app's CaptionOverlay word states: spoken solid white, the
+      // most recently *started* word in Pulse red, words yet to come dimmed.
+      function SubtitleOverlay({ cue, wordIdx }) {
+        if (!cue) return null;
+        return html`
+          <div className="subtitle-overlay">
+            <p className="subtitle-pill">
+              ${cue.words.map((w, i) => html`
+                <span key=${i} className=${i === wordIdx ? "word-active" : i < wordIdx ? "word-spoken" : "word-future"}>
+                  ${w.text}${i < cue.words.length - 1 ? " " : ""}
+                </span>`)}
+            </p>
+          </div>`;
+      }
+
+      // ── The smart player: one <video> per pulse that plays its clips back to
+      // back (manifest order), swaps subtitles per clip, and reports progress.
+      // Segment sessions have many clips; a merged session is one looping video. ──
+      function SmartPlayer({ pulse, active, near, muted, onToggleMute }) {
+        const { anchorId, items } = pulse;
+        const videos = items.filter((u) => u.kind === "video");
+        const manifest = items.find((u) => u.kind === "project");
+        const poster = items.find((u) => u.kind === "thumbnail"); // merged-mode poster frame
+        const subtitlesCount = items.filter((u) => u.kind === "captions").length; // "captions" is the wire kind
+        // A merged session is a single video (it also ships a beat manifest + thumbnail, so
+        // "has a manifest" can't tell the modes apart); >1 video means a segment session.
+        const isSegmented = videos.length > 1;
+        const totalSize = items.reduce((sum, u) => sum + u.size, 0);
+
+        const videoRef = useRef(null);
+        const [clipIndex, setClipIndex] = useState(0);
+        const [progress, setProgress] = useState(0);
+        const [halted, setHalted] = useState(false); // user-paused OR autoplay blocked
+        const [cues, setCues] = useState(null);
+        const [cuePos, setCuePos] = useState(null); // { cueIdx, wordIdx }
+
+        // Clip order comes from a segment session's ordering manifest
+        // (`{ segments: [{ artifactId, order }] }`) — authoritative; upload timestamps are
+        // only the fallback while/if it's missing. (A merged session's `-beats.pulse` is a
+        // timecode manifest keyed by local segmentId, not an ordering, and it has a single
+        // video anyway — so `m.segments` is absent there and order stays null, which is fine.)
+        const [order, setOrder] = useState(null);
+        useEffect(() => {
+          if (!manifest) return;
+          let cancelled = false;
+          fetch(manifest.playbackUrl)
+            .then((r) => r.json())
+            .then((m) => {
+              if (cancelled || !Array.isArray(m?.segments)) return;
+              setOrder(new Map(m.segments.map((s) => [s.artifactId, s.order])));
+            })
+            .catch(() => {});
+          return () => { cancelled = true; };
+        }, [manifest?.artifactId]);
+
+        const clips = [...videos].sort((a, b) =>
+          order
+            ? (order.get(a.artifactId) ?? 0) - (order.get(b.artifactId) ?? 0)
+            : a.creation_date.localeCompare(b.creation_date),
+        );
+        const clip = clips[Math.min(clipIndex, clips.length - 1)];
+        const clipCount = clips.length;
+        const clipCountRef = useRef(clipCount);
+        clipCountRef.current = clipCount;
+
+        // The <video>'s src is managed imperatively, never as a React prop — the
+        // 8s feed poll can re-render this component without touching playback.
+        useEffect(() => {
+          const video = videoRef.current;
+          if (!video || !clip) return;
+          if (!near) {
+            // Off-screen slides release their network/decoder resources.
+            if (video.src) { video.removeAttribute("src"); video.load(); }
+            return;
+          }
+          const src = new URL(clip.playbackUrl, location.origin).href;
+          if (video.src !== src) {
+            video.src = src;
+            video.preload = "auto";
+            // A single merged video loops natively; segment sessions advance on `ended`.
+            video.loop = clipCount === 1;
+            if (active && !halted) video.play().catch(() => setHalted(true));
+          }
+        }, [clip?.playbackUrl, near, clipCount]);
+
+        // Play when snapped into view; pause + rewind to clip 1 when scrolled away
+        // (matches Reels: re-entering a slide starts the pulse over).
+        useEffect(() => {
+          const video = videoRef.current;
+          if (!video) return;
+          if (active) {
+            setHalted(false);
+            video.play().catch(() => setHalted(true));
+          } else {
+            video.pause();
+            video.currentTime = 0;
+            setClipIndex(0);
+            setProgress(0);
+            setCuePos(null);
+          }
+        }, [active]);
+
+        useEffect(() => {
+          if (videoRef.current) videoRef.current.muted = muted;
+        }, [muted]);
+
+        // Sequential clips: when one ends, the next starts (wrap to clip 1).
+        useEffect(() => {
+          const video = videoRef.current;
+          if (!video) return;
+          const onEnded = () => setClipIndex((i) => (i + 1) % clipCountRef.current);
+          video.addEventListener("ended", onEnded);
+          return () => video.removeEventListener("ended", onEnded);
+        }, []);
+
+        // The merged video carries its captions starting at 0:00 (segment clips carry
+        // none), so the cue set swaps wholesale when the active clip changes — no
+        // timeline offset math needed.
+        useEffect(() => {
+          setCues(null);
+          setCuePos(null);
+          if (!clip?.subtitlesUrl) return;
+          let cancelled = false;
+          fetch(clip.subtitlesUrl)
+            .then((r) => r.text())
+            .then((text) => { if (!cancelled) setCues(parseVtt(text)); })
+            .catch(() => {});
+          return () => { cancelled = true; };
+        }, [clip?.subtitlesUrl]);
+
+        // One rAF loop while active drives both the segment bar and the karaoke
+        // highlight. setState is change-gated so 60fps polling ≠ 60fps renders.
+        useEffect(() => {
+          if (!active) return;
+          let raf;
+          const tick = () => {
+            const video = videoRef.current;
+            if (video && Number.isFinite(video.duration) && video.duration > 0) {
+              const t = video.currentTime;
+              const p = Math.min(t / video.duration, 1);
+              setProgress((prev) => (Math.abs(p - prev) >= 0.005 ? p : prev));
+              setCuePos((prev) => {
+                const cueIdx = cues ? cues.findIndex((c) => t >= c.start && t < c.end) : -1;
+                if (cueIdx < 0) return prev === null ? prev : null;
+                const cue = cues[cueIdx];
+                let wordIdx = 0;
+                for (let i = 0; i < cue.words.length; i++) if (t >= cue.words[i].start) wordIdx = i;
+                return prev?.cueIdx === cueIdx && prev?.wordIdx === wordIdx ? prev : { cueIdx, wordIdx };
+              });
+            }
+            raf = requestAnimationFrame(tick);
+          };
+          raf = requestAnimationFrame(tick);
+          return () => cancelAnimationFrame(raf);
+        }, [active, cues]);
+
+        // A tap is a user gesture, so play() here also recovers from blocked autoplay.
+        const togglePlay = useCallback(() => {
+          const video = videoRef.current;
+          if (!video) return;
+          if (video.paused) {
+            video.play().then(() => setHalted(false)).catch(() => setHalted(true));
+          } else {
+            video.pause();
+            setHalted(true);
+          }
+        }, []);
+
+        const activeCue = cuePos && cues ? cues[cuePos.cueIdx] : null;
+
+        return html`
+          <div style=${{ position: "absolute", inset: 0 }} onClick=${togglePlay}>
+            <video ref=${videoRef} muted playsInline poster=${poster?.playbackUrl ?? undefined}></video>
+            <${SegmentProgress} count=${clipCount} current=${Math.min(clipIndex, clipCount - 1)} progress=${progress} />
+            <${SubtitleOverlay} cue=${activeCue} wordIdx=${cuePos?.wordIdx ?? 0} />
+            ${halted && html`<div className="play-glyph">▶</div>`}
+            <div className="info-overlay">
+              ${poster && html`
+                <div className="thumb">
+                  <span className="thumb-label">Thumbnail</span>
+                  <img src=${poster.playbackUrl} alt="Pulse thumbnail" />
+                </div>`}
+              <p style=${{ margin: "0 0 0.4rem" }}>
+                <span className="badge">${isSegmented ? `pulse · ${clipCount} segments` : "merged"}</span>
+              </p>
+              <p className="mono" style=${{ margin: 0 }}>
+                ${formatSize(totalSize)} · ${new Date(pulse.newest).toLocaleString()}
+                ${subtitlesCount ? ` · ${subtitlesCount} subtitle${subtitlesCount > 1 ? "s" : ""}` : ""}
+              </p>
+              <p className="mono" style=${{ margin: "0.15rem 0 0", opacity: 0.7 }}>${anchorId}</p>
+            </div>
+            <div className="rail">
+              <button
+                className="rail-btn"
+                title=${muted ? "Unmute" : "Mute"}
+                onClick=${(e) => { e.stopPropagation(); onToggleMute(); }}
+              >
+                ${muted ? "🔇" : "🔊"}
+              </button>
+            </div>
+          </div>`;
+      }
+
+      function PulseSlide({ pulse, active, near, muted, onToggleMute, registerSlide }) {
+        return html`
+          <div
+            className="slide"
+            data-anchor=${pulse.anchorId}
+            ref=${(el) => registerSlide(pulse.anchorId, el)}
+          >
+            <${SmartPlayer}
+              pulse=${pulse}
+              active=${active}
+              near=${near}
+              muted=${muted}
+              onToggleMute=${onToggleMute}
+            />
+          </div>`;
+      }
+
+      function Feed() {
+        const [uploads, setUploads] = useState(null);
+        const [activeAnchor, setActiveAnchor] = useState(null);
+        const [muted, setMuted] = useState(true); // browsers require muted autoplay
+        const feedRef = useRef(null);
+        const slideEls = useRef(new Map()); // anchorId -> element, for the observer
+        const lastPayload = useRef(null);
+
+        const registerSlide = useCallback((anchorId, el) => {
+          if (el) slideEls.current.set(anchorId, el);
+          else slideEls.current.delete(anchorId);
+        }, []);
+
+        // Poll like the old page did, but skip the setState when nothing changed —
+        // an identical payload must never re-render (and risk disturbing) playback.
+        const refresh = useCallback(() => {
+          fetch("/videos")
+            .then((r) => r.text())
+            .then((text) => {
+              if (text === lastPayload.current) return;
+              lastPayload.current = text;
+              setUploads(JSON.parse(text));
+            })
+            .catch(() => {});
+        }, []);
+        useEffect(() => {
+          refresh();
+          const id = setInterval(refresh, 8000);
+          return () => clearInterval(id);
+        }, [refresh]);
+
+        // Feed = pulses that actually have video (orphan subtitle/manifest groups
+        // left behind by partial deletes would otherwise render black slides).
+        const groups = uploads === null ? null : groupUploads(uploads);
+        const pulses = groups?.filter((g) => g.items.some((u) => u.kind === "video")) ?? null;
+        const pulsesKey = pulses?.map((p) => p.anchorId).join() ?? "";
+
+        // One observer decides which slide is "the" slide: ≥60% visible plays,
+        // everything else pauses. This is the entire autoplay engine.
+        useEffect(() => {
+          if (!pulses?.length) return;
+          const observer = new IntersectionObserver(
+            (entries) => {
+              for (const entry of entries) {
+                if (entry.isIntersecting) setActiveAnchor(entry.target.dataset.anchor);
+              }
+            },
+            { root: feedRef.current, threshold: 0.6 },
+          );
+          for (const el of slideEls.current.values()) observer.observe(el);
+          return () => observer.disconnect();
+        }, [pulsesKey]);
+
+        // A new pulse prepends to the list and would shift every snap position —
+        // keep the slide the user is watching in place.
+        useEffect(() => {
+          if (!activeAnchor) return;
+          slideEls.current.get(activeAnchor)?.scrollIntoView({ behavior: "instant" });
+        }, [pulsesKey]);
+
+        const activeIndex = pulses?.findIndex((p) => p.anchorId === activeAnchor) ?? -1;
+
+        const topBar = html`
+          <div className="top-bar">
+            <div className="brand-row">
+              <div className="brand-mark">PV</div>
+              <div>
+                <h1>Feed</h1>
+                <p className="brand-sub">Minimal demo · Meteor · no auth</p>
+              </div>
+            </div>
+            <a href="/" className="pair-link">← Pair a device</a>
+          </div>`;
+
+        if (pulses === null)
+          return html`<div className="placeholder">${topBar}<p className="mono">Loading…</p></div>`;
+
+        if (pulses.length === 0)
+          return html`
+            <div className="placeholder">
+              ${topBar}
+              <div className="brand-mark" style=${{ width: "3rem", height: "3rem", fontSize: "1.2rem" }}>PV</div>
+              <p>No uploads yet — pair a device from the <a href="/">pairing page</a> and upload from the Pulse app.</p>
+              <p className="credit">@mieweb/pulsevault · <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a></p>
+            </div>`;
+
+        return html`
+          <div className="feed" ref=${feedRef}>
+            ${topBar}
+            ${pulses.map((p, i) => html`
+              <${PulseSlide}
+                key=${p.anchorId}
+                pulse=${p}
+                active=${p.anchorId === activeAnchor || (activeIndex === -1 && i === 0)}
+                near=${activeIndex === -1 ? i <= 1 : Math.abs(i - activeIndex) <= 1}
+                muted=${muted}
+                onToggleMute=${() => setMuted((m) => !m)}
+                registerSlide=${registerSlide}
+              />`)}
+          </div>`;
+      }
+
+      createRoot(document.getElementById("root")).render(html`<${Feed} />`);
+    </script>
+  </body>
+</html>
