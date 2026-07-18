@@ -183,24 +183,34 @@ function parseUploadMetadata(header: string): {
  * token for their own artifact could smuggle a second, victim artifactId as
  * a trailing path segment and have their bytes land there instead, fully
  * bypassing authorization for the artifact actually written to.
+ *
+ * Implemented with plain string ops (not the regex itself) because the
+ * unanchored-start regex is polynomial on adversarial inputs (CodeQL
+ * js/polynomial-redos). Semantics are identical: after stripping at most one
+ * trailing `/`, the match is the non-empty run of non-`/` characters at the
+ * end of the string, or no match if that run is empty (e.g. `a//`).
  */
-const TUS_LAST_URL_SEGMENT = /([^/]+)\/?$/;
+function tusLastUrlSegment(url: string): string | undefined {
+  const trimmed = url.endsWith('/') ? url.slice(0, -1) : url;
+  const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
+  return segment.length > 0 ? segment : undefined;
+}
 
 /**
  * Decode the tus file id (base64url-encoded, shaped `<kind>/<artifactId><ext>`
  * by `namingFunction` in `lib/pulsevaultTus.ts`) that `@tus/server` itself
  * will resolve a PATCH/HEAD/DELETE request to, and recover the artifactId via
  * the exact same parser `onUploadFinish` uses — so this can never drift from
- * what `@tus/server` actually operates on. See `TUS_LAST_URL_SEGMENT` above
+ * what `@tus/server` actually operates on. See `tusLastUrlSegment` above
  * for why this must match the *last* URL segment, not the first one after
  * `/upload/`.
  */
 function artifactIdFromTusUrl(url: string): string | undefined {
-  const match = TUS_LAST_URL_SEGMENT.exec(url);
-  if (!match?.[1]) return undefined;
+  const rawSegment = tusLastUrlSegment(url);
+  if (!rawSegment) return undefined;
   let lastSegment: string;
   try {
-    lastSegment = decodeURIComponent(match[1]);
+    lastSegment = decodeURIComponent(rawSegment);
   } catch {
     return undefined;
   }
