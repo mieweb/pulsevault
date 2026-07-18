@@ -195,6 +195,46 @@ test("an aborted PATCH mid-body does not crash the server process", async () => 
   }
 });
 
+test("an aborted creation-with-upload POST mid-body does not crash the server process", async () => {
+  const ctx = await startApp();
+  try {
+    // Same failure mode as the PATCH abort, but via the POST handler's creation-with-upload path
+    // (Content-Type: application/offset+octet-stream on the creation request), which also runs
+    // through BaseHandler.writeToStore.
+    const size = 1 << 16;
+    const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+    const url = new URL(`${PREFIX}/upload`, ctx.baseUrl);
+    await new Promise((resolve) => {
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          "Tus-Resumable": "1.0.0",
+          "Upload-Length": String(size),
+          "Upload-Metadata": `artifactId ${b64(ID1)},filename ${b64("clip.mp4")}`,
+          "Content-Type": "application/offset+octet-stream",
+          "Content-Length": String(size),
+        },
+      });
+      req.on("error", () => {});
+      req.write(Buffer.alloc(64));
+      setTimeout(() => {
+        req.destroy();
+        resolve();
+      }, 30);
+    });
+
+    // The server must still be alive after observing the aborted creation body.
+    await new Promise((r) => setTimeout(r, 50));
+    const caps = await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`);
+    assert.equal(caps.status, 200);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("second reserve for same artifactId returns 409", async () => {
   const ctx = await startApp();
   try {
