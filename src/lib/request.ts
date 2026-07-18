@@ -20,6 +20,8 @@ export type PulseVaultRequest = {
 export type PulseVaultLogger = {
   info(obj: unknown, msg?: string): void;
   error(obj: unknown, msg?: string): void;
+  /** Optional low-noise level for expected, per-request events (e.g. a client aborting mid-upload). */
+  debug?(obj: unknown, msg?: string): void;
 };
 
 /** Default logger for hosts that don't supply one. */
@@ -31,5 +33,9 @@ export const consoleLogger: PulseVaultLogger = {
   error(obj, msg) {
     if (msg) console.error(msg, obj);
     else console.error(obj);
+  },
+  debug(obj, msg) {
+    if (msg) console.debug(msg, obj);
+    else console.debug(obj);
   },
 };

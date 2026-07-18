@@ -325,10 +325,12 @@ function hardenPatchAgainstClientAbort(server: Server, logger: PulseVaultLogger)
   patch.writeToStore = (data, ...rest) => {
     if (data && typeof data.on === 'function') {
       data.on('error', (err: unknown) => {
-        logger.info(
-          { err: err instanceof Error ? err.message : String(err) },
-          'pulsevault: PATCH body stream aborted (client disconnected mid-upload)',
-        );
+        // Debug (falling back to info for loggers without it): a client dropping mid-upload is an
+        // expected, per-request event on flaky mobile networks — not something to page over.
+        const obj = { err: err instanceof Error ? err.message : String(err) };
+        const msg = 'pulsevault: PATCH body stream aborted (client disconnected mid-upload)';
+        if (logger.debug) logger.debug(obj, msg);
+        else logger.info(obj, msg);
       });
     }
     return original(data, ...rest);
