@@ -147,7 +147,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     logger = consoleLogger,
   } = options;
 
-  return new Server({
+  const server = new Server({
     path: tusPath,
     datastore: storage.datastore,
     maxSize,
@@ -289,6 +289,52 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       return {};
     },
   });
+
+  hardenPatchAgainstClientAbort(server, logger);
+
+  return server;
+}
+
+/**
+ * Stops a dropped upload connection from crashing the whole server process.
+ *
+ * @tus/server@2's `PatchHandler.writeToStore` pipes the incoming body (`Readable.fromWeb(req.body)`)
+ * into an internal proxy via `data.pipe(proxy)` and attaches an 'error' handler to the *proxy* — but
+ * never to `data` itself. `.pipe()` doesn't forward source errors, so when the client drops the
+ * connection mid-PATCH (a mobile app killed during a transfer, a network reset, a cancelled upload)
+ * `data` emits an 'error' ('aborted' / ECONNRESET) with no listener. An unhandled stream 'error' is
+ * fatal to Node: the process crashes, taking down every other in-flight upload (observed as the
+ * server dying and subsequent requests 502-ing).
+ *
+ * We wrap the PATCH handler's `writeToStore` to attach a no-op 'error' listener to `data` before
+ * delegating. The abort then unwinds normally — the proxy/pipeline still rejects the write and the
+ * stored offset simply doesn't advance, so the client resumes from the last persisted byte on its
+ * next PATCH. Defensive: it no-ops if a future @tus version renames/fixes this, and the extra
+ * listener is harmless if they add their own. (Long-term fix: upgrade @tus/server once it handles
+ * the source-stream error itself.)
+ */
+function hardenPatchAgainstClientAbort(server: Server, logger: PulseVaultLogger): void {
+  const patch = (server as unknown as { handlers?: Record<string, unknown> }).handlers?.PATCH as
+    | { writeToStore?: (data: NodeJS.ReadableStream, ...rest: unknown[]) => unknown }
+    | undefined;
+  if (!patch || typeof patch.writeToStore !== 'function') {
+    logger.info({}, 'pulsevault: could not harden PATCH handler against client abort (API changed?)');
+    return;
+  }
+  const original = patch.writeToStore.bind(patch);
+  patch.writeToStore = (data, ...rest) => {
+    if (data && typeof data.on === 'function') {
+      data.on('error', (err: unknown) => {
+        // Debug (falling back to info for loggers without it): a client dropping mid-upload is an
+        // expected, per-request event on flaky mobile networks — not something to page over.
+        const obj = { err: err instanceof Error ? err.message : String(err) };
+        const msg = 'pulsevault: PATCH body stream aborted (client disconnected mid-upload)';
+        if (logger.debug) logger.debug(obj, msg);
+        else logger.info(obj, msg);
+      });
+    }
+    return original(data, ...rest);
+  };
 }
 
 /**

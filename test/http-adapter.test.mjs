@@ -142,6 +142,59 @@ test("HEAD + resume PATCH completes the upload", async () => {
   }
 });
 
+test("an aborted PATCH mid-body does not crash the server process", async () => {
+  const ctx = await startApp();
+  try {
+    const size = 1 << 16; // 64 KiB — big enough to reliably abort mid-body
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size,
+    });
+    assert.equal(create.status, 201);
+    const location = new URL(create.headers.get("location"), ctx.baseUrl);
+
+    // Start a PATCH that PROMISES `size` bytes (Content-Length) but send only a handful, then rip
+    // the socket away without finishing the body — exactly what an app kill / network reset does
+    // mid-transfer. Before the fix this made Node emit an unhandled 'error' ('aborted' /
+    // ECONNRESET) on the request stream and crash the whole process.
+    await new Promise((resolve) => {
+      const req = http.request({
+        hostname: location.hostname,
+        port: location.port,
+        path: location.pathname,
+        method: "PATCH",
+        headers: {
+          "Tus-Resumable": "1.0.0",
+          "Upload-Offset": "0",
+          "Content-Type": "application/offset+octet-stream",
+          "Content-Length": String(size),
+        },
+      });
+      req.on("error", () => {}); // the client half also observes the reset
+      req.write(Buffer.alloc(64));
+      setTimeout(() => {
+        req.destroy(); // abort without completing the body
+        resolve();
+      }, 30);
+    });
+
+    // Give the server a couple ticks to observe the aborted stream, then prove it's still alive:
+    // had it crashed, this would ECONNREFUSED instead of answering.
+    await new Promise((r) => setTimeout(r, 50));
+    const caps = await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`);
+    assert.equal(caps.status, 200);
+
+    // The upload also survives as a resumable sidecar (offset somewhere in [0, size]).
+    const head = await tusHead(location.href);
+    assert.equal(head.status, 200);
+    const offset = Number(head.headers.get("upload-offset"));
+    assert.ok(Number.isInteger(offset) && offset >= 0 && offset <= size);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("second reserve for same artifactId returns 409", async () => {
   const ctx = await startApp();
   try {
