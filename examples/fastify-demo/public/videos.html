@@ -303,7 +303,11 @@
           const src = new URL(clip.playbackUrl, location.origin).href;
           if (video.src !== src) {
             video.src = src;
-            video.preload = "auto";
+            // Neighbors warm up with metadata only (a few KB); full buffering
+            // is reserved for the on-screen slide. Measured: 3 parallel
+            // full-file streams to one client collapse to ~0.36 MB/s each —
+            // worse in aggregate than a single stream.
+            video.preload = active ? "auto" : "metadata";
             // A single merged video loops natively; segment sessions advance on `ended`.
             video.loop = clipCount === 1;
             if (active && !halted) video.play().catch(() => setHalted(true));
@@ -317,6 +321,7 @@
           if (!video) return;
           if (active) {
             setHalted(false);
+            video.preload = "auto"; // promoted from the neighbor's metadata-only warmup
             video.play().catch(() => setHalted(true));
           } else {
             video.pause();
