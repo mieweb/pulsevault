@@ -386,7 +386,10 @@ app.get("/deeplinks", { schema: { tags: ["demo"], summary: "Mint a pairing deep 
 await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: createLocalStorage({ workspaceDir: dataDir }),
-  maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
+  // Matches the deployment edge's `client_max_body_size 2G` — advertising more
+  // (`Tus-Max-Size`) than the infra accepts means clients get promised sizes
+  // that 413 mid-flight. Raise only if the edge limit is raised.
+  maxUploadSize: 2 * 1024 * 1024 * 1024, // 2 GiB
   uploadUnit,
   // All kinds stay enabled — a merged-mode session uploads a .pulse beat
   // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
