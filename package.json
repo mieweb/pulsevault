@@ -1,6 +1,6 @@
 {
   "name": "@mieweb/pulsevault",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Resumable video uploads via TUS for Fastify (plugin) or any Node backend (framework-agnostic core), with a pluggable storage adapter and a filesystem-first local-storage default.",
   "type": "module",
   "main": "./dist/app.js",
