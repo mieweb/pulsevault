@@ -13,6 +13,7 @@ import {
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
   composeOnUploadComplete,
+  type PulseVaultAllowedExtensionsInput,
 } from './lib/options.js';
 
 /**
@@ -76,18 +77,16 @@ export type PulseVaultPluginOptions = {
   decoratorName?: string;
   /**
    * File extensions allowed per artifact kind. Accepts:
-   * - A flat array (`[".mp4"]`) — treated as video-only; project/captions
+   * - A flat array (`[".mp4"]`) — treated as video-only; the other kinds
    *   default. This is the legacy form for back-compat.
-   * - An object with optional `video`/`project`/`captions` keys; unset keys
-   *   fall back to their defaults.
+   * - An object with optional `video`/`project`/`captions`/`thumbnail` keys;
+   *   unset keys fall back to their defaults.
    * - Omitted entirely — defaults to
-   *   `{ video: [".mp4"], project: [".pulse", ".zip"], captions: [".srt"] }`.
+   *   `{ video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] }`.
    *
    * All extensions must include the leading dot and are matched case-insensitively.
    */
-  allowedExtensions?:
-    | readonly string[]
-    | { video?: readonly string[]; project?: readonly string[]; captions?: readonly string[] };
+  allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /**
    * Cache-control options forwarded to `@fastify/send` for the GET route.
    * When omitted, `@fastify/send`'s defaults apply (`Cache-Control: public,

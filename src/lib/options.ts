@@ -29,8 +29,8 @@ const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**
  * Normalize the consumer's `allowedExtensions` option (legacy array or per-kind
- * object) into the canonical `{ video, project, captions }` shape both
- * adapters pass down to the tus layer.
+ * object) into the canonical `{ video, project, captions, thumbnail }` shape
+ * both adapters pass down to the tus layer.
  */
 export function normalizeAllowedExtensions(
   raw: PulseVaultAllowedExtensionsInput | undefined,

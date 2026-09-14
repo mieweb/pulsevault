@@ -27,7 +27,7 @@ The local storage adapter writes to a stable on-disk layout (see [Local storage]
 
 ## Requirements
 
-- Node.js `>=18`
+- Node.js `>=20`
 - Fastify `^5.x` — only if you use the default `@mieweb/pulsevault` (Fastify
   plugin) entry point. The framework-agnostic `@mieweb/pulsevault/core` entry
   point (Express, Meteor, or plain `http.createServer`) has no Fastify

@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-14
+
 This release reworks the upload contract for genuine multi-tenant use — any
 third party can implement a compatible server from `PROTOCOL.md` alone, not
 just by reading this package's source. It bundles several breaking changes
@@ -67,6 +69,16 @@ if you've evaluated against an intermediate build.
 
 ### Breaking
 
+- **Node.js `>=20` is now required** (`engines.node` was `>=18`). Node 18 is
+  past end-of-life; every dependency floor in this release is tested against
+  20+ only.
+- **The `fastify` peer-dependency floor rose from `^5.8.5` to `^5.12.1`**,
+  which is the first release fixing GHSA-w2qp-rph6-63g4 (schema-validation
+  bypass via root primitive coercion mismatch, moderate) and
+  GHSA-3m5p-2c4r-xxw2 (`X-Forwarded-*` spoofing under `trustProxy`
+  hop-count, moderate). Refreshing the lockfile alongside it also clears the
+  transitive `find-my-way` HTTP/2 DDoS advisory (GHSA-c96f-x56v-gq3h, high)
+  and the `fast-uri` host-confusion/SSRF advisory cluster (high).
 - **Renamed `videoid` → `artifactId`** across the storage interface
   (`ReserveUploadParams`, `PulseVaultStorage` methods), the `authorize`
   context (`PulseVaultAuthorizeContext`), the `validatePayload`/
@@ -182,6 +194,12 @@ if you've evaluated against an intermediate build.
 
 ### Changed
 
+- Dependency floors bumped to current patch releases: `@fastify/send`
+  `^4.1.1`, `@tus/s3-store` `^2.0.6`, AWS SDK `^3.1131.0`, TypeScript
+  `^6.0.3`, `@types/node` `^25.9.6`. `@tus/server`/`@tus/file-store` stay
+  deliberately pinned at `2.0.0` (Meteor `srvx` exports issue — see the
+  Meteor compatibility entry below); `fastify-plugin` stays on `^5.1.0`
+  (v6 is a major, out of scope for a security-motivated bump).
 - Replaced `examples/rn-demo` with two focused Fastify examples:
   `examples/fastify-demo` (the smallest runnable server — no auth, local
   storage, QR pairing; start here) and `examples/fastify-auth-demo`
@@ -264,4 +282,5 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mieweb/pulsevault/compare/v0.0.1...v0.2.0
