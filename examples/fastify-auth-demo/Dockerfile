@@ -5,7 +5,7 @@
 #   docker build -f examples/fastify-auth-demo/Dockerfile -t pulsevault-auth-demo .
 
 # --- Stage 1: build the library (dist/ is not committed) --------------------
-FROM node:22-slim AS lib
+FROM node:24-slim AS lib
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci
@@ -13,7 +13,7 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 # --- Stage 2: the demo server ------------------------------------------------
-FROM node:22-slim
+FROM node:24-slim
 ENV NODE_ENV=production
 # Prisma's engines need OpenSSL at runtime.
 RUN apt-get update -y && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
