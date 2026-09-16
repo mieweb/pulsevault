@@ -7,11 +7,13 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-16
+
 ### Changed
 
-- **Node.js 20 is no longer supported** (`engines.node` is now `>=22`).
-  Node 20 reached end-of-life on 2026-04-30; Node 22 (maintenance LTS) and
-  Node 24 (active LTS) remain supported.
+- **Breaking: Node.js 20 is no longer supported** (`engines.node` is now
+  `>=22`). Node 20 reached end-of-life on 2026-04-30; Node 22 (maintenance
+  LTS) and Node 24 (active LTS) remain supported.
 
 ## [0.2.0] - 2026-09-14
 
@@ -288,5 +290,6 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mieweb/pulsevault/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mieweb/pulsevault/compare/v0.0.1...v0.2.0
