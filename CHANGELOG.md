@@ -7,6 +7,12 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Node.js 20 is no longer supported** (`engines.node` is now `>=22`).
+  Node 20 reached end-of-life on 2026-04-30; Node 22 (maintenance LTS) and
+  Node 24 (active LTS) remain supported.
+
 ## [0.2.0] - 2026-09-14
 
 This release reworks the upload contract for genuine multi-tenant use — any
