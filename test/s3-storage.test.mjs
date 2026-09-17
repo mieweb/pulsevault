@@ -254,18 +254,9 @@ test('presignPut refuses a TUS-shaped reservation under the same artifactId', as
   }
 });
 
-// The degraded-backend branch: a store that rejects `If-None-Match` outright
-// (501 NotImplemented) must fall back to check-then-write — reserve keeps
-// working, duplicates still 409 via the check, and the operator is warned
-// exactly once per process. This branch was untestable against s3rver (it
-// silently ignored the header) and is the one path the reserve rewrite in
-// this release touches without conditional-write protection.
-/** An adapter against a fresh mock with the given conditional-write personality, plus its captured warnings. */
-async function degradedAdapter(conditionalWrites) {
+/** An adapter against a fresh mock with the given conditional-write personality. */
+async function adapterWith(conditionalWrites) {
   const mock = await startMockS3({ buckets: [BUCKET], conditionalWrites });
-  const warns = [];
-  const realWarn = console.warn;
-  console.warn = (...args) => warns.push(args.join(' '));
   const storage = await createS3Storage({
     bucket: BUCKET,
     endpoint: mock.endpoint,
@@ -280,34 +271,20 @@ async function degradedAdapter(conditionalWrites) {
   });
   const reserve = (artifactId) =>
     storage.reserveUpload({ artifactId, kind: 'video', ext: '.mp4', filename: 'clip.mp4' });
-  return {
-    storage,
-    reserve,
-    warns,
-    close: async () => {
-      console.warn = realWarn;
-      await mock.close();
-    },
-  };
+  return { storage, reserve, close: () => mock.close() };
 }
 
-// The degraded-backend branch is decided ONCE, by a boot-time probe, for both kinds
-// of backend that can't be trusted with `If-None-Match`: those that reject the
-// header (501) and — the dangerous ones — those that accept it and silently
-// ignore it. Both fall back to check-then-write: reserve keeps working,
-// duplicates still 409 via the check, and the operator is warned exactly once.
+// The one-winner create depends on `If-None-Match`, so a backend that can't be
+// trusted with it is refused at the boot-time probe — both the kind that
+// rejects the header (501) and, the dangerous kind, the one that accepts it
+// and silently ignores it. There is no degraded mode.
 for (const personality of ['unsupported', 'ignored']) {
-  test(`conditional-write-${personality} backend: probe degrades once, still 409s duplicates, warns once`, async () => {
-    const { reserve, warns, close } = await degradedAdapter(personality);
+  test(`conditional-write-${personality} backend: the probe refuses the adapter`, async () => {
+    const { storage, reserve, close } = await adapterWith(personality);
     try {
-      await reserve(randomUUID());
-      const dup = randomUUID();
-      await reserve(dup);
-      await assert.rejects(
-        () => reserve(dup),
-        (err) => err?.statusCode === 409,
-      );
-      assert.equal(warns.filter((w) => w.includes('conditional writes')).length, 1);
+      await assert.rejects(() => storage.initialize(), /conditional writes/);
+      // The lazy path (a host that skipped initialize) fails the same way.
+      await assert.rejects(() => reserve(randomUUID()), /conditional writes/);
     } finally {
       await close();
     }
@@ -315,31 +292,35 @@ for (const personality of ['unsupported', 'ignored']) {
 }
 
 test('a lost conditional write answered the AWS way (409 ConditionalRequestConflict) is the reserve 409', async () => {
-  const { reserve, warns, close } = await degradedAdapter('conflict-409');
+  const { storage, reserve, close } = await adapterWith('conflict-409');
   try {
+    // A backend that honors the header (just with the other status) passes the probe.
+    await storage.initialize();
     const id = randomUUID();
     await reserve(id);
     await assert.rejects(
       () => reserve(id),
       (err) => err?.statusCode === 409,
     );
-    // A backend that honors the header (just with the other status) is not degraded.
-    assert.equal(warns.filter((w) => w.includes('conditional writes')).length, 0);
   } finally {
     await close();
   }
 });
 
-test('listArtifactIds enumerates every sidecar (reserved or ready) — the retention sweep input on S3', async () => {
-  const { storage, reserve, close } = await degradedAdapter('supported');
+test('listArtifactIds enumerates every sidecar, tombstones included — the retention sweep input on S3', async () => {
+  const { storage, reserve, close } = await adapterWith('supported');
   try {
     const ids = [randomUUID(), randomUUID()];
     for (const id of ids) await reserve(id);
     await storage.markReady(ids[0]);
     const listed = await storage.listArtifactIds();
     assert.deepEqual(listed.filter((id) => ids.includes(id)).sort(), [...ids].sort());
-    await storage.remove(ids[1]);
-    assert.ok(!(await storage.listArtifactIds()).includes(ids[1]));
+    // A removed id is still listed (its tombstone keeps it spent) but reads as absent.
+    assert.equal(await storage.remove(ids[1]), true);
+    assert.ok((await storage.listArtifactIds()).includes(ids[1]));
+    assert.equal(await storage.getMetadata(ids[1]), null);
+    assert.equal(await storage.remove(ids[1]), false, 'already tombstoned');
+    await assert.rejects(() => reserve(ids[1]), (err) => err?.statusCode === 409);
   } finally {
     await close();
   }

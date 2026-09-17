@@ -129,8 +129,17 @@ export async function resolveStorageRelatedTo(
 /** Message an authorize rejection surfaces to the client. */
 export const extractAuthzMessage = (err: unknown): string => errorMessage(err, 'Forbidden');
 
-/** The identity of the artifact a request is about — one storage read where the adapter has `getMetadata`. */
-export type ArtifactIdentity = { kind: UploadKind; relatedTo: string | undefined };
+/**
+ * The identity of the artifact a request is about — one storage read where
+ * the adapter has `getMetadata`, the per-field getters otherwise. Also used
+ * by the TUS finish hook, which runs on the PATCH request's own context, not
+ * the POST's, and so must read what it needs from storage.
+ */
+export type ArtifactIdentity = {
+  kind: UploadKind;
+  relatedTo: string | undefined;
+  checksum: string | undefined;
+};
 
 export async function resolveArtifactIdentity(
   storage: PulseVaultStorage,
@@ -138,11 +147,12 @@ export async function resolveArtifactIdentity(
 ): Promise<ArtifactIdentity> {
   if (storage.getMetadata) {
     const meta = await storage.getMetadata(artifactId);
-    return { kind: meta?.kind ?? 'video', relatedTo: meta?.relatedTo };
+    return { kind: meta?.kind ?? 'video', relatedTo: meta?.relatedTo, checksum: meta?.checksum };
   }
   return {
     kind: await resolveStorageKind(storage, artifactId),
     relatedTo: await resolveStorageRelatedTo(storage, artifactId),
+    checksum: (await storage.getChecksum?.(artifactId)) ?? undefined,
   };
 }
 
@@ -193,14 +203,21 @@ export async function authorizeTusRequest(
   request: PulseVaultRequest,
   input: { method: string | undefined; url: string; uploadMetadata: string | undefined },
 ): Promise<AuthorizeDecision<{ artifactId: string | undefined } & ArtifactIdentity>> {
-  const none = { artifactId: undefined, kind: 'video' as const, relatedTo: undefined };
+  const none = {
+    artifactId: undefined,
+    kind: 'video' as const,
+    relatedTo: undefined,
+    checksum: undefined,
+  };
   // OPTIONS is the tus capabilities/CORS preflight — no artifact, no bytes,
   // and browsers can't attach the bearer header to it. Let @tus/server answer.
   if (input.method === 'OPTIONS') return { ok: true, ...none };
   const phase = input.method === 'POST' ? 'create' : 'patch';
   let identity: { artifactId: string | undefined } & ArtifactIdentity = none;
   if (phase === 'create') {
-    if (input.uploadMetadata) identity = parseUploadMetadataHeader(input.uploadMetadata);
+    if (input.uploadMetadata) {
+      identity = { ...parseUploadMetadataHeader(input.uploadMetadata), checksum: undefined };
+    }
   } else {
     const artifactId = artifactIdFromTusUrl(input.url);
     if (artifactId) {

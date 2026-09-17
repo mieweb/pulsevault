@@ -8,8 +8,14 @@ import { parseUploadKind } from './types.js';
  * the reserve-collision error. The local adapter persists a sidecar as a JSON
  * file under `.pulsevault/`, the S3 adapter as a JSON object under the
  * `.pulsevault/` key prefix; the CONTENT and semantics are identical by
- * design, and this module is what keeps them identical — before it existed,
- * every sidecar change had to be hand-mirrored across both adapters.
+ * design, and this module is what keeps them identical.
+ *
+ * The sidecar is the reservation: while one exists under an artifactId, no
+ * create for that id can succeed. `remove` never deletes it — it rewrites it
+ * as a `"deleted"` tombstone, so an id stays spent forever. That one rule is
+ * what makes every stale handle harmless: a stale presigned PUT lands on a key
+ * nothing will ever serve, a stale cache entry describes an id whose identity
+ * can never change, and a cancel that races a finish can only ever un-serve.
  */
 
 /** Sidecar schema version. Increment for breaking changes. */
@@ -25,16 +31,18 @@ export const DEFAULT_META_CACHE_LIMIT = 10_000;
 export type Sidecar = {
   /** Sidecar schema version. */
   version: typeof SIDECAR_VERSION;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
+  /** Lowercase extension including the leading dot (e.g. `".mp4"`). Empty on a tombstone left over unparseable debris. */
   ext: string;
-  /** Original filename from `Upload-Metadata.filename`. */
+  /** Original filename from `Upload-Metadata.filename`. Empty on a tombstone left over unparseable debris. */
   filename: string;
   /**
    * `"uploading"` between `reserveUpload` and `markReady`; `"ready"` once
-   * every post-upload validation has passed. Only `"ready"` sidecars are
-   * served — partially-written uploads never leak out.
+   * every post-upload validation has passed; `"deleted"` once `remove` ran.
+   * Only `"ready"` sidecars are served. `"deleted"` is a tombstone: readers
+   * treat it as absent, but the file/object still occupies the id, so
+   * `reserveUpload` keeps conflicting.
    */
-  status: 'uploading' | 'ready';
+  status: 'uploading' | 'ready' | 'deleted';
   /** Artifact kind. Optional for back-compat — pre-kind sidecars read as `"video"`. */
   kind?: UploadKind;
   /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
@@ -44,31 +52,20 @@ export type Sidecar = {
   /** Optional human-facing display name. See `ReserveUploadParams.name`. */
   name?: string;
   /**
-   * Epoch-ms timestamp of the `reserveUpload` that wrote this sidecar.
-   * ArtifactIds are single-use — a reservation that never reaches `"ready"`
-   * is abandoned, not reused — so this exists for retention tooling: an
-   * operator sweep (or object-storage lifecycle rule) can age out abandoned
-   * `"uploading"` sidecars by this timestamp. Carried in the JSON (not
-   * derived from file mtimes) so it survives backup/restore and works
+   * Epoch-ms timestamp of the `reserveUpload` that wrote this sidecar. Exists
+   * for retention tooling: an operator sweep (or object-storage lifecycle
+   * rule) ages out abandoned `"uploading"` sidecars by it. Carried in the JSON
+   * (not derived from file mtimes) so it survives backup/restore and works
    * identically on object storage.
    */
   reservedAt?: number;
   /** Expected total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
   expectedSize?: number;
-  /**
-   * Per-reservation object-key suffix (direct uploads only). A presigned PUT
-   * outlives the reservation that minted it — deleting the reservation cannot
-   * revoke the URL — so each direct reservation writes its bytes to its own
-   * key (`<kind>/<id>.<suffix><ext>`). A superseded grant then targets a key
-   * no other reservation (and no ready artifact) reads from, instead of
-   * silently overwriting the deterministic final key. Absent on TUS uploads
-   * (the server writes those itself) and on pre-suffix sidecars — both read
-   * the base `<kind>/<id><ext>` key.
-   */
-  objectSuffix?: string;
+  /** Epoch-ms timestamp of the `remove` that tombstoned this sidecar. */
+  deletedAt?: number;
 };
 
-/** The subset of a sidecar the adapters keep in their in-memory cache. */
+/** The subset of a sidecar the adapters keep in their in-memory cache. Never a tombstone. */
 export type CachedMeta = {
   ext: string;
   ready: boolean;
@@ -79,12 +76,10 @@ export type CachedMeta = {
   name?: string;
   reservedAt?: number;
   expectedSize?: number;
-  objectSuffix?: string;
 };
 
 /** Fresh `"uploading"` sidecar for a reserve, stamped with the reservation time. A declared
- * size marks a direct upload (see `ReserveUploadParams.size`), which also gets its
- * per-reservation `objectSuffix` — see that field's doc for why. */
+ * size marks a direct upload (see `ReserveUploadParams.size`). */
 export function buildSidecar(params: ReserveUploadParams): Sidecar {
   return {
     version: SIDECAR_VERSION,
@@ -96,15 +91,26 @@ export function buildSidecar(params: ReserveUploadParams): Sidecar {
     checksum: params.checksum,
     name: params.name,
     reservedAt: Date.now(),
-    ...(params.size !== undefined
-      ? { expectedSize: params.size, objectSuffix: newObjectSuffix() }
-      : {}),
+    ...(params.size !== undefined ? { expectedSize: params.size } : {}),
   };
 }
 
-/** Short random token for `Sidecar.objectSuffix` — uniqueness per reservation, not secrecy. */
-function newObjectSuffix(): string {
-  return `g${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+/**
+ * The tombstone `remove` leaves behind. Keeps what identity it can (an
+ * unparseable sidecar has none) so listings stay informative; the status is
+ * what matters — it is what keeps the id spent.
+ */
+export function tombstoneSidecar(prev: Sidecar | null): Sidecar {
+  return {
+    version: SIDECAR_VERSION,
+    ext: prev?.ext ?? '',
+    filename: prev?.filename ?? '',
+    status: 'deleted',
+    kind: prev?.kind,
+    relatedTo: prev?.relatedTo,
+    reservedAt: prev?.reservedAt,
+    deletedAt: Date.now(),
+  };
 }
 
 /**
@@ -124,23 +130,20 @@ export function parseSidecar(raw: string): Sidecar | null {
   if (typeof parsed.filename !== 'string') return null;
   // Fail closed on an unknown explicit status — only a MISSING status reads as
   // "ready" (pre-status sidecars), never a corrupted value.
-  if (parsed.status !== undefined && parsed.status !== 'uploading' && parsed.status !== 'ready') {
-    return null;
-  }
-  const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
-  const kind = parseUploadKind(parsed.kind);
+  const status = parsed.status ?? 'ready';
+  if (status !== 'uploading' && status !== 'ready' && status !== 'deleted') return null;
   return {
     version: SIDECAR_VERSION,
     ext: parsed.ext,
     filename: parsed.filename,
     status,
-    kind,
+    kind: parseUploadKind(parsed.kind),
     relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
     checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
     name: typeof parsed.name === 'string' ? parsed.name : undefined,
     reservedAt: typeof parsed.reservedAt === 'number' ? parsed.reservedAt : undefined,
     expectedSize: typeof parsed.expectedSize === 'number' ? parsed.expectedSize : undefined,
-    objectSuffix: typeof parsed.objectSuffix === 'string' ? parsed.objectSuffix : undefined,
+    deletedAt: typeof parsed.deletedAt === 'number' ? parsed.deletedAt : undefined,
   };
 }
 
@@ -156,7 +159,6 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
     name: sidecar.name,
     reservedAt: sidecar.reservedAt,
     expectedSize: sidecar.expectedSize,
-    objectSuffix: sidecar.objectSuffix,
   };
 }
 
@@ -179,9 +181,7 @@ export function cachedMetaToArtifactMetadata(artifactId: string, meta: CachedMet
 /**
  * The read side every adapter shares: a cached `loadMeta` over the adapter's
  * own `readSidecar`, plus the per-field getters and the `ArtifactMetadata`
- * projection of the storage contract. Adapters spread this into their storage
- * object, so the cache's epoch protocol (capture BEFORE the read, hand it to
- * `set`) and the projection exist exactly once instead of once per adapter.
+ * projection of the storage contract. A tombstone reads as absent.
  */
 export function createSidecarReader(deps: {
   cache: MetaCache;
@@ -196,14 +196,13 @@ export function createSidecarReader(deps: {
       const cached = cache.get(artifactId);
       if (cached) return cached;
     }
-    // Capture the deletion epoch BEFORE the storage read: if a `remove` lands
-    // while this read is in flight, the epoch moves and the stale fill below
-    // is discarded instead of resurrecting a deleted artifact's metadata.
-    const asOf = cache.epoch();
     const sidecar = await readSidecar(artifactId);
-    if (!sidecar) return null;
+    if (!sidecar || sidecar.status === 'deleted') {
+      cache.delete(artifactId);
+      return null;
+    }
     const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    cache.set(artifactId, meta, asOf);
+    cache.set(artifactId, meta);
     return meta;
   };
   return {
@@ -252,16 +251,7 @@ export function extToContentType(ext: string): string {
 
 export type MetaCache = {
   get(artifactId: string): CachedMeta | undefined;
-  /**
-   * Deletion epoch — capture it BEFORE starting an async storage read, then
-   * pass it to `set`: a fill whose read straddled any deletion is discarded
-   * instead of cached, so a slow read can never resurrect a just-deleted
-   * artifact's metadata (the point-in-time double-eviction the adapters used
-   * before could still lose to a fill that began before the delete and
-   * finished after the second eviction).
-   */
-  epoch(): number;
-  set(artifactId: string, meta: CachedMeta, asOfEpoch?: number): void;
+  set(artifactId: string, meta: CachedMeta): void;
   delete(artifactId: string): void;
 };
 
@@ -270,20 +260,16 @@ export type MetaCache = {
  * (a `Map` preserves insertion order; re-setting a key moves it to the end,
  * so eviction always drops the least-recently-set entry). A cache miss falls
  * back to reading the sidecar from storage, so eviction only costs an extra
- * read, never correctness — and a `set` carrying a stale `asOfEpoch` is
- * skipped for the same reason (see `MetaCache.epoch`).
+ * read, never correctness. A stale entry is harmless too: an id's identity
+ * never changes (ids are single-use), and the only state that can go stale is
+ * `ready` — a stale "ready" for a tombstoned id resolves to bytes that are
+ * gone, which the serving path reports as 404.
  */
 export function createMetaCache(limit: number): MetaCache {
   const cache = new Map<string, CachedMeta>();
-  // One counter for the whole cache, not per key: deletions are rare, a
-  // skipped fill only costs one extra read, and this keeps the guard O(1)
-  // in memory with no per-key bookkeeping to leak.
-  let deletionEpoch = 0;
   return {
     get: (artifactId) => cache.get(artifactId),
-    epoch: () => deletionEpoch,
-    set: (artifactId, meta, asOfEpoch) => {
-      if (asOfEpoch !== undefined && asOfEpoch !== deletionEpoch) return;
+    set: (artifactId, meta) => {
       cache.delete(artifactId);
       cache.set(artifactId, meta);
       if (cache.size > limit) {
@@ -292,7 +278,6 @@ export function createMetaCache(limit: number): MetaCache {
       }
     },
     delete: (artifactId) => {
-      deletionEpoch += 1;
       cache.delete(artifactId);
     },
   };

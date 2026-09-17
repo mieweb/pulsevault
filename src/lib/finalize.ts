@@ -16,9 +16,7 @@ export type FinalizeInput = {
   artifactId: string;
   kind: UploadKind;
   size: number;
-  /** Datastore id of the upload (the tus upload id). For direct uploads this is the
-   * deterministic id-shaped key, NOT necessarily the stored object's key (direct objects
-   * may be suffix-fenced) — locate bytes via the id-keyed adapter accessors, never this. */
+  /** Datastore id of the upload (the tus upload id; for direct uploads the same `<kind>/<id><ext>` key). */
   uploadId: string;
   checksum?: string;
   localPath: string | null;
@@ -32,8 +30,8 @@ export type FinalizeResult = { ok: true } | { ok: false; statusCode: number; mes
  * ingestion paths can never diverge on validation/cleanup semantics:
  *
  * 1. `validatePayload` (magic bytes, checksum, virus scan…). Failure wipes the
- *    bytes from storage — the client gets a 4xx, the sidecar is gone, and a
- *    corrected retry can safely re-create. 5xx reasons stay server-side.
+ *    bytes from storage and the client gets a 4xx. The id is spent either way
+ *    (single-use); the client mints a fresh one. 5xx reasons stay server-side.
  * 2. `markReady` — flips the sidecar so `resolve` will serve the bytes. Done
  *    *before* the consumer hook so a downstream service reacting to
  *    `onUploadComplete` can immediately GET the artifact.
@@ -66,15 +64,12 @@ export async function finalizeArtifact(
     } catch (err) {
       const statusCode = statusCodeOf(err, 422);
       const message = err instanceof Error ? err.message : 'Payload validation failed';
-      try {
-        await storage.remove?.(artifactId);
-      } catch (rmErr) {
-        // A 4xx rejection promises the id is freed for a corrected retry — if
-        // the wipe failed it is NOT, so surface a server failure instead.
+      // Best effort: the rejection stands whether or not the wipe lands. A
+      // stuck "uploading" reservation with bytes behind it is what the
+      // retention sweep exists for.
+      await storage.remove?.(artifactId).catch((rmErr: unknown) => {
         logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
-        await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
-        return { ok: false, statusCode: 500, message: 'Upload was rejected but cleanup failed' };
-      }
+      });
       await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
       // 4xx rejection reasons are the client's business (e.g. "Checksum
       // mismatch: …"); 5xx means *our* side broke — log the real error and

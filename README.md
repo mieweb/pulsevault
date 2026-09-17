@@ -273,7 +273,7 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
 | `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
-| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
+| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete an upload's bytes; the artifactId is tombstoned and never reusable |
 
 \* `DELETE /pulsevault/upload/:id` is TUS's own "cancel in-flight upload" — distinct from `DELETE /pulsevault/artifacts/:artifactId`, which removes a finalized artifact.
 
@@ -781,14 +781,13 @@ edges live in bucket configuration, not code:
   it applies server-side without any request header. If you must have
   SSE-KMS, set it as the bucket **default** encryption instead of enforcing
   it per-request in a policy.
-- **Atomic reservation needs conditional writes.** The collision guard uses
+- **Conditional writes are required.** The collision guard is
   `If-None-Match: "*"` on `PutObject`. AWS S3 supports this (since
   Nov 2024), R2 supports it. The adapter probes the bucket once at
   `initialize()` (or on the first reserve) — writing a throwaway key twice
-  and requiring the 412/409 — so a backend that rejects the header *or
-  silently ignores it* is detected, falls back to a weaker check-then-write,
-  and is warned about once. See *S3-compatible backend collision-guard
-  fallback* in `OPERATIONS.md` for what that reopens.
+  and requiring the 412/409 — and refuses to start against a backend that
+  rejects the header *or silently ignores it*. There is no degraded mode;
+  see `OPERATIONS.md`.
 - **Expired or lost grants are cheap.** Grants inherit `presignTtlSeconds`.
   If the app is killed or the URL expires before the `PUT` lands, the client
   just re-`POST`s the same create: an incomplete same-shape reservation is
@@ -805,16 +804,13 @@ edges live in bucket configuration, not code:
   rule (or your own `listArtifactIds`-based sweep, see *Retention* in
   `OPERATIONS.md`) removes
   the bytes.
-- **Each direct reservation writes to its own object key.** A presigned URL
-  can't be revoked by deleting its reservation, so grants are fenced by KEY:
-  every direct reservation gets a random per-reservation suffix
-  (`<kind>/<id>.<suffix><ext>`), and a superseded grant firing late lands on
-  a key nothing reads from instead of overwriting a newer reservation's (or a
-  ready artifact's) bytes. Those late-PUT orphans are covered by the same
-  prefix-scoped expiry rule as never-completed uploads. Within one
-  reservation, the grant holder can still overwrite its own object until the
-  URL's TTL lapses (PROTOCOL.md §9.1 *Grant fencing*) — keep
-  `presignTtlSeconds` short if you need immutable-after-ready bytes.
+- **Deleting a reservation never frees its id.** A presigned URL can't be
+  revoked, so instead the id is tombstoned: a late `PUT` from a stale grant
+  lands on the deterministic key, but nothing will reserve or serve that id
+  again and the prefix-scoped expiry rule removes the orphan. Within one
+  reservation the grant holder can still overwrite its own object until the
+  URL expires — use short TTLs (or TUS) if you need immutable-after-ready
+  bytes.
 
 ## Custom storage adapter
 

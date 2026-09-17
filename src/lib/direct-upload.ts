@@ -204,11 +204,9 @@ export async function directUploadCreate(
     // same session anchor — without that clause a token authorized for anchor
     // A could submit anchor B's known artifactId with `relatedTo: A` and walk
     // away with a PUT grant for B's artifact), a fresh presigned URL is the
-    // correct answer: the client lost or outlived its grant (app kill, URL
-    // TTL) and needs a new one to retry the PUT. The adapter reads storage
-    // truth ONCE, at mint time, and compares every identity field itself — a
-    // finished artifact, a TUS reservation, or any mismatch is a 409 — so
-    // there is no window between "checked" and "signed".
+    // correct answer: the client's PUT failed or its URL expired and it needs
+    // a new one to retry. The adapter reads storage truth once, at mint time,
+    // and compares every identity field itself.
     try {
       const regrant = await storage.presignPut(normalized.artifactId, {
         size,
@@ -251,10 +249,7 @@ export async function directUploadComplete(
     return err(400, '`artifactId` must be a valid UUID');
   }
 
-  // Storage truth for the pre-lock read too — not just the serialized re-read:
-  // a stale cached `ready` (another instance deleted + re-reserved this id)
-  // would otherwise take the idempotent-200 fast path below and report a NEW
-  // reservation complete without ever verifying its bytes.
+  // Storage truth: another instance may have just marked this artifact ready.
   const meta = await storage.getMetadata(artifactId, { fresh: true });
   if (!meta) return err(404, 'Unknown artifactId — create the direct upload first');
 
@@ -292,11 +287,8 @@ export async function directUploadComplete(
   // onUploadComplete as at-least-once (PROTOCOL §9.2).
   const run = (completing.get(artifactId) ?? Promise.resolve()).then(
     async (): Promise<DirectUploadResult> => {
-      // Storage truth, not the per-process cache: a rival instance's complete
-      // may have already marked this artifact ready — taking the idempotent
-      // 200 path here (instead of re-running finalize on a stale "uploading"
-      // snapshot) is what keeps cross-instance retries at-least-once rather
-      // than duplicating hooks unnecessarily.
+      // Re-read under the lock: the winner of a retry race has just marked
+      // this ready, and the loser must take the idempotent 200 path.
       const fresh = await storage.getMetadata(artifactId, { fresh: true });
       if (!fresh) return err(404, 'Unknown artifactId — create the direct upload first');
       if (fresh.ready) {
@@ -342,17 +334,11 @@ async function completeUnlocked(
   }
   if (storedSize !== meta.expectedSize) {
     // Wrong bytes landed (truncated PUT, or a different payload). Same
-    // fail-closed cleanup as a validation failure: wipe and let the client
-    // re-create with a fresh grant.
-    try {
-      await storage.remove(artifactId);
-    } catch (rmErr) {
-      // The 422 contract promises the id is freed for a re-create — if the
-      // wipe failed it is NOT, so report a server failure instead of a
-      // retryable-looking rejection the client can't act on.
+    // fail-closed cleanup as a validation failure: wipe; the id is spent and
+    // the client mints a fresh one.
+    await storage.remove(artifactId).catch((rmErr: unknown) => {
       logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove mismatched upload');
-      return err(500, 'Upload was rejected but cleanup failed — try again later');
-    }
+    });
     await onArtifactEvent?.({
       phase: 'reject',
       artifactId,

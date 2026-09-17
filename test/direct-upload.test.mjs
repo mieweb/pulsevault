@@ -259,7 +259,7 @@ test('direct: re-creating an incomplete upload re-grants a fresh URL (200), mism
   }
 });
 
-test('direct: size mismatch on complete is 422, wipes the upload, and frees the artifactId', async () => {
+test('direct: size mismatch on complete is 422, wipes the upload, and spends the artifactId', async () => {
   const ctx = await startNodeApp();
   const id = randomUUID();
   const body = makeMp4(4096);
@@ -279,13 +279,22 @@ test('direct: size mismatch on complete is 422, wipes the upload, and frees the 
     const done = await completeDirect(ctx.baseUrl, id);
     assert.equal(done.status, 422);
 
-    // Fail-closed cleanup: the artifactId is reusable immediately.
+    // Fail-closed cleanup: nothing is served, and the id is spent — the
+    // client mints a fresh one rather than retrying under it.
+    const get = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}`, { redirect: 'manual' });
+    assert.equal(get.status, 404);
     const recreate = await createDirect(ctx.baseUrl, {
       artifactId: id,
       filename: 'clip.mp4',
       size: body.length,
     });
-    assert.equal(recreate.status, 201, 'artifactId freed after mismatch cleanup');
+    assert.equal(recreate.status, 409, 'artifactId stays spent after mismatch cleanup');
+    const fresh = await createDirect(ctx.baseUrl, {
+      artifactId: randomUUID(),
+      filename: 'clip.mp4',
+      size: body.length,
+    });
+    assert.equal(fresh.status, 201);
   } finally {
     await ctx.teardown();
   }
@@ -490,14 +499,11 @@ test('direct: fastify adapter delegates the routes (parsed-body path)', async ()
   }
 });
 
-test('direct: a superseded reservation\u2019s grant cannot write into the new reservation\u2019s object', async () => {
+test('direct: a grant that outlives its deleted reservation can never publish anything', async () => {
   const ctx = await startNodeApp();
   const id = randomUUID();
   const staleBytes = makeMp4(4096);
-  const freshBytes = makeMp4(4096);
-  freshBytes.fill(0xab, 64); // same size, different content
   try {
-    // First reservation — its grant will outlive the reservation.
     const first = await createDirect(ctx.baseUrl, {
       artifactId: id,
       filename: 'clip.mp4',
@@ -506,25 +512,19 @@ test('direct: a superseded reservation\u2019s grant cannot write into the new re
     assert.equal(first.status, 201);
     const staleGrant = await first.json();
 
-    // The reservation is torn down (client gave up / operator DELETE) …
+    // The reservation is torn down (client gave up / operator DELETE). A
+    // presigned URL cannot be revoked — but the id is tombstoned, so nothing
+    // can ever reserve it again and nothing will ever serve it.
     const del = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}`, { method: 'DELETE' });
     assert.equal(del.status, 204);
-
-    // … and the id is re-reserved with the same shape — a NEW reservation.
-    const second = await createDirect(ctx.baseUrl, {
+    const again = await createDirect(ctx.baseUrl, {
       artifactId: id,
       filename: 'clip.mp4',
-      size: freshBytes.length,
+      size: staleBytes.length,
     });
-    assert.equal(second.status, 201);
-    const freshGrant = await second.json();
-    assert.notEqual(
-      new URL(staleGrant.uploadUrl).pathname,
-      new URL(freshGrant.uploadUrl).pathname,
-      'each reservation gets its own object key — deleting a reservation cannot revoke its presigned URL, so the KEY is the fence',
-    );
+    assert.equal(again.status, 409, 'deleted id stays spent');
 
-    // The old (still unexpired) URL fires anyway. It lands on the OLD key…
+    // The old (still unexpired) URL fires anyway and lands its bytes …
     const stalePut = await fetch(staleGrant.uploadUrl, {
       method: 'PUT',
       headers: staleGrant.headers,
@@ -532,24 +532,11 @@ test('direct: a superseded reservation\u2019s grant cannot write into the new re
     });
     assert.equal(stalePut.status, 200);
 
-    // …so the new reservation still has no object: complete stays a 409
-    // instead of validating and publishing the superseded grant's bytes.
-    const early = await completeDirect(ctx.baseUrl, id);
-    assert.equal(early.status, 409);
-
-    // The new reservation's own PUT + complete then serve the RIGHT bytes.
-    const put = await fetch(freshGrant.uploadUrl, {
-      method: 'PUT',
-      headers: freshGrant.headers,
-      body: freshBytes,
-    });
-    assert.equal(put.status, 200);
-    assert.equal((await completeDirect(ctx.baseUrl, id)).status, 200);
-
+    // … which are orphaned: complete has no reservation to confirm, and the
+    // artifact is never served. Bucket lifecycle rules clean the object.
+    assert.equal((await completeDirect(ctx.baseUrl, id)).status, 404);
     const get = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}`, { redirect: 'manual' });
-    assert.equal(get.status, 302);
-    const served = await fetch(get.headers.get('location'));
-    assert.equal(Buffer.compare(Buffer.from(await served.arrayBuffer()), freshBytes), 0);
+    assert.equal(get.status, 404);
   } finally {
     await ctx.teardown();
   }

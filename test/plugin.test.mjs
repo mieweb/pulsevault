@@ -448,16 +448,24 @@ test('DELETE removes the artifact; second DELETE is 404', async () => {
     const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del.status, 204);
 
-    const sidecarStat = await fs
-      .stat(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`))
-      .catch(() => null);
-    assert.equal(sidecarStat, null);
+    const sidecar = JSON.parse(
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'utf8'),
+    );
+    assert.equal(sidecar.status, 'deleted', 'sidecar tombstoned — the id stays spent');
 
     const postGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(postGet.status, 404);
 
     const del2 = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del2.status, 404);
+
+    // Single-use survives the delete: the id can never be created again.
+    const recreate = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: 'clip.mp4',
+      size: 1024,
+    });
+    assert.equal(recreate.status, 409, 'deleted artifactId stays spent');
   } finally {
     await ctx.teardown();
   }
@@ -479,10 +487,10 @@ test('createMp4Sniffer rejects non-MP4 bytes and removes the artifact', async ()
     const patch = await tusPatch(location, 0, fake);
     assert.ok(patch.status >= 400 && patch.status < 500, `expected 4xx, got ${patch.status}`);
 
-    const sidecarStat = await fs
-      .stat(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`))
-      .catch(() => null);
-    assert.equal(sidecarStat, null, 'sidecar should be removed');
+    const sidecar = JSON.parse(
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'utf8'),
+    );
+    assert.equal(sidecar.status, 'deleted', 'sidecar tombstoned — the id stays spent');
 
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 404);
@@ -591,17 +599,21 @@ test('malformed sidecar: absent for readers, burned for writes (single-use)', as
     });
     assert.equal(create.status, 409);
 
-    // …but the debris is not a life sentence: DELETE clears an existing-but-
-    // unparseable sidecar (there is nothing else an operator could call), after
-    // which the id is a plain fresh reservation again.
+    // DELETE tombstones the debris like any other sidecar: the operator's
+    // retention sweep can account for it, readers still 404, and the id stays
+    // spent — ids are single-use even through a delete.
     const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del.status, 204);
+    const sidecar = JSON.parse(
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'utf8'),
+    );
+    assert.equal(sidecar.status, 'deleted');
     const recreate = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(recreate.status, 201);
+    assert.equal(recreate.status, 409);
   } finally {
     await ctx.teardown();
   }
@@ -783,10 +795,10 @@ test('checksum validator accepts a matching digest and rejects a mismatched one'
     const patch = await tusPatch(location, 0, body);
     assert.equal(patch.status, 422, 'mismatched checksum is rejected');
 
-    const sidecarStat = await fs
-      .stat(path.join(ctx.workspaceDir, '.pulsevault', `${ID2}.json`))
-      .catch(() => null);
-    assert.equal(sidecarStat, null, "rejected upload's sidecar is cleaned up");
+    const sidecar = JSON.parse(
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID2}.json`), 'utf8'),
+    );
+    assert.equal(sidecar.status, 'deleted', "rejected upload's bytes are wiped, id tombstoned");
   } finally {
     await ctx.teardown();
   }

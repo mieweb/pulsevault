@@ -114,7 +114,7 @@ async function tusDelete(url) {
 
 // ---------- local: termination sweeps the sidecar ----------
 
-test('local: TUS DELETE mid-upload sweeps the sidecar and frees the artifactId', async () => {
+test('local: TUS DELETE mid-upload tombstones the sidecar; the artifactId stays spent', async () => {
   const ctx = await startLocalApp();
   const id = randomUUID();
   try {
@@ -134,23 +134,27 @@ test('local: TUS DELETE mid-upload sweeps the sidecar and frees the artifactId',
     const del = await tusDelete(location);
     assert.equal(del.status, 204);
 
-    // POST_TERMINATE cleanup is post-response — poll for the sidecar sweep.
-    await eventually(async () => !(await fileExists(ctx.sidecarPath(id))));
-    assert.equal(await ctx.storage.getKind(id), null, 'adapter forgot the artifact');
+    // POST_TERMINATE cleanup is post-response — poll for the tombstone.
+    await eventually(async () => (await ctx.storage.getKind(id)) === null);
+    assert.ok(await fileExists(ctx.sidecarPath(id)), 'sidecar kept as a tombstone');
+    assert.equal(
+      JSON.parse(await fs.readFile(ctx.sidecarPath(id), 'utf8')).status,
+      'deleted',
+    );
 
-    // The artifactId is genuinely free again: a fresh create succeeds.
+    // Single-use even through a cancel: a fresh create under the id still 409s.
     const recreate = await tusCreate(ctx.baseUrl, PREFIX, {
       artifactId: id,
       filename: 'clip.mp4',
       size: body.length,
     });
-    assert.equal(recreate.status, 201, 'artifactId reusable after termination');
+    assert.equal(recreate.status, 409, 'artifactId stays spent after termination');
   } finally {
     await ctx.teardown();
   }
 });
 
-test('local: TUS DELETE after completion removes bytes, sidecar, and serving', async () => {
+test('local: TUS DELETE after completion removes bytes and serving', async () => {
   const ctx = await startLocalApp();
   const id = randomUUID();
   try {
@@ -159,7 +163,7 @@ test('local: TUS DELETE after completion removes bytes, sidecar, and serving', a
     const del = await tusDelete(location);
     assert.equal(del.status, 204);
 
-    await eventually(async () => !(await fileExists(ctx.sidecarPath(id))));
+    await eventually(async () => (await ctx.storage.getKind(id)) === null);
     const get = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}`);
     assert.equal(get.status, 404, 'terminated artifact no longer served');
   } finally {
@@ -251,7 +255,7 @@ test('local: reserve still 409s a genuinely in-flight upload and a ready artifac
 
 // ---------- S3: same invariants against the mock bucket ----------
 
-test('s3: TUS DELETE mid-upload sweeps the sidecar object and frees the artifactId', async () => {
+test('s3: TUS DELETE mid-upload tombstones the sidecar object; the artifactId stays spent', async () => {
   const ctx = await startS3App();
   const id = randomUUID();
   try {
@@ -274,7 +278,7 @@ test('s3: TUS DELETE mid-upload sweeps the sidecar object and frees the artifact
       filename: 'clip.mp4',
       size: body.length,
     });
-    assert.equal(recreate.status, 201, 'artifactId reusable after termination');
+    assert.equal(recreate.status, 409, 'artifactId stays spent after termination');
   } finally {
     await ctx.teardown();
   }

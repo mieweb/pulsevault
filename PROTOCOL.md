@@ -171,13 +171,14 @@ grant) and create anew. An upload the client can still name — it holds the
 `Location` from its own create — remains resumable per §4.2: single-use ids
 constrain creates, not resumption.
 
-A reservation is freed only by explicit termination (TUS `DELETE`, which
-MUST also sweep the per-upload metadata) or by operator retention — a
-storage lifecycle rule or sweep keyed on the reservation timestamp (see
-OPERATIONS.md). Servers MUST NOT reclaim or silently reuse a reserved id
-in-band: a `409` stays a `409` until the reservation is deleted or aged
-out. This keeps every create one-winner-atomic — there is no grace window
-in which two clients can both claim an id.
+A reservation is never freed. Explicit deletion (TUS `DELETE` termination,
+or `DELETE {prefix}/artifacts/<artifactId>`) and operator retention (see
+OPERATIONS.md) remove the bytes and **tombstone** the id: the serving route
+answers `404`, and a create for that id still answers `409`. Servers MUST
+NOT reclaim or reuse a reserved or deleted id. This keeps every create
+one-winner-atomic with no grace window, and it is what makes every stale
+handle harmless: a stale upload URL, grant or cache entry can only ever
+refer to an id whose identity cannot change.
 
 The tus resource id this implementation mints happens to be
 `base64url("<kind>/<artifactId><ext>")`. As of this version that is an
@@ -289,7 +290,10 @@ corrupt bytes.
 A server MUST expose `GET {prefix}/artifacts/<artifactId>` returning either
 the bytes directly or a redirect to a URL serving them (e.g. a presigned
 object-storage URL). The kind is resolved server-side; it is not encoded in
-this URL. A server MUST also expose `DELETE {prefix}/artifacts/<artifactId>`.
+this URL. A server MUST also expose `DELETE {prefix}/artifacts/<artifactId>`,
+which removes the bytes and tombstones the id (§4.2.1): `204` on the first
+delete, `404` when the id is unknown or already deleted. A deleted id is
+never reusable.
 
 ### 6.3 Checksum (optional)
 
@@ -418,12 +422,12 @@ artifact, or with a different declared shape, remains `409`. The re-grant
 decision MUST be made against current storage state, not a per-instance
 cache — another instance may have just completed the artifact.
 
-**Grant fencing.** A presigned URL cannot be revoked by deleting its
-reservation — it stays valid until `expiresAt`. Servers MUST therefore
-ensure a grant issued for one reservation cannot write into the object a
-*different* (later) reservation of the same artifactId completes and
-serves, e.g. by giving each reservation its own storage key. Within a
-single reservation the holder of an unexpired grant can by construction
+**Stale grants.** A presigned URL cannot be revoked by deleting its
+reservation — it stays valid until `expiresAt`. Because a deleted id is
+tombstoned (§4.2.1), a grant that outlives its reservation can only write
+bytes nothing will ever reserve again or serve (a `complete` for that id is
+`404`); operators expire such orphans with storage lifecycle rules. Within
+a single reservation the holder of an unexpired grant can by construction
 still overwrite its own object until `expiresAt` — including briefly after
 `complete` — so operators requiring strictly immutable-after-ready bytes
 SHOULD use short grant TTLs or the TUS profile.
@@ -449,14 +453,14 @@ The server MUST verify the stored object exists and matches the declared
   the server returns `5xx` but a retried complete takes the idempotent
   `200` path without re-running the hook — a consumer that must never lose
   its side effect should make the hook atomic (`storage.remove` + throw on
-  failure, which frees the artifactId for a clean re-create) or reconcile
-  from artifact listings.
+  failure, after which the client creates anew under a fresh artifactId) or
+  reconcile from artifact listings.
 - `409` — no stored object yet (the `PUT` didn't happen or didn't finish).
   The client retries the `PUT`, then completes again.
 - `422` — the stored object failed verification (size mismatch or §6
-  validation). The server MUST delete the stored bytes and free the
-  artifactId, exactly like a failed TUS validation; the client re-creates
-  with a fresh grant.
+  validation). The server MUST delete the stored bytes, exactly like a
+  failed TUS validation; the artifactId is spent, and the client creates
+  anew under a fresh one.
 
 An artifact for which `complete` never arrives MUST NOT be served (§6.1);
 operators SHOULD age out such reservations via retention (§4.2.1) and expire

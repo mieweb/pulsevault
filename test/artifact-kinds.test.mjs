@@ -372,10 +372,10 @@ test('DELETE works for kind=project, through the generic route', async () => {
     const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del.status, 204);
 
-    const sidecarStat = await fs
-      .stat(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`))
-      .catch(() => null);
-    assert.equal(sidecarStat, null, 'sidecar removed');
+    const sidecar = JSON.parse(
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'utf8'),
+    );
+    assert.equal(sidecar.status, 'deleted', 'sidecar tombstoned — the id stays spent');
 
     const postGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(postGet.status, 404);

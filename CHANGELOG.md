@@ -7,6 +7,35 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `remove()` tombstones an artifactId instead of freeing it.**
+  `DELETE /artifacts/:id`, TUS termination, retention, and validation-failure
+  cleanup all delete the bytes and rewrite the sidecar as `status: "deleted"`.
+  Readers see `404`; a later create for the id is still `409`. Single-use now
+  means single-use even through a delete, and that one rule made a whole
+  layer of defenses unnecessary — all deleted: per-reservation object-key
+  suffixes for direct uploads (a stale presigned PUT now lands on bytes
+  nothing will ever serve), the deletion-epoch cache guard, the generation
+  gate on the post-terminate sweep, the fresh sidecar re-read on every byte
+  accessor, the ordered "sidecar last" delete choreography, and the local
+  adapter's per-artifact lock. A `422` no longer "frees the id for a
+  corrected retry" — clients mint a fresh id, as PROTOCOL.md §4.2.1 already
+  required — and a failed cleanup after a rejection is logged rather than
+  turned into a `500`. Tombstones are a few hundred bytes; `listArtifactIds`
+  includes them and `getMetadata` reports them as absent. PROTOCOL.md
+  §4.2.1, §6.2 and §9 are rewritten accordingly.
+- **Breaking: S3-compatible backends must honor `If-None-Match`.** The
+  boot-time probe now refuses a backend that rejects or silently ignores
+  conditional writes instead of falling back to check-then-write with a
+  warning. The degraded mode reopened the exact race the single-use
+  contract exists to close.
+- `PulseVaultTusContext` carries only the request; the tus finish hook reads
+  kind and checksum from storage (one `getMetadata`) instead of a per-request
+  cache with a storage fallback. A missing context or unparseable upload id
+  in that hook is now a loud `500`, not a silent skip that left a finished
+  upload unserved.
+
 ### Removed
 
 - **Breaking: artifactIds are single-use — in-band debris reclaim is gone.**

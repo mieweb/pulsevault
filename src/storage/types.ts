@@ -171,10 +171,12 @@ export interface PulseVaultStorage {
   markReady?(artifactId: string): Promise<void>;
 
   /**
-   * Delete all storage associated with an artifactId. Returns `true` if
-   * something was removed, `false` if the artifactId was already absent.
-   * Called both from the `DELETE /artifacts/:artifactId` route and from the
-   * plugin's cleanup path when `validatePayload` rejects a completed upload.
+   * Delete the bytes for an artifactId and tombstone its reservation: the id
+   * stays spent (a later create for it is still `409`), but readers treat it
+   * as absent. Returns `true` if something was removed, `false` if the
+   * artifactId was absent or already tombstoned. Called from the
+   * `DELETE /artifacts/:artifactId` route, TUS termination, and the cleanup
+   * path when `validatePayload` rejects a completed upload.
    */
   remove?(artifactId: string): Promise<boolean>;
 

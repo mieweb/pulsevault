@@ -61,28 +61,18 @@ instance talks to the same bucket, so it scales horizontally with zero
 additional configuration. Prefer it for any multi-instance deployment unless
 you have a specific reason to use local disk.
 
-### S3-compatible backend collision-guard fallback
+### S3-compatible backends must honor conditional writes
 
-`reserveUpload`'s collision guard normally uses `PutObjectCommand`'s
-`IfNoneMatch: "*"` to atomically reject a second create for an artifactId
-that already has an upload. Some S3-compatible backends don't honor
-conditional writes — either rejecting the header outright (501) or, more
-dangerously, accepting it and silently ignoring it.
-
-The adapter decides which kind of bucket it has **once**: `initialize()` (or
+`reserveUpload`'s one-winner guarantee is `PutObjectCommand`'s
+`IfNoneMatch: "*"`. The adapter verifies it **once** — `initialize()` (or
 the first reserve, for hosts that skip it) writes a throwaway key under the
 metadata prefix twice, the second time conditionally, and requires the
-412/409 that an honoring backend returns. Anything else puts the adapter in
-a degraded check-then-write mode — functionally the same guard, but with
-the original race reopened: two truly concurrent (or retried) creates for
-the same artifactId can both pass the check before either writes, and the
-second silently clobbers the first's metadata. There's no way to close this
-without an external lock, since it's a limitation of the backend, not this
-package. Degraded mode logs one `console.warn` per adapter at the probe —
-treat that warning as a signal to either move to a backend that supports
-conditional writes, or serialize artifactId creation yourself (e.g. in your
-own `/reserve` endpoint) if concurrent creates for the same id are a real
-possibility in your deployment.
+412/409 an honoring backend returns. A backend that rejects the header
+(501) or, more dangerously, accepts it and silently ignores it fails that
+probe and the adapter refuses to start. There is no degraded mode: without
+conditional writes two creates for one artifactId can both succeed, and no
+amount of check-then-write closes that. AWS S3 (since Nov 2024) and
+Cloudflare R2 both qualify.
 
 ## Resource limits and abuse prevention
 
@@ -280,15 +270,19 @@ than a retention window (compliance-driven deletion):
 > `complete` never arrives leaves an `"uploading"` sidecar plus (possibly) a
 > stored object the client PUT but never confirmed. The abandoned-upload
 > cutoff below covers the sidecar; on S3/R2 also add a bucket lifecycle rule
-> for unconfirmed objects. ArtifactIds are single-use (PROTOCOL.md §4.2.1),
-> so this sweep is the only thing that frees an abandoned id — clients never
-> re-contest one; they mint a fresh id per attempt.
+> for unconfirmed objects. ArtifactIds are single-use (PROTOCOL.md §4.2.1):
+> this sweep reclaims an abandoned reservation's bytes, and the id itself
+> stays spent — clients never re-contest one; they mint a fresh id per
+> attempt.
 
 Both built-in adapters implement `listArtifactIds()`/`getMetadata()`, so the
 same sweep runs unchanged against local disk or an S3/R2 bucket (where it is
-a paginated `ListObjectsV2` over the metadata prefix). `remove()` also clears
-a sidecar that exists but no longer parses, so debris from a crash or a
-foreign schema never leaves an id that nothing can free.
+a paginated `ListObjectsV2` over the metadata prefix). `remove()` deletes the
+bytes and rewrites the sidecar as a `"deleted"` tombstone rather than
+deleting it, so a removed id can never be reserved again; `getMetadata()`
+reports a tombstone as absent, so the sweep below skips it. A tombstone is
+a few hundred bytes — keep them. An unparseable sidecar (crash debris, a
+foreign schema) is tombstoned the same way.
 
 ```ts
 import { createLocalStorage } from "@mieweb/pulsevault";
