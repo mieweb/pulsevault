@@ -1,0 +1,17 @@
+{
+  "name": "pulsevault-workers-demo",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers demo: a PROTOCOL.md-compatible control plane on a V8 isolate — direct-upload profile (§9) with R2 as the data plane; implements the wire contract from the spec (not by running @mieweb/pulsevault, whose tus stack needs node:fs)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/worker.mjs"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

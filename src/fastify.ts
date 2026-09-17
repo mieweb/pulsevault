@@ -1,14 +1,15 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
+import type { PulseVaultCoreCacheOptions } from './core.js';
 import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultStorage } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
+  rejectRemovedOptions,
   validateBasePath,
   validateMaxUploadSize,
-  validateUploadUnit,
   validateAllowedExtensions,
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
@@ -17,25 +18,13 @@ import {
 } from './lib/options.js';
 
 /**
- * Subset of `@fastify/send`'s cache-related options forwarded to the GET
- * route. All upload filenames are content-addressable (keyed by the upload
- * UUID), so `immutable: true` is safe whenever you also set a non-zero
- * `maxAge`.
+ * Cache-control options forwarded to `@fastify/send` for the GET route — the
+ * same shape the framework-agnostic core takes; aliased here so plugin
+ * consumers keep the established name. All upload filenames are
+ * content-addressable (keyed by the upload UUID), so `immutable: true` is safe
+ * whenever you also set a non-zero `maxAge`.
  */
-export type PulseVaultCacheOptions = {
-  /** Enable the `Cache-Control` response header. Defaults to `true`. */
-  cacheControl?: boolean;
-  /**
-   * `max-age` for the `Cache-Control` header. Accepts a number of
-   * milliseconds or an `ms`-style string such as `"1y"`. Defaults to `0`.
-   */
-  maxAge?: string | number;
-  /**
-   * Add the `immutable` directive to `Cache-Control`. Requires `maxAge > 0`
-   * to take effect. Defaults to `false`.
-   */
-  immutable?: boolean;
-};
+export type PulseVaultCacheOptions = PulseVaultCoreCacheOptions;
 
 export type PulseVaultPluginOptions = {
   /** Storage adapter. Use `createLocalStorage(...)` for filesystem-backed deployments. */
@@ -53,15 +42,6 @@ export type PulseVaultPluginOptions = {
    * explicit cap for their deployment. Use `Infinity` for no cap.
    */
   maxUploadSize: number;
-  /**
-   * Which upload strategy this deployment expects: `"segment"` uploads each
-   * clip individually (no client-side merge/re-encode pass) plus a manifest
-   * artifact for ordering, while `"merged"` expects one pre-merged video per
-   * pulse (plus its captions, beat manifest and thumbnail). Purely advertised
-   * via `GET /capabilities` for the client to branch on — `pulsevault` doesn't
-   * enforce either. Defaults to `"segment"`.
-   */
-  uploadUnit?: 'segment' | 'merged';
   /**
    * Fastify instance decorator name under which the storage adapter is
    * exposed. Defaults to `"pulseVault"`. Override when registering this
@@ -164,9 +144,9 @@ export type PulseVaultPluginOptions = {
 const DEFAULT_DECORATOR_NAME = 'pulseVault';
 
 const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) => {
+  rejectRemovedOptions(opts);
   validateBasePath(opts.prefix, 'prefix');
   validateMaxUploadSize(opts.maxUploadSize);
-  validateUploadUnit(opts.uploadUnit);
   validateAllowedExtensions(opts.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(opts);
 
@@ -187,7 +167,6 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     prefix: opts.prefix,
     storage: opts.storage,
     maxUploadSize: opts.maxUploadSize,
-    uploadUnit: opts.uploadUnit ?? 'segment',
     allowedExtensions,
     cache: opts.cache,
     authorize: opts.authorize,
@@ -225,7 +204,12 @@ export type {
 export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export type {
+  WebReadyAction,
+  WebReadyOptions,
+  WebReadyResult,
+  MoovPosition,
+} from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {

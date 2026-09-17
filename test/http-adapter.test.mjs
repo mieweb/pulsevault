@@ -3,13 +3,13 @@
 // around `core.handler` instead of a Fastify instance — proves the core is
 // protocol-correct on its own, independent of any host framework.
 
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import http from "node:http";
-import os from "node:os";
-import path from "node:path";
-import { createHash } from "node:crypto";
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   createPulseVaultCore,
   createLocalStorage,
@@ -17,19 +17,13 @@ import {
   createChecksumValidator,
   issueCapabilityToken,
   createCapabilityAuthorize,
-} from "../dist/core.js";
-import {
-  makeMp4,
-  tusCreate as tusCreateRaw,
-  tusPatch,
-  tusHead,
-  uploadFull,
-} from "./helpers.mjs";
+} from '../dist/core.js';
+import { makeMp4, tusCreate as tusCreateRaw, tusPatch, tusHead, uploadFull } from './helpers.mjs';
 
-const ID1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const ID2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const ID1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const ID2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
-const PREFIX = "/pulsevault";
+const PREFIX = '/pulsevault';
 
 const tusCreate = (baseUrl, opts) => tusCreateRaw(baseUrl, PREFIX, opts);
 const uploadFullMp4 = (ctx, artifactId, size = 1024) =>
@@ -37,7 +31,7 @@ const uploadFullMp4 = (ctx, artifactId, size = 1024) =>
 const artifactUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}`;
 
 async function startApp({ coreOptions = {}, withSniffer = false } = {}) {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-http-test-"));
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pv-http-test-'));
   const storage = createLocalStorage({ workspaceDir });
   const core = createPulseVaultCore({
     basePath: PREFIX,
@@ -52,7 +46,7 @@ async function startApp({ coreOptions = {}, withSniffer = false } = {}) {
       res.end(String(err));
     });
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   return {
     core,
@@ -67,22 +61,20 @@ async function startApp({ coreOptions = {}, withSniffer = false } = {}) {
   };
 }
 
-test("reserve + full upload flips sidecar to ready and GET streams the bytes", async () => {
+test('reserve + full upload flips sidecar to ready and GET streams the bytes', async () => {
   const ctx = await startApp();
   try {
     const { body } = await uploadFullMp4(ctx, ID1);
 
     const sidecar = JSON.parse(
-      await fs.readFile(
-        path.join(ctx.workspaceDir, ".pulsevault", `${ID1}.json`),
-        "utf8",
-      ),
+      await fs.readFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'utf8'),
     );
-    assert.equal(sidecar.status, "ready");
+    assert.equal(sidecar.status, 'ready');
 
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 200);
-    assert.equal(get.headers.get("protocol-version"), "1");
+    assert.equal(get.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(get.headers.get('protocol-version'), '1');
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(bytes.length, body.length);
     assert.equal(Buffer.compare(bytes, body), 0);
@@ -91,12 +83,12 @@ test("reserve + full upload flips sidecar to ready and GET streams the bytes", a
   }
 });
 
-test("GET returns 404 while the upload is still in progress", async () => {
+test('GET returns 404 while the upload is still in progress', async () => {
   const ctx = await startApp();
   try {
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: 1024,
     });
     assert.equal(create.status, 201);
@@ -108,16 +100,16 @@ test("GET returns 404 while the upload is still in progress", async () => {
   }
 });
 
-test("HEAD + resume PATCH completes the upload", async () => {
+test('HEAD + resume PATCH completes the upload', async () => {
   const ctx = await startApp();
   try {
     const body = makeMp4(4096);
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: body.length,
     });
-    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    const location = new URL(create.headers.get('location'), ctx.baseUrl).href;
     const half = body.length / 2;
 
     const p1 = await tusPatch(location, 0, body.subarray(0, half));
@@ -125,7 +117,7 @@ test("HEAD + resume PATCH completes the upload", async () => {
 
     const head = await tusHead(location);
     assert.equal(head.status, 200);
-    assert.equal(head.headers.get("upload-offset"), String(half));
+    assert.equal(head.headers.get('upload-offset'), String(half));
 
     const midGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(midGet.status, 404);
@@ -142,17 +134,17 @@ test("HEAD + resume PATCH completes the upload", async () => {
   }
 });
 
-test("an aborted PATCH mid-body does not crash the server process", async () => {
+test('an aborted PATCH mid-body does not crash the server process', async () => {
   const ctx = await startApp();
   try {
     const size = 1 << 16; // 64 KiB — big enough to reliably abort mid-body
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size,
     });
     assert.equal(create.status, 201);
-    const location = new URL(create.headers.get("location"), ctx.baseUrl);
+    const location = new URL(create.headers.get('location'), ctx.baseUrl);
 
     // Start a PATCH that PROMISES `size` bytes (Content-Length) but send only a handful, then rip
     // the socket away without finishing the body — exactly what an app kill / network reset does
@@ -163,15 +155,15 @@ test("an aborted PATCH mid-body does not crash the server process", async () => 
         hostname: location.hostname,
         port: location.port,
         path: location.pathname,
-        method: "PATCH",
+        method: 'PATCH',
         headers: {
-          "Tus-Resumable": "1.0.0",
-          "Upload-Offset": "0",
-          "Content-Type": "application/offset+octet-stream",
-          "Content-Length": String(size),
+          'Tus-Resumable': '1.0.0',
+          'Upload-Offset': '0',
+          'Content-Type': 'application/offset+octet-stream',
+          'Content-Length': String(size),
         },
       });
-      req.on("error", () => {}); // the client half also observes the reset
+      req.on('error', () => {}); // the client half also observes the reset
       req.write(Buffer.alloc(64));
       setTimeout(() => {
         req.destroy(); // abort without completing the body
@@ -188,37 +180,37 @@ test("an aborted PATCH mid-body does not crash the server process", async () => 
     // The upload also survives as a resumable sidecar (offset somewhere in [0, size]).
     const head = await tusHead(location.href);
     assert.equal(head.status, 200);
-    const offset = Number(head.headers.get("upload-offset"));
+    const offset = Number(head.headers.get('upload-offset'));
     assert.ok(Number.isInteger(offset) && offset >= 0 && offset <= size);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("an aborted creation-with-upload POST mid-body does not crash the server process", async () => {
+test('an aborted creation-with-upload POST mid-body does not crash the server process', async () => {
   const ctx = await startApp();
   try {
     // Same failure mode as the PATCH abort, but via the POST handler's creation-with-upload path
     // (Content-Type: application/offset+octet-stream on the creation request), which also runs
     // through BaseHandler.writeToStore.
     const size = 1 << 16;
-    const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+    const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
     const url = new URL(`${PREFIX}/upload`, ctx.baseUrl);
     await new Promise((resolve) => {
       const req = http.request({
         hostname: url.hostname,
         port: url.port,
         path: url.pathname,
-        method: "POST",
+        method: 'POST',
         headers: {
-          "Tus-Resumable": "1.0.0",
-          "Upload-Length": String(size),
-          "Upload-Metadata": `artifactId ${b64(ID1)},filename ${b64("clip.mp4")}`,
-          "Content-Type": "application/offset+octet-stream",
-          "Content-Length": String(size),
+          'Tus-Resumable': '1.0.0',
+          'Upload-Length': String(size),
+          'Upload-Metadata': `artifactId ${b64(ID1)},filename ${b64('clip.mp4')}`,
+          'Content-Type': 'application/offset+octet-stream',
+          'Content-Length': String(size),
         },
       });
-      req.on("error", () => {});
+      req.on('error', () => {});
       req.write(Buffer.alloc(64));
       setTimeout(() => {
         req.destroy();
@@ -235,19 +227,19 @@ test("an aborted creation-with-upload POST mid-body does not crash the server pr
   }
 });
 
-test("second reserve for same artifactId returns 409", async () => {
+test('second reserve for same artifactId returns 409', async () => {
   const ctx = await startApp();
   try {
     const first = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: 1024,
     });
     assert.equal(first.status, 201);
 
     const dup = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: 1024,
     });
     assert.equal(dup.status, 409);
@@ -256,30 +248,27 @@ test("second reserve for same artifactId returns 409", async () => {
   }
 });
 
-test("non-allowed extension is rejected at create", async () => {
+test('non-allowed extension is rejected at create', async () => {
   const ctx = await startApp();
   try {
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "evil.exe",
+      filename: 'evil.exe',
       size: 1024,
     });
-    assert.ok(
-      create.status >= 400 && create.status < 500,
-      `expected 4xx, got ${create.status}`,
-    );
+    assert.ok(create.status >= 400 && create.status < 500, `expected 4xx, got ${create.status}`);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("range GET returns 206 with the requested slice", async () => {
+test('range GET returns 206 with the requested slice', async () => {
   const ctx = await startApp();
   try {
     const { body } = await uploadFullMp4(ctx, ID1, 2048);
 
     const range = await fetch(artifactUrl(ctx, ID1), {
-      headers: { Range: "bytes=0-99" },
+      headers: { Range: 'bytes=0-99' },
     });
     assert.equal(range.status, 206);
     const slice = Buffer.from(await range.arrayBuffer());
@@ -290,7 +279,7 @@ test("range GET returns 206 with the requested slice", async () => {
   }
 });
 
-test("GET of an unknown artifactId returns 404", async () => {
+test('GET of an unknown artifactId returns 404', async () => {
   const ctx = await startApp();
   try {
     const res = await fetch(artifactUrl(ctx, ID1));
@@ -300,26 +289,60 @@ test("GET of an unknown artifactId returns 404", async () => {
   }
 });
 
-test("OPTIONS /upload (tus preflight) is handled, not 404", async () => {
+test('OPTIONS /upload (tus preflight) is handled, not 404', async () => {
   const ctx = await startApp();
   try {
     const res = await fetch(`${ctx.baseUrl}${PREFIX}/upload`, {
-      method: "OPTIONS",
-      headers: { "Tus-Resumable": "1.0.0" },
+      method: 'OPTIONS',
+      headers: { 'Tus-Resumable': '1.0.0' },
     });
     assert.notEqual(res.status, 404);
-    assert.equal(res.headers.get("tus-version"), "1.0.0");
+    assert.equal(res.headers.get('tus-version'), '1.0.0');
   } finally {
     await ctx.teardown();
   }
 });
 
-test("trailing slash on /upload/ still routes to the tus handler", async () => {
+test('OPTIONS /upload passes with `authorize` configured — a preflight carries no bearer and names no artifact', async () => {
+  const ctx = await startApp({
+    coreOptions: {
+      authorize: async () => {
+        throw Object.assign(new Error('no'), { statusCode: 403 });
+      },
+    },
+  });
+  try {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/upload`, {
+      method: 'OPTIONS',
+      headers: { 'Tus-Resumable': '1.0.0' },
+    });
+    assert.notEqual(res.status, 403);
+    assert.equal(res.headers.get('tus-version'), '1.0.0');
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test('HEAD /artifacts/:id answers like GET, headers only', async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1);
+    const head = await fetch(artifactUrl(ctx, ID1), { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-length'), String(body.length));
+    assert.equal(head.headers.get('accept-ranges'), 'bytes');
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test('trailing slash on /upload/ still routes to the tus handler', async () => {
   const ctx = await startApp();
   try {
     const res = await fetch(`${ctx.baseUrl}${PREFIX}/upload/`, {
-      method: "OPTIONS",
-      headers: { "Tus-Resumable": "1.0.0" },
+      method: 'OPTIONS',
+      headers: { 'Tus-Resumable': '1.0.0' },
     });
     assert.notEqual(res.status, 404);
   } finally {
@@ -327,7 +350,7 @@ test("trailing slash on /upload/ still routes to the tus handler", async () => {
   }
 });
 
-test("authorize rejection blocks create, GET, and DELETE", async () => {
+test('authorize rejection blocks create, GET, and DELETE', async () => {
   const ctx = await startApp({
     coreOptions: {
       authorize: async (_req, { phase }) => {
@@ -338,7 +361,7 @@ test("authorize rejection blocks create, GET, and DELETE", async () => {
   try {
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: 1024,
     });
     assert.equal(create.status, 403);
@@ -346,14 +369,14 @@ test("authorize rejection blocks create, GET, and DELETE", async () => {
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 403);
 
-    const del = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
+    const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del.status, 403);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("DELETE removes the artifact; second DELETE is 404", async () => {
+test('DELETE removes the artifact; second DELETE is 404', async () => {
   const ctx = await startApp();
   try {
     await uploadFullMp4(ctx, ID1);
@@ -361,39 +384,33 @@ test("DELETE removes the artifact; second DELETE is 404", async () => {
     const preGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(preGet.status, 200);
 
-    const del = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
+    const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del.status, 204);
 
     const postGet = await fetch(artifactUrl(ctx, ID1));
     assert.equal(postGet.status, 404);
 
-    const del2 = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
+    const del2 = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
     assert.equal(del2.status, 404);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("createMp4Sniffer rejects non-MP4 bytes and removes the artifact", async () => {
+test('createMp4Sniffer rejects non-MP4 bytes and removes the artifact', async () => {
   const ctx = await startApp({ withSniffer: true });
   try {
-    const fake = Buffer.concat([
-      Buffer.from("GIF89a"),
-      Buffer.alloc(1024, 0xff),
-    ]);
+    const fake = Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(1024, 0xff)]);
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
-      filename: "fake.mp4",
+      filename: 'fake.mp4',
       size: fake.length,
     });
     assert.equal(create.status, 201);
-    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    const location = new URL(create.headers.get('location'), ctx.baseUrl).href;
 
     const patch = await tusPatch(location, 0, fake);
-    assert.ok(
-      patch.status >= 400 && patch.status < 500,
-      `expected 4xx, got ${patch.status}`,
-    );
+    assert.ok(patch.status >= 400 && patch.status < 500, `expected 4xx, got ${patch.status}`);
 
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 404);
@@ -402,7 +419,7 @@ test("createMp4Sniffer rejects non-MP4 bytes and removes the artifact", async ()
   }
 });
 
-test("onUploadComplete fires exactly once with the right ctx", async () => {
+test('onUploadComplete fires exactly once with the right ctx', async () => {
   const calls = [];
   const ctx = await startApp({
     coreOptions: {
@@ -416,18 +433,17 @@ test("onUploadComplete fires exactly once with the right ctx", async () => {
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].artifactId, ID1);
-    assert.equal(calls[0].kind, "video");
+    assert.equal(calls[0].kind, 'video');
     assert.equal(calls[0].size, body.length);
   } finally {
     await ctx.teardown();
   }
 });
 
-test("GET /capabilities is unauthenticated and reports the configured uploadUnit", async () => {
+test('GET /capabilities is unauthenticated', async () => {
   const authorizeCalls = [];
   const ctx = await startApp({
     coreOptions: {
-      uploadUnit: "merged",
       authorize: async (_req, ctx) => {
         authorizeCalls.push(ctx.phase);
       },
@@ -438,23 +454,22 @@ test("GET /capabilities is unauthenticated and reports the configured uploadUnit
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.protocolVersion, 1);
-    assert.equal(body.uploadUnit, "merged");
-    assert.deepEqual(body.kinds.sort(), ["captions", "project", "thumbnail", "video"]);
+    assert.deepEqual(body.kinds.sort(), ['captions', 'project', 'thumbnail', 'video']);
     assert.equal(body.maxUploadSize, 10 * 1024 * 1024);
     assert.ok(Array.isArray(body.checksum.algorithms));
-    assert.equal(authorizeCalls.length, 0, "capabilities must not run authorize");
+    assert.equal(authorizeCalls.length, 0, 'capabilities must not run authorize');
   } finally {
     await ctx.teardown();
   }
 });
 
-test("checksum validator accepts a matching digest and rejects a mismatched one", async () => {
+test('checksum validator accepts a matching digest and rejects a mismatched one', async () => {
   const ctx = await startApp({
     coreOptions: { validatePayload: createChecksumValidator() },
   });
   try {
     const body = makeMp4(1024);
-    const digest = createHash("sha256").update(body).digest("hex");
+    const digest = createHash('sha256').update(body).digest('hex');
 
     await uploadFull(ctx.baseUrl, PREFIX, {
       artifactId: ID1,
@@ -462,33 +477,33 @@ test("checksum validator accepts a matching digest and rejects a mismatched one"
       checksum: `sha256:${digest}`,
     });
     const get = await fetch(artifactUrl(ctx, ID1));
-    assert.equal(get.status, 200, "matching checksum is accepted");
+    assert.equal(get.status, 200, 'matching checksum is accepted');
 
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID2,
-      filename: "clip.mp4",
+      filename: 'clip.mp4',
       size: body.length,
-      checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      checksum: 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
     });
-    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    const location = new URL(create.headers.get('location'), ctx.baseUrl).href;
     const patch = await tusPatch(location, 0, body);
-    assert.equal(patch.status, 422, "mismatched checksum is rejected");
+    assert.equal(patch.status, 422, 'mismatched checksum is rejected');
   } finally {
     await ctx.teardown();
   }
 });
 
-test("createCapabilityAuthorize: valid token authorizes its own artifact and a related one, rejects others", async () => {
-  const secret = "test-secret";
-  const issuer = "https://vault.example.test";
-  const lookupSecret = (kid) => (kid === "k1" ? secret : null);
+test('createCapabilityAuthorize: valid token authorizes its own artifact and a related one, rejects others', async () => {
+  const secret = 'test-secret';
+  const issuer = 'https://vault.example.test';
+  const lookupSecret = (kid) => (kid === 'k1' ? secret : null);
   const ctx = await startApp({
     coreOptions: {
       authorize: createCapabilityAuthorize(lookupSecret, { issuer }),
     },
   });
   try {
-    const token = issueCapabilityToken(ID1, secret, { keyId: "k1", issuer });
+    const token = issueCapabilityToken(ID1, secret, { keyId: 'k1', issuer });
 
     await uploadFull(ctx.baseUrl, PREFIX, {
       artifactId: ID1,
@@ -501,22 +516,21 @@ test("createCapabilityAuthorize: valid token authorizes its own artifact and a r
 
     const captionsCreate = await tusCreateRaw(ctx.baseUrl, PREFIX, {
       artifactId: ID2,
-      filename: "clip.vtt",
+      filename: 'clip.vtt',
       size: 10,
-      kind: "captions",
+      kind: 'captions',
       relatedTo: ID1,
       headers: { Authorization: `Bearer ${token}` },
     });
-    assert.equal(captionsCreate.status, 201, "related artifact authorized by the session token");
+    assert.equal(captionsCreate.status, 201, 'related artifact authorized by the session token');
 
-    const unrelatedToken = issueCapabilityToken(
-      "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      secret,
-      { keyId: "k1", issuer },
-    );
+    const unrelatedToken = issueCapabilityToken('cccccccc-cccc-4ccc-8ccc-cccccccccccc', secret, {
+      keyId: 'k1',
+      issuer,
+    });
     const rejected = await tusCreateRaw(ctx.baseUrl, PREFIX, {
-      artifactId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      filename: "clip.mp4",
+      artifactId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      filename: 'clip.mp4',
       size: 1024,
       headers: { Authorization: `Bearer ${unrelatedToken}` },
     });
@@ -526,15 +540,15 @@ test("createCapabilityAuthorize: valid token authorizes its own artifact and a r
   }
 });
 
-test("old root-level paths return 404", async () => {
+test('old root-level paths return 404', async () => {
   const ctx = await startApp();
   try {
     const uploadRoot = await fetch(`${ctx.baseUrl}/upload`, {
-      method: "POST",
+      method: 'POST',
       headers: {
-        "Tus-Resumable": "1.0.0",
-        "Upload-Length": "1024",
-        "Upload-Metadata": `artifactId ${Buffer.from(ID1).toString("base64")}`,
+        'Tus-Resumable': '1.0.0',
+        'Upload-Length': '1024',
+        'Upload-Metadata': `artifactId ${Buffer.from(ID1).toString('base64')}`,
       },
     });
     assert.equal(uploadRoot.status, 404);

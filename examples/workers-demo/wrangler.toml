@@ -1,0 +1,19 @@
+name = "pulsevault-workers-demo"
+main = "src/worker.mjs"
+compatibility_date = "2026-08-04"
+
+# R2 data plane: bytes go straight to the bucket via presigned PUT (PROTOCOL.md §9);
+# the Worker is only the control plane (authorize / reserve / complete / redirect).
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "pulse-videos"
+
+[vars]
+R2_ACCOUNT_ID = "<account-id>"
+R2_BUCKET_NAME = "pulse-videos"
+PV_ISSUER = "https://pulsevault-workers-demo.example.workers.dev"
+
+# Secrets (wrangler secret put …):
+#   PV_TOKEN_SECRET      — HMAC secret for capability tokens (kid "k1")
+#   R2_ACCESS_KEY_ID     — R2 S3-API token for presigning
+#   R2_SECRET_ACCESS_KEY

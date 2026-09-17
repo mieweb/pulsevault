@@ -3,91 +3,31 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isUuid } from '../lib/uuid.js';
 import type {
+  ArtifactMetadata,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
-import { parseUploadKind } from './types.js';
+import {
+  buildSidecar,
+  createMetaCache,
+  createSidecarReader,
+  DEFAULT_META_CACHE_LIMIT,
+  extToContentType,
+  parseSidecar,
+  reserveConflictError,
+  type Sidecar,
+  sidecarToCachedMeta,
+  tombstoneSidecar,
+} from './sidecar.js';
 
-/**
- * Per-artifact metadata sidecar written at
- * `<workspaceRoot>/.pulsevault/<artifactId>.json`. Lets `resolve()` recover an
- * artifact's extension and completion state without scanning the directory,
- * and keeps the on-disk layout self-describing for downstream tools
- * (ArtiPod pipelines, ffmpeg, rsync, etc.).
- */
-type Sidecar = {
-  /** Sidecar schema version. Increment for breaking changes. */
-  version: 1;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
-  ext: string;
-  /** Original filename from `Upload-Metadata.filename`. */
-  filename: string;
-  /**
-   * `"uploading"` between `reserveUpload` and `markReady`; `"ready"` once
-   * every post-upload validation has passed. The GET route only serves
-   * `"ready"` sidecars — partially-written files never leak out.
-   */
-  status: 'uploading' | 'ready';
-  /**
-   * Artifact kind. Optional for back-compat — sidecars written before
-   * kind was introduced are read as `"video"` with no on-disk migration.
-   */
-  kind?: UploadKind;
-  /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
-  relatedTo?: string;
-  /** Optional client-supplied checksum metadata. See `ReserveUploadParams.checksum`. */
-  checksum?: string;
-  /** Optional human-facing display name. See `ReserveUploadParams.name`. */
-  name?: string;
-};
+// Sidecar schema, parsing, cache, and the reserve-collision error all live in
+// `./sidecar.js`, shared verbatim with the S3 adapter — this file owns only
+// the filesystem-specific I/O around them.
 
-const SIDECAR_VERSION = 1 as const;
 /** Hidden directory inside workspaceRoot that holds per-upload sidecar files. */
 const PULSEVAULT_META_DIR = '.pulsevault';
-/** Default cap on the in-memory metadata cache before evicting the oldest entry. */
-const DEFAULT_META_CACHE_LIMIT = 10_000;
-
-type CachedMeta = {
-  ext: string;
-  ready: boolean;
-  kind: UploadKind;
-  relatedTo?: string;
-  checksum?: string;
-  name?: string;
-};
-
-/** Map a file extension to the `Content-Type` the GET route should return. */
-function extToContentType(ext: string): string {
-  switch (ext) {
-    case '.mp4':
-      return 'video/mp4';
-    case '.zip':
-      return 'application/zip';
-    case '.vtt':
-      return 'text/vtt';
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg';
-    case '.png':
-      return 'image/png';
-    default:
-      return 'application/octet-stream';
-  }
-}
-
-/** Project a `Sidecar` into the shape kept in the in-memory cache. */
-function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
-  return {
-    ext: sidecar.ext,
-    ready,
-    kind: sidecar.kind ?? 'video',
-    relatedTo: sidecar.relatedTo,
-    checksum: sidecar.checksum,
-    name: sidecar.name,
-  };
-}
 
 export type LocalStorageOptions = {
   /** Directory where uploads are stored (flat kind-scoped subdirs). Resolved against CWD if relative. */
@@ -116,11 +56,11 @@ export type LocalStorageOptions = {
  *   captions/<artifactId><ext>.json # @tus/file-store offset/metadata sidecar
  * ```
  *
- * `workspaceRoot` is exposed so consumers can layer post-processing (e.g.
- * hydrate an ArtiPod with `video/`, `transcripts/`, `frames/` mounts) against
- * the same on-disk tree from an `onUploadComplete` hook. `getLocalPath` is
- * exposed for `validatePayload` helpers that need to sniff the bytes before
- * the upload is marked ready.
+ * A removed artifact keeps its sidecar as a `"deleted"` tombstone (bytes
+ * gone, id still spent). `workspaceRoot` is exposed so consumers can layer
+ * post-processing against the same on-disk tree from an `onUploadComplete`
+ * hook. `getLocalPath` is exposed for `validatePayload` helpers that need to
+ * sniff the bytes before the upload is marked ready.
  */
 export type LocalStorage = PulseVaultStorage & {
   readonly workspaceRoot: string;
@@ -143,30 +83,23 @@ export type LocalStorage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract (incl. `{ fresh }`). */
+  getMetadata(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
+  /**
+   * All artifactIds with a sidecar — reserved, ready or tombstoned — one
+   * readdir of the metadata directory. Complements `getMetadata` so a
+   * consumer can list uploads without crawling the sidecar files by hand.
+   */
+  listArtifactIds(): Promise<string[]>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const workspaceRoot = path.resolve(opts.workspaceDir);
   const datastore = new FileStore({ directory: workspaceRoot });
-  const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
   // Metadata cache keyed by artifactId. Populated eagerly on reserve and
   // lazily from the sidecar on cache-miss — so we never do a workspace-wide
   // scan at boot and never do a per-request readdir on the GET hot path.
-  // Bounded with simple insertion-order eviction (a `Map` preserves insertion
-  // order, and re-setting a key moves it to the end) so a long-running server
-  // doesn't grow this unboundedly; a cache miss just costs an extra disk read.
-  const metaCache = new Map<string, CachedMeta>();
-
-  const cacheSet = (artifactId: string, meta: CachedMeta): void => {
-    // Re-inserting moves the key to the end of iteration order, so eviction
-    // below always drops the actual least-recently-set entry.
-    metaCache.delete(artifactId);
-    metaCache.set(artifactId, meta);
-    if (metaCache.size > metaCacheLimit) {
-      const oldest = metaCache.keys().next().value;
-      if (oldest !== undefined) metaCache.delete(oldest);
-    }
-  };
+  const metaCache = createMetaCache(opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT);
 
   /** Absolute path to the hidden metadata directory. */
   const sidecarDir = (): string => path.join(workspaceRoot, PULSEVAULT_META_DIR);
@@ -201,61 +134,32 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     await fs.rename(tmpPath, finalPath);
   };
 
-  const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
+  /** Raw sidecar text, or `null` if no sidecar file exists. */
+  const readSidecarRaw = async (artifactId: string): Promise<string | null> => {
     // Every sidecar/artifact path in this module is built by joining
     // `artifactId` straight into a filesystem path — reject anything that
-    // isn't a real UUID before it reaches `fs`, the same way `resolve()`
-    // already refuses to serve non-UUID ids, so a stray `../` (or one
-    // smuggled in by a caller that skips the HTTP route layer, e.g. a
-    // direct `getLocalPath`/`getKind` call) can never escape the intended
-    // `.pulsevault`/`<kind>` subdirectories. This is the single funnel
-    // every other method in this file goes through (`loadMeta`), so
-    // gating here covers `getLocalPath`, `getKind`, `getRelatedTo`,
-    // `getChecksum`, `resolve`, `remove`, and `markReady` in one place.
+    // isn't a real UUID before it reaches `fs`, so a stray `../` (or one
+    // smuggled in by a caller that skips the HTTP route layer) can never
+    // escape the intended `.pulsevault`/`<kind>` subdirectories. This is the
+    // single funnel every other method in this file goes through.
     if (!isUuid(artifactId)) return null;
-    let raw: string;
     try {
-      raw = await fs.readFile(sidecarPath(artifactId), 'utf8');
+      return await fs.readFile(sidecarPath(artifactId), 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
       throw err;
     }
-    try {
-      const parsed = JSON.parse(raw) as Partial<Sidecar>;
-      if (typeof parsed.ext !== 'string') return null;
-      if (typeof parsed.filename !== 'string') return null;
-      // Older sidecars (pre-status) are treated as ready so an in-place
-      // upgrade doesn't hide finalized uploads. New uploads always write a
-      // `status` field explicitly.
-      const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
-      // Older sidecars without `kind` default to `"video"` — no migration.
-      const kind = parseUploadKind(parsed.kind);
-      return {
-        version: SIDECAR_VERSION,
-        ext: parsed.ext,
-        filename: parsed.filename,
-        status,
-        kind,
-        relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
-        checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
-        name: typeof parsed.name === 'string' ? parsed.name : undefined,
-      };
-    } catch {
-      // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
-      // it on the next create.
-      return null;
-    }
   };
 
-  const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
-    const cached = metaCache.get(artifactId);
-    if (cached) return cached;
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) return null;
-    const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    cacheSet(artifactId, meta);
-    return meta;
+  // Malformed sidecars parse to null — absent for readers, but the file still
+  // occupies the id for `reserveUpload` (exclusive create), like a tombstone.
+  const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
+    const raw = await readSidecarRaw(artifactId);
+    return raw === null ? null : parseSidecar(raw);
   };
+
+  const { loadMeta, getKind, getRelatedTo, getChecksum, getName, getMetadata } =
+    createSidecarReader({ cache: metaCache, readSidecar });
 
   const initialize = async (): Promise<void> => {
     // Dirs PulseVault creates itself get mode 0o750 directly (mkdir's mode caps
@@ -267,53 +171,32 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
-  const reserveUpload = async ({
-    artifactId,
-    filename,
-    ext,
-    kind,
-    relatedTo,
-    checksum,
-    name,
-  }: ReserveUploadParams): Promise<string> => {
+  const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
+    const { artifactId, kind, ext } = params;
     await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
-    const sidecar: Sidecar = {
-      version: SIDECAR_VERSION,
-      ext,
-      filename,
-      status: 'uploading',
-      kind,
-      relatedTo,
-      checksum,
-      name,
-    };
+    const sidecar = buildSidecar(params);
 
-    // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
-    // this artifactId, rather than the previous read-then-write (`loadMeta` then
-    // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
-    // the check before either had written — letting the second silently clobber the first's
-    // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
-    // @tus/server's error path, same as before.
+    // ArtifactIds are single-use: the sidecar is written whole to a temp file
+    // and then hard-linked into place — `link` is atomic AND exclusive (EEXIST
+    // if any sidecar, even a tombstone or crash debris, already holds the
+    // name), so a collision is a plain 409 whether the previous upload
+    // finished, is still in flight, died halfway, or was deleted. Clients
+    // mint a fresh id per attempt.
+    const finalPath = sidecarPath(artifactId);
+    const tmpPath = `${finalPath}.${crypto.randomUUID()}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(sidecar));
     try {
-      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+      await fs.link(tmpPath, finalPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      // A file already exists at this path, but `readSidecar` treats a malformed/corrupt
-      // one as absent (e.g. debris from a crash mid-write) — re-check before deciding this
-      // is a genuine collision rather than debris that's safe to overwrite.
-      const existing = await readSidecar(artifactId);
-      if (existing) {
-        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-          statusCode: 409,
-          status_code: 409,
-        });
-      }
-      await writeSidecar(artifactId, sidecar);
+      throw reserveConflictError(artifactId);
+    } finally {
+      await fs.rm(tmpPath, { force: true });
     }
 
-    cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum, name });
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false));
     // @tus/file-store joins this onto its configured `directory`, so the
     // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
     return artifactRelPath(artifactId, kind, ext);
@@ -349,27 +232,43 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
       );
     }
+    if (sidecar.status === 'deleted') {
+      throw new Error(`markReady: artifactId ${artifactId} was deleted`);
+    }
     if (sidecar.status === 'ready') {
       // Idempotent: already ready is fine, keep the cache consistent.
-      cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
       return;
     }
     await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
   };
 
+  /**
+   * Delete the bytes and datastore state, then rewrite the sidecar as a
+   * tombstone. The id stays spent, so nothing can race a re-create; a
+   * `markReady` that interleaves with this on the same id can at worst leave a
+   * "ready" sidecar over missing bytes, which `resolve` reports as 404.
+   * Returns `false` if there was nothing to remove (absent or already
+   * tombstoned).
+   */
   const remove = async (artifactId: string): Promise<boolean> => {
-    const meta = await loadMeta(artifactId);
-    // Drop from cache before rm so a racing `resolve` arriving after the
-    // rm but before cache eviction can't hand back a stale path.
+    const raw = await readSidecarRaw(artifactId);
+    if (raw === null) return false;
+    // Unparseable debris (crash mid-write on an older build, a foreign
+    // schema) is tombstoned too — its bytes, if any, are unknowable without
+    // kind/ext; retention covers those.
+    const sidecar = parseSidecar(raw);
+    if (sidecar?.status === 'deleted') return false;
+    if (sidecar) {
+      const artifactPath = path.join(workspaceRoot, sidecar.kind ?? 'video', `${artifactId}${sidecar.ext}`);
+      await Promise.all([
+        fs.rm(artifactPath, { force: true }),
+        fs.rm(`${artifactPath}.json`, { force: true }),
+      ]);
+    }
+    await writeSidecar(artifactId, tombstoneSidecar(sidecar));
     metaCache.delete(artifactId);
-    if (!meta) return false;
-    const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
-    await Promise.all([
-      fs.rm(artifactPath, { force: true }),
-      fs.rm(`${artifactPath}.json`, { force: true }),
-      fs.rm(sidecarPath(artifactId), { force: true }),
-    ]);
     return true;
   };
 
@@ -379,24 +278,18 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
   };
 
-  const getKind = async (artifactId: string): Promise<UploadKind | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta ? meta.kind : null;
-  };
-
-  const getRelatedTo = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.relatedTo ?? null;
-  };
-
-  const getChecksum = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.checksum ?? null;
-  };
-
-  const getName = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.name ?? null;
+  const listArtifactIds = async (): Promise<string[]> => {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(sidecarDir());
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+      throw err;
+    }
+    return entries
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => name.slice(0, -'.json'.length))
+      .filter(isUuid);
   };
 
   return {
@@ -412,5 +305,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     getRelatedTo,
     getChecksum,
     getName,
+    getMetadata,
+    listArtifactIds,
   };
 }

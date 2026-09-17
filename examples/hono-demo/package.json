@@ -1,0 +1,14 @@
+{
+  "name": "pulsevault-hono-demo",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Hono demo for @mieweb/pulsevault — mounts the web-standard (Request→Response) handler; the same mount line works on Node, Bun, and Deno",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "@mieweb/pulsevault": "file:../..",
+    "hono": "^4.11.9"
+  }
+}

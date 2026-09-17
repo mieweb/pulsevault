@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { httpError } from './errors.js';
 import type { PulseVaultRequest } from './request.js';
 import type { PulseVaultAuthorize, PulseVaultAuthorizeContext } from './authorize.js';
 
@@ -171,7 +172,8 @@ function extractToken(
  * Authorizes the request if the token's `artifactId` matches either the
  * artifact being acted on, or that artifact's `relatedTo` session anchor —
  * so one token issued for a video also covers its captions/manifest/thumbnail
- * and (under `uploadUnit: "segment"`) every clip and the ordering manifest
+ * and every related artifact of the session (captions, the beat-manifest
+ * project file, the thumbnail) chains to it via `relatedTo`
  * uploaded in the same session, without minting a token per artifact.
  */
 export function createCapabilityAuthorize(
@@ -181,14 +183,14 @@ export function createCapabilityAuthorize(
   return async (request, ctx) => {
     const token = extractToken(request, ctx);
     if (!token) {
-      throw Object.assign(new Error('Missing capability token'), { statusCode: 401 });
+      throw httpError(401, 'Missing capability token');
     }
     const verified = verifyCapabilityToken(token, lookupSecret, opts);
     if (!verified) {
-      throw Object.assign(new Error('Invalid or expired capability token'), { statusCode: 403 });
+      throw httpError(403, 'Invalid or expired capability token');
     }
     if (ctx.artifactId !== verified.artifactId && ctx.relatedTo !== verified.artifactId) {
-      throw Object.assign(new Error('Token does not authorize this artifact'), { statusCode: 403 });
+      throw httpError(403, 'Token does not authorize this artifact');
     }
   };
 }

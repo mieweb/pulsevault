@@ -1,13 +1,14 @@
-import { Server } from '@tus/server';
+import { Server, EVENTS } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
-import { statusCodeOf } from './errors.js';
+import { httpError } from './errors.js';
+import { finalizeArtifact } from './finalize.js';
+import { normalizeUploadMetadata } from './upload-metadata.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
 import type { PulseVaultStorage } from '../storage/types.js';
 import type { UploadKind } from '../storage/types.js';
-import { parseUploadKind } from '../storage/types.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -17,13 +18,6 @@ import { parseUploadKind } from '../storage/types.js';
  */
 export type PulseVaultTusContext = {
   request: PulseVaultRequest;
-  artifactId?: string;
-  /** Kind resolved during TUS create; available on the same request only. */
-  kind?: UploadKind;
-  /** `relatedTo` resolved during TUS create; available on the same request only. */
-  relatedTo?: string;
-  /** Raw `checksum` metadata value (`<algorithm>:<hex>`), if the client sent one. */
-  checksum?: string;
 };
 
 export const pulseVaultTusContext = new AsyncLocalStorage<PulseVaultTusContext>();
@@ -79,80 +73,28 @@ export type PulsevaultTusOptions = {
 };
 
 /**
- * Shape `@tus/server` recognizes for sending an error response. We tag both
+ * Shape `@tus/server` recognizes for sending an error response. Alias of
+ * `httpError` kept for its established name in this module — both tag
  * `statusCode` and `status_code` so throws originating from either Fastify
  * conventions (camelCase) or the tus convention (snake_case) surface with the
  * right HTTP status.
  */
-export function tusError(status: number, body: string): Error {
-  return Object.assign(new Error(body), {
-    statusCode: status,
-    status_code: status,
-    body,
-  });
-}
+const tusError = httpError;
 
-/** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
-export function artifactIdFromUploadId(id: string): string | undefined {
-  const [, nameWithExt] = id.split('/');
-  if (!nameWithExt) return undefined;
-  const ext = path.extname(nameWithExt);
-  const candidate = ext ? nameWithExt.slice(0, -ext.length) : nameWithExt;
-  return isUuid(candidate) ? candidate : undefined;
-}
-
-/**
- * Defensive upper bound on the stored display `name`. The header is base64 and
- * comma-joined with the other metadata; a runaway value would bloat every
- * request and every sidecar. 512 chars is far more than any real title and
- * still leaves generous headroom under typical proxy header limits. The client
- * should cap first; this is belt-and-suspenders so the server never trusts it.
- */
-const MAX_ARTIFACT_NAME_LENGTH = 512;
-
-type ParsedUploadMetadata = {
-  artifactId: string;
-  filename: string;
-  kind: UploadKind;
-  relatedTo?: string;
-  checksum?: string;
-  name?: string;
-};
+// Single parser for `<kind>/<artifactId><ext>` upload ids, shared with the
+// always-loaded request-interpretation module (which must stay Node-free —
+// this module is the lazily-loaded Node-only side). Re-exported for the core.
+import { artifactIdFromUploadId, resolveArtifactIdentity } from './tus-request.js';
+export { artifactIdFromUploadId };
 
 /**
  * Extract and normalize the fields `namingFunction` cares about from raw
  * `Upload-Metadata`. Doesn't validate — the caller still checks `artifactId`
- * is a UUID and `filename`'s extension is allowed for `kind`.
+ * is a UUID and `filename`'s extension is allowed for `kind`. Normalization
+ * (incl. the artifactId alias precedence) is shared with the authorize path
+ * via `lib/upload-metadata.ts` so the two can never disagree.
  */
-function parseUploadMetadata(
-  metadata: Record<string, string | null> | undefined,
-): ParsedUploadMetadata {
-  // Accept `artifactId` plus the legacy `videoid`/`projectid` aliases for
-  // back-compat with pre-`artifactId` clients.
-  const artifactId = (
-    metadata?.artifactId ??
-    metadata?.videoid ??
-    metadata?.projectid ??
-    ''
-  ).trim();
-  const filename = (metadata?.filename ?? '').trim();
-  // `kind` defaults to `"video"` so existing clients that don't send the field continue to work unchanged.
-  const kind = parseUploadKind(metadata?.kind);
-  const rawRelatedTo = (metadata?.relatedTo ?? '').trim();
-  const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
-  const checksum = (metadata?.checksum ?? '').trim() || undefined;
-  // Free-form display title. Trim, then hard-cap length so a hostile or buggy
-  // client can't bloat the sidecar; an all-whitespace/empty value is dropped.
-  // Cap by code point (Array.from iterates code points) rather than by
-  // `.slice()`'s UTF-16 units, so a title truncated at the boundary can't be
-  // left with a split surrogate pair (a half-emoji / lone surrogate).
-  const name =
-    Array.from((metadata?.name ?? '').trim())
-      .slice(0, MAX_ARTIFACT_NAME_LENGTH)
-      .join('') || undefined;
-
-  return { artifactId, filename, kind, relatedTo, checksum, name };
-}
+const parseUploadMetadata = normalizeUploadMetadata;
 
 export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
   const {
@@ -174,6 +116,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       const { artifactId, filename, kind, relatedTo, checksum, name } =
         parseUploadMetadata(metadata);
 
+
       if (!isUuid(artifactId)) {
         throw tusError(400, 'Upload-Metadata must include a valid `artifactId` UUID.\n');
       }
@@ -185,16 +128,6 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           400,
           `Upload-Metadata \`filename\` for kind="${kind}" must end with one of: ${allowed.join(', ')}\n`,
         );
-      }
-
-      // Store kind/relatedTo/checksum in the AsyncLocalStorage context so the
-      // authorize hook (already running) and onUploadFinish (same-request
-      // uploads) can read them without a storage round-trip.
-      const store = pulseVaultTusContext.getStore();
-      if (store) {
-        store.kind = kind;
-        store.relatedTo = relatedTo;
-        store.checksum = checksum;
       }
 
       return storage.reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum, name });
@@ -216,101 +149,69 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       // Completion sequence: validate → markReady → consumer hook. Each step
       // gates the next; failure anywhere short-circuits with a tus error
       // (and cleans up disk state for validation failures specifically).
+      // Both are programming errors, not client states: the host always
+      // establishes a store before calling into tus, and every id this server
+      // mints parses. Fail loudly — a quiet return here would leave a finished
+      // upload unfinalized and never served, with nothing in the logs.
       const store = pulseVaultTusContext.getStore();
-      if (!store) {
-        // Should not happen — the Fastify layer always establishes a store
-        // before calling into tus. Bail quietly rather than crash.
-        return {};
-      }
+      if (!store) throw tusError(500, 'pulsevault: tus request context missing\n');
       const artifactId = artifactIdFromUploadId(upload.id);
-      if (!artifactId) {
-        return {};
-      }
+      if (!artifactId) throw tusError(500, 'pulsevault: unparseable upload id\n');
       const size = upload.size ?? 0;
       const uploadId = upload.id;
 
-      // Resolve kind/checksum: prefer the context value (set during the same
-      // request's namingFunction for single-request uploads), fall back to a
-      // storage lookup (cheap in-memory cache hit) for chunked uploads, or —
-      // just as commonly — a single-PATCH upload sent as two separate HTTP
-      // requests (create, then patch), where `onUploadFinish` runs on the
-      // PATCH request's own fresh context, not the one `namingFunction`
-      // populated during the earlier POST.
-      const kind: UploadKind = store.kind ?? (await resolveKind(storage, artifactId));
-      const checksum = store.checksum ?? (await resolveChecksum(storage, artifactId));
+      // `onUploadFinish` runs on the PATCH request, whose context is not the
+      // POST's, so kind and checksum come from storage (a cache hit).
+      const { kind, checksum } = await resolveArtifactIdentity(storage, artifactId);
 
-      // 1. Validate payload (magic bytes, checksum, virus scan, etc.). If
-      //    this throws we wipe the bytes from storage — the client gets a
-      //    4xx, the sidecar is gone, and they can safely retry with a
-      //    corrected file. The same hook runs for every kind; consumers that
-      //    want kind-specific behavior branch on `ctx.kind` themselves.
-      if (validatePayload) {
-        try {
-          await validatePayload(store.request, {
-            artifactId,
-            size,
-            uploadId,
-            localPath: await resolveLocalPath(storage, artifactId),
-            ...(checksum ? { checksum } : {}),
-            kind,
-          });
-        } catch (err) {
-          const status = statusCodeOf(err, 422);
-          const message = err instanceof Error ? err.message : 'Payload validation failed';
-          try {
-            await storage.remove?.(artifactId);
-          } catch (rmErr) {
-            logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
-          }
-          await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
-          // 4xx rejection reasons are the client's business (e.g. "Checksum
-          // mismatch: …"); 5xx means *our* side broke — log the real error and
-          // return a generic body so internals (adapter wiring, stack detail)
-          // never reach the client.
-          if (status >= 500) {
-            logger.error({ err, artifactId, kind }, 'pulsevault payload validation errored');
-            throw tusError(status, 'Payload validation failed\n');
-          }
-          throw tusError(status, `${message}\n`);
-        }
+      // The completion sequence (validate → markReady → consumer hook →
+      // event) lives in `finalize.ts`, shared with the direct-upload complete
+      // endpoint so the two ingestion paths can't diverge. Failures map to a
+      // tus error here; the direct endpoint maps the same result to JSON.
+      const result = await finalizeArtifact(
+        { storage, validatePayload, onUploadComplete, onArtifactEvent, logger },
+        store.request,
+        {
+          artifactId,
+          kind,
+          size,
+          uploadId,
+          checksum,
+          localPath: await resolveLocalPath(storage, artifactId),
+        },
+      );
+      if (!result.ok) {
+        throw tusError(result.statusCode, `${result.message}\n`);
       }
-
-      // 2. Flip the sidecar to "ready" so `resolve` will serve the bytes.
-      //    Done *before* the consumer hook so a downstream service that
-      //    reacts to `onUploadComplete` can immediately GET the artifact.
-      try {
-        await storage.markReady?.(artifactId);
-      } catch (err) {
-        // Internal failure — log the real error server-side, return a generic
-        // body (a storage error message can leak paths/config to the client).
-        logger.error({ err, artifactId, kind }, 'pulsevault markReady failed');
-        throw tusError(500, 'Upload finalization failed\n');
-      }
-
-      // 3. Consumer hook — business logic (DB writes, queue jobs).
-      if (onUploadComplete) {
-        try {
-          await onUploadComplete(store.request, { artifactId, kind, size, uploadId });
-        } catch (err) {
-          // Propagate as a tus error so the client sees a non-2xx and can
-          // distinguish "bytes stored but completion hook failed" from
-          // success. The artifact is marked ready at this point — consumers
-          // who want "all-or-nothing" should `storage.remove` before
-          // throwing.
-          // The real error (often a consumer DB failure whose message can leak
-          // schema/infra detail) stays in the server log, not the client body.
-          logger.error({ err, artifactId, kind }, 'pulsevault onUploadComplete failed');
-          throw tusError(500, 'Upload completion hook failed\n');
-        }
-      }
-
-      await onArtifactEvent?.({ phase: 'complete', artifactId, kind, size });
 
       return {};
     },
   });
 
   hardenAgainstClientAbort(server, logger);
+
+  // TUS termination (DELETE /upload/<id>) only removes what the *datastore* knows about —
+  // the bytes and the offset-tracking `.info`/`.json` file. The storage adapter's own
+  // artifact metadata (the `.pulsevault` sidecar written by `reserveUpload`) is invisible
+  // to @tus/server, so `remove` runs here to tombstone it (the id stays spent; the sidecar
+  // stops describing an upload). POST_TERMINATE fires after the 204 is already on the
+  // wire, so failures are logged, never thrown.
+  server.on(EVENTS.POST_TERMINATE, (_req, _res, id: string) => {
+    const artifactId = artifactIdFromUploadId(id);
+    if (!artifactId) return;
+    void Promise.resolve()
+      .then(async () => {
+        if (!(await storage.remove?.(artifactId))) {
+          logger.info({ artifactId }, 'pulsevault terminated upload had no metadata to sweep');
+        }
+      })
+      .catch((err) => {
+        logger.error(
+          { err, artifactId },
+          'pulsevault failed to clean up terminated upload metadata',
+        );
+      });
+  });
 
   return server;
 }
@@ -338,8 +239,7 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
   const handlers = (server as unknown as { handlers?: Record<string, unknown> }).handlers ?? {};
   for (const method of ['PATCH', 'POST'] as const) {
     const handler = handlers[method] as
-      | { writeToStore?: (data: NodeJS.ReadableStream, ...rest: unknown[]) => unknown }
-      | undefined;
+      { writeToStore?: (data: NodeJS.ReadableStream, ...rest: unknown[]) => unknown } | undefined;
     if (!handler || typeof handler.writeToStore !== 'function') {
       logger.info(
         { method },
@@ -362,31 +262,6 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
       return original(data, ...rest);
     };
   }
-}
-
-/**
- * Resolve the artifact kind from storage for a known artifactId. Used by
- * `onUploadFinish` for chunked uploads where the kind is not in the current
- * request's context. Defaults to `"video"` for adapters that don't implement
- * `getKind` or when the artifactId is not found.
- */
-async function resolveKind(storage: PulseVaultStorage, artifactId: string): Promise<UploadKind> {
-  const result = await storage.getKind?.(artifactId);
-  return result ?? 'video';
-}
-
-/**
- * Resolve the `checksum` metadata from storage for a known artifactId. Same
- * rationale as `resolveKind` — `namingFunction`'s in-memory context doesn't
- * survive past the request it ran on, so completion (which may run on a
- * later, separate request) needs a storage-backed fallback.
- */
-async function resolveChecksum(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<string | undefined> {
-  const result = await storage.getChecksum?.(artifactId);
-  return result ?? undefined;
 }
 
 /**

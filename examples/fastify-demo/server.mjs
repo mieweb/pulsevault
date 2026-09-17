@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
@@ -21,7 +21,7 @@ import fastifyCompress from "@fastify/compress";
 import fastifyEtag from "@fastify/etag";
 import underPressure from "@fastify/under-pressure";
 import QRCode from "qrcode";
-import pulseVault, { createLocalStorage, buildUploadLink, ensureWebReady } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage, buildUploadLink, ensureWebReady } from "@mieweb/pulsevault/fastify";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // The route schema says `format: "uuid"` but Fastify's default Ajv doesn't
@@ -46,14 +46,6 @@ function insideDataDir(...segments) {
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
-
-// Deployment-wide default advertised via GET /pulsevault/capabilities — purely
-// advisory; the plugin never enforces "segment" vs "merged", it just reports
-// whichever value this server passes at registration (README "Upload unit").
-// Default "merged" here so this demo exercises the full merged pipeline
-// (video + captions + beat manifest + thumbnail); set UPLOAD_UNIT=segment to
-// test per-clip uploads instead.
-const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
 
 const app = Fastify({
   // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
@@ -233,18 +225,12 @@ app.get(
   async (req, reply) => {
     const { artifactId } = req.params;
     if (!UUID_RE.test(artifactId)) return reply.code(400).send();
-    let sidecar;
-    try {
-      sidecar = JSON.parse(await readFile(insideDataDir(".pulsevault", `${artifactId}.json`), "utf8"));
-    } catch {
-      return reply.code(404).send();
-    }
+    const meta = await storage.getMetadata(artifactId);
     // Only serve real, finished captions uploads — never hand a video body to text/vtt.
-    if (sidecar.kind !== "captions" || sidecar.status !== "ready") return reply.code(404).send();
-    const ext = sidecar.ext ?? ".vtt";
+    if (!meta || meta.kind !== "captions" || !meta.ready) return reply.code(404).send();
     let text;
     try {
-      text = await readFile(insideDataDir("captions", `${artifactId}${ext}`), "utf8");
+      text = await readFile(insideDataDir("captions", `${artifactId}${meta.ext}`), "utf8");
     } catch {
       return reply.code(404).send();
     }
@@ -252,66 +238,45 @@ app.get(
   },
 );
 
-// List all uploads under dataDir. Reads each upload's sidecar to determine
-// kind and subdir rather than hard-coding "video/" — handles video/project/captions.
+// List all uploads. Uses the adapter's own listing/metadata API rather than
+// hand-parsing sidecar files — the adapter owns the sidecar schema.
 app.get("/videos", {
   schema: { tags: ["demo"], summary: "List finished uploads (flat)" },
-  // Crawls every sidecar on disk per request — tighter per-IP budget than the
+  // Reads every artifact's metadata per request — tighter per-IP budget than the
   // global limit (the feed polls this every 8s, so 60/min is still generous).
   config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
 }, async (_req, reply) => {
-  const pulsevaultMetaDir = path.join(dataDir, ".pulsevault");
-  let entries;
-  try {
-    entries = await readdir(pulsevaultMetaDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code === "ENOENT") return reply.send([]);
-    throw err;
-  }
-
   const uploads = await Promise.all(
-    entries
-      .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-      .map(async (e) => {
-        const artifactId = e.name.slice(0, -".json".length);
-        let sidecar;
-        try {
-          sidecar = JSON.parse(await readFile(path.join(pulsevaultMetaDir, e.name), "utf8"));
-        } catch {
-          return null;
-        }
-        // Only list ready uploads; skip in-progress ones.
-        if (sidecar.status !== "ready") return null;
+    (await storage.listArtifactIds()).map(async (artifactId) => {
+      const meta = await storage.getMetadata(artifactId);
+      // Only list ready uploads; skip in-progress ones.
+      if (!meta || !meta.ready) return null;
+      const artifactStat = await stat(
+        path.join(dataDir, meta.kind, `${artifactId}${meta.ext}`),
+      ).catch(() => null);
+      if (!artifactStat || artifactStat.size === 0) return null;
 
-        const kind = sidecar.kind ?? "video";
-        const ext = sidecar.ext ?? ".mp4";
-        const artifactFile = `${artifactId}${ext}`;
-        const artifactPath = path.join(dataDir, kind, artifactFile);
-        const [artifactStat, tusMeta] = await Promise.all([
-          stat(artifactPath).catch(() => null),
-          readFile(`${artifactPath}.json`, "utf8").then(JSON.parse).catch(() => null),
-        ]);
-        if (!artifactStat || artifactStat.size === 0) return null;
-
-        return {
-          artifactId,
-          kind,
-          filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
-          // Human-facing display title the client sent via `Upload-Metadata.name`
-          // (e.g. the draft name), or null if the upload carried no name. A UI
-          // should escape this — it's free-form, client-supplied text.
-          name: sidecar.name ?? null,
-          ext,
-          size: artifactStat.size,
-          // Session anchor this artifact belongs to (a segment session's clips point at
-          // their ordering manifest; a merged video's captions/beat manifest/thumbnail
-          // point at the video) — lets the library page group one pulse's artifacts
-          // together instead of listing them flat.
-          relatedTo: sidecar.relatedTo ?? null,
-          playbackUrl: `/pulsevault/artifacts/${artifactId}`,
-          creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
-        };
-      }),
+      return {
+        artifactId,
+        kind: meta.kind,
+        filename: meta.filename,
+        // Human-facing display title the client sent via `Upload-Metadata.name`
+        // (e.g. the draft name), or null if the upload carried no name. A UI
+        // should escape this — it's free-form, client-supplied text.
+        name: meta.name ?? null,
+        ext: meta.ext,
+        size: artifactStat.size,
+        // Session anchor this artifact belongs to (a segment session's clips point at
+        // their ordering manifest; a merged video's captions/beat manifest/thumbnail
+        // point at the video) — lets the library page group one pulse's artifacts
+        // together instead of listing them flat.
+        relatedTo: meta.relatedTo ?? null,
+        playbackUrl: `/pulsevault/artifacts/${artifactId}`,
+        creation_date: meta.reservedAt
+          ? new Date(meta.reservedAt).toISOString()
+          : artifactStat.birthtime.toISOString(),
+      };
+    }),
   );
 
   const ready = uploads.filter(Boolean);
@@ -354,26 +319,15 @@ app.get("/videos", {
 // `${server}/<path>` with no prefix concept of its own. With no auth there's
 // no issuer to stay consistent with, so deriving `server` from request
 // headers is fine here.
-//
-// `?uploadUnit=segment|merged` lets this *one* pairing link override the
-// deployment-wide default set above (PROTOCOL.md §3, §8) — handy for testing
-// both modes without restarting the server. Omit it and the link carries no
-// override; the client falls back to whatever `/capabilities` reports.
 app.get("/deeplinks", { schema: { tags: ["demo"], summary: "Mint a pairing deep link + QR code" } }, async (req, reply) => {
   const proto = req.headers["x-forwarded-proto"] ?? "http";
   const requestHost = req.headers["x-forwarded-host"] ?? req.headers.host;
   const server = `${proto}://${requestHost}/pulsevault`;
   const artifactId = randomUUID();
 
-  const requestedUploadUnit = req.query?.uploadUnit;
-  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "segment" && requestedUploadUnit !== "merged") {
-    return reply.code(400).send({ error: '`uploadUnit` query param must be "segment" or "merged"' });
-  }
-
   const upload = buildUploadLink({
     server,
     artifactId,
-    ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
   });
   const qrUpload = await QRCode.toDataURL(upload, {
     width: 224,
@@ -395,11 +349,9 @@ await app.register(pulseVault, {
   // (`Tus-Max-Size`) than the infra accepts means clients get promised sizes
   // that 413 mid-flight. Raise only if the edge limit is raised.
   maxUploadSize: 2 * 1024 * 1024 * 1024, // 2 GiB
-  uploadUnit,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside the video; rejecting any of those
+  // would make this a broken pairing target.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],

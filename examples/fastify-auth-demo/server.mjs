@@ -8,7 +8,7 @@
 import path from "node:path";
 import os from "node:os";
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
@@ -34,7 +34,7 @@ import pulseVault, {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
@@ -180,52 +180,34 @@ const artifactIndex = {
     })),
 };
 
-/** Reads one finished artifact's metadata from its filesystem sidecars, or null. */
+/** Reads one finished artifact's metadata via the storage adapter, or null. */
 async function readArtifactFromDisk(artifactId) {
-  let sidecar;
-  try {
-    sidecar = JSON.parse(await readFile(path.join(dataDir, ".pulsevault", `${artifactId}.json`), "utf8"));
-  } catch {
-    return null;
-  }
-  if (sidecar.status !== "ready") return null;
+  const meta = await pulseStorage.getMetadata(artifactId);
+  if (!meta || !meta.ready) return null;
 
-  const kind = sidecar.kind ?? "video";
-  const ext = sidecar.ext ?? ".mp4";
-  const artifactPath = path.join(dataDir, kind, `${artifactId}${ext}`);
-  const [artifactStat, tusMeta] = await Promise.all([
-    stat(artifactPath).catch(() => null),
-    readFile(`${artifactPath}.json`, "utf8").then(JSON.parse).catch(() => null),
-  ]);
+  const artifactStat = await stat(
+    path.join(dataDir, meta.kind, `${artifactId}${meta.ext}`),
+  ).catch(() => null);
   if (!artifactStat || artifactStat.size === 0) return null;
 
   return {
     artifactId,
-    kind,
-    filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? `${artifactId}${ext}`,
-    ext,
+    kind: meta.kind,
+    filename: meta.filename,
+    ext: meta.ext,
     size: artifactStat.size,
-    relatedTo: sidecar.relatedTo ?? null,
-    checksumVerified: Boolean(sidecar.checksum),
-    creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
+    relatedTo: meta.relatedTo ?? null,
+    checksumVerified: Boolean(meta.checksum),
+    creation_date: meta.reservedAt
+      ? new Date(meta.reservedAt).toISOString()
+      : artifactStat.birthtime.toISOString(),
   };
 }
 
-/** Boot-time reconcile: index sidecars the table doesn't know, drop rows whose files are gone. */
+/** Boot-time reconcile: index artifacts the table doesn't know, drop rows whose files are gone. */
 async function reconcileArtifactIndex() {
-  const metaDir = path.join(dataDir, ".pulsevault");
-  let entries = [];
-  try {
-    entries = await readdir(metaDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code !== "ENOENT") throw err;
-  }
   const onDisk = (
-    await Promise.all(
-      entries
-        .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-        .map((e) => readArtifactFromDisk(e.name.slice(0, -".json".length))),
-    )
+    await Promise.all((await pulseStorage.listArtifactIds()).map(readArtifactFromDisk))
   ).filter(Boolean);
 
   for (const row of onDisk) await artifactIndex.upsert(row);
@@ -266,24 +248,6 @@ function recordEvent(event) {
   recentEvents.unshift({ ...event, at: new Date().toISOString() });
   if (recentEvents.length > MAX_EVENTS) recentEvents.length = MAX_EVENTS;
 }
-
-// ---------------------------------------------------------------------------
-// Upload-unit deployment default (README "Upload unit") — purely advisory
-// via `GET /pulsevault/capabilities`; the plugin never enforces "segment" vs
-// "merged", it just reports whichever value this server passes at
-// registration. The plugin bakes this in as a fixed option captured once at
-// `register()` time — there's no live setter for it, so changing this
-// deployment-wide default means restarting with a different env var
-// (`UPLOAD_UNIT=segment npm start`), not a runtime toggle. To test both
-// "segment" and "merged" without restarting, use the per-link `uploadUnit`
-// override on `GET /deeplinks` / `buildUploadLink` instead (PROTOCOL.md §3,
-// §8) — the pairing page's "Upload unit for this link" selector drives it.
-//
-// Default "merged" here (mirrors ../fastify-demo) so this demo exercises the
-// full merged pipeline — video + captions + beat manifest + thumbnail; set
-// UPLOAD_UNIT=segment to test per-clip uploads instead.
-// ---------------------------------------------------------------------------
-const uploadUnitDefault = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
 
 const app = Fastify({
   // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
@@ -743,13 +707,6 @@ app.get(
 // `issuer` claim uses — never derived from request headers, or verification
 // would fail for every request that didn't happen to arrive on the exact
 // host header the token was issued under.
-//
-// `?uploadUnit=segment|merged` lets this *one* pairing link override the
-// deployment-wide default set above — demonstrates running "segment" and
-// "merged" sessions concurrently (README "Upload unit") instead of one fixed
-// value for every pairing. Omit it and behavior is unchanged: the link
-// carries no override, and the client falls back to whatever `/capabilities`
-// reports.
 app.get(
   "/deeplinks",
   {
@@ -759,16 +716,6 @@ app.get(
       summary: "Mint a pairing deep link + QR code",
       description:
         "Generates a fresh artifactId, issues a session-scoped capability token, and returns the `pulsecam://` deep link (plus a QR data URL) the Pulse app pairs with.",
-      querystring: {
-        type: "object",
-        properties: {
-          uploadUnit: {
-            type: "string",
-            enum: ["segment", "merged"],
-            description: "Per-link override of the deployment-wide upload-unit default.",
-          },
-        },
-      },
       response: {
         200: {
           description: "One pairing link and its QR code.",
@@ -790,7 +737,6 @@ app.get(
   async (req, reply) => {
     const server = `${ISSUER}/pulsevault`;
     const artifactId = randomUUID();
-    const requestedUploadUnit = req.query?.uploadUnit;
 
     const token = issueCapabilityToken(artifactId, PULSEVAULT_SECRET, {
       keyId: PULSEVAULT_KEY_ID,
@@ -802,7 +748,6 @@ app.get(
       server,
       artifactId,
       token,
-      ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
     });
 
     const qrUpload = await QRCode.toDataURL(upload, {
@@ -842,11 +787,9 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  uploadUnit: uploadUnitDefault,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target. Mirrors ../fastify-demo.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside the video; rejecting any of those
+  // would make this a broken pairing target. Mirrors ../fastify-demo.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],

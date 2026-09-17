@@ -7,6 +7,311 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `remove()` tombstones an artifactId instead of freeing it.**
+  `DELETE /artifacts/:id`, TUS termination, retention, and validation-failure
+  cleanup all delete the bytes and rewrite the sidecar as `status: "deleted"`.
+  Readers see `404`; a later create for the id is still `409`. Single-use now
+  means single-use even through a delete, and that one rule made a whole
+  layer of defenses unnecessary — all deleted: per-reservation object-key
+  suffixes for direct uploads (a stale presigned PUT now lands on bytes
+  nothing will ever serve), the deletion-epoch cache guard, the generation
+  gate on the post-terminate sweep, the fresh sidecar re-read on every byte
+  accessor, the ordered "sidecar last" delete choreography, and the local
+  adapter's per-artifact lock. A `422` no longer "frees the id for a
+  corrected retry" — clients mint a fresh id, as PROTOCOL.md §4.2.1 already
+  required — and a failed cleanup after a rejection is logged rather than
+  turned into a `500`. Tombstones are a few hundred bytes; `listArtifactIds`
+  includes them and `getMetadata` reports them as absent. PROTOCOL.md
+  §4.2.1, §6.2 and §9 are rewritten accordingly.
+- **Breaking: S3-compatible backends must honor `If-None-Match`.** The
+  boot-time probe now refuses a backend that rejects or silently ignores
+  conditional writes instead of falling back to check-then-write with a
+  warning. The degraded mode reopened the exact race the single-use
+  contract exists to close.
+- `PulseVaultTusContext` carries only the request; the tus finish hook reads
+  kind and checksum from storage (one `getMetadata`) instead of a per-request
+  cache with a storage fallback. A missing context or unparseable upload id
+  in that hook is now a loud `500`, not a silent skip that left a finished
+  upload unserved.
+
+### Removed
+
+- **Breaking: artifactIds are single-use — in-band debris reclaim is gone.**
+  `reserveUpload` is now a plain atomic create: the first reservation of an
+  artifactId wins and every later create for the same id answers `409`,
+  whether the previous attempt finished, is in flight, or died halfway. The
+  reclaim state machine that tried to tell crash debris from live uploads
+  (staleness grace, datastore-liveness probes, the S3 `IfMatch` claim dance,
+  local reclaim sweeps) is deleted from both adapters, along with the
+  `reclaimGraceMs` option. Abandoned reservations are freed by TUS `DELETE`
+  (termination) or by operator retention — the OPERATIONS.md sweep keyed on
+  the sidecar's `reservedAt`, plus bucket lifecycle rules — not by contest.
+  Rationale: reclaim existed so a client could retry a crashed create under
+  the SAME id; clients that mint a fresh id per attempt (as PROTOCOL.md now
+  requires) never need it, and deleting it removes every reclaim race by
+  construction. PROTOCOL.md §4.2.1 is rewritten accordingly: the
+  deterministic tus id scheme is demoted to an internal detail (clients MUST
+  NOT derive upload URLs from it), and the client-side 409-derive-resume
+  recovery is withdrawn.
+
+- **Breaking: the `uploadUnit` concept is gone.** There is one way to upload a
+  pulse — the video plus its related artifacts (captions, beat manifest,
+  thumbnail) under a single session token. The per-clip "segment" strategy
+  carried no information the beat manifest doesn't (beats are timecode ranges
+  in the manifest, not separate uploads), so it was removed rather than
+  maintained in parallel. Concretely: the `uploadUnit` option is removed from
+  the Fastify plugin, the Node core, and the web handler; `buildUploadLink`
+  no longer accepts or emits an `uploadUnit` param (clients ignore it on old
+  links); `GET /capabilities` no longer returns an `uploadUnit` field; and
+  PROTOCOL.md §8 now defines the single upload set. Operators who set
+  `uploadUnit` must simply delete the option; clients that branched on it
+  should upload the one defined set.
+
+### Documentation
+
+- README grew a **Deployment caveats (AWS S3 & R2)** section: the 5 GiB
+  single-`PUT` cap on direct uploads, why bucket policies that enforce
+  SSE-KMS per request reject presigned grant `PUT`s (use default bucket
+  encryption instead), conditional-write (`If-None-Match`) support and the
+  fallback's consequences, the expired-grant re-grant behavior, presigned-URL
+  TTL ceilings (7 days on both AWS and R2; no custom domains on R2), and
+  which lifecycle rules clean up TUS-multipart vs direct-upload debris.
+- The `OPERATIONS.md` retention sample now uses the public
+  `listArtifactIds()`/`getMetadata()` API instead of hand-parsing sidecar
+  files.
+
+### Changed
+
+- **Breaking for custom direct-upload adapters:** `presignPut(artifactId,
+  expected, ttl?)` takes the full expected identity instead of a bare size,
+  `createDirectUpload` lost its unused options argument, and
+  `DirectUploadCapableStorage` requires `getMetadata` (the runtime guard
+  already did). `DirectUploadGrant` is exported as the one grant type.
+- **Breaking: the package entry points are flipped to match what the library
+  actually is.** `@mieweb/pulsevault` (the `.` export / `main`) is now the
+  **framework-agnostic core** — `createPulseVaultCore`, the storage adapters,
+  and every helper; it has no Fastify dependency. The Fastify plugin moved to
+  **`@mieweb/pulsevault/fastify`** (same default export, options, and
+  behavior). Migration is a one-line import change:
+  `import pulseVault from "@mieweb/pulsevault"` →
+  `import pulseVault from "@mieweb/pulsevault/fastify"`.
+  The legacy `@mieweb/pulsevault/core` subpath is kept indefinitely as an
+  alias of `.` so existing core consumers (including Meteor's
+  exports-map-unaware bundler, via the root `core.js` stub) are unaffected.
+  `@mieweb/pulsevault/augment` is unchanged.
+
+### Fixed
+
+- **The OPTIONS-preflight bypass now holds on every surface.** It had landed
+  only in the web core; the Node core (and so the Fastify plugin) still
+  classified a browser's CORS preflight as an in-flight `patch`, failed to
+  resolve an artifactId from `/upload`, and answered 403 whenever `authorize`
+  was configured — blocking every browser tus client at the preflight. The
+  authorize decision for TUS requests and for the artifact routes now lives
+  once, in `lib/tus-request.ts` (`authorizeTusRequest`,
+  `authorizeArtifactRequest`), and both cores only render its result — so
+  the phase derivation, the §5.2 unresolvable-id rule, the preflight bypass,
+  the rejection mapping and the event can no longer drift between them.
+- **`HEAD /artifacts/:id` on the Node core** answers like `GET`, headers only
+  (it 404'd; the web core and the Fastify plugin already served it).
+- **AWS's answer to a lost conditional write is honored.** S3 answers two
+  *concurrent* `If-None-Match: "*"` writes to one key with `409
+  ConditionalRequestConflict`, not `412`; the adapter mapped only 412, so a
+  racing duplicate create surfaced as a tus 500 (with the SDK message in the
+  body) instead of the promised 409.
+- **Conditional-write support is decided once, by a boot-time probe, and
+  backends that silently ignore `If-None-Match` are caught.** The adapter
+  used to infer the degraded path per request from a 501; a backend that
+  accepts the header and ignores it (older MinIO, some gateways) never hit
+  that branch and would overwrite a finished artifact's sidecar on every
+  collision with no warning. `initialize()` (or the first reserve) now
+  writes a probe key twice and requires the 412/409 — anything else is the
+  documented check-then-write mode, warned about once per adapter.
+- **A corrupt sidecar is no longer a permanently burned id.** An
+  existing-but-unparseable sidecar (crash mid-write on an older build, a
+  foreign schema) read as absent everywhere, so `DELETE /artifacts/:id`
+  404'd, the retention sweep skipped it, and `reserveUpload` kept 409ing
+  forever. `remove` now clears the sidecar when it exists but doesn't parse,
+  and the local adapter's reserve writes the sidecar whole to a temp file and
+  hard-links it into place (atomic *and* exclusive), so a crash mid-write
+  can't leave debris under the real name in the first place.
+- **The re-grant identity check is one read, in the adapter.** `presignPut`
+  takes the full expected identity (`size`, `kind`, `ext`, `relatedTo`),
+  reads storage truth once at mint time and compares every field; the core
+  no longer does a separate same-shape read that a remove + re-reserve could
+  race between.
+- **`complete` decides "is this a TUS reservation" under its lock**, on the
+  serialized re-read, not on the pre-lock snapshot a racing 422-cleanup +
+  TUS re-create could invalidate.
+- **The S3 byte readers that feed `validatePayload` read the sidecar fresh**
+  — on shared storage a rival instance may have removed + re-reserved the id
+  since this process cached its per-reservation object key, and validating
+  (then wiping) the wrong object turned a good upload into a 500.
+- **The Fastify surface accepts what the other surfaces accept.** Its Ajv
+  body schema for `POST /direct-uploads` was stricter than the core's
+  normalization (no `videoid`/`projectid` aliases, case-sensitive `kind`,
+  non-UUID `relatedTo` rejected instead of dropped); the schema is now
+  documentation only and the core is the one rulebook. `POST …/complete`
+  under a `Content-Type: application/json` header with no body (the common
+  fetch/axios default) was a 400 from Fastify's JSON parser where the Node
+  and web cores return 200; the plugin scopes its own tolerant parser.
+- **Direct-upload grants really pin the content type.** The presigner leaves
+  `content-type` unsigned by default; it is now named as signable, so the
+  grant's `headers` are what the URL will accept, as documented.
+- **Passing the removed `uploadUnit` option is a `TypeError` at boot** on
+  the plugin, the core and the web handler, instead of silent acceptance
+  that quietly changed wire behavior for not-yet-upgraded clients.
+- **Direct-upload re-grants require the same session anchor.** The same-shape
+  predicate compared kind/ext/size but not `relatedTo`, so a token authorized
+  for anchor A could submit anchor B's known artifactId with `relatedTo: A`,
+  pass authorization, and receive a fresh PUT grant for B's incomplete
+  reservation. The relation is now part of the reservation's identity in the
+  core and the Workers demo, and `presignPut` re-validates at mint time
+  (ready or reshaped reservations lose the race as a 409, never armed as a
+  grant; the create path passes such 4xx conflicts through instead of
+  masking them as 500s).
+- **The web entry's always-loaded graph is fully Node-builtin-free** —
+  verified by walking the compiled static import graph. `artifactIdFromUploadId`
+  moved from the tus module into the request-interpretation module (same
+  single parser, dependency reversed), so importing
+  `@mieweb/pulsevault/web` on a V8 isolate works for capabilities, direct
+  uploads, and S3/R2 playback; only an actual TUS request loads the tus
+  stack.
+- **Terminate cleanup is generation-gated.** The `POST_TERMINATE` sweep runs
+  after the 204; if the freed artifactId was already re-reserved by the time
+  it ran, it could delete the NEW reservation's state. The sweep now reads
+  storage truth first and skips reservations younger than the termination.
+- **The direct-upload module is Node-builtin-free** (`path.extname` replaced
+  with a pure helper), completing the web entry's loadability on runtimes
+  without Node compatibility.
+- **Workers demo:** presigned PUTs now sign the grant's `Content-Type` into
+  `X-Amz-SignedHeaders` (the declared size stays enforced at `complete` —
+  `Content-Length` is a fetch-forbidden header runtimes may strip before
+  signing), and object URLs are path-style, matching the S3 adapter's R2
+  convention.
+- **Direct-upload grants are fenced by per-reservation object keys.** A
+  presigned `PUT` URL outlives the reservation that minted it (deleting the
+  reservation cannot revoke the URL), so each direct reservation now writes
+  its bytes to its own key (`<kind>/<id>.<suffix><ext>`, recorded in the
+  sidecar). A superseded grant firing late lands on a key nothing reads from
+  instead of silently overwriting a newer reservation's — or a ready
+  artifact's — object. TUS uploads are unaffected (deterministic base key,
+  written server-side). PROTOCOL.md §9.1 now specifies the fencing
+  requirement and the residual same-reservation TTL window.
+- **Direct-upload re-grant and complete decisions now read storage truth, not
+  the per-process metadata cache.** On multi-instance deployments sharing one
+  bucket, a stale cached `"uploading"` entry could re-grant a `PUT` against
+  an artifact another instance had just completed and validated;
+  `getMetadata` gained an opt-in `{ fresh: true }` read used by both
+  decision points.
+- **The adapters' metadata caches can no longer resurrect a deleted
+  artifact.** A cache fill that started before a `remove()` and finished
+  after its evictions could re-insert the deleted artifact's metadata and
+  serve it indefinitely; fills now capture a deletion epoch before reading
+  and are discarded if any deletion landed meanwhile.
+- **Local storage serializes `markReady`/`remove` per artifactId.** Their
+  multi-step read→write / read→delete sequences could interleave across
+  concurrent callers — a `markReady` racing a `remove` could re-write a
+  sidecar the remove had just deleted, resurrecting a half-deleted artifact.
+  A per-artifact in-process lock serializes them; creates keep the lock-free
+  atomic `wx` fast path. (In-process is the honest scope: multiple processes
+  sharing one local workspace were never a supported topology — use the S3
+  adapter for that.)
+- **The web handler serves zero-byte artifacts.** A valid zero-length upload
+  previously crashed the streaming path (`fs.createReadStream` rejects
+  `end: -1`); it now returns the empty `200` the headers describe, and
+  unsatisfiable ranges over it get the correct `416`.
+- **The web entry no longer hard-requires Node built-ins at import time.**
+  The tus stack (`@tus/server` → `node:async_hooks`/`node:path`) is loaded
+  lazily on the first TUS request, so `createPulseVaultWebHandler` can boot
+  on runtimes without Node compatibility and still serve capabilities,
+  direct uploads, and S3/R2 artifact redirects; the docstring now states the
+  TUS surface's runtime requirements honestly.
+- **Workers demo hardening:** capability-token signatures are verified with
+  `crypto.subtle.verify` (constant-time) instead of a string compare; the
+  reservation write is atomic via a signed S3-API `PUT` with
+  `If-None-Match: "*"` (two concurrent creates can no longer both claim
+  `201`); object keys carry the same per-reservation fencing suffix as the
+  S3 adapter; `DELETE /artifacts/:id` (PROTOCOL §6.2) is implemented; and
+  the TUS `501` / prefixed `404` responses carry `Protocol-Version`.
+- **TUS termination (`DELETE /upload/<id>`) now sweeps the adapter's own
+  artifact metadata** (the `.pulsevault` sidecar and caches) via
+  `@tus/server`'s `POST_TERMINATE` event. Previously only the datastore's
+  bytes/offset state was removed, leaving a permanent `"uploading"` sidecar
+  behind — the cancelled artifactId stayed `409`-reserved forever and the
+  paired client's only escape was re-pairing for a fresh id.
+- **`remove()` could resurrect deleted artifacts in the metadata cache**: a
+  concurrent read racing between the pre-delete cache eviction and the
+  (slow, I/O-bound) deletes re-populated the cache from the still-present
+  sidecar, and the stale entry outlived the deletion. Both adapters now
+  evict again after the deletes complete.
+
+### Added
+
+- **`listArtifactIds()` on the S3/R2 adapter** (a paginated
+  `ListObjectsV2` over the metadata prefix), so the OPERATIONS.md retention
+  sweep — the only thing besides tus `DELETE` that frees an abandoned
+  single-use id — can run on object storage, not just the local adapter.
+- **Web-standard core: `@mieweb/pulsevault/web`.** `createPulseVaultWebHandler`
+  serves the whole protocol as a WHATWG `Request → Response` handler — one-line
+  mounts under Hono (any runtime), Bun, Deno, and fetch-style meta-framework
+  routes, with its own single-`Range`/`HEAD` artifact serving (via the
+  maintained `range-parser`) instead of Node streaming internals. New
+  [`examples/hono-demo`](examples/hono-demo). tus uploads still need a
+  `node:fs`-capable runtime for the datastore; pure V8 isolates use the
+  direct-upload profile below.
+- **Direct-upload profile (PROTOCOL.md §9): presigned PUT data plane.**
+  `POST {prefix}/direct-uploads` authorizes + reserves (same artifactId
+  space/collision rules as TUS) and returns a presigned `PUT` URL with
+  `Content-Type`/`Content-Length` signed in; `POST
+  {prefix}/direct-uploads/:artifactId/complete` verifies the stored object's
+  size and runs the exact same validate → markReady → onUploadComplete
+  sequence as TUS (shared `lib/finalize.ts`, so the two ingestion paths cannot
+  diverge). Served by the Node core, the web core, and the Fastify adapter;
+  advertised via the new `directUpload` capability field only when the storage
+  adapter supports it (the S3/R2 adapter's new
+  `createDirectUpload`/`headObjectSize`; local storage answers `501`).
+  Explicitly single-`PUT` (retryable, not mid-file resumable) — TUS remains
+  the default transport.
+- **[`examples/workers-demo`](examples/workers-demo)**: a Cloudflare Workers
+  control plane implementing the wire contract from PROTOCOL.md alone —
+  WebCrypto capability tokens, direct uploads against R2 via `aws4fetch`
+  presigning, presigned playback redirects — documenting the recommended
+  V8-isolate deployment shape.
+- **Cloudflare R2 auto-configuration in `createS3Storage`.** When `endpoint`
+  is an `*.r2.cloudflarestorage.com` URL, the `@tus/s3-store` datastore now
+  defaults to `partSize`/`minPartSize` of 8 MiB (R2 requires all non-trailing
+  multipart parts to be the same size) and `useTags: false` (R2 does not
+  implement `PutObjectTagging`; with tags on, every completed upload attempts
+  a tagging call). New `minPartSize`, `maxMultipartParts`, and `useTags`
+  options are forwarded for explicit control on any backend.
+- **PROTOCOL.md §4.2.1**: artifactIds are specified as **single-use** — the
+  first create wins, later creates for the same id are stable `409`s, clients
+  mint a fresh id per attempt, and abandoned reservations age out via
+  termination or operator retention. Sidecars carry a `reservedAt` timestamp
+  so retention sweeps can age reservations without relying on filesystem
+  mtimes.
+- **`getMetadata(artifactId)`** on both storage adapters (and the optional
+  `PulseVaultStorage` contract) returns the whole artifact record — kind, ext,
+  filename, ready, relatedTo, checksum, name, reservedAt — in one read, and
+  **`LocalStorage.listArtifactIds()`** enumerates known artifacts. Together
+  they replace consumers hand-parsing `.pulsevault` sidecar files (all four
+  example servers now use them; the sidecar schema is no longer part of any
+  consumer's code).
+
+### Internal
+
+- Storage adapters now share one sidecar module (`storage/sidecar.ts`):
+  schema, parsing/normalization, bounded metadata cache, staleness gate, and
+  the reserve-conflict error were previously hand-mirrored between the local
+  and S3 adapters. Upload-Metadata normalization — including the
+  security-relevant artifactId alias precedence that the authorize and
+  reserve paths must agree on — is likewise single-sourced in
+  `lib/upload-metadata.ts`, and all HTTP-mapped throws share
+  `httpError(status, message)`.
+
 ## [0.3.0] - 2026-09-16
 
 ### Changed

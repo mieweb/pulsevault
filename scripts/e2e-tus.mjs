@@ -124,8 +124,8 @@ async function main() {
     assert.equal(typeof caps.protocolVersion, "number");
     assert.ok(caps.minSupportedVersion <= caps.protocolVersion);
     assert.ok(caps.protocolVersion <= caps.maxSupportedVersion);
-    assert.ok(["segment", "merged"].includes(caps.uploadUnit));
-    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
+    assert.equal(caps.protocolVersion, 1);
+    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}`);
 
     // 2a. Dashboard routes are Better Auth-protected: no session -> 401.
     const unauthed = await fetch(`${BASE}/deeplinks`);
@@ -188,10 +188,13 @@ async function main() {
     assert.equal(create.status, 201, `create should be 201, got ${create.status}`);
     const location = create.headers.get("location");
     assert.ok(location, "create response should include a Location header");
+    // Location is deliberately path-relative (PROTOCOL.md §4 — reverse-proxy
+    // safe), so resolve it against the create URL exactly as real clients do.
+    const uploadUrl = new URL(location, `${PREFIX}/upload`).href;
     console.log("  ✓ TUS create succeeded");
 
     const half = body.length / 2;
-    const patch1 = await fetch(location, {
+    const patch1 = await fetch(uploadUrl, {
       method: "PATCH",
       headers: {
         "Tus-Resumable": "1.0.0",
@@ -204,13 +207,13 @@ async function main() {
     assert.equal(patch1.status, 204, `first PATCH should be 204, got ${patch1.status}`);
 
     // Resume via HEAD before the second chunk — never trust a cached offset.
-    const head = await fetch(location, {
+    const head = await fetch(uploadUrl, {
       method: "HEAD",
       headers: { "Tus-Resumable": "1.0.0", Authorization: `Bearer ${token}` },
     });
     assert.equal(Number(head.headers.get("upload-offset")), half, "HEAD should report the offset after chunk 1");
 
-    const patch2 = await fetch(location, {
+    const patch2 = await fetch(uploadUrl, {
       method: "PATCH",
       headers: {
         "Tus-Resumable": "1.0.0",

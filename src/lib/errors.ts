@@ -7,6 +7,26 @@ export function pulseVaultError(error: string): PulseVaultErrorBody {
   return { ok: false, error };
 }
 
+/**
+ * The one way this package throws an HTTP-mapped error. Tags the status under
+ * both spellings so it surfaces correctly through every layer that inspects
+ * thrown errors — `statusCode` (Fastify/consumer convention, read by
+ * `statusCodeOf`) and `status_code` + `body` (the shape `@tus/server` turns
+ * into an HTTP response).
+ */
+export function httpError(status: number, message: string): Error {
+  return Object.assign(new Error(message), {
+    statusCode: status,
+    status_code: status,
+    body: message,
+  });
+}
+
+/** The message a thrown error surfaces to the client, or `fallback` when it carries none. */
+export function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 /** A usable HTTP status: an integer in 100–599. Anything else would make `res.writeHead` throw. */
 function isHttpStatus(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599;

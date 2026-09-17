@@ -70,15 +70,24 @@ export function validateBasePath(basePath: string, optionName: string): void {
   }
 }
 
-export function validateMaxUploadSize(maxUploadSize: number): void {
-  if (!(maxUploadSize > 0)) {
-    throw new TypeError('`maxUploadSize` must be a positive number (use Infinity for no cap)');
+/**
+ * Options this major removed. Silently accepting them would let an un-upgraded
+ * config boot and quietly change wire behavior (`/capabilities` no longer
+ * advertises `uploadUnit`, so an old client falls back to segment uploads the
+ * backend no longer expects) — a TypeError at boot is the usual breaking-option
+ * signal, and the one place a deploy notices.
+ */
+export function rejectRemovedOptions(opts: object): void {
+  if ('uploadUnit' in opts) {
+    throw new TypeError(
+      '`uploadUnit` was removed: there is one way to upload a pulse (PROTOCOL.md §8) — delete the option',
+    );
   }
 }
 
-export function validateUploadUnit(uploadUnit: 'segment' | 'merged' | undefined): void {
-  if (uploadUnit && uploadUnit !== 'segment' && uploadUnit !== 'merged') {
-    throw new TypeError('`uploadUnit` must be "segment" or "merged"');
+export function validateMaxUploadSize(maxUploadSize: number): void {
+  if (!(maxUploadSize > 0)) {
+    throw new TypeError('`maxUploadSize` must be a positive number (use Infinity for no cap)');
   }
 }
 

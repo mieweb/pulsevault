@@ -37,7 +37,6 @@ The response body MUST be a JSON object with at least the following fields:
   "protocolVersion": 1,
   "minSupportedVersion": 1,
   "maxSupportedVersion": 1,
-  "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
@@ -52,19 +51,19 @@ The response body MUST be a JSON object with at least the following fields:
   SHOULD refuse to pair if its own version falls outside this range, and
   SHOULD show the user an actionable message ("update the app" /
   "this server needs an update") rather than a generic error.
-- `uploadUnit` (`"segment"` or `"merged"`, REQUIRED): which upload strategy this
-  deployment expects (§8). The client MUST read this before doing any
-  merge/upload work and branch accordingly. (Note: "beat" no longer refers to
-  an upload unit — it now names a timecode range on the merged timeline; see §8.)
 - `kinds` (array of string, REQUIRED): artifact kinds this server accepts.
 - `allowedExtensions` (object, REQUIRED): allowed file extensions per kind.
-- `maxUploadSize` (integer, REQUIRED): maximum artifact size in bytes.
+- `maxUploadSize` (integer or `null`, REQUIRED): maximum artifact size in
+  bytes; `null` means the deployment declares no cap.
 - `checksum.algorithms` (array of string, OPTIONAL): digest algorithms this
   server can verify (§6.3). Absent or empty means the server does not
   support checksum verification. Note for implementers: this field
   describes capability, not whether verification is actually wired in for
   every upload — a server MAY list an algorithm it's capable of checking
   even for a deployment where the operator hasn't enabled that check.
+- `directUpload` (object, OPTIONAL): present iff the server supports the
+  presigned direct-upload profile (§9). Currently `{ "enabled": true }`.
+  Absent means TUS (§4) is the only ingestion path.
 
 A server response to this endpoint MUST NOT include any secret. Every other
 response from the server MUST include a `Protocol-Version` header carrying
@@ -75,7 +74,7 @@ the integer from `protocolVersion`.
 A server presents a pairing link or QR code of the form:
 
 ```
-pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>&uploadUnit=<segment|merged>
+pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
 ```
 
 - `v` (REQUIRED): the deep-link schema version. A client MUST refuse and
@@ -97,17 +96,10 @@ pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>&uploadUnit=<seg
   `artifactId` (or a session it anchors, §5.4), not a standing general
   credential — see §5.4 for the recommended (but not required) capability-
   token shape.
-- `uploadUnit` (OPTIONAL, `"segment"` or `"merged"`): per-session override of the
-  deployment-wide value reported by `GET /capabilities` (§2, §8). When
-  present, a client MUST use this value for the session anchored to this
-  link instead of whatever `/capabilities` currently reports, and MUST NOT
-  perform a separate `/capabilities` fetch just to decide merge/upload
-  strategy for it. When absent, a client MUST fall back to `/capabilities`
-  exactly as before this field existed — an operator that never sets it sees
-  no change in client behavior. This lets one deployment run "segment" and
-  "merged" sessions concurrently (e.g. a staged rollout) without racing a
-  single, deployment-wide `/capabilities` value against whichever moment a
-  client happened to fetch it.
+
+A client MUST ignore unrecognized query parameters on a link whose `v` it
+supports (earlier revisions carried an `uploadUnit` param here; it is
+retired — §8).
 
 A client SHOULD display the server's origin (and, where feasible, its TLS
 certificate fingerprint) to the user before uploading anything, rather than
@@ -161,6 +153,37 @@ A client MUST always issue a `HEAD` request to learn the authoritative
 offset before resuming an interrupted upload — it MUST NOT trust a locally
 cached byte count, which can be stale (server restart, a partial write that
 never committed, clock differences between client and a previous session).
+
+#### 4.2.1 Single-use artifactIds and create conflicts
+
+An `artifactId` is single-use: it names one upload attempt, not a retryable
+slot. The first create for an id (TUS `POST /upload` or §9 direct create)
+wins; every later create for the same id — whether the previous attempt
+finished, is still in flight, or died halfway — MUST be rejected with
+`409 Conflict`, decided against current storage state, not a per-instance
+cache. (The one exception is the §9.1 re-grant, which re-arms the *same*
+reservation with a fresh grant rather than electing a new winner.)
+
+A client MUST NOT try to recover from a `409` by deriving or guessing the
+existing upload's resource URL; it MUST obtain a fresh `artifactId` (in
+deployments where ids are minted with the authorization grant, a fresh
+grant) and create anew. An upload the client can still name — it holds the
+`Location` from its own create — remains resumable per §4.2: single-use ids
+constrain creates, not resumption.
+
+A reservation is never freed. Explicit deletion (TUS `DELETE` termination,
+or `DELETE {prefix}/artifacts/<artifactId>`) and operator retention (see
+OPERATIONS.md) remove the bytes and **tombstone** the id: the serving route
+answers `404`, and a create for that id still answers `409`. Servers MUST
+NOT reclaim or reuse a reserved or deleted id. This keeps every create
+one-winner-atomic with no grace window, and it is what makes every stale
+handle harmless: a stale upload URL, grant or cache entry can only ever
+refer to an id whose identity cannot change.
+
+The tus resource id this implementation mints happens to be
+`base64url("<kind>/<artifactId><ext>")`. As of this version that is an
+internal implementation detail — clients MUST NOT construct upload URLs
+from it.
 
 ### 4.3 `Location` header validation
 
@@ -246,9 +269,8 @@ expired token. `issuer` prevents a token minted by one deployment from being
 replayed against a different one that happens to share a secret. A token MAY
 authorize an artifact other than the one it names if that artifact declares
 the token's `artifactId` as its `relatedTo` (§8) — this lets one token cover
-an entire upload session (a merged video plus its captions, beat manifest and
-thumbnail, or every clip plus the ordering manifest under
-`uploadUnit: "segment"`) rather than requiring one token per artifact.
+an entire upload session (the pulse video plus its captions, beat manifest
+and thumbnail) rather than requiring one token per artifact.
 
 This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
@@ -268,7 +290,10 @@ corrupt bytes.
 A server MUST expose `GET {prefix}/artifacts/<artifactId>` returning either
 the bytes directly or a redirect to a URL serving them (e.g. a presigned
 object-storage URL). The kind is resolved server-side; it is not encoded in
-this URL. A server MUST also expose `DELETE {prefix}/artifacts/<artifactId>`.
+this URL. A server MUST also expose `DELETE {prefix}/artifacts/<artifactId>`,
+which removes the bytes and tombstones the id (§4.2.1): `204` on the first
+delete, `404` when the id is unknown or already deleted. A deleted id is
+never reusable.
 
 ### 6.3 Checksum (optional)
 
@@ -288,41 +313,28 @@ every response. A client encountering a server whose supported range
 excludes its own version MUST NOT attempt to pair, and SHOULD surface a
 clear, specific message rather than a generic failure.
 
-## 8. Artifact relationships (`relatedTo`) and `uploadUnit`
+## 8. Artifact relationships (`relatedTo`) and the upload set
 
-A pulse (a short composed of one or more recorded **segments**) MAY be uploaded
-as a single pre-merged video (`uploadUnit: "merged"`) or as individual
-per-segment artifacts plus an ordering manifest (`uploadUnit: "segment"`) — the
-operator declares which via `/capabilities` (§2), optionally overridden per
-session via the pairing link's `uploadUnit` param (§3); this document does not
-prefer one over the other.
+A **pulse** (a short composed of one or more recorded **segments**) is
+uploaded as one video plus its related artifacts. Earlier protocol revisions
+defined a second, per-segment upload strategy selected via an `uploadUnit`
+field; it is **retired** — beat timing rides in the beat manifest below, so
+per-segment uploads carried no information the merged set doesn't.
 
 > **Terminology:** a **segment** is a recorded clip (the source unit). A
-> **beat** is a *timecode range on the merged timeline* — one recorded
-> segment's start/end within the merged video — carried only in the merged
-> mode's beat manifest below. (Earlier revisions used "beat" for what is now
-> called the `segment` upload unit; that meaning is retired.)
+> **beat** is a *timecode range on the pulse's timeline* — one recorded
+> segment's start/end within the video — carried in the beat manifest.
 
-Under `uploadUnit: "segment"`, a client uploads each segment under its own
-`artifactId`, plus exactly one **ordering manifest** artifact (`kind:
-"project"`, e.g. `<draftId>-segments.pulse`, a JSON document listing the
-ordered segment `artifactId`s). Segmented mode carries **no** captions and
-**no** thumbnail.
-
-```json
-{ "version": 1, "segments": [ { "artifactId": "<uuid>", "order": 0 } ] }
-```
-
-Under `uploadUnit: "merged"`, a client uploads one pre-merged video as the
-session anchor, plus (all as related artifacts):
+A client uploads one video as the session anchor, plus (all as related
+artifacts):
 
 - **captions** (`kind: "captions"`, `<draftId>.vtt`) — WebVTT for the whole
   merged video, OPTIONAL (absent when the video has no speech or no on-device
   model was available); MAY carry word-level inline cue timestamps like
   `<00:00:01.500>word` for karaoke rendering;
 - a **beat manifest** (`kind: "project"`, e.g. `<draftId>-beats.pulse`) giving
-  each recorded segment's precise `startMs`/`endMs` on the merged timeline,
-  contiguous and summing to the true merged `durationMs` (groundwork for
+  each recorded segment's precise `startMs`/`endMs` on the pulse's timeline,
+  contiguous and summing to the true `durationMs` (groundwork for
   keyframe-aligned deep links / HLS);
 - a **thumbnail** (`kind: "thumbnail"`, `<draftId>.jpg`) — the pulse's poster
   frame.
@@ -332,7 +344,7 @@ session anchor, plus (all as related artifacts):
   "beats": [ { "segmentId": "<local id>", "order": 0, "startMs": 0, "endMs": 4210 } ] }
 ```
 
-Every non-anchor artifact in either session SHOULD declare `relatedTo` pointing
+Every non-anchor artifact in the session SHOULD declare `relatedTo` pointing
 at the session's anchor `artifactId` (the one named in the pairing link) so a
 single capability token can authorize the whole session (§5.4).
 
@@ -342,7 +354,119 @@ graph is a query/relational concern for the operator's own systems, built
 from `relatedTo` and whatever additional metadata the operator chooses to
 record — not something a Pulse-compatible server is required to implement.
 
-## 9. Compatibility notes
+## 9. Direct upload profile (presigned data plane)
+
+An OPTIONAL ingestion profile for deployments where upload bytes should go
+straight to object storage (S3/R2) instead of through the application server
+— serverless/edge control planes, or operators avoiding double bandwidth.
+Advertised via the `directUpload` capability field (§2); a client MUST NOT
+attempt these endpoints against a server that doesn't advertise it.
+
+Trade-off vs TUS, stated plainly: a direct upload is a single HTTP `PUT` —
+retryable from zero but **not resumable mid-file**. TUS remains the default
+and the right choice for large files on flaky mobile networks; this profile
+is an operator opt-in. Servers supporting this profile MUST still support
+TUS (§4).
+
+### 9.1 Create
+
+`POST {prefix}/direct-uploads` with a JSON body carrying the same fields as
+the TUS `Upload-Metadata` (§4.1) plus a mandatory exact byte count:
+
+```json
+{
+  "artifactId": "<uuid>",
+  "filename": "clip.mp4",
+  "kind": "video",
+  "relatedTo": "<uuid, optional>",
+  "checksum": "<algorithm>:<hex, optional>",
+  "name": "<display title, optional>",
+  "size": 12345678
+}
+```
+
+Authentication and authorization are identical to a TUS create (§5): the
+same bearer token, checked against the same `artifactId`/`relatedTo` scope.
+The reservation shares the artifactId space and collision rules with TUS
+(§4.2.1) — a 409 means the id already has an upload, and the same
+single-use rule applies: the client obtains a fresh artifactId rather than
+contesting the existing one.
+
+Success is `201`:
+
+```json
+{
+  "ok": true,
+  "artifactId": "<uuid>",
+  "uploadUrl": "https://… presigned PUT URL …",
+  "expiresAt": "2026-09-16T12:00:00.000Z",
+  "headers": { "Content-Type": "video/mp4", "Content-Length": "12345678" }
+}
+```
+
+The client MUST `PUT` the exact bytes to `uploadUrl` before `expiresAt`,
+sending the returned `headers` verbatim (the server SHOULD sign them into
+the grant so the URL can only upload the declared payload shape). The
+`uploadUrl` is a bearer credential — the client MUST NOT log it or send it
+anywhere but the storage host it names.
+
+Errors: `400` invalid body, `401`/`403` per §5, `409` id already in use,
+`413` `size` over `maxUploadSize`, `501` profile not supported.
+
+**Re-grant.** A repeated create for an artifactId whose reservation exists
+but is not yet complete, with the same declared shape (`kind`, extension,
+`size`), MUST return a fresh grant with status `200` rather than `409` —
+this is how a client that lost its grant (killed mid-session) or outlived
+its `expiresAt` retries without a dead end. A create for a **ready**
+artifact, or with a different declared shape, remains `409`. The re-grant
+decision MUST be made against current storage state, not a per-instance
+cache — another instance may have just completed the artifact.
+
+**Stale grants.** A presigned URL cannot be revoked by deleting its
+reservation — it stays valid until `expiresAt`. Because a deleted id is
+tombstoned (§4.2.1), a grant that outlives its reservation can only write
+bytes nothing will ever reserve again or serve (a `complete` for that id is
+`404`); operators expire such orphans with storage lifecycle rules. Within
+a single reservation the holder of an unexpired grant can by construction
+still overwrite its own object until `expiresAt` — including briefly after
+`complete` — so operators requiring strictly immutable-after-ready bytes
+SHOULD use short grant TTLs or the TUS profile.
+
+### 9.2 Complete
+
+After the `PUT` succeeds, the client MUST confirm:
+
+`POST {prefix}/direct-uploads/{artifactId}/complete` (no body; same bearer
+token — authorized like a TUS `PATCH`).
+
+The server MUST verify the stored object exists and matches the declared
+`size`, MUST run the same post-upload validation it applies to TUS uploads
+(§6), and only then mark the artifact ready. Responses:
+
+- `200 { "ok": true }` — artifact is ready. Completing an already-ready
+  artifact MUST return `200` again without re-running hooks (idempotent, so
+  a client can retry a complete whose response it lost). Servers SHOULD
+  serialize concurrent completes for one artifactId; across multiple server
+  instances sharing object storage that cannot be guaranteed, so consumer
+  hooks (`onUploadComplete` and equivalents) MUST tolerate at-least-once
+  delivery. If a consumer hook fails AFTER the artifact was marked ready,
+  the server returns `5xx` but a retried complete takes the idempotent
+  `200` path without re-running the hook — a consumer that must never lose
+  its side effect should make the hook atomic (`storage.remove` + throw on
+  failure, after which the client creates anew under a fresh artifactId) or
+  reconcile from artifact listings.
+- `409` — no stored object yet (the `PUT` didn't happen or didn't finish).
+  The client retries the `PUT`, then completes again.
+- `422` — the stored object failed verification (size mismatch or §6
+  validation). The server MUST delete the stored bytes, exactly like a
+  failed TUS validation; the artifactId is spent, and the client creates
+  anew under a fresh one.
+
+An artifact for which `complete` never arrives MUST NOT be served (§6.1);
+operators SHOULD age out such reservations via retention (§4.2.1) and expire
+the underlying stored object via storage lifecycle rules.
+
+## 10. Compatibility notes
 
 A client or server MAY support additional, non-normative extensions to this
 contract (additional `Upload-Metadata` keys, additional kinds, additional

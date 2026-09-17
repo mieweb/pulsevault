@@ -43,6 +43,37 @@ export function parseUploadKind(raw: string | null | undefined): UploadKind {
   return (UPLOAD_KINDS as readonly string[]).includes(lower) ? (lower as UploadKind) : 'video';
 }
 
+/**
+ * Everything an adapter knows about one artifact, in a single read — the
+ * consumer-facing projection of the metadata sidecar. Replaces hand-parsing
+ * sidecar files (or chaining `getKind`/`getRelatedTo`/`getChecksum`/`getName`)
+ * when a consumer needs the whole record, e.g. to render an uploads listing.
+ */
+export type ArtifactMetadata = {
+  artifactId: string;
+  kind: UploadKind;
+  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
+  ext: string;
+  /** Original filename from `Upload-Metadata.filename`. */
+  filename: string;
+  /** Whether the upload has completed and passed validation — only ready artifacts are served. */
+  ready: boolean;
+  relatedTo?: string;
+  checksum?: string;
+  name?: string;
+  /** Epoch-ms timestamp of the reservation that created this artifact, when known. */
+  reservedAt?: number;
+  /** Declared total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
+  expectedSize?: number;
+};
+
+/** A presigned direct-upload grant — the PROTOCOL.md §9.1 response body's data-plane half. */
+export type DirectUploadGrant = {
+  uploadUrl: string;
+  expiresAt: string;
+  headers: Record<string, string>;
+};
+
 export type ReserveUploadParams = {
   /** UUID from `Upload-Metadata.artifactId` (or the `videoid`/`projectid` legacy aliases). */
   artifactId: string;
@@ -57,7 +88,7 @@ export type ReserveUploadParams = {
    * `Upload-Metadata.relatedTo`. Lets a single capability token scoped to one
    * "session" artifact (e.g. a video) authorize related artifacts uploaded in
    * the same session (a merged video's captions, beat manifest and thumbnail,
-   * or — under `uploadUnit: "segment"` — each clip plus the ordering manifest)
+   * or each related artifact of the session — captions, project manifest, thumbnail)
    * without minting a token per artifact.
    * The storage layer itself only stores and returns this value — it does not
    * validate that the referenced artifact exists or was created by the same
@@ -87,6 +118,13 @@ export type ReserveUploadParams = {
    * consumers MUST escape it for their own output context (HTML, shell, etc.).
    */
   name?: string;
+  /**
+   * Expected total size in bytes, when known at reserve time. Sent by direct
+   * (presigned PUT) uploads so completion can verify the stored object matches
+   * what the client declared; TUS uploads leave it unset (the tus offset
+   * protocol already owns byte accounting).
+   */
+  size?: number;
 };
 
 /**
@@ -133,10 +171,12 @@ export interface PulseVaultStorage {
   markReady?(artifactId: string): Promise<void>;
 
   /**
-   * Delete all storage associated with an artifactId. Returns `true` if
-   * something was removed, `false` if the artifactId was already absent.
-   * Called both from the `DELETE /artifacts/:artifactId` route and from the
-   * plugin's cleanup path when `validatePayload` rejects a completed upload.
+   * Delete the bytes for an artifactId and tombstone its reservation: the id
+   * stays spent (a later create for it is still `409`), but readers treat it
+   * as absent. Returns `true` if something was removed, `false` if the
+   * artifactId was absent or already tombstoned. Called from the
+   * `DELETE /artifacts/:artifactId` route, TUS termination, and the cleanup
+   * path when `validatePayload` rejects a completed upload.
    */
   remove?(artifactId: string): Promise<boolean>;
 
@@ -169,4 +209,18 @@ export interface PulseVaultStorage {
    * sidecar directly.
    */
   getName?(artifactId: string): Promise<string | null>;
+
+  /**
+   * Return everything the adapter knows about an artifact in one read, or
+   * `null` if the artifactId is unknown. Prefer this over chaining the
+   * per-field getters when rendering listings or feeds — and over parsing
+   * sidecar files by hand, which couples the consumer to the sidecar schema.
+   *
+   * `opts.fresh` asks the adapter to bypass any in-memory metadata cache and
+   * read storage truth. On shared object storage another server instance may
+   * have just changed an artifact's state (e.g. marked it ready) — decisions
+   * that must not act on a stale snapshot (the direct-upload re-grant check)
+   * pass `{ fresh: true }`. Adapters without a cache may ignore it.
+   */
+  getMetadata?(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
 }

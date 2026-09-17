@@ -61,25 +61,18 @@ instance talks to the same bucket, so it scales horizontally with zero
 additional configuration. Prefer it for any multi-instance deployment unless
 you have a specific reason to use local disk.
 
-### S3-compatible backend collision-guard fallback
+### S3-compatible backends must honor conditional writes
 
-`reserveUpload`'s collision guard normally uses `PutObjectCommand`'s
-`IfNoneMatch: "*"` to atomically reject a second create for an artifactId
-that already has an upload. Some S3-compatible backends (older/less-complete
-implementations) don't support conditional writes and reject that header
-outright.
-On those backends, `reserveUpload` falls back to a weaker check-then-write —
-functionally the same guard, but with the original race reopened: two
-truly concurrent (or retried) creates for the same artifactId can both pass
-the check before either writes, and the second silently clobbers the
-first's metadata. There's no way to close this without an external lock,
-since it's a limitation of the backend, not this package. If your bucket
-provider doesn't support `IfNoneMatch`, this fallback logs a one-time
-`console.warn` per process the first time it's used — treat that warning as
-a signal to either move to a backend that supports conditional writes, or
-serialize artifactId creation yourself (e.g. in your own `/reserve`
-endpoint) if concurrent creates for the same id are a real possibility in
-your deployment.
+`reserveUpload`'s one-winner guarantee is `PutObjectCommand`'s
+`IfNoneMatch: "*"`. The adapter verifies it **once** — `initialize()` (or
+the first reserve, for hosts that skip it) writes a throwaway key under the
+metadata prefix twice, the second time conditionally, and requires the
+412/409 an honoring backend returns. A backend that rejects the header
+(501) or, more dangerously, accepts it and silently ignores it fails that
+probe and the adapter refuses to start. There is no degraded mode: without
+conditional writes two creates for one artifactId can both succeed, and no
+amount of check-then-write closes that. AWS S3 (since Nov 2024) and
+Cloudflare R2 both qualify.
 
 ## Resource limits and abuse prevention
 
@@ -102,6 +95,46 @@ await app.register(rateLimit, {
 ```
 
 Under `@mieweb/pulsevault/core` (Express, Meteor, plain `http`), use the equivalent middleware for your host — e.g. `express-rate-limit` mounted ahead of `pulseVault.handler`, scoped the same way.
+
+### One valid token can create many artifacts (`relatedTo` amplification)
+
+A capability token authorizes its `artifactId` **and** any artifact whose
+`relatedTo` metadata points at it — that's the session-anchor design that lets
+one pairing upload a video plus its captions, thumbnail, and project file.
+The flip side: a single leaked or hoarded token permits **unbounded artifact
+creation** under that anchor, and pulsevault imposes no count. With no rate
+limit that's a disk-fill amplifier from one credential — and under the
+direct-upload profile (PROTOCOL.md §9) the amplified bytes go straight to
+your bucket without ever transiting the server, so server-side body limits
+never see them.
+
+Mitigate in your `authorize` hook, where the policy belongs: cap artifacts
+per anchor (count existing `relatedTo` matches before allowing a `create`),
+constrain which `kind`s a related artifact may use, and keep token TTLs short
+(a deep-link token only needs to outlive one upload session). The rate-limit
+example above bounds the request *rate*; the per-anchor cap bounds the
+*total*.
+
+### Tokens ride in URLs — treat request logs as sensitive
+
+Two places a capability token legitimately appears in a URL, by design:
+pairing deep links (`pulsecam://…&token=…`) and the `?token=` fallback on
+artifact `GET`s (for `<video>` tags and native players that can't set an
+`Authorization` header). Consequences to plan for:
+
+- **Reverse-proxy and access logs** capture query strings by default — scrub
+  or truncate them (nginx: log `$uri`, not `$request`/`$args`) or the logs
+  become a token store with a longer retention than the tokens.
+- **`Referer` leakage**: a browser page that links out after loading a
+  tokenized URL can leak it. Serve any web player pages with
+  `Referrer-Policy: no-referrer` (or `same-origin`).
+- Prefer the `Authorization` header everywhere a client can set one; treat
+  `?token=` as the fallback it is. Short TTLs bound the damage of any single
+  leaked URL.
+
+The S3/R2 presigned redirect has the same property one hop later (the
+presigned URL embeds its own signature); its lifetime is `presignTtlSeconds`
+(default 900 s) — keep it short for the same reason.
 
 ## Monitoring and audit logging
 
@@ -233,27 +266,38 @@ cron script for the local adapter, deleting artifacts whose sidecar has been
 `"uploading"` for longer than a cutoff (abandoned uploads) or that are older
 than a retention window (compliance-driven deletion):
 
+> **Direct uploads (PROTOCOL.md §9).** A direct-upload reservation whose
+> `complete` never arrives leaves an `"uploading"` sidecar plus (possibly) a
+> stored object the client PUT but never confirmed. The abandoned-upload
+> cutoff below covers the sidecar; on S3/R2 also add a bucket lifecycle rule
+> for unconfirmed objects. ArtifactIds are single-use (PROTOCOL.md §4.2.1):
+> this sweep reclaims an abandoned reservation's bytes, and the id itself
+> stays spent — clients never re-contest one; they mint a fresh id per
+> attempt.
+
+Both built-in adapters implement `listArtifactIds()`/`getMetadata()`, so the
+same sweep runs unchanged against local disk or an S3/R2 bucket (where it is
+a paginated `ListObjectsV2` over the metadata prefix). `remove()` deletes the
+bytes and rewrites the sidecar as a `"deleted"` tombstone rather than
+deleting it, so a removed id can never be reserved again; `getMetadata()`
+reports a tombstone as absent, so the sweep below skips it. A tombstone is
+a few hundred bytes — keep them. An unparseable sidecar (crash debris, a
+foreign schema) is tombstoned the same way.
+
 ```ts
-import { readdir, readFile, stat } from "node:fs/promises";
-import path from "node:path";
 import { createLocalStorage } from "@mieweb/pulsevault";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
-const sidecarDir = path.join(storage.workspaceRoot, ".pulsevault");
 const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000; // 24h stuck "uploading"
 const RETAIN_FOR_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
-for (const file of await readdir(sidecarDir)) {
-  if (!file.endsWith(".json")) continue;
-  const artifactId = file.slice(0, -".json".length);
-  const sidecarPath = path.join(sidecarDir, file);
-  const [sidecar, stats] = await Promise.all([
-    readFile(sidecarPath, "utf8").then(JSON.parse),
-    stat(sidecarPath),
-  ]);
-  const ageMs = Date.now() - stats.mtimeMs;
-  const stuckUploading = sidecar.status === "uploading" && ageMs > ABANDONED_AFTER_MS;
-  const pastRetention = sidecar.status === "ready" && ageMs > RETAIN_FOR_MS;
+for (const artifactId of await storage.listArtifactIds()) {
+  const meta = await storage.getMetadata(artifactId);
+  if (!meta) continue;
+  // reservedAt is absent on sidecars written before v0.3; treat those as old.
+  const ageMs = Date.now() - (meta.reservedAt ?? 0);
+  const stuckUploading = !meta.ready && ageMs > ABANDONED_AFTER_MS;
+  const pastRetention = meta.ready && ageMs > RETAIN_FOR_MS;
   if (stuckUploading || pastRetention) {
     await storage.remove(artifactId);
     console.log(`removed ${artifactId} (${stuckUploading ? "abandoned" : "retention"})`);

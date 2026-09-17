@@ -21,7 +21,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { ensureWebReady, scanMoovPosition } from "../dist/app.js";
+import { ensureWebReady, scanMoovPosition } from "../dist/core.js";
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");

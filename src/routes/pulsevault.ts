@@ -5,14 +5,19 @@ import type {
   FastifyRequest,
   FastifySchema,
 } from 'fastify';
-import type { PulseVaultCacheOptions } from '../app.js';
-import { createPulseVaultCore, PROTOCOL_VERSION } from '../core.js';
+import {
+  createPulseVaultCore,
+  PROTOCOL_VERSION,
+  type PulseVaultCoreCacheOptions,
+} from '../core.js';
 import type {
   PulseVaultOnUploadComplete,
   PulseVaultOnArtifactEvent,
 } from '../lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import { type PulseVaultAuthorize } from '../lib/authorize.js';
+import { errorMessage, pulseVaultError, statusCodeOf } from '../lib/errors.js';
+import { MAX_DIRECT_UPLOAD_BODY_BYTES } from '../lib/direct-upload.js';
 import type { PulseVaultAllowedExtensions } from '../lib/options.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
@@ -35,9 +40,7 @@ export type PulseVaultRoutesOptions = {
   storage: PulseVaultStorage;
   maxUploadSize: number;
   allowedExtensions: PulseVaultAllowedExtensions;
-  /** Advertised via `GET /capabilities` so the client knows which upload strategy this server expects. */
-  uploadUnit: 'segment' | 'merged';
-  cache?: PulseVaultCacheOptions;
+  cache?: PulseVaultCoreCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;
   onUploadComplete?: PulseVaultOnUploadComplete;
@@ -162,7 +165,7 @@ const capabilitiesSchema: OpenApiRouteSchema = {
   tags: ['pulsevault'],
   summary: "Discover this deployment's protocol version and configuration",
   description:
-    'Unauthenticated — the response carries no secrets. Lets a client detect protocol compatibility before pairing, and which upload strategy (`uploadUnit`) this server expects.',
+    'Unauthenticated — the response carries no secrets. Lets a client detect protocol compatibility before pairing.',
   response: {
     200: {
       type: 'object',
@@ -170,7 +173,6 @@ const capabilitiesSchema: OpenApiRouteSchema = {
         protocolVersion: { type: 'number' },
         minSupportedVersion: { type: 'number' },
         maxSupportedVersion: { type: 'number' },
-        uploadUnit: { type: 'string', enum: ['segment', 'merged'] },
         kinds: { type: 'array', items: { type: 'string' } },
         allowedExtensions: {
           type: 'object',
@@ -186,6 +188,13 @@ const capabilitiesSchema: OpenApiRouteSchema = {
           type: 'object',
           properties: { algorithms: { type: 'array', items: { type: 'string' } } },
         },
+        // Present only when the storage adapter supports the §9 direct-upload
+        // profile — without this declaration Fastify's response serializer
+        // strips the field and clients never see the capability.
+        directUpload: {
+          type: 'object',
+          properties: { enabled: { type: 'boolean' } },
+        },
       },
     },
   },
@@ -193,6 +202,67 @@ const capabilitiesSchema: OpenApiRouteSchema = {
 
 // Fastify doesn't type route params from the schema alone, so `:artifactId` comes through as `unknown`.
 type ArtifactIdParams = { artifactId?: unknown };
+
+const directUploadCreateSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: 'Create a presigned direct upload (PROTOCOL.md §9)',
+  description:
+    'Reserves an artifactId (same collision rules as a TUS create) and returns a presigned PUT URL the client uploads the bytes to directly — the data plane bypasses this server. Requires a storage adapter with direct-upload support (the S3/R2 adapter); local-filesystem deployments return 501.',
+  // Documentation only — no `required`, formats, or enums: the core validates the
+  // body with the same rulebook as TUS `Upload-Metadata` (aliases, case-folded kind,
+  // non-UUID `relatedTo` dropped), and Ajv must not reject what the other surfaces accept.
+  body: {
+    type: 'object',
+    properties: {
+      artifactId: { type: 'string', description: 'UUID. Required.' },
+      filename: { type: 'string', description: 'Required; the extension selects the content type.' },
+      kind: { type: 'string', description: '`video` (default), `project`, `captions`, or `thumbnail`.' },
+      relatedTo: { type: 'string', description: 'UUID of the session anchor this artifact belongs to.' },
+      checksum: { type: 'string', description: '`<algorithm>:<hex digest>` of the finished file.' },
+      name: { type: 'string', description: 'Free-form display title (session anchor only).' },
+      size: { type: 'integer', description: 'Exact byte count; required, signed into the URL.' },
+    },
+  },
+  response: {
+    400: { description: 'Invalid request.', ...pulseVaultErrorResponse },
+    403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
+    409: { description: 'artifactId already has an upload.', ...pulseVaultErrorResponse },
+    413: { description: '`size` exceeds the maximum upload size.', ...pulseVaultErrorResponse },
+    501: {
+      description: 'Storage adapter has no direct-upload support.',
+      ...pulseVaultErrorResponse,
+    },
+  },
+};
+
+const directUploadCompleteSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: 'Confirm a presigned direct upload (PROTOCOL.md §9)',
+  description:
+    'Verifies the stored object matches the declared size, then runs the same validate → markReady → onUploadComplete sequence as a finished TUS upload. Idempotent: completing an already-ready artifact returns 200 without re-running hooks.',
+  params: {
+    type: 'object',
+    properties: { artifactId: { type: 'string', format: 'uuid' } },
+    required: ['artifactId'],
+  },
+  response: {
+    400: { description: 'Invalid artifactId.', ...pulseVaultErrorResponse },
+    403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
+    404: { description: 'Unknown artifactId.', ...pulseVaultErrorResponse },
+    409: {
+      description: 'No uploaded object found for this artifactId.',
+      ...pulseVaultErrorResponse,
+    },
+    422: {
+      description: 'Stored object failed validation (size/checksum/sniff).',
+      ...pulseVaultErrorResponse,
+    },
+    501: {
+      description: 'Storage adapter has no direct-upload support.',
+      ...pulseVaultErrorResponse,
+    },
+  },
+};
 
 /** Coerce the raw route param to a string; an invalid UUID is rejected by the core's own check either way. */
 function paramToString(value: unknown): string {
@@ -204,7 +274,6 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     storage,
     maxUploadSize,
     allowedExtensions,
-    uploadUnit,
     cache,
     authorize,
     validatePayload,
@@ -221,7 +290,6 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     // `fastify.prefix` is `""` when the plugin is mounted at the root.
     basePath: fastify.prefix,
     maxUploadSize,
-    uploadUnit,
     allowedExtensions,
     cache,
     authorize,
@@ -277,7 +345,65 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     reply.hijack();
     await core.handleArtifactGet(request.raw, reply.raw, artifactId, token);
   });
+
+  // Direct-upload profile (PROTOCOL.md §9). Fastify already parsed the JSON
+  // body, so these call the core's data-level entry points instead of the raw
+  // handlers (which would try to re-read the drained request stream).
+  //
+  // Plugin-scoped error shaping: schema-validation rejections fire BEFORE the
+  // handlers (so their `.header(...)` chains never run), and a rejected core
+  // promise would otherwise hit Fastify's default handler — both must still
+  // answer in the protocol's error shape, Protocol-Version stamped, with 5xx
+  // internals kept server-side.
+  fastify.setErrorHandler((error, request, reply) => {
+    const code = statusCodeOf(error, 500);
+    const statusCode = code >= 400 ? code : 500;
+    if (statusCode >= 500) request.log.error({ err: error }, 'pulsevault route failed');
+    const message = statusCode >= 500 ? 'Internal Server Error' : errorMessage(error, 'Bad Request');
+    return reply
+      .header('Protocol-Version', String(PROTOCOL_VERSION))
+      .code(statusCode)
+      .send(pulseVaultError(message));
+  });
+
+  // PROTOCOL §9.2's `complete` has no body, but clients commonly send a default
+  // `Content-Type: application/json` on every POST — Fastify's stock JSON parser
+  // 400s an empty body under that header, where the Node and web cores (which
+  // never read it) return 200. Scoped to this plugin's encapsulation context.
+  fastify.removeContentTypeParser('application/json');
+  fastify.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string', bodyLimit: MAX_DIRECT_UPLOAD_BODY_BYTES },
+    (_request, body, done) => {
+      if (!body) return done(null, undefined);
+      try {
+        done(null, JSON.parse(String(body)));
+      } catch {
+        done(Object.assign(new Error('Request body must be JSON'), { statusCode: 400 }), undefined);
+      }
+    },
+  );
+
+  fastify.post('/direct-uploads', { schema: directUploadCreateSchema }, async (request, reply) => {
+    const result = await core.directUploadCreate(request, request.body);
+    return reply
+      .header('Protocol-Version', String(PROTOCOL_VERSION))
+      .code(result.statusCode)
+      .send(result.body);
+  });
+
+  fastify.post(
+    '/direct-uploads/:artifactId/complete',
+    { schema: directUploadCompleteSchema },
+    async (request, reply) => {
+      const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
+      const result = await core.directUploadComplete(request, artifactId);
+      return reply
+        .header('Protocol-Version', String(PROTOCOL_VERSION))
+        .code(result.statusCode)
+        .send(result.body);
+    },
+  );
 };
 
 export default pulseVaultRoutes;
-export { PROTOCOL_VERSION };

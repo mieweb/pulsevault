@@ -1,6 +1,6 @@
 # @mieweb/pulsevault
 
-Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. Ships as a Fastify plugin (`@mieweb/pulsevault`) and as a framework-agnostic core (`@mieweb/pulsevault/core`) for Express, Meteor, or plain `http.createServer` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
+Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. The main entry point (`@mieweb/pulsevault`) is a **framework-agnostic core** — a connect-style handler for Express, Meteor, Hono-on-Node, or plain `http.createServer` — with a first-party **Fastify plugin adapter** at `@mieweb/pulsevault/fastify`. See [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server *without* this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
 
@@ -28,9 +28,9 @@ The local storage adapter writes to a stable on-disk layout (see [Local storage]
 ## Requirements
 
 - Node.js `>=22`
-- Fastify `^5.x` — only if you use the default `@mieweb/pulsevault` (Fastify
-  plugin) entry point. The framework-agnostic `@mieweb/pulsevault/core` entry
-  point (Express, Meteor, or plain `http.createServer`) has no Fastify
+- Fastify `^5.x` — only if you use the `@mieweb/pulsevault/fastify` plugin
+  adapter. The main `@mieweb/pulsevault` entry point (the framework-agnostic
+  core — Express, Meteor, or plain `http.createServer`) has no Fastify
   dependency at all — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 ## Installation
@@ -44,7 +44,7 @@ npm install @mieweb/pulsevault
 ```ts
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage } from "@mieweb/pulsevault/fastify";
 
 const app = Fastify();
 
@@ -70,11 +70,12 @@ for a secure-by-default option, and `OPERATIONS.md` for the full production chec
 
 Everything above the Fastify-specific route/hook wiring — the authorize/
 validatePayload/onUploadComplete orchestration, the TUS glue, the
-capabilities payload, artifact GET/DELETE — lives in a framework-agnostic
-core that the Fastify plugin itself is a thin adapter over. That core is
-published as a separate entry point, `@mieweb/pulsevault/core`, with no
-Fastify dependency, so a non-Fastify backend gets full protocol parity for
-about the same amount of code as the Fastify quick-start above.
+capabilities payload, artifact GET/DELETE — lives in the framework-agnostic
+core that the Fastify plugin itself is a thin adapter over. The core IS the
+main `@mieweb/pulsevault` entry point (the legacy `@mieweb/pulsevault/core`
+subpath resolves to the same module), with no Fastify dependency, so a
+non-Fastify backend gets full protocol parity for about the same amount of
+code as the Fastify quick-start above.
 
 `createPulseVaultCore(...)` returns a connect-style `handler(req, res, next?)`
 you can mount directly:
@@ -83,7 +84,7 @@ you can mount directly:
 // Express
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const app = express();
 const pulseVault = createPulseVaultCore({
@@ -107,7 +108,7 @@ app.listen(3030);
 ```ts
 // Meteor (server-only module)
 import { WebApp } from "meteor/webapp";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
@@ -141,7 +142,7 @@ leave `stripBasePath` at its default (`true`):
 
 ```ts
 import http from "node:http";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
@@ -173,7 +174,43 @@ diagnostics — the Fastify plugin always uses `request.log` for these
 automatically, but a non-Fastify host has no equivalent to infer one from,
 so it falls back to `console` when omitted.
 
-Four runnable example servers live under [`examples/`](examples):
+## Web-standard handler (Hono, Bun, Deno, meta-frameworks)
+
+`@mieweb/pulsevault/web` exposes the same server as a WHATWG
+`Request → Response` handler — no `http.IncomingMessage` anywhere — so it
+mounts in one line under anything that speaks fetch primitives:
+
+```ts
+import { createPulseVaultWebHandler } from "@mieweb/pulsevault/web";
+import { createLocalStorage } from "@mieweb/pulsevault";
+
+const vault = createPulseVaultWebHandler({
+  basePath: "/pulsevault",
+  storage: createLocalStorage({ workspaceDir: "./data" }),
+  maxUploadSize: 5 * 1024 * 1024 * 1024,
+});
+
+// Hono — identical on Node (@hono/node-server), Bun, and Deno:
+app.all("/pulsevault/*", (c) => vault.handler(c.req.raw));
+// Bun without a framework:
+Bun.serve({ fetch: (req) => vault.handler(req) });
+// Next.js/Nuxt/SvelteKit-style route handlers: export the handler for every
+// method on a catch-all route under /pulsevault.
+```
+
+Same options and hooks as `createPulseVaultCore` (minus `stripBasePath` —
+web requests carry absolute URLs, and minus `cache`). Artifact serving
+implements single-`Range` requests (206/416) and `HEAD` itself — what real
+video players send — instead of delegating to a Node streaming library.
+Local-filesystem serving needs a runtime with `node:fs` (Node, Bun, Deno);
+on filesystem-less edge runtimes use the S3/R2 adapter, whose playback is a
+presigned redirect and never touches a local file. Note tus uploads still
+require the datastore stack (`@tus/file-store`/`@tus/s3-store`, which need
+`node:fs`), so a pure V8-isolate deployment should use the
+[direct-upload profile](#direct-uploads-presigned-put-data-plane) instead —
+see [`examples/workers-demo`](examples/workers-demo).
+
+Six runnable example servers live under [`examples/`](examples):
 
 - [`examples/fastify-demo`](examples/fastify-demo) — the smallest runnable
   server: Fastify plugin mount, QR pairing, flat upload listing, no auth,
@@ -190,11 +227,19 @@ Four runnable example servers live under [`examples/`](examples):
   live feed.
 - [`examples/express-demo`](examples/express-demo) and
   [`examples/meteor-demo`](examples/meteor-demo) — the same demo on
-  `@mieweb/pulsevault/core` instead of the plugin, proving the core needs
+  the framework-agnostic core instead of the plugin, proving the core needs
   about the same amount of glue code under a different framework. Both are
   verified against the real frameworks, not just the test suite —
   `meteor-demo` in particular against a real `meteor create` app, since
   Meteor's bundler needed the compatibility fixes described above.
+- [`examples/hono-demo`](examples/hono-demo) — the web-standard handler
+  mounted under Hono in one wildcard route; the same app object serves on
+  Node, Bun, and Deno unchanged.
+- [`examples/workers-demo`](examples/workers-demo) — a Cloudflare Workers
+  control plane implementing the wire contract **from PROTOCOL.md alone**
+  (capabilities, capability tokens via WebCrypto, direct-upload profile with
+  R2 as the data plane, presigned playback). Documents honestly why the tus
+  stack itself can't run on a V8 isolate.
 
 ## How a pairing + upload session flows
 
@@ -224,11 +269,11 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, `uploadUnit`, allowed extensions, limits |
+| `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, allowed extensions, limits |
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
 | `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
-| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
+| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete an upload's bytes; the artifactId is tombstoned and never reusable |
 
 \* `DELETE /pulsevault/upload/:id` is TUS's own "cancel in-flight upload" — distinct from `DELETE /pulsevault/artifacts/:artifactId`, which removes a finalized artifact.
 
@@ -243,7 +288,6 @@ type PulseVaultPluginOptions = {
   storage: PulseVaultStorage;
   prefix: string;
   maxUploadSize: number;
-  uploadUnit?: "segment" | "merged";           // default: "segment" — see "Upload unit"
   decoratorName?: string;                      // default: "pulseVault"
   allowedExtensions?:
     | string[]                                                                              // legacy — treated as video-only
@@ -275,18 +319,9 @@ URL prefix for all plugin routes. Set to `"/pulsevault"` for the standard namesp
 
 Maximum upload size in bytes. Use `Infinity` for no cap.
 
-### Upload unit
+### What a pulse uploads
 
-`uploadUnit: "segment" | "merged"` — purely advertised via `GET /pulsevault/capabilities`; **the plugin doesn't enforce either.** It tells the client which upload strategy this deployment expects:
-
-- `"segment"` (default): the client uploads each recorded clip individually (no merge/re-encode pass), plus one `kind=project` ordering manifest (`<draftId>-segments.pulse`). No captions or thumbnail. Lower client-side cost, finer-grained resumability.
-- `"merged"`: the client pre-merges a pulse's clips into one video before uploading, alongside its captions (`kind=captions`), a beat-timecode manifest (`kind=project`, `<draftId>-beats.pulse` — per-segment `startMs`/`endMs` on the merged timeline), and a poster `kind=thumbnail`. Simpler server-side mental model (one primary artifact per pulse), more client-side work.
-
-(A "beat" is a timecode range on the merged timeline — one recorded segment's placement within the merged video — not an upload unit. The old `"beat"` upload unit was renamed to `"segment"`.)
-
-A client reads `uploadUnit` at pairing time, before doing any merge or upload work, and branches accordingly. See `PROTOCOL.md` §8 for the full contract.
-
-Need both strategies live at once instead of one fixed value for the whole deployment? Pass `uploadUnit` to [`buildUploadLink`](#deep-link-helper) per session — it overrides `/capabilities` for that pairing only, with no server-side option to change.
+One video per pulse, plus its related artifacts under the same session token (`relatedTo` — `PROTOCOL.md` §8): WebVTT captions (`kind=captions`), a beat-timecode manifest (`kind=project`, `<draftId>-beats.pulse` — per-segment `startMs`/`endMs` on the pulse's timeline), and a poster `kind=thumbnail`. A "beat" is a timecode range on that timeline, not a separate upload. (Earlier releases had an `uploadUnit` option selecting a per-clip upload strategy; it was removed in 0.4.0.)
 
 ### `decoratorName`
 
@@ -377,6 +412,9 @@ type PulseVaultValidatePayload = (
   ctx: {
     artifactId: string;
     size: number;
+    /** The tus upload id (`<kind>/<artifactId><ext>`). For direct uploads it is the same
+     * logical id, NOT the stored object's key — reach the bytes through `storage.resolve()`
+     * or the id-keyed adapter accessors, never by building a key from this. */
     uploadId: string;
     kind: "video" | "project" | "captions";
     /** Absolute path to finalized bytes for adapters that expose `getLocalPath`. */
@@ -394,7 +432,7 @@ import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
   createChecksumValidator,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
 
@@ -426,6 +464,7 @@ Optional async hook fired once the final byte is written, `validatePayload` has 
 ```ts
 type PulseVaultOnUploadComplete = (
   request: PulseVaultRequest, // see the note under `authorize` above
+  // `uploadId` is the logical upload id, not a storage key — see `validatePayload` above.
   ctx: { artifactId: string; kind: "video" | "project" | "captions"; size: number; uploadId: string },
 ) => void | Promise<void>;
 ```
@@ -473,7 +512,6 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "protocolVersion": 1,
   "minSupportedVersion": 1,
   "maxSupportedVersion": 1,
-  "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
@@ -495,7 +533,7 @@ import pulseVault, {
   createCapabilityAuthorize,
   issueCapabilityToken,
   buildUploadLink,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 import { randomUUID } from "node:crypto";
 
 const keys = { "2026-06": process.env.PULSEVAULT_KEY_2026_06! }; // add the previous key during rotation
@@ -522,7 +560,7 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a merged video also covers its captions, beat manifest and thumbnail (or, under `uploadUnit: "segment"`, every clip and the ordering manifest) in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
 
 ## Upload-Metadata protocol
 
@@ -585,7 +623,7 @@ The filesystem layout is the integration surface. Use the `onUploadComplete` hoo
 ```ts
 import path from "node:path";
 import { ArtiPod, ArtiMount } from "@mieweb/artipod";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage } from "@mieweb/pulsevault/fastify";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
 
@@ -625,7 +663,7 @@ npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store
 **Cloudflare R2:**
 
 ```ts
-import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault";
+import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault/fastify";
 
 const storage = await createS3Storage({
   bucket: "pulse-videos",
@@ -679,9 +717,14 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 | `sessionToken` | — | Optional STS session token for temporary credentials. |
 | `forcePathStyle` | `true` when `endpoint` is set | R2 and most S3-compatible stores need path-style. |
 | `presignTtlSeconds` | `900` | Lifetime of the playback presigned URL. |
-| `partSize` | computed | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `partSize` | computed; `8 MiB` on R2 | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `minPartSize` | `partSize` on R2 | Forwarded to `@tus/s3-store`. Set equal to `partSize` to force equal-size non-trailing parts. |
+| `maxMultipartParts` | `10000` | Forwarded to `@tus/s3-store`. Lower for stores with tighter limits (e.g. Scaleway: 1000). |
+| `useTags` | `true`; `false` on R2 | Whether `@tus/s3-store` may tag objects (its `Tus-Completed` tag powers lifecycle cleanup). |
 | `metaCacheLimit` | `10000` | Caps the in-memory metadata cache before evicting the oldest entry. |
 | `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
+
+> **Cloudflare R2 is auto-configured**: when `endpoint` is an `*.r2.cloudflarestorage.com` URL, the adapter defaults `partSize`/`minPartSize` to 8 MiB (R2 requires all non-trailing multipart parts to be the same size) and `useTags` to `false` (R2 does not implement object tagging). Explicit options always win. On R2, prefer [bucket lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) to clean up incomplete multipart uploads (R2 aborts them after 7 days by default).
 
 > A typical deployment wires these to environment variables (e.g. `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) and picks the storage adapter with a `STORAGE=local|s3` switch — the options table above maps one-to-one onto `createS3Storage(...)`.
 
@@ -692,6 +735,82 @@ The default `createMp4Sniffer`/`createChecksumValidator` read a local file path,
 ### Direct playback & CORS
 
 Because playback is a 302 redirect to a presigned URL, a browser fetching it goes **directly** to R2/S3. If you play back from a web origin, add a bucket CORS rule allowing your origin (`GET`, and `Range` for seeking). Native clients that follow redirects need no CORS.
+
+Presigned-URL limits to know: R2 caps presigned TTLs at **7 days** and does not serve presigned URLs over custom domains (they always use the `*.r2.cloudflarestorage.com` endpoint you signed against). AWS SigV4 has the same 7-day ceiling. `presignTtlSeconds` past that will fail at request time, not at config time.
+
+### Direct uploads (presigned PUT data plane)
+
+With the S3/R2 adapter, the server automatically advertises the
+[PROTOCOL.md §9](PROTOCOL.md) direct-upload profile via `/capabilities`
+(`directUpload: { enabled: true }`) and serves two extra routes:
+
+- `POST {prefix}/direct-uploads` — authorize + reserve (same collision rules
+  as a TUS create) + return a presigned `PUT` URL with `Content-Type` and the
+  exact `Content-Length` signed in. Bytes go straight to the bucket.
+- `POST {prefix}/direct-uploads/:artifactId/complete` — verify the stored
+  object matches the declared size, then run the exact same
+  `validatePayload → markReady → onUploadComplete` sequence as a finished TUS
+  upload. Idempotent on retry.
+
+The trade, stated plainly: a direct upload is one `PUT` — retryable from
+zero, **not resumable mid-file**. TUS stays the default and is always served
+alongside; the client picks per `/capabilities`. Uploads that never complete
+are cleaned up by your bucket lifecycle rules plus a retention sweep (see
+*Retention* in `OPERATIONS.md`) — artifactIds are single-use, so an
+abandoned reservation is never re-contested by a client, only aged out.
+Local-filesystem deployments answer `501`
+and don't advertise the profile. For browser `PUT`s add a CORS rule on the
+bucket allowing `PUT` from your origin.
+
+### Deployment caveats (AWS S3 & R2)
+
+Everything above works against plain AWS S3 unchanged — omit `endpoint`, set
+`region`, and the R2 auto-configuration simply never activates. The sharp
+edges live in bucket configuration, not code:
+
+- **Single-`PUT` size cap.** A direct-upload grant is one `PUT`, and both
+  AWS S3 and R2 cap a single `PUT` at **5 GiB**. Larger artifacts must go
+  through TUS (multipart under the hood). Set `maxUploadSize` accordingly if
+  you rely on direct uploads.
+- **Bucket policies that require extra signed headers break grants.** The
+  presigned `PUT` signs exactly `Content-Type` and `Content-Length`. A bucket
+  policy that *demands* another header — the classic one is a `Deny` unless
+  `s3:x-amz-server-side-encryption: aws:kms` — rejects the client's `PUT`
+  with `403`, because the client can't add headers that weren't signed.
+  Default bucket encryption (SSE-S3 on AWS, R2's built-in encryption) is fine:
+  it applies server-side without any request header. If you must have
+  SSE-KMS, set it as the bucket **default** encryption instead of enforcing
+  it per-request in a policy.
+- **Conditional writes are required.** The collision guard is
+  `If-None-Match: "*"` on `PutObject`. AWS S3 supports this (since
+  Nov 2024), R2 supports it. The adapter probes the bucket once at
+  `initialize()` (or on the first reserve) — writing a throwaway key twice
+  and requiring the 412/409 — and refuses to start against a backend that
+  rejects the header *or silently ignores it*. There is no degraded mode;
+  see `OPERATIONS.md`.
+- **Expired or lost grants are cheap.** Grants inherit `presignTtlSeconds`.
+  If the app is killed or the URL expires before the `PUT` lands, the client
+  just re-`POST`s the same create: an incomplete same-shape reservation is
+  re-granted with a fresh URL (`200`, PROTOCOL.md §9) — no operator action,
+  no 409.
+- **Lifecycle rules are the cleanup backstop.** Two distinct kinds of debris:
+  *TUS* uploads that die mid-flight leave incomplete **multipart** uploads —
+  on AWS add an `AbortIncompleteMultipartUpload` lifecycle rule (R2 aborts
+  them after 7 days by default); on AWS, `@tus/s3-store`'s `Tus-Completed`
+  tag (`useTags`, default on) can additionally drive tag-filtered expiry.
+  *Direct* uploads that `PUT` but never `complete` leave a full object at the
+  reservation's key with its sidecar stuck at `"uploading"` — artifactIds are
+  single-use, so nothing contends for the id again; a prefix-scoped expiry
+  rule (or your own `listArtifactIds`-based sweep, see *Retention* in
+  `OPERATIONS.md`) removes
+  the bytes.
+- **Deleting a reservation never frees its id.** A presigned URL can't be
+  revoked, so instead the id is tombstoned: a late `PUT` from a stale grant
+  lands on the deterministic key, but nothing will reserve or serve that id
+  again and the prefix-scoped expiry rule removes the orphan. Within one
+  reservation the grant holder can still overwrite its own object until the
+  URL expires — use short TTLs (or TUS) if you need immutable-after-ready
+  bytes.
 
 ## Custom storage adapter
 
@@ -761,12 +880,9 @@ const uploadLink = buildUploadLink({
   server: "https://example.com/pulsevault",
   artifactId: randomUUID(), // generate server-side; skip POST /reserve on the app
   token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
-  uploadUnit: "merged", // optional — see "Upload unit" below
 });
-// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret&uploadUnit=merged
+// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
-
-`uploadUnit` on the link is a **per-session override** of whatever `GET /capabilities` currently reports (PROTOCOL.md §3, §8). Omit it and nothing changes — the client falls back to `/capabilities` exactly as before. Set it when you want "segment" and "merged" sessions live at the same time (staged rollout, A/B test, per-tenant policy) instead of one fixed value for the whole deployment — `/capabilities` can only ever report one current value, and a client reading it separately from opening the link is racing whatever the server happened to be serving at that moment, not the value this specific session was paired under.
 
 ## Tests
 
