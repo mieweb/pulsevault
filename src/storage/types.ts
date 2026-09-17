@@ -43,6 +43,28 @@ export function parseUploadKind(raw: string | null | undefined): UploadKind {
   return (UPLOAD_KINDS as readonly string[]).includes(lower) ? (lower as UploadKind) : 'video';
 }
 
+/**
+ * Everything an adapter knows about one artifact, in a single read — the
+ * consumer-facing projection of the metadata sidecar. Replaces hand-parsing
+ * sidecar files (or chaining `getKind`/`getRelatedTo`/`getChecksum`/`getName`)
+ * when a consumer needs the whole record, e.g. to render an uploads listing.
+ */
+export type ArtifactMetadata = {
+  artifactId: string;
+  kind: UploadKind;
+  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
+  ext: string;
+  /** Original filename from `Upload-Metadata.filename`. */
+  filename: string;
+  /** Whether the upload has completed and passed validation — only ready artifacts are served. */
+  ready: boolean;
+  relatedTo?: string;
+  checksum?: string;
+  name?: string;
+  /** Epoch-ms timestamp of the reservation that created this artifact, when known. */
+  reservedAt?: number;
+};
+
 export type ReserveUploadParams = {
   /** UUID from `Upload-Metadata.artifactId` (or the `videoid`/`projectid` legacy aliases). */
   artifactId: string;
@@ -169,4 +191,12 @@ export interface PulseVaultStorage {
    * sidecar directly.
    */
   getName?(artifactId: string): Promise<string | null>;
+
+  /**
+   * Return everything the adapter knows about an artifact in one read, or
+   * `null` if the artifactId is unknown. Prefer this over chaining the
+   * per-field getters when rendering listings or feeds — and over parsing
+   * sidecar files by hand, which couples the consumer to the sidecar schema.
+   */
+  getMetadata?(artifactId: string): Promise<ArtifactMetadata | null>;
 }

@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { httpError } from './errors.js';
 import type { PulseVaultRequest } from './request.js';
 import type { LocalStorage } from '../storage/local.js';
 import type { S3Storage } from '../storage/s3.js';
@@ -89,16 +90,11 @@ export function createMp4Sniffer(storage: LocalStorage): PulseVaultValidatePaylo
   return async (_request, { artifactId }) => {
     const localPath = await storage.getLocalPath(artifactId);
     if (!localPath) {
-      throw Object.assign(
-        new Error(`Cannot validate upload ${artifactId}: no local path available`),
-        { statusCode: 500 },
-      );
+      throw httpError(500, `Cannot validate upload ${artifactId}: no local path available`);
     }
     const ok = await sniffMp4(localPath);
     if (!ok) {
-      throw Object.assign(new Error('Uploaded bytes are not a valid MP4 (missing ftyp header)'), {
-        statusCode: 422,
-      });
+      throw httpError(422, 'Uploaded bytes are not a valid MP4 (missing ftyp header)');
     }
   };
 }
@@ -125,15 +121,10 @@ export function createS3Mp4Sniffer(storage: S3Storage): PulseVaultValidatePayloa
   return async (_request, { artifactId }) => {
     const header = await storage.readHeader(artifactId, 12);
     if (!header) {
-      throw Object.assign(
-        new Error(`Cannot validate upload ${artifactId}: no object bytes available`),
-        { statusCode: 500 },
-      );
+      throw httpError(500, `Cannot validate upload ${artifactId}: no object bytes available`);
     }
     if (!hasFtypBox(header)) {
-      throw Object.assign(new Error('Uploaded bytes are not a valid MP4 (missing ftyp header)'), {
-        statusCode: 422,
-      });
+      throw httpError(422, 'Uploaded bytes are not a valid MP4 (missing ftyp header)');
     }
   };
 }

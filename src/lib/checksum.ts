@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import { httpError } from './errors.js';
 import type { S3Storage } from '../storage/s3.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 
@@ -42,9 +43,7 @@ async function digestLocalFile(path: string, algorithm: ChecksumAlgorithm): Prom
   return hash.digest('hex');
 }
 
-function checksumError(message: string): Error {
-  return Object.assign(new Error(message), { statusCode: 422 });
-}
+const checksumError = (message: string): Error => httpError(422, message);
 
 /**
  * Build a `validatePayload` (or `validateCaptionsPayload`/`validateProjectPayload`)

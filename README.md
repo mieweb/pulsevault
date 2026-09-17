@@ -554,6 +554,7 @@ import { createLocalStorage } from "@mieweb/pulsevault";
 const storage = createLocalStorage({
   workspaceDir: "./data",   // directory for uploads; created if absent
   metaCacheLimit: 10_000,   // optional — bounds the in-memory metadata cache
+  reclaimGraceMs: 60_000,   // optional — age before an orphaned "uploading" sidecar is reclaimable
 });
 ```
 
@@ -679,9 +680,15 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 | `sessionToken` | — | Optional STS session token for temporary credentials. |
 | `forcePathStyle` | `true` when `endpoint` is set | R2 and most S3-compatible stores need path-style. |
 | `presignTtlSeconds` | `900` | Lifetime of the playback presigned URL. |
-| `partSize` | computed | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `partSize` | computed; `8 MiB` on R2 | Preferred multipart part size (≥ 5 MiB), forwarded to `@tus/s3-store`. |
+| `minPartSize` | `partSize` on R2 | Forwarded to `@tus/s3-store`. Set equal to `partSize` to force equal-size non-trailing parts. |
+| `maxMultipartParts` | `10000` | Forwarded to `@tus/s3-store`. Lower for stores with tighter limits (e.g. Scaleway: 1000). |
+| `useTags` | `true`; `false` on R2 | Whether `@tus/s3-store` may tag objects (its `Tus-Completed` tag powers lifecycle cleanup). |
 | `metaCacheLimit` | `10000` | Caps the in-memory metadata cache before evicting the oldest entry. |
+| `reclaimGraceMs` | `60000` | Age an orphaned `"uploading"` sidecar with no datastore state must reach before a retried create reclaims it instead of 409ing. |
 | `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
+
+> **Cloudflare R2 is auto-configured**: when `endpoint` is an `*.r2.cloudflarestorage.com` URL, the adapter defaults `partSize`/`minPartSize` to 8 MiB (R2 requires all non-trailing multipart parts to be the same size) and `useTags` to `false` (R2 does not implement object tagging). Explicit options always win. On R2, prefer [bucket lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) to clean up incomplete multipart uploads (R2 aborts them after 7 days by default).
 
 > A typical deployment wires these to environment variables (e.g. `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) and picks the storage adapter with a `STORAGE=local|s3` switch — the options table above maps one-to-one onto `createS3Storage(...)`.
 

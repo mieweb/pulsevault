@@ -7,6 +7,44 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **TUS termination (`DELETE /upload/<id>`) now sweeps the adapter's own
+  artifact metadata** (the `.pulsevault` sidecar and caches) via
+  `@tus/server`'s `POST_TERMINATE` event. Previously only the datastore's
+  bytes/offset state was removed, leaving a permanent `"uploading"` sidecar
+  behind — the cancelled artifactId stayed `409`-reserved forever and the
+  paired client's only escape was re-pairing for a fresh id.
+- **`reserveUpload` no longer 409s crash debris forever.** Both storage
+  adapters now distinguish a genuine collision (a `ready` artifact, or an
+  `uploading` one whose datastore state still exists, or a sidecar younger
+  than the reclaim grace — a concurrent create in flight) from an orphaned
+  `"uploading"` sidecar with no datastore state (a kill between reserve and
+  datastore create, or a pre-cleanup termination), and reclaim the latter.
+  New `reclaimGraceMs` option on both adapters (default 60 000 ms). Sidecars
+  now carry a `reservedAt` timestamp to age-gate this without relying on
+  filesystem mtimes.
+- **`remove()` could resurrect deleted artifacts in the metadata cache**: a
+  concurrent read racing between the pre-delete cache eviction and the
+  (slow, I/O-bound) deletes re-populated the cache from the still-present
+  sidecar, and the stale entry outlived the deletion. Both adapters now
+  evict again after the deletes complete.
+
+### Added
+
+- **Cloudflare R2 auto-configuration in `createS3Storage`.** When `endpoint`
+  is an `*.r2.cloudflarestorage.com` URL, the `@tus/s3-store` datastore now
+  defaults to `partSize`/`minPartSize` of 8 MiB (R2 requires all non-trailing
+  multipart parts to be the same size) and `useTags: false` (R2 does not
+  implement `PutObjectTagging`; with tags on, every completed upload attempts
+  a tagging call). New `minPartSize`, `maxMultipartParts`, and `useTags`
+  options are forwarded for explicit control on any backend.
+- **PROTOCOL.md §4.2.1**: the deterministic tus id scheme
+  (`base64url("<kind>/<artifactId><ext>")`) is now a documented, stable part
+  of protocol version 1, together with the client-side `409` recovery it
+  enables (derive the resource URL, confirm with `HEAD`, resume) and the
+  server-side debris-reclaim recommendation.
+
 ## [0.3.0] - 2026-09-16
 
 ### Changed

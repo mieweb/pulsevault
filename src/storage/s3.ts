@@ -6,91 +6,34 @@ import type { DataStore } from '@tus/server';
 // install `@aws-sdk/*` or `@tus/s3-store`.
 import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
 import type {
+  ArtifactMetadata,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
-import { parseUploadKind } from './types.js';
+import {
+  buildSidecar,
+  createMetaCache,
+  DEFAULT_META_CACHE_LIMIT,
+  DEFAULT_RECLAIM_GRACE_MS,
+  extToContentType,
+  parseSidecar,
+  reserveConflictError,
+  type Sidecar,
+  sidecarIsStale,
+  sidecarToCachedMeta,
+} from './sidecar.js';
 
-/**
- * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
- * `.pulsevault/<artifactId>.json`. This mirrors the local adapter's on-disk
- * sidecar: it lets `resolve`/`getKind` recover an upload's extension, kind and
- * completion state from the `artifactId` alone (the object key needs both
- * `kind` and `ext`, which the bare artifactId doesn't carry), and survives a
- * restart.
- */
-type Sidecar = {
-  /** Sidecar schema version. Increment for breaking changes. */
-  version: 1;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
-  ext: string;
-  /** Original filename from `Upload-Metadata.filename`. */
-  filename: string;
-  /**
-   * `"uploading"` between `reserveUpload` and `markReady`; `"ready"` once every
-   * post-upload validation has passed. `resolve` only serves `"ready"` uploads
-   * so an object that exists but failed validation is never handed out.
-   */
-  status: 'uploading' | 'ready';
-  /** Artifact kind. Optional for back-compat; absent is read as `"video"`. */
-  kind?: UploadKind;
-  /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
-  relatedTo?: string;
-  /** Optional client-supplied checksum metadata. See `ReserveUploadParams.checksum`. */
-  checksum?: string;
-  /** Optional human-facing display name. See `ReserveUploadParams.name`. */
-  name?: string;
-};
+// Sidecar schema, parsing, cache, staleness gate, and the reserve-collision
+// error all live in `./sidecar.js`, shared verbatim with the local adapter —
+// this file owns only the bucket-specific I/O around them. The sidecar for an
+// artifact is a small JSON object at `.pulsevault/<artifactId>.json`.
 
-const SIDECAR_VERSION = 1 as const;
 /** Key prefix inside the bucket that holds the per-upload sidecar objects. */
 const PULSEVAULT_META_PREFIX = '.pulsevault';
 /** Default presigned playback URL lifetime (15 minutes). */
 const DEFAULT_PRESIGN_TTL_SECONDS = 900;
-/** Default cap on the in-memory metadata cache before evicting the oldest entry. */
-const DEFAULT_META_CACHE_LIMIT = 10_000;
-
-type CachedMeta = {
-  ext: string;
-  ready: boolean;
-  kind: UploadKind;
-  relatedTo?: string;
-  checksum?: string;
-  name?: string;
-};
-
-/** Map a file extension to the `Content-Type` the playback URL should return. */
-function extToContentType(ext: string): string {
-  switch (ext) {
-    case '.mp4':
-      return 'video/mp4';
-    case '.zip':
-      return 'application/zip';
-    case '.vtt':
-      return 'text/vtt';
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg';
-    case '.png':
-      return 'image/png';
-    default:
-      return 'application/octet-stream';
-  }
-}
-
-/** Project a `Sidecar` into the shape kept in the in-memory cache. */
-function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
-  return {
-    ext: sidecar.ext,
-    ready,
-    kind: sidecar.kind ?? 'video',
-    relatedTo: sidecar.relatedTo,
-    checksum: sidecar.checksum,
-    name: sidecar.name,
-  };
-}
 
 export type S3StorageOptions = {
   /** Target bucket. Must already exist (the integrator provisions it). */
@@ -126,9 +69,31 @@ export type S3StorageOptions = {
   presignTtlSeconds?: number;
   /**
    * Preferred multipart part size in bytes, forwarded to `@tus/s3-store`. Must
-   * be >= 5 MiB. When omitted, `@tus/s3-store` computes an optimal size.
+   * be >= 5 MiB. When omitted, `@tus/s3-store` computes an optimal size —
+   * except on Cloudflare R2 (auto-detected from `endpoint`), where it defaults
+   * to 8 MiB because R2 requires all non-trailing parts to be the same size.
    */
   partSize?: number;
+  /**
+   * Minimum multipart part size in bytes, forwarded to `@tus/s3-store`.
+   * Setting `minPartSize === partSize` makes every non-trailing part exactly
+   * that size — REQUIRED by Cloudflare R2. Auto-defaulted to `partSize` when
+   * the endpoint is R2; leave unset for AWS S3.
+   */
+  minPartSize?: number;
+  /**
+   * Maximum number of parts per multipart upload, forwarded to
+   * `@tus/s3-store`. Defaults to 10,000 (the AWS limit); some S3-compatible
+   * stores allow fewer (e.g. Scaleway: 1,000).
+   */
+  maxMultipartParts?: number;
+  /**
+   * Whether `@tus/s3-store` may tag objects (its `Tus-Completed` tag powers
+   * lifecycle-based cleanup of unfinished uploads). Cloudflare R2 does not
+   * implement object tagging, so this is auto-defaulted to `false` when the
+   * endpoint is R2; leave unset for AWS S3.
+   */
+  useTags?: boolean;
   /**
    * Max number of entries kept in the in-memory metadata cache before the
    * oldest (by insertion order) is evicted. A cache miss falls back to a
@@ -137,6 +102,14 @@ export type S3StorageOptions = {
    */
   metaCacheLimit?: number;
   /**
+   * Minimum age (ms) an `"uploading"` sidecar with no datastore state must
+   * reach before `reserveUpload` treats it as crash debris and reclaims it
+   * instead of 409ing. A younger sidecar may belong to a concurrent create
+   * that hasn't written its datastore `.info` yet — those must still
+   * conflict. Defaults to 60,000 (1 minute).
+   */
+  reclaimGraceMs?: number;
+  /**
    * Advanced escape hatch: extra `S3ClientConfig` fields merged into the
    * client used for both playback presigning and the underlying TUS datastore
    * (e.g. checksum flags for S3-compatible stores). Values here win over the
@@ -144,6 +117,56 @@ export type S3StorageOptions = {
    */
   clientConfig?: Partial<S3ClientConfig>;
 };
+
+/** Default multipart part size on backends that require equal-size parts (Cloudflare R2). */
+const R2_DEFAULT_PART_SIZE = 8 * 1024 * 1024;
+
+/** Whether an endpoint URL points at Cloudflare R2. Tolerant of unparseable input (returns false). */
+function isR2Endpoint(endpoint: string | undefined): boolean {
+  if (!endpoint) return false;
+  try {
+    return /(^|\.)r2\.cloudflarestorage\.com$/i.test(new URL(endpoint).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the `@tus/s3-store` construction options from the adapter options,
+ * applying Cloudflare R2's documented requirements automatically when the
+ * endpoint is R2 (unless explicitly overridden):
+ *
+ * - R2 requires all non-trailing multipart parts to be the SAME size →
+ *   `partSize`/`minPartSize` both default to 8 MiB.
+ * - R2 does not implement `PutObjectTagging` → `useTags` defaults to `false`
+ *   (with tags on, `@tus/s3-store` tries to tag every upload's objects).
+ *
+ * Exported for direct unit testing; not part of the documented public surface.
+ */
+export function deriveDatastoreOptions(
+  opts: Pick<
+    S3StorageOptions,
+    'endpoint' | 'partSize' | 'minPartSize' | 'maxMultipartParts' | 'useTags'
+  >,
+): {
+  partSize?: number;
+  minPartSize?: number;
+  maxMultipartParts?: number;
+  useTags?: boolean;
+} {
+  const r2 = isR2Endpoint(opts.endpoint);
+  const partSize = opts.partSize ?? (r2 ? R2_DEFAULT_PART_SIZE : undefined);
+  const minPartSize = opts.minPartSize ?? (r2 ? partSize : undefined);
+  const useTags = opts.useTags ?? (r2 ? false : undefined);
+  return {
+    ...(partSize !== undefined ? { partSize } : {}),
+    ...(minPartSize !== undefined ? { minPartSize } : {}),
+    ...(opts.maxMultipartParts !== undefined
+      ? { maxMultipartParts: opts.maxMultipartParts }
+      : {}),
+    ...(useTags !== undefined ? { useTags } : {}),
+  };
+}
 
 /**
  * S3 / Cloudflare R2 storage adapter. Uploads stream into the bucket via S3
@@ -183,6 +206,8 @@ export type S3Storage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract. */
+  getMetadata(artifactId: string): Promise<ArtifactMetadata | null>;
 };
 
 /**
@@ -219,13 +244,14 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         `(original error: ${err instanceof Error ? err.message : String(err)})`,
     );
   }
-  const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = s3;
+  const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, HeadObjectCommand } =
+    s3;
   const { getSignedUrl } = presigner;
   const { S3Store } = s3store;
 
   const bucket = opts.bucket;
   const presignTtl = opts.presignTtlSeconds ?? DEFAULT_PRESIGN_TTL_SECONDS;
-  const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
+  const reclaimGraceMs = opts.reclaimGraceMs ?? DEFAULT_RECLAIM_GRACE_MS;
 
   const credentials =
     opts.accessKeyId && opts.secretAccessKey
@@ -248,29 +274,65 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   // presigning. The TUS datastore creates its own client from the same config.
   const client: S3Client = new S3Client(clientConfig);
   const datastore = new S3Store({
-    ...(opts.partSize ? { partSize: opts.partSize } : {}),
+    ...deriveDatastoreOptions(opts),
     s3ClientConfig: { ...clientConfig, bucket },
   }) as unknown as DataStore;
 
   // Metadata cache keyed by artifactId, mirroring the local adapter: populated
   // eagerly on reserve and lazily from the sidecar on a cache-miss, so the GET
-  // hot path avoids a per-request round-trip to the bucket. Bounded with
-  // simple insertion-order eviction, same rationale as the local adapter.
-  const metaCache = new Map<string, CachedMeta>();
-
-  const cacheSet = (artifactId: string, meta: CachedMeta): void => {
-    metaCache.delete(artifactId);
-    metaCache.set(artifactId, meta);
-    if (metaCache.size > metaCacheLimit) {
-      const oldest = metaCache.keys().next().value;
-      if (oldest !== undefined) metaCache.delete(oldest);
-    }
-  };
+  // hot path avoids a per-request round-trip to the bucket.
+  const metaCache = createMetaCache(opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT);
 
   const sidecarKey = (artifactId: string): string => `${PULSEVAULT_META_PREFIX}/${artifactId}.json`;
   /** Object key for the artifact bytes — also the TUS file id / multipart key. */
   const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
+
+  /**
+   * Whether `@tus/s3-store` still has live upload state (the `<key>.info`
+   * object) for the upload a sidecar describes. Mirrors the local adapter's
+   * check: `reserveUpload` writes the sidecar *before* the datastore creates
+   * its `.info`, so a crash in that window — or a TUS DELETE handled by a
+   * server too old to sweep sidecars — leaves an `"uploading"` sidecar with no
+   * datastore state behind it. That artifactId is not really in use.
+   */
+  const datastoreInfoExists = async (
+    artifactId: string,
+    kind: UploadKind,
+    ext: string,
+  ): Promise<boolean> => {
+    try {
+      await client.send(
+        new HeadObjectCommand({
+          Bucket: bucket,
+          Key: `${artifactKey(artifactId, kind, ext)}.info`,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (isNotFound(err)) return false;
+      throw err;
+    }
+  };
+
+  /**
+   * Reclaim-aware collision check for `reserveUpload`: reads the sidecar
+   * FRESH from the bucket (the in-memory cache can't tell live state from
+   * debris) and reports a genuine conflict for a `"ready"` artifact, an
+   * `"uploading"` one whose datastore `.info` still exists, or an
+   * `"uploading"` one still inside the reclaim grace window (a concurrent
+   * create that hasn't written its `.info` yet — letting that through would
+   * give simultaneous duplicate creates two winners). Everything else — no
+   * sidecar, malformed sidecar, or an aged `"uploading"` sidecar with no
+   * datastore state — is crash/termination debris, safe to overwrite.
+   */
+  const conflictingUpload = async (artifactId: string): Promise<boolean> => {
+    const existing = await readSidecar(artifactId);
+    if (!existing) return false;
+    if (existing.status === 'ready') return true;
+    if (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) return true;
+    return !sidecarIsStale(existing, reclaimGraceMs);
+  };
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     await client.send(
@@ -294,75 +356,41 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       if (isNotFound(err)) return null;
       throw err;
     }
-    try {
-      const parsed = JSON.parse(raw) as Partial<Sidecar>;
-      if (typeof parsed.ext !== 'string') return null;
-      if (typeof parsed.filename !== 'string') return null;
-      const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
-      const kind = parseUploadKind(parsed.kind);
-      return {
-        version: SIDECAR_VERSION,
-        ext: parsed.ext,
-        filename: parsed.filename,
-        status,
-        kind,
-        relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
-        checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
-        name: typeof parsed.name === 'string' ? parsed.name : undefined,
-      };
-    } catch {
-      // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
-      return null;
-    }
+    // Malformed sidecars parse to null — treated as absent; `reserveUpload` rewrites them.
+    return parseSidecar(raw);
   };
 
-  const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
+  const loadMeta = async (artifactId: string) => {
     const cached = metaCache.get(artifactId);
     if (cached) return cached;
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
     const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    cacheSet(artifactId, meta);
+    metaCache.set(artifactId, meta);
     return meta;
   };
 
-  const reserveUpload = async ({
-    artifactId,
-    filename,
-    ext,
-    kind,
-    relatedTo,
-    checksum,
-    name,
-  }: ReserveUploadParams): Promise<string> => {
-    const sidecar: Sidecar = {
-      version: SIDECAR_VERSION,
-      ext,
-      filename,
-      status: 'uploading',
-      kind,
-      relatedTo,
-      checksum,
-      name,
+  const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
+    const { artifactId, kind, ext } = params;
+    const sidecar = buildSidecar(params);
+
+    const conflict = (): never => {
+      throw reserveConflictError(artifactId);
     };
 
-    // Fast-path rejection for the common case. Not atomic by itself (two concurrent
-    // requests can both observe no existing meta before either writes) — the conditional
-    // write below closes that race on backends that support it — but it's also the only
-    // enforcement on S3-compatible backends that silently ignore `IfNoneMatch` instead of
-    // erroring.
-    const existing = await loadMeta(artifactId);
-    if (existing) {
-      throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-        statusCode: 409,
-        status_code: 409,
-      });
-    }
+    // Fast-path rejection for a known-finished artifact; anything else needs the
+    // reclaim-aware fresh read below (a cached `"uploading"` entry may be debris —
+    // see `conflictingUpload`). Not atomic by itself — the conditional write below
+    // closes the race on backends that support it.
+    if (metaCache.get(artifactId)?.ready) conflict();
+    if (await conflictingUpload(artifactId)) conflict();
 
     // Collision guard: `IfNoneMatch: "*"` makes the write itself atomically fail
-    // (PreconditionFailed) if a sidecar object already exists for this artifactId, closing
-    // the race the check above can't close by itself. Surfaces as HTTP 409 via @tus/server's
-    // error path, same as before.
+    // (PreconditionFailed) if a sidecar object already exists for this artifactId. Because
+    // debris sidecars legitimately exist (and were cleared for reclaim above), a
+    // PreconditionFailed re-runs the reclaim check: still-not-conflicting means the
+    // existing object is debris — overwrite it plainly; conflicting means a concurrent
+    // reserve won the race — 409, same as before.
     try {
       await client.send(
         new PutObjectCommand({
@@ -375,29 +403,23 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       );
     } catch (err) {
       if (isPreconditionFailed(err)) {
-        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-          statusCode: 409,
-          status_code: 409,
-        });
+        if (await conflictingUpload(artifactId)) conflict();
+        await writeSidecar(artifactId, sidecar);
+      } else if (isConditionalWriteUnsupported(err)) {
+        // Some S3-compatible backends don't support conditional writes — fall back to the
+        // check-then-write already performed above. Weaker (the original TOCTOU window
+        // reopens) but keeps reserve working on those backends instead of hard-failing
+        // every upload. Surface this degraded mode once per process so operators know
+        // their backend can't fully guarantee collision safety under concurrent/retried
+        // creates for the same artifactId.
+        warnAboutConditionalWriteFallbackOnce();
+        await writeSidecar(artifactId, sidecar);
+      } else {
+        throw err;
       }
-      if (!isConditionalWriteUnsupported(err)) throw err;
-      // Some S3-compatible backends don't support conditional writes — fall back to the
-      // previous check-then-write. Weaker (the original TOCTOU window reopens) but keeps
-      // reserve working on those backends instead of hard-failing every upload. Surface
-      // this degraded mode once per process so operators know their backend can't fully
-      // guarantee collision safety under concurrent/retried creates for the same artifactId.
-      warnAboutConditionalWriteFallbackOnce();
-      const meta = await loadMeta(artifactId);
-      if (meta) {
-        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-          statusCode: 409,
-          status_code: 409,
-        });
-      }
-      await writeSidecar(artifactId, sidecar);
     }
 
-    cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum, name });
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false));
     // @tus/s3-store uses this as the object key for the multipart upload, so
     // the finished object lands at `<kind>/<artifactId><ext>`.
     return artifactKey(artifactId, kind, ext);
@@ -433,11 +455,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     const next = sidecarToCachedMeta(sidecar, true);
     if (sidecar.status === 'ready') {
       // Idempotent: already ready, just keep the cache consistent.
-      cacheSet(artifactId, next);
+      metaCache.set(artifactId, next);
       return;
     }
     await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    cacheSet(artifactId, next);
+    metaCache.set(artifactId, next);
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
@@ -459,6 +481,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
     ]);
+    // Evict again AFTER the deletes: these are HTTP round-trips, so a read racing
+    // between the pre-delete eviction and the DeleteObjects completing re-populates
+    // the cache from the still-present sidecar object — and that resurrected entry
+    // would outlive the deletion forever without this second eviction.
+    metaCache.delete(artifactId);
     return true;
   };
 
@@ -530,6 +557,22 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta?.name ?? null;
   };
 
+  const getMetadata = async (artifactId: string): Promise<ArtifactMetadata | null> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) return null;
+    return {
+      artifactId,
+      kind: meta.kind,
+      ext: meta.ext,
+      filename: meta.filename ?? `${artifactId}${meta.ext}`,
+      ready: meta.ready,
+      relatedTo: meta.relatedTo,
+      checksum: meta.checksum,
+      name: meta.name,
+      reservedAt: meta.reservedAt,
+    };
+  };
+
   const shutdown = async (): Promise<void> => {
     client.destroy();
   };
@@ -548,6 +591,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     getRelatedTo,
     getChecksum,
     getName,
+    getMetadata,
     shutdown,
   };
 }

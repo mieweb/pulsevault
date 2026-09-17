@@ -13,7 +13,11 @@ import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
-import { parseUploadKind, UPLOAD_KINDS } from './storage/types.js';
+import { UPLOAD_KINDS } from './storage/types.js';
+import {
+  decodeUploadMetadataHeader,
+  normalizeUploadMetadata,
+} from './lib/upload-metadata.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -119,55 +123,23 @@ export type PulseVaultCore = {
 
 /**
  * Pull `artifactId` (or the legacy `videoid`/`projectid` aliases), `kind`,
- * and `relatedTo` out of a raw `Upload-Metadata` header. Format is a
- * comma-separated list of `<key> <base64-value>` pairs (tus v1 creation
- * extension).
- *
- * Alias precedence is a fixed priority (`artifactId` beats `videoid` beats
- * `projectid`, regardless of header order) so this always agrees with
- * `namingFunction` in `lib/pulsevaultTus.ts` — which uses the same
- * `?? `-chain precedence to decide what's actually reserved/written to
- * storage. If these two disagreed, `authorize()` could validate ownership of
- * a different artifactId than the one the upload actually lands under.
+ * and `relatedTo` out of a raw `Upload-Metadata` header. Decoding and alias
+ * precedence live in `lib/upload-metadata.ts`, shared with `namingFunction`
+ * in `lib/pulsevaultTus.ts` — the function that decides what's actually
+ * reserved/written to storage — so the artifactId `authorize()` validates can
+ * never diverge from the one the upload lands under.
  */
 function parseUploadMetadata(header: string): {
   artifactId: string | undefined;
   kind: UploadKind;
   relatedTo: string | undefined;
 } {
-  let artifactIdRaw: string | undefined;
-  let videoidRaw: string | undefined;
-  let projectidRaw: string | undefined;
-  let kind: UploadKind = 'video';
-  let relatedTo: string | undefined;
-  for (const pair of header.split(',')) {
-    const trimmed = pair.trim();
-    if (!trimmed) continue;
-    const sep = trimmed.indexOf(' ');
-    if (sep < 0) continue;
-    const key = trimmed.slice(0, sep);
-    const value = trimmed.slice(sep + 1).trim();
-    if (!value) continue;
-    try {
-      const decoded = Buffer.from(value, 'base64').toString('utf8');
-      if (key === 'artifactId') {
-        artifactIdRaw ??= decoded;
-      } else if (key === 'videoid') {
-        videoidRaw ??= decoded;
-      } else if (key === 'projectid') {
-        projectidRaw ??= decoded;
-      } else if (key === 'kind') {
-        kind = parseUploadKind(decoded);
-      } else if (key === 'relatedTo' && !relatedTo) {
-        relatedTo = isUuid(decoded) ? decoded : undefined;
-      }
-    } catch {
-      // ignore malformed base64
-    }
-  }
-  const candidate = (artifactIdRaw ?? videoidRaw ?? projectidRaw ?? '').trim();
-  const artifactId = isUuid(candidate) ? candidate : undefined;
-  return { artifactId, kind, relatedTo };
+  const normalized = normalizeUploadMetadata(decodeUploadMetadataHeader(header));
+  return {
+    artifactId: isUuid(normalized.artifactId) ? normalized.artifactId : undefined,
+    kind: normalized.kind,
+    relatedTo: normalized.relatedTo,
+  };
 }
 
 /**
@@ -224,17 +196,14 @@ function artifactIdFromTusUrl(url: string): string | undefined {
 }
 
 /**
- * Resolve the artifact kind for an artifactId from storage. Duck-typed so it
- * works with any adapter (those without `getKind` return `"video"`).
+ * Resolve the artifact kind for an artifactId from storage. Adapters without
+ * `getKind` (or that don't know the id) resolve to `"video"`.
  */
 async function resolveStorageKind(
   storage: PulseVaultStorage,
   artifactId: string,
 ): Promise<UploadKind> {
-  const candidate = (storage as { getKind?: unknown }).getKind;
-  if (typeof candidate !== 'function') return 'video';
-  const result = await (candidate as (id: string) => Promise<UploadKind | null>)(artifactId);
-  return result ?? 'video';
+  return (await storage.getKind?.(artifactId)) ?? 'video';
 }
 
 /** Resolve the `relatedTo` artifact for an artifactId from storage, if the adapter supports it. */
@@ -242,10 +211,7 @@ async function resolveStorageRelatedTo(
   storage: PulseVaultStorage,
   artifactId: string,
 ): Promise<string | undefined> {
-  const candidate = (storage as { getRelatedTo?: unknown }).getRelatedTo;
-  if (typeof candidate !== 'function') return undefined;
-  const result = await (candidate as (id: string) => Promise<string | null>)(artifactId);
-  return result ?? undefined;
+  return (await storage.getRelatedTo?.(artifactId)) ?? undefined;
 }
 
 function extractAuthzMessage(err: unknown): string {

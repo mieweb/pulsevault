@@ -162,6 +162,33 @@ offset before resuming an interrupted upload — it MUST NOT trust a locally
 cached byte count, which can be stale (server restart, a partial write that
 never committed, clock differences between client and a previous session).
 
+#### 4.2.1 Deterministic upload ids and create-conflict recovery
+
+The tus resource id this implementation mints is deterministic:
+`base64url("<kind>/<artifactId><ext>")`, where `<ext>` is the lowercased
+extension of the `filename` metadata. This is a **stable part of protocol
+version 1**, not an implementation detail — do not change the scheme within
+this protocol version.
+
+It exists so a client can recover from the "lost handle" crash window: a
+client killed after the server accepted `POST /upload` but before the client
+durably persisted the returned `Location` has a live server-side reservation
+it can no longer name. Its retried `POST` yields `409 Conflict`. On a `409`,
+a client MAY derive the resource URL from the identifiers it already holds
+(`{server}/upload/base64url("<kind>/<artifactId><ext>")`), confirm liveness
+with `HEAD`, and resume from the returned offset. If the `HEAD` does not
+return an offset, the client MUST treat the original `409` as authoritative.
+All of §4.2's and §4.3's rules apply to the derived URL exactly as if it had
+arrived in a `Location` header.
+
+Servers additionally SHOULD NOT let a crashed create reserve an artifactId
+forever: a reservation whose sidecar/bookkeeping exists but whose upload
+state was never created (or was terminated without cleanup) SHOULD become
+reclaimable after a grace period, so a retried create eventually succeeds
+rather than returning `409` indefinitely. This implementation reclaims such
+debris after a configurable grace (default 60 s) and sweeps all per-upload
+metadata when a `DELETE` terminates an upload.
+
 ### 4.3 `Location` header validation
 
 The TUS spec permits the `POST /upload` response's `Location` header to be

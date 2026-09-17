@@ -1,13 +1,13 @@
-import { Server } from '@tus/server';
+import { Server, EVENTS } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
-import { statusCodeOf } from './errors.js';
+import { httpError, statusCodeOf } from './errors.js';
+import { normalizeUploadMetadata } from './upload-metadata.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
 import type { PulseVaultStorage } from '../storage/types.js';
 import type { UploadKind } from '../storage/types.js';
-import { parseUploadKind } from '../storage/types.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -79,18 +79,13 @@ export type PulsevaultTusOptions = {
 };
 
 /**
- * Shape `@tus/server` recognizes for sending an error response. We tag both
+ * Shape `@tus/server` recognizes for sending an error response. Alias of
+ * `httpError` kept for its established name in this module — both tag
  * `statusCode` and `status_code` so throws originating from either Fastify
  * conventions (camelCase) or the tus convention (snake_case) surface with the
  * right HTTP status.
  */
-export function tusError(status: number, body: string): Error {
-  return Object.assign(new Error(body), {
-    statusCode: status,
-    status_code: status,
-    body,
-  });
-}
+export const tusError = httpError;
 
 /** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
 export function artifactIdFromUploadId(id: string): string | undefined {
@@ -102,57 +97,13 @@ export function artifactIdFromUploadId(id: string): string | undefined {
 }
 
 /**
- * Defensive upper bound on the stored display `name`. The header is base64 and
- * comma-joined with the other metadata; a runaway value would bloat every
- * request and every sidecar. 512 chars is far more than any real title and
- * still leaves generous headroom under typical proxy header limits. The client
- * should cap first; this is belt-and-suspenders so the server never trusts it.
- */
-const MAX_ARTIFACT_NAME_LENGTH = 512;
-
-type ParsedUploadMetadata = {
-  artifactId: string;
-  filename: string;
-  kind: UploadKind;
-  relatedTo?: string;
-  checksum?: string;
-  name?: string;
-};
-
-/**
  * Extract and normalize the fields `namingFunction` cares about from raw
  * `Upload-Metadata`. Doesn't validate — the caller still checks `artifactId`
- * is a UUID and `filename`'s extension is allowed for `kind`.
+ * is a UUID and `filename`'s extension is allowed for `kind`. Normalization
+ * (incl. the artifactId alias precedence) is shared with the authorize path
+ * via `lib/upload-metadata.ts` so the two can never disagree.
  */
-function parseUploadMetadata(
-  metadata: Record<string, string | null> | undefined,
-): ParsedUploadMetadata {
-  // Accept `artifactId` plus the legacy `videoid`/`projectid` aliases for
-  // back-compat with pre-`artifactId` clients.
-  const artifactId = (
-    metadata?.artifactId ??
-    metadata?.videoid ??
-    metadata?.projectid ??
-    ''
-  ).trim();
-  const filename = (metadata?.filename ?? '').trim();
-  // `kind` defaults to `"video"` so existing clients that don't send the field continue to work unchanged.
-  const kind = parseUploadKind(metadata?.kind);
-  const rawRelatedTo = (metadata?.relatedTo ?? '').trim();
-  const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
-  const checksum = (metadata?.checksum ?? '').trim() || undefined;
-  // Free-form display title. Trim, then hard-cap length so a hostile or buggy
-  // client can't bloat the sidecar; an all-whitespace/empty value is dropped.
-  // Cap by code point (Array.from iterates code points) rather than by
-  // `.slice()`'s UTF-16 units, so a title truncated at the boundary can't be
-  // left with a split surrogate pair (a half-emoji / lone surrogate).
-  const name =
-    Array.from((metadata?.name ?? '').trim())
-      .slice(0, MAX_ARTIFACT_NAME_LENGTH)
-      .join('') || undefined;
-
-  return { artifactId, filename, kind, relatedTo, checksum, name };
-}
+const parseUploadMetadata = normalizeUploadMetadata;
 
 export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
   const {
@@ -311,6 +262,28 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
   });
 
   hardenAgainstClientAbort(server, logger);
+
+  // TUS termination (DELETE /upload/<id>) only removes what the *datastore* knows about —
+  // the bytes and the offset-tracking `.info`/`.json` file. The storage adapter's own
+  // artifact metadata (the `.pulsevault` sidecar written by `reserveUpload`) is invisible
+  // to @tus/server, so without this hook every cancelled upload left a permanent
+  // `"uploading"` sidecar behind and its artifactId stayed 409-reserved forever (the
+  // client's only escape was re-pairing for a fresh id). POST_TERMINATE fires after the
+  // 204 is already on the wire; `storage.remove` is idempotent (rm/delete with force on
+  // already-gone datastore files), so this just sweeps the sidecar and adapter caches.
+  // Cleanup failures are logged, never thrown — the client's DELETE has already succeeded.
+  server.on(EVENTS.POST_TERMINATE, (_req, _res, id: string) => {
+    const artifactId = artifactIdFromUploadId(id);
+    if (!artifactId) return;
+    void Promise.resolve()
+      .then(() => storage.remove?.(artifactId))
+      .catch((err) => {
+        logger.error(
+          { err, artifactId },
+          'pulsevault failed to clean up terminated upload metadata',
+        );
+      });
+  });
 
   return server;
 }

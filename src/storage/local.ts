@@ -3,91 +3,31 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isUuid } from '../lib/uuid.js';
 import type {
+  ArtifactMetadata,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
-import { parseUploadKind } from './types.js';
+import {
+  buildSidecar,
+  createMetaCache,
+  DEFAULT_META_CACHE_LIMIT,
+  DEFAULT_RECLAIM_GRACE_MS,
+  extToContentType,
+  parseSidecar,
+  reserveConflictError,
+  type Sidecar,
+  sidecarIsStale,
+  sidecarToCachedMeta,
+} from './sidecar.js';
 
-/**
- * Per-artifact metadata sidecar written at
- * `<workspaceRoot>/.pulsevault/<artifactId>.json`. Lets `resolve()` recover an
- * artifact's extension and completion state without scanning the directory,
- * and keeps the on-disk layout self-describing for downstream tools
- * (ArtiPod pipelines, ffmpeg, rsync, etc.).
- */
-type Sidecar = {
-  /** Sidecar schema version. Increment for breaking changes. */
-  version: 1;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
-  ext: string;
-  /** Original filename from `Upload-Metadata.filename`. */
-  filename: string;
-  /**
-   * `"uploading"` between `reserveUpload` and `markReady`; `"ready"` once
-   * every post-upload validation has passed. The GET route only serves
-   * `"ready"` sidecars — partially-written files never leak out.
-   */
-  status: 'uploading' | 'ready';
-  /**
-   * Artifact kind. Optional for back-compat — sidecars written before
-   * kind was introduced are read as `"video"` with no on-disk migration.
-   */
-  kind?: UploadKind;
-  /** Optional id of another artifact this one belongs to. See `ReserveUploadParams.relatedTo`. */
-  relatedTo?: string;
-  /** Optional client-supplied checksum metadata. See `ReserveUploadParams.checksum`. */
-  checksum?: string;
-  /** Optional human-facing display name. See `ReserveUploadParams.name`. */
-  name?: string;
-};
+// Sidecar schema, parsing, cache, staleness gate, and the reserve-collision
+// error all live in `./sidecar.js`, shared verbatim with the S3 adapter — this
+// file owns only the filesystem-specific I/O around them.
 
-const SIDECAR_VERSION = 1 as const;
 /** Hidden directory inside workspaceRoot that holds per-upload sidecar files. */
 const PULSEVAULT_META_DIR = '.pulsevault';
-/** Default cap on the in-memory metadata cache before evicting the oldest entry. */
-const DEFAULT_META_CACHE_LIMIT = 10_000;
-
-type CachedMeta = {
-  ext: string;
-  ready: boolean;
-  kind: UploadKind;
-  relatedTo?: string;
-  checksum?: string;
-  name?: string;
-};
-
-/** Map a file extension to the `Content-Type` the GET route should return. */
-function extToContentType(ext: string): string {
-  switch (ext) {
-    case '.mp4':
-      return 'video/mp4';
-    case '.zip':
-      return 'application/zip';
-    case '.vtt':
-      return 'text/vtt';
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg';
-    case '.png':
-      return 'image/png';
-    default:
-      return 'application/octet-stream';
-  }
-}
-
-/** Project a `Sidecar` into the shape kept in the in-memory cache. */
-function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
-  return {
-    ext: sidecar.ext,
-    ready,
-    kind: sidecar.kind ?? 'video',
-    relatedTo: sidecar.relatedTo,
-    checksum: sidecar.checksum,
-    name: sidecar.name,
-  };
-}
 
 export type LocalStorageOptions = {
   /** Directory where uploads are stored (flat kind-scoped subdirs). Resolved against CWD if relative. */
@@ -99,6 +39,15 @@ export type LocalStorageOptions = {
    * correctness. Defaults to 10,000.
    */
   metaCacheLimit?: number;
+  /**
+   * Minimum age (ms) an `"uploading"` sidecar with no datastore state must
+   * reach before `reserveUpload` treats it as crash debris and reclaims it
+   * instead of 409ing. The gap between the sidecar write and the datastore
+   * create is milliseconds, so a fresh sidecar without datastore state is a
+   * concurrent create in progress — not debris — and must still conflict.
+   * Defaults to 60,000 (1 minute).
+   */
+  reclaimGraceMs?: number;
 };
 
 /**
@@ -143,30 +92,24 @@ export type LocalStorage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract. */
+  getMetadata(artifactId: string): Promise<ArtifactMetadata | null>;
+  /**
+   * All artifactIds with a readable sidecar, ready or not — one readdir of the
+   * metadata directory. Complements `getMetadata` so a consumer can list
+   * uploads without crawling the sidecar files by hand.
+   */
+  listArtifactIds(): Promise<string[]>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const workspaceRoot = path.resolve(opts.workspaceDir);
   const datastore = new FileStore({ directory: workspaceRoot });
-  const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
+  const reclaimGraceMs = opts.reclaimGraceMs ?? DEFAULT_RECLAIM_GRACE_MS;
   // Metadata cache keyed by artifactId. Populated eagerly on reserve and
   // lazily from the sidecar on cache-miss — so we never do a workspace-wide
   // scan at boot and never do a per-request readdir on the GET hot path.
-  // Bounded with simple insertion-order eviction (a `Map` preserves insertion
-  // order, and re-setting a key moves it to the end) so a long-running server
-  // doesn't grow this unboundedly; a cache miss just costs an extra disk read.
-  const metaCache = new Map<string, CachedMeta>();
-
-  const cacheSet = (artifactId: string, meta: CachedMeta): void => {
-    // Re-inserting moves the key to the end of iteration order, so eviction
-    // below always drops the actual least-recently-set entry.
-    metaCache.delete(artifactId);
-    metaCache.set(artifactId, meta);
-    if (metaCache.size > metaCacheLimit) {
-      const oldest = metaCache.keys().next().value;
-      if (oldest !== undefined) metaCache.delete(oldest);
-    }
-  };
+  const metaCache = createMetaCache(opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT);
 
   /** Absolute path to the hidden metadata directory. */
   const sidecarDir = (): string => path.join(workspaceRoot, PULSEVAULT_META_DIR);
@@ -190,6 +133,35 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   /** Relative path (from workspaceRoot) to the artifact bytes. */
   const artifactRelPath = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
+
+  /**
+   * Whether @tus/file-store still has live upload state (`<bytes path>.json`)
+   * for the upload a sidecar describes. Used by `reserveUpload` to tell a
+   * genuine in-flight collision apart from crash debris: `reserveUpload`
+   * writes the sidecar *before* the datastore creates its `.json`, so a kill
+   * in that window — or a TUS DELETE handled by a server too old to sweep
+   * sidecars — leaves an `"uploading"` sidecar with no datastore state behind
+   * it. That artifactId is not really in use; treating it as a 409 would
+   * poison it forever.
+   */
+  const datastoreInfoExists = async (
+    artifactId: string,
+    kind: UploadKind,
+    ext: string,
+  ): Promise<boolean> => {
+    try {
+      await fs.access(path.join(workspaceRoot, `${artifactRelPath(artifactId, kind, ext)}.json`));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Whether a sidecar is old enough to be reclaimable debris — see
+   * `sidecarIsStale` in `./sidecar.js`; this just binds the configured grace.
+   */
+  const isStale = (sidecar: Sidecar): boolean => sidecarIsStale(sidecar, reclaimGraceMs);
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     // Atomic tmp + rename so a crash mid-write can never leave a truncated
@@ -220,40 +192,18 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
       throw err;
     }
-    try {
-      const parsed = JSON.parse(raw) as Partial<Sidecar>;
-      if (typeof parsed.ext !== 'string') return null;
-      if (typeof parsed.filename !== 'string') return null;
-      // Older sidecars (pre-status) are treated as ready so an in-place
-      // upgrade doesn't hide finalized uploads. New uploads always write a
-      // `status` field explicitly.
-      const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
-      // Older sidecars without `kind` default to `"video"` — no migration.
-      const kind = parseUploadKind(parsed.kind);
-      return {
-        version: SIDECAR_VERSION,
-        ext: parsed.ext,
-        filename: parsed.filename,
-        status,
-        kind,
-        relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
-        checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
-        name: typeof parsed.name === 'string' ? parsed.name : undefined,
-      };
-    } catch {
-      // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
-      // it on the next create.
-      return null;
-    }
+    // Malformed sidecars parse to null — treated as absent; `reserveUpload`
+    // rewrites them on the next create.
+    return parseSidecar(raw);
   };
 
-  const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
+  const loadMeta = async (artifactId: string) => {
     const cached = metaCache.get(artifactId);
     if (cached) return cached;
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
     const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    cacheSet(artifactId, meta);
+    metaCache.set(artifactId, meta);
     return meta;
   };
 
@@ -267,28 +217,12 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
-  const reserveUpload = async ({
-    artifactId,
-    filename,
-    ext,
-    kind,
-    relatedTo,
-    checksum,
-    name,
-  }: ReserveUploadParams): Promise<string> => {
+  const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
+    const { artifactId, kind, ext } = params;
     await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
-    const sidecar: Sidecar = {
-      version: SIDECAR_VERSION,
-      ext,
-      filename,
-      status: 'uploading',
-      kind,
-      relatedTo,
-      checksum,
-      name,
-    };
+    const sidecar = buildSidecar(params);
 
     // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
     // this artifactId, rather than the previous read-then-write (`loadMeta` then
@@ -300,20 +234,32 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      // A file already exists at this path, but `readSidecar` treats a malformed/corrupt
-      // one as absent (e.g. debris from a crash mid-write) — re-check before deciding this
-      // is a genuine collision rather than debris that's safe to overwrite.
+      // A file already exists at this path. Four cases, in order:
+      //  - unreadable/malformed sidecar (crash mid-write debris) → safe to overwrite;
+      //  - readable `"ready"` sidecar, or `"uploading"` with live datastore state →
+      //    genuine collision, 409 (an in-flight upload is resumable via HEAD+PATCH,
+      //    a finished artifact must never be silently replaced);
+      //  - readable `"uploading"` sidecar with no datastore `.json` but YOUNGER than
+      //    the reclaim grace → a concurrent create that hasn't written its datastore
+      //    state yet → still a 409 (preserves one-winner atomicity under races);
+      //  - readable `"uploading"` sidecar with no datastore `.json`, older than the
+      //    grace → crash/termination debris (see `datastoreInfoExists`) → reclaim so
+      //    the client's retried create succeeds instead of 409-poisoning the
+      //    artifactId forever.
       const existing = await readSidecar(artifactId);
       if (existing) {
-        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-          statusCode: 409,
-          status_code: 409,
-        });
+        const live =
+          existing.status === 'ready' ||
+          (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) ||
+          !isStale(existing);
+        if (live) {
+          throw reserveConflictError(artifactId);
+        }
       }
       await writeSidecar(artifactId, sidecar);
     }
 
-    cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum, name });
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false));
     // @tus/file-store joins this onto its configured `directory`, so the
     // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
     return artifactRelPath(artifactId, kind, ext);
@@ -351,11 +297,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     }
     if (sidecar.status === 'ready') {
       // Idempotent: already ready is fine, keep the cache consistent.
-      cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
       return;
     }
     await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
@@ -370,6 +316,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       fs.rm(`${artifactPath}.json`, { force: true }),
       fs.rm(sidecarPath(artifactId), { force: true }),
     ]);
+    // Evict again AFTER the deletes: a read racing between the eviction above and the
+    // rm completing re-populates the cache from the still-on-disk sidecar, and without
+    // this second eviction that resurrected entry would outlive the deletion forever.
+    metaCache.delete(artifactId);
     return true;
   };
 
@@ -399,6 +349,36 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return meta?.name ?? null;
   };
 
+  const getMetadata = async (artifactId: string): Promise<ArtifactMetadata | null> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) return null;
+    return {
+      artifactId,
+      kind: meta.kind,
+      ext: meta.ext,
+      filename: meta.filename ?? `${artifactId}${meta.ext}`,
+      ready: meta.ready,
+      relatedTo: meta.relatedTo,
+      checksum: meta.checksum,
+      name: meta.name,
+      reservedAt: meta.reservedAt,
+    };
+  };
+
+  const listArtifactIds = async (): Promise<string[]> => {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(sidecarDir());
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+      throw err;
+    }
+    return entries
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => name.slice(0, -'.json'.length))
+      .filter(isUuid);
+  };
+
   return {
     datastore,
     workspaceRoot,
@@ -412,5 +392,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     getRelatedTo,
     getChecksum,
     getName,
+    getMetadata,
+    listArtifactIds,
   };
 }
