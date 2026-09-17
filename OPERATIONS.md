@@ -277,9 +277,9 @@ than a retention window (compliance-driven deletion):
 > `complete` never arrives leaves an `"uploading"` sidecar plus (possibly) a
 > stored object the client PUT but never confirmed. The abandoned-upload
 > cutoff below covers the sidecar; on S3/R2 also add a bucket lifecycle rule
-> for unconfirmed objects, and rely on the built-in reserve debris-reclaim
-> (`reclaimGraceMs`, default 60 s) to free the artifactId for a retried
-> create.
+> for unconfirmed objects. ArtifactIds are single-use (PROTOCOL.md §4.2.1),
+> so this sweep is the only thing that frees an abandoned id — clients never
+> re-contest one; they mint a fresh id per attempt.
 
 ```ts
 import { createLocalStorage } from "@mieweb/pulsevault";

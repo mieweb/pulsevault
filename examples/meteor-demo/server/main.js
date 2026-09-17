@@ -233,6 +233,9 @@ WebApp.connectHandlers.use("/deeplinks", async (req, res) => {
 // to build the tus Location header. This is the smallest working mount — no
 // authorize, no validatePayload, no hooks.
 const storage = createLocalStorage({ workspaceDir });
+// Tighten the upload tree's permissions (0750) before any request lands —
+// @tus/file-store would otherwise create the workspace world-writable.
+await storage.initialize();
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
   stripBasePath: false,

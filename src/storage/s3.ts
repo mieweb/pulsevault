@@ -16,19 +16,17 @@ import {
   buildSidecar,
   createMetaCache,
   DEFAULT_META_CACHE_LIMIT,
-  DEFAULT_RECLAIM_GRACE_MS,
   extToContentType,
   parseSidecar,
   reserveConflictError,
   type Sidecar,
-  sidecarIsStale,
   sidecarToCachedMeta,
 } from './sidecar.js';
 
-// Sidecar schema, parsing, cache, staleness gate, and the reserve-collision
-// error all live in `./sidecar.js`, shared verbatim with the local adapter —
-// this file owns only the bucket-specific I/O around them. The sidecar for an
-// artifact is a small JSON object at `.pulsevault/<artifactId>.json`.
+// Sidecar schema, parsing, cache, and the reserve-collision error all live in
+// `./sidecar.js`, shared verbatim with the local adapter — this file owns only
+// the bucket-specific I/O around them. The sidecar for an artifact is a small
+// JSON object at `.pulsevault/<artifactId>.json`.
 
 /** Key prefix inside the bucket that holds the per-upload sidecar objects. */
 const PULSEVAULT_META_PREFIX = '.pulsevault';
@@ -101,14 +99,6 @@ export type S3StorageOptions = {
    * Defaults to 10,000.
    */
   metaCacheLimit?: number;
-  /**
-   * Minimum age (ms) an `"uploading"` sidecar with no datastore state must
-   * reach before `reserveUpload` treats it as crash debris and reclaims it
-   * instead of 409ing. A younger sidecar may belong to a concurrent create
-   * that hasn't written its datastore `.info` yet — those must still
-   * conflict. Defaults to 60,000 (1 minute).
-   */
-  reclaimGraceMs?: number;
   /**
    * Advanced escape hatch: extra `S3ClientConfig` fields merged into the
    * client used for both playback presigning and the underlying TUS datastore
@@ -210,7 +200,7 @@ export type S3Storage = PulseVaultStorage & {
    * Reserve an artifact and mint a presigned PUT URL the client uploads the
    * bytes to directly — the data plane bypasses the app server entirely (the
    * PROTOCOL.md §9 direct-upload profile). Runs the same `reserveUpload`
-   * bookkeeping as a TUS create (sidecar, collision/debris handling), so the
+   * bookkeeping as a TUS create (sidecar, single-use collision rule), so the
    * artifactId space is shared with TUS uploads. `Content-Type` and
    * `Content-Length` are baked into the signature so the URL can only upload
    * the declared payload shape.
@@ -273,7 +263,6 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
 
   const bucket = opts.bucket;
   const presignTtl = opts.presignTtlSeconds ?? DEFAULT_PRESIGN_TTL_SECONDS;
-  const reclaimGraceMs = opts.reclaimGraceMs ?? DEFAULT_RECLAIM_GRACE_MS;
 
   const credentials =
     opts.accessKeyId && opts.secretAccessKey
@@ -325,52 +314,6 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       ? `${meta.kind ?? 'video'}/${artifactId}.${meta.objectSuffix}${meta.ext}`
       : artifactKey(artifactId, meta.kind ?? 'video', meta.ext);
 
-  /**
-   * Whether `@tus/s3-store` still has live upload state (the `<key>.info`
-   * object) for the upload a sidecar describes. Mirrors the local adapter's
-   * check: `reserveUpload` writes the sidecar *before* the datastore creates
-   * its `.info`, so a crash in that window — or a TUS DELETE handled by a
-   * server too old to sweep sidecars — leaves an `"uploading"` sidecar with no
-   * datastore state behind it. That artifactId is not really in use.
-   */
-  const datastoreInfoExists = async (
-    artifactId: string,
-    kind: UploadKind,
-    ext: string,
-  ): Promise<boolean> => {
-    try {
-      await client.send(
-        new HeadObjectCommand({
-          Bucket: bucket,
-          Key: `${artifactKey(artifactId, kind, ext)}.info`,
-        }),
-      );
-      return true;
-    } catch (err) {
-      if (isNotFound(err)) return false;
-      throw err;
-    }
-  };
-
-  /**
-   * Reclaim-aware collision check for `reserveUpload`: reads the sidecar
-   * FRESH from the bucket (the in-memory cache can't tell live state from
-   * debris) and reports a genuine conflict for a `"ready"` artifact, an
-   * `"uploading"` one whose datastore `.info` still exists, or an
-   * `"uploading"` one still inside the reclaim grace window (a concurrent
-   * create that hasn't written its `.info` yet — letting that through would
-   * give simultaneous duplicate creates two winners). Everything else — no
-   * sidecar, malformed sidecar, or an aged `"uploading"` sidecar with no
-   * datastore state — is crash/termination debris, safe to overwrite.
-   */
-  const conflictingUpload = async (artifactId: string): Promise<boolean> => {
-    const existing = await readSidecar(artifactId);
-    if (!existing) return false;
-    if (existing.status === 'ready') return true;
-    if (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) return true;
-    return !sidecarIsStale(existing, reclaimGraceMs, presignTtl * 1000);
-  };
-
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     await client.send(
       new PutObjectCommand({
@@ -393,29 +336,10 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       if (isNotFound(err)) return null;
       throw err;
     }
-    // Malformed sidecars parse to null — treated as absent; `reserveUpload` rewrites them.
+    // Malformed sidecars parse to null — treated as absent by readers; the
+    // artifactId stays burned for writes (the object still exists, so the
+    // conditional create in `reserveUpload` still conflicts).
     return parseSidecar(raw);
-  };
-
-  /**
-   * `readSidecar` + the object's ETag — the reclaim path claims debris atomically
-   * via `IfMatch`. `meta` is null for an unparseable-but-present sidecar (the
-   * claim still works; there's just no kind/ext to clean a stale object with).
-   */
-  const readSidecarWithEtag = async (
-    artifactId: string,
-  ): Promise<{ meta: Sidecar | null; etag: string } | null> => {
-    try {
-      const res = await client.send(
-        new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
-      );
-      const raw = (await bodyToBuffer(res.Body)).toString('utf8');
-      if (!res.ETag) return null;
-      return { meta: parseSidecar(raw), etag: res.ETag };
-    } catch (err) {
-      if (isNotFound(err)) return null;
-      throw err;
-    }
   };
 
   const loadMeta = async (artifactId: string, opts?: { fresh?: boolean }) => {
@@ -434,112 +358,42 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta;
   };
 
-  /** Delete the (possibly present) data object at a reservation's key — reclaim hygiene. */
-  const deleteArtifactObject = async (artifactId: string, stale: Sidecar): Promise<void> => {
-    try {
-      await client.send(
-        new DeleteObjectCommand({ Bucket: bucket, Key: dataKey(artifactId, stale) }),
-      );
-    } catch (err) {
-      if (!isNotFound(err)) throw err;
-    }
-  };
-
   const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
     const { artifactId, kind, ext } = params;
     const sidecar = buildSidecar(params);
     const asOf = metaCache.epoch();
 
-    const conflict = (): never => {
-      throw reserveConflictError(artifactId);
-    };
-
-    // Fast-path rejection for a known-finished artifact; anything else needs the
-    // reclaim-aware fresh read below (a cached `"uploading"` entry may be debris —
-    // see `conflictingUpload`). Not atomic by itself — the conditional write below
-    // closes the race on backends that support it.
-    if (metaCache.get(artifactId)?.ready) conflict();
-    if (await conflictingUpload(artifactId)) conflict();
-
-    // Collision guard: `IfNoneMatch: "*"` makes the write itself atomically fail
-    // (PreconditionFailed) if a sidecar object already exists for this artifactId. Because
-    // debris sidecars legitimately exist (and were cleared for reclaim above), a
-    // PreconditionFailed re-runs the reclaim check: still-not-conflicting means the
-    // existing object is debris — claim it atomically below; conflicting means a
-    // concurrent reserve won the race — 409, same as before.
-    const putSidecarConditional = (cond: { IfNoneMatch?: string; IfMatch?: string }) =>
-      client.send(
+    // ArtifactIds are single-use: `IfNoneMatch: "*"` makes the write itself
+    // atomically fail (PreconditionFailed) if a sidecar object already exists
+    // for this artifactId — whether the previous upload finished, is still in
+    // flight, or died halfway. Every collision is a plain 409; clients mint a
+    // fresh id per attempt, and abandoned reservations age out via operator
+    // retention (see OPERATIONS.md), not an in-band reclaim.
+    try {
+      await client.send(
         new PutObjectCommand({
           Bucket: bucket,
           Key: sidecarKey(artifactId),
           Body: JSON.stringify(sidecar),
           ContentType: 'application/json',
-          ...cond,
+          IfNoneMatch: '*',
         }),
       );
-    try {
-      await putSidecarConditional({ IfNoneMatch: '*' });
     } catch (err) {
       if (isPreconditionFailed(err)) {
-        // ONE read supplies both the liveness verdict and the claim etag. A
-        // separate check-then-read pair (the previous shape) reopened the
-        // TOCTOU the conditional claim exists to close: a rival reclaimer's
-        // FRESH sidecar written between the two reads would pass the stale
-        // check on the first read yet hand its own etag to the second — and
-        // be claimed right back, electing two winners. Evaluating staleness
-        // on the same object version the `IfMatch` pins makes the claim
-        // decide against exactly the state that was judged reclaimable.
-        const stale = await readSidecarWithEtag(artifactId);
-        if (!stale) {
-          // Vanished between the failed create and this read (rival reclaim in
-          // flight): retry the conditional create — a rival's fresh sidecar
-          // fails it, one winner.
-          try {
-            await putSidecarConditional({ IfNoneMatch: '*' });
-          } catch (retryErr) {
-            if (isPreconditionFailed(retryErr)) conflict();
-            throw retryErr;
-          }
-        } else {
-          const live =
-            stale.meta &&
-            (stale.meta.status === 'ready' ||
-              (await datastoreInfoExists(
-                artifactId,
-                stale.meta.kind ?? 'video',
-                stale.meta.ext,
-              )) ||
-              !sidecarIsStale(stale.meta, reclaimGraceMs, presignTtl * 1000));
-          if (live) conflict();
-          try {
-            await putSidecarConditional({ IfMatch: stale.etag });
-          } catch (claimErr) {
-            // Rival won the claim (etag changed) or deleted the sidecar under us.
-            if (isPreconditionFailed(claimErr) || isNotFound(claimErr)) conflict();
-            if (!isConditionalWriteUnsupported(claimErr)) throw claimErr;
-            // Backend supports `If-None-Match` but not `If-Match`: same degraded
-            // check-then-write fallback as below, warned once per process.
-            warnAboutConditionalWriteFallbackOnce();
-            await writeSidecar(artifactId, sidecar);
-          }
-          // Only the claim winner reaches here. A direct-upload reservation has
-          // no `.info` but MAY have already PUT its object at its reservation's
-          // key — delete it (at the STALE sidecar's key, which can differ from
-          // this reservation's) so a later `complete` can never mark the
-          // previous attempt's bytes ready under the new reservation. Skipped
-          // when the stale sidecar was unparseable (no key to locate it with).
-          if (stale.meta) {
-            await deleteArtifactObject(artifactId, stale.meta);
-          }
-        }
-      } else if (isConditionalWriteUnsupported(err)) {
-        // Some S3-compatible backends don't support conditional writes — fall back to the
-        // check-then-write already performed above. Weaker (the original TOCTOU window
-        // reopens) but keeps reserve working on those backends instead of hard-failing
-        // every upload. Surface this degraded mode once per process so operators know
-        // their backend can't fully guarantee collision safety under concurrent/retried
-        // creates for the same artifactId.
+        throw reserveConflictError(artifactId);
+      }
+      if (isConditionalWriteUnsupported(err)) {
+        // Some S3-compatible backends don't support conditional writes — fall
+        // back to check-then-write. Weaker (a TOCTOU window opens between the
+        // read and the write) but keeps reserve working on those backends
+        // instead of hard-failing every upload. Surfaced once per process so
+        // operators know their backend can't fully guarantee collision safety
+        // under concurrent/retried creates for the same artifactId.
         warnAboutConditionalWriteFallbackOnce();
+        if (await readSidecar(artifactId)) {
+          throw reserveConflictError(artifactId);
+        }
         await writeSidecar(artifactId, sidecar);
       } else {
         throw err;
@@ -592,8 +446,8 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
-    // Disk truth, not the cache — another instance's reclaim may have moved the
-    // bytes to a different reservation key since this instance last looked.
+    // Disk truth, not the cache — the current objectSuffix decides which key
+    // the deletes below target, and a cached entry could be stale.
     const meta = await loadMeta(artifactId, { fresh: true });
     // Evict before deleting so a racing `resolve` can't hand back a stale key.
     metaCache.delete(artifactId);
@@ -609,11 +463,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     ]);
     // Delete the artifact bytes and the @tus/s3-store `.info` sidecar FIRST,
     // and only then our metadata sidecar: the sidecar is the reservation lock
-    // (while it exists, `reserveUpload` conflicts or claims it atomically), so
-    // deleting it last guarantees no new reservation can re-create the same
-    // deterministic keys while these deletes are still in flight. TUS never
-    // suffixes, so the `.info` lives at the base key. DeleteObject is
-    // idempotent — safe whether or not the multipart abort removed some.
+    // (while it exists, `reserveUpload` conflicts), so deleting it last
+    // guarantees no new reservation can re-create the same deterministic keys
+    // while these deletes are still in flight. TUS never suffixes, so the
+    // `.info` lives at the base key. DeleteObject is idempotent — safe whether
+    // or not the multipart abort removed some.
     await Promise.all([
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
       client.send(
@@ -724,9 +578,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     params: ReserveUploadParams & { size: number },
     opts?: { ttlSeconds?: number },
   ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }> => {
-    // Same reservation as a TUS create — sidecar written, collisions/debris
-    // handled identically — so a direct upload and a TUS upload can never
-    // silently share an artifactId.
+    // Same reservation as a TUS create — sidecar written, single-use
+    // collision rule applied identically — so a direct upload and a TUS
+    // upload can never silently share an artifactId.
     await reserveUpload(params);
     return presignPut(params.artifactId, params.size, opts?.ttlSeconds);
   };
@@ -748,7 +602,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     if (!meta) throw new Error(`presignPut: unknown artifactId ${artifactId}`);
     // Re-validate at mint time, not just in the caller's earlier check: the
     // reservation can complete (another instance's `complete`) or change shape
-    // (reclaim + re-reserve) between that read and this one, and a PUT grant
+    // (remove + re-reserve) between that read and this one, and a PUT grant
     // against a ready object or a different declared size must lose the race
     // as a 409, never be armed.
     if (meta.ready || (meta.expectedSize !== undefined && meta.expectedSize !== size)) {

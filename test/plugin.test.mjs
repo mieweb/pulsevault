@@ -572,21 +572,24 @@ test(
   },
 );
 
-test('malformed sidecar is treated as absent; reserve rewrites it', async () => {
+test('malformed sidecar: absent for readers, burned for writes (single-use)', async () => {
   const ctx = await startApp();
   try {
     await fs.mkdir(path.join(ctx.workspaceDir, '.pulsevault'), { recursive: true });
     await fs.writeFile(path.join(ctx.workspaceDir, '.pulsevault', `${ID1}.json`), 'not json');
 
+    // Readers treat an unparseable sidecar as absent — never serve garbage.
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 404);
 
+    // Writers still conflict — the file occupies the id, and ids are
+    // single-use: the client mints a fresh id; retention cleans this one up.
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(create.status, 201);
+    assert.equal(create.status, 409);
   } finally {
     await ctx.teardown();
   }

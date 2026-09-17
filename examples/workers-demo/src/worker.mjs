@@ -149,9 +149,15 @@ async function issueToken(artifactId, env, expirySeconds = 1800) {
 async function authorize(request, env, artifactId, relatedTo) {
   const header = request.headers.get('authorization') ?? '';
   const url = new URL(request.url);
+  // The `?token=` query fallback exists for playback surfaces that can't set
+  // headers (video tags, redirects) — GET only. Mutating requests must send
+  // the Authorization header: URLs leak (logs, referrers, history), and a
+  // leaked query token must never authorize a write.
   const token = /^Bearer /i.test(header)
     ? header.slice('Bearer '.length)
-    : (url.searchParams.get('token') ?? '');
+    : request.method === 'GET'
+      ? (url.searchParams.get('token') ?? '')
+      : '';
   if (!token) return fail(401, 'Missing capability token');
   const verified = await verifyToken(token, env);
   if (!verified) return fail(403, 'Invalid or expired capability token');

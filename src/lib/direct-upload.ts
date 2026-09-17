@@ -75,7 +75,7 @@ const err = (statusCode: number, error: string): DirectUploadResult => ({
 
 /**
  * `POST {prefix}/direct-uploads` — authorize, reserve (same sidecar
- * bookkeeping and collision/debris rules as a TUS create), and mint the
+ * bookkeeping and single-use collision rule as a TUS create), and mint the
  * presigned PUT URL. Body fields mirror the TUS `Upload-Metadata` fields plus
  * the mandatory `size` (signed into the URL, so the grant can only upload
  * exactly the declared payload).

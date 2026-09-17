@@ -9,6 +9,24 @@ breaking changes, called out explicitly below.
 
 ### Removed
 
+- **Breaking: artifactIds are single-use — in-band debris reclaim is gone.**
+  `reserveUpload` is now a plain atomic create: the first reservation of an
+  artifactId wins and every later create for the same id answers `409`,
+  whether the previous attempt finished, is in flight, or died halfway. The
+  reclaim state machine that tried to tell crash debris from live uploads
+  (staleness grace, datastore-liveness probes, the S3 `IfMatch` claim dance,
+  local reclaim sweeps) is deleted from both adapters, along with the
+  `reclaimGraceMs` option. Abandoned reservations are freed by TUS `DELETE`
+  (termination) or by operator retention — the OPERATIONS.md sweep keyed on
+  the sidecar's `reservedAt`, plus bucket lifecycle rules — not by contest.
+  Rationale: reclaim existed so a client could retry a crashed create under
+  the SAME id; clients that mint a fresh id per attempt (as PROTOCOL.md now
+  requires) never need it, and deleting it removes every reclaim race by
+  construction. PROTOCOL.md §4.2.1 is rewritten accordingly: the
+  deterministic tus id scheme is demoted to an internal detail (clients MUST
+  NOT derive upload URLs from it), and the client-side 409-derive-resume
+  recovery is withdrawn.
+
 - **Breaking: the `uploadUnit` concept is gone.** There is one way to upload a
   pulse — the video plus its related artifacts (captions, beat manifest,
   thumbnail) under a single session token. The per-clip "segment" strategy
@@ -68,20 +86,10 @@ breaking changes, called out explicitly below.
   `@mieweb/pulsevault/web` on a V8 isolate works for capabilities, direct
   uploads, and S3/R2 playback; only an actual TUS request loads the tus
   stack.
-- **Direct reservations are no longer reclaimable mid-grant.** The debris
-  check treated "no TUS `.info`" as a crash signature, but that is a direct
-  reservation's normal live shape — after the default 60 s grace a retried
-  create could yank a legitimate in-flight PUT's reservation. Staleness for
-  direct reservations now also covers the presigned-URL lifetime.
 - **Terminate cleanup is generation-gated.** The `POST_TERMINATE` sweep runs
   after the 204; if the freed artifactId was already re-reserved by the time
   it ran, it could delete the NEW reservation's state. The sweep now reads
   storage truth first and skips reservations younger than the termination.
-- **Local storage: reclaim sweeps the stale reservation's bytes** (and its
-  datastore `.json`) before re-reserving — `@tus/file-store` writes at
-  offsets, so a fresh upload over longer leftover bytes would have kept the
-  stale tail. And `datastoreInfoExists` only treats `ENOENT` as "absent":
-  an `EACCES`/`EIO` blip can no longer reclassify a live upload as debris.
 - **The direct-upload module is Node-builtin-free** (`path.extname` replaced
   with a pure helper), completing the web entry's loadability on runtimes
   without Node compatibility.
@@ -110,15 +118,14 @@ breaking changes, called out explicitly below.
   after its evictions could re-insert the deleted artifact's metadata and
   serve it indefinitely; fills now capture a deletion epoch before reading
   and are discarded if any deletion landed meanwhile.
-- **Local storage serializes reclaim/remove per artifactId.** The multi-step
-  reclaim (read → liveness check → unlink → exclusive re-create) and
-  `remove()`'s deletes could interleave across concurrent callers — two
-  reclaimers could both "win" (the slower unlink erasing the winner's fresh
-  reservation), and a remove could delete files a concurrent reclaim had just
-  re-reserved. A per-artifact in-process lock closes every such interleave;
-  plain concurrent creates keep the lock-free atomic `wx` fast path.
-  (In-process is the honest scope: multiple processes sharing one local
-  workspace were never a supported topology — use the S3 adapter for that.)
+- **Local storage serializes `markReady`/`remove` per artifactId.** Their
+  multi-step read→write / read→delete sequences could interleave across
+  concurrent callers — a `markReady` racing a `remove` could re-write a
+  sidecar the remove had just deleted, resurrecting a half-deleted artifact.
+  A per-artifact in-process lock serializes them; creates keep the lock-free
+  atomic `wx` fast path. (In-process is the honest scope: multiple processes
+  sharing one local workspace were never a supported topology — use the S3
+  adapter for that.)
 - **The web handler serves zero-byte artifacts.** A valid zero-length upload
   previously crashed the streaming path (`fs.createReadStream` rejects
   `end: -1`); it now returns the empty `200` the headers describe, and
@@ -142,15 +149,6 @@ breaking changes, called out explicitly below.
   bytes/offset state was removed, leaving a permanent `"uploading"` sidecar
   behind — the cancelled artifactId stayed `409`-reserved forever and the
   paired client's only escape was re-pairing for a fresh id.
-- **`reserveUpload` no longer 409s crash debris forever.** Both storage
-  adapters now distinguish a genuine collision (a `ready` artifact, or an
-  `uploading` one whose datastore state still exists, or a sidecar younger
-  than the reclaim grace — a concurrent create in flight) from an orphaned
-  `"uploading"` sidecar with no datastore state (a kill between reserve and
-  datastore create, or a pre-cleanup termination), and reclaim the latter.
-  New `reclaimGraceMs` option on both adapters (default 60 000 ms). Sidecars
-  now carry a `reservedAt` timestamp to age-gate this without relying on
-  filesystem mtimes.
 - **`remove()` could resurrect deleted artifacts in the metadata cache**: a
   concurrent read racing between the pre-delete cache eviction and the
   (slow, I/O-bound) deletes re-populated the cache from the still-present
@@ -169,7 +167,7 @@ breaking changes, called out explicitly below.
   direct-upload profile below.
 - **Direct-upload profile (PROTOCOL.md §9): presigned PUT data plane.**
   `POST {prefix}/direct-uploads` authorizes + reserves (same artifactId
-  space/collision/debris rules as TUS) and returns a presigned `PUT` URL with
+  space/collision rules as TUS) and returns a presigned `PUT` URL with
   `Content-Type`/`Content-Length` signed in; `POST
   {prefix}/direct-uploads/:artifactId/complete` verifies the stored object's
   size and runs the exact same validate → markReady → onUploadComplete
@@ -192,11 +190,12 @@ breaking changes, called out explicitly below.
   implement `PutObjectTagging`; with tags on, every completed upload attempts
   a tagging call). New `minPartSize`, `maxMultipartParts`, and `useTags`
   options are forwarded for explicit control on any backend.
-- **PROTOCOL.md §4.2.1**: the deterministic tus id scheme
-  (`base64url("<kind>/<artifactId><ext>")`) is now a documented, stable part
-  of protocol version 1, together with the client-side `409` recovery it
-  enables (derive the resource URL, confirm with `HEAD`, resume) and the
-  server-side debris-reclaim recommendation.
+- **PROTOCOL.md §4.2.1**: artifactIds are specified as **single-use** — the
+  first create wins, later creates for the same id are stable `409`s, clients
+  mint a fresh id per attempt, and abandoned reservations age out via
+  termination or operator retention. Sidecars carry a `reservedAt` timestamp
+  so retention sweeps can age reservations without relying on filesystem
+  mtimes.
 - **`getMetadata(artifactId)`** on both storage adapters (and the optional
   `PulseVaultStorage` contract) returns the whole artifact record — kind, ext,
   filename, ready, relatedTo, checksum, name, reservedAt — in one read, and

@@ -13,18 +13,16 @@ import {
   buildSidecar,
   createMetaCache,
   DEFAULT_META_CACHE_LIMIT,
-  DEFAULT_RECLAIM_GRACE_MS,
   extToContentType,
   parseSidecar,
   reserveConflictError,
   type Sidecar,
-  sidecarIsStale,
   sidecarToCachedMeta,
 } from './sidecar.js';
 
-// Sidecar schema, parsing, cache, staleness gate, and the reserve-collision
-// error all live in `./sidecar.js`, shared verbatim with the S3 adapter — this
-// file owns only the filesystem-specific I/O around them.
+// Sidecar schema, parsing, cache, and the reserve-collision error all live in
+// `./sidecar.js`, shared verbatim with the S3 adapter — this file owns only
+// the filesystem-specific I/O around them.
 
 /** Hidden directory inside workspaceRoot that holds per-upload sidecar files. */
 const PULSEVAULT_META_DIR = '.pulsevault';
@@ -39,15 +37,6 @@ export type LocalStorageOptions = {
    * correctness. Defaults to 10,000.
    */
   metaCacheLimit?: number;
-  /**
-   * Minimum age (ms) an `"uploading"` sidecar with no datastore state must
-   * reach before `reserveUpload` treats it as crash debris and reclaims it
-   * instead of 409ing. The gap between the sidecar write and the datastore
-   * create is milliseconds, so a fresh sidecar without datastore state is a
-   * concurrent create in progress — not debris — and must still conflict.
-   * Defaults to 60,000 (1 minute).
-   */
-  reclaimGraceMs?: number;
 };
 
 /**
@@ -105,7 +94,6 @@ export type LocalStorage = PulseVaultStorage & {
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const workspaceRoot = path.resolve(opts.workspaceDir);
   const datastore = new FileStore({ directory: workspaceRoot });
-  const reclaimGraceMs = opts.reclaimGraceMs ?? DEFAULT_RECLAIM_GRACE_MS;
   // Metadata cache keyed by artifactId. Populated eagerly on reserve and
   // lazily from the sidecar on cache-miss — so we never do a workspace-wide
   // scan at boot and never do a per-request readdir on the GET hot path.
@@ -135,51 +123,16 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     `${kind}/${artifactId}${ext}`;
 
   /**
-   * Whether @tus/file-store still has live upload state (`<bytes path>.json`)
-   * for the upload a sidecar describes. Used by `reserveUpload` to tell a
-   * genuine in-flight collision apart from crash debris: `reserveUpload`
-   * writes the sidecar *before* the datastore creates its `.json`, so a kill
-   * in that window — or a TUS DELETE handled by a server too old to sweep
-   * sidecars — leaves an `"uploading"` sidecar with no datastore state behind
-   * it. That artifactId is not really in use; treating it as a 409 would
-   * poison it forever.
-   */
-  const datastoreInfoExists = async (
-    artifactId: string,
-    kind: UploadKind,
-    ext: string,
-  ): Promise<boolean> => {
-    try {
-      await fs.access(path.join(workspaceRoot, `${artifactRelPath(artifactId, kind, ext)}.json`));
-      return true;
-    } catch (err) {
-      // Only a confirmed absence means "no datastore state". EACCES/EIO etc.
-      // must propagate — mapping them to `false` would let a permissions blip
-      // reclassify a LIVE upload as reclaimable debris.
-      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
-      throw err;
-    }
-  };
-
-  /**
-   * Whether a sidecar is old enough to be reclaimable debris — see
-   * `sidecarIsStale` in `./sidecar.js`; this just binds the configured grace.
-   */
-  const isStale = (sidecar: Sidecar): boolean => sidecarIsStale(sidecar, reclaimGraceMs);
-
-  /**
-   * Per-artifact critical sections for the mutating operations (reserve's
-   * reclaim, remove, markReady). The exclusive `wx` create keeps plain
-   * concurrent creates one-winner-atomic even across processes, but the
-   * multi-step reclaim/remove sequences (read → liveness check → delete →
-   * write) can interleave: two reclaimers could each unlink-and-recreate, the
-   * slower one erasing the winner's fresh reservation; a remove's deletes
-   * could land on files a concurrent reclaim just re-reserved. Serializing
-   * per artifactId closes every such interleave in one move. In-process is
-   * the honest scope: multiple server processes sharing one local workspace
-   * are not a supported topology (the underlying @tus/file-store has no
-   * cross-process coordination either) — use the S3 adapter, whose
-   * conditional writes arbitrate across instances, for shared storage.
+   * Per-artifact critical sections for the multi-step mutating operations
+   * (markReady's read→write, remove's read→delete→evict). Without it, a
+   * markReady racing a remove could re-write a sidecar the remove just
+   * deleted, resurrecting a half-deleted artifact. `reserveUpload` doesn't
+   * need it — its exclusive `wx` create is already one-winner-atomic, even
+   * across processes. In-process is the honest scope: multiple server
+   * processes sharing one local workspace are not a supported topology (the
+   * underlying @tus/file-store has no cross-process coordination either) —
+   * use the S3 adapter, whose conditional writes arbitrate across instances,
+   * for shared storage.
    */
   const locks = new Map<string, Promise<void>>();
   const withArtifactLock = async <T>(artifactId: string, fn: () => Promise<T>): Promise<T> => {
@@ -258,82 +211,32 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
-  const reserveUpload = async (params: ReserveUploadParams): Promise<string> =>
-    withArtifactLock(params.artifactId, async () => {
-      const { artifactId, kind, ext } = params;
-      await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
-      await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
+const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
+    const { artifactId, kind, ext } = params;
+    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
-      const sidecar = buildSidecar(params);
-      const asOf = metaCache.epoch();
+    const sidecar = buildSidecar(params);
+    const asOf = metaCache.epoch();
 
-      // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
-      // this artifactId, rather than the previous read-then-write (`loadMeta` then
-      // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
-      // the check before either had written — letting the second silently clobber the first's
-      // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
-      // @tus/server's error path, same as before.
-      try {
-        await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-        // A file already exists at this path. Four cases, in order:
-        //  - unreadable/malformed sidecar (crash mid-write debris) → safe to overwrite;
-        //  - readable `"ready"` sidecar, or `"uploading"` with live datastore state →
-        //    genuine collision, 409 (an in-flight upload is resumable via HEAD+PATCH,
-        //    a finished artifact must never be silently replaced);
-        //  - readable `"uploading"` sidecar with no datastore `.json` but YOUNGER than
-        //    the reclaim grace → a concurrent create that hasn't written its datastore
-        //    state yet → still a 409 (preserves one-winner atomicity under races);
-        //  - readable `"uploading"` sidecar with no datastore `.json`, older than the
-        //    grace → crash/termination debris (see `datastoreInfoExists`) → reclaim so
-        //    the client's retried create succeeds instead of 409-poisoning the
-        //    artifactId forever.
-        const existing = await readSidecar(artifactId);
-        if (existing) {
-          const live =
-            existing.status === 'ready' ||
-            (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) ||
-            !isStale(existing);
-          if (live) {
-            throw reserveConflictError(artifactId);
-          }
-        }
-        // Reclaim (stale debris) or overwrite (unreadable/corrupt sidecar): sweep
-        // the debris, then retry the exclusive `wx` create. The sweep covers the
-        // stale reservation's BYTES and datastore `.json` too (when the sidecar
-        // was readable enough to locate them) — @tus/file-store writes at offsets,
-        // so a fresh upload over leftover longer bytes would otherwise keep the
-        // stale tail. The artifact lock serializes rival reclaimers and removes in
-        // this process, so these deletes can never erase a rival's fresh
-        // reservation; the `wx` retry still arbitrates against plain concurrent
-        // creates, which take the lock-free fast path above.
-        if (existing) {
-          const stalePath = path.join(
-            workspaceRoot,
-            artifactRelPath(artifactId, existing.kind ?? 'video', existing.ext),
-          );
-          await Promise.all([
-            fs.rm(stalePath, { force: true }),
-            fs.rm(`${stalePath}.json`, { force: true }),
-          ]);
-        }
-        await fs.rm(sidecarPath(artifactId), { force: true });
-        try {
-          await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
-        } catch (retryErr) {
-          if ((retryErr as NodeJS.ErrnoException)?.code === 'EEXIST') {
-            throw reserveConflictError(artifactId);
-          }
-          throw retryErr;
-        }
-      }
+    // ArtifactIds are single-use: the exclusive `wx` create fails atomically
+    // with EEXIST if a sidecar already exists for this artifactId — whether
+    // the previous upload finished, is still in flight, or died halfway.
+    // Every collision is a plain 409 (via @tus/server's error path); clients
+    // mint a fresh id per attempt, and abandoned reservations age out via
+    // operator retention (see OPERATIONS.md), not an in-band reclaim.
+    try {
+      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+      throw reserveConflictError(artifactId);
+    }
 
-      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false), asOf);
-      // @tus/file-store joins this onto its configured `directory`, so the
-      // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
-      return artifactRelPath(artifactId, kind, ext);
-    });
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false), asOf);
+    // @tus/file-store joins this onto its configured `directory`, so the
+    // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
+    return artifactRelPath(artifactId, kind, ext);
+  };
 
   const resolve = async (artifactId: string): Promise<PulseVaultResolution | null> => {
     const meta = await loadMeta(artifactId);
@@ -378,9 +281,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const remove = async (artifactId: string): Promise<boolean> =>
     withArtifactLock(artifactId, async () => {
-      // Read disk truth under the lock — a reclaim that just re-reserved this id
-      // must not lose its files to a remove aimed at the PREVIOUS reservation
-      // (the lock serializes them; the fresh read sees the current kind/ext).
+      // Read disk truth under the lock — the current kind/ext decide which
+      // files the deletes below target, and a cached entry could be stale.
       const meta = await loadMeta(artifactId, { fresh: true });
       // Drop from cache before rm so a racing `resolve` arriving after the
       // rm but before cache eviction can't hand back a stale path.

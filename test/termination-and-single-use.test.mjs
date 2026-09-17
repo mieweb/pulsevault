@@ -1,16 +1,15 @@
-// Termination cleanup + crash-debris reclaim suite.
+// Termination cleanup + single-use artifactId suite.
 //
-// Covers the two halves of the "409-poisoned artifactId" fix:
+// Covers the two halves of the create-conflict contract (PROTOCOL.md §4.2.1):
 //
 //  1. TUS DELETE (termination) must sweep the adapter's `.pulsevault` sidecar,
-//     not just the datastore's bytes/offset state — otherwise a cancelled
-//     upload's artifactId stays reserved forever (POST_TERMINATE hook in
+//     not just the datastore's bytes/offset state — termination is the one
+//     in-band way an artifactId is freed (POST_TERMINATE hook in
 //     `lib/pulsevaultTus.ts`).
-//  2. `reserveUpload` must tell a genuine collision (ready artifact, or an
-//     in-flight upload with live datastore state) apart from crash debris (an
-//     `"uploading"` sidecar with no datastore state — a kill between reserve
-//     and datastore-create, or a termination handled by a pre-cleanup server)
-//     and reclaim the debris instead of 409ing.
+//  2. ArtifactIds are single-use: every repeat create — against an in-flight
+//     upload, a ready artifact, or an abandoned reservation of any age — is a
+//     stable 409. There is no reclaim; abandoned reservations age out via
+//     operator retention, never by a contested create.
 //
 // Runs both storage backends: local filesystem and the in-process mock S3.
 
@@ -52,12 +51,9 @@ async function eventually(check, { timeoutMs = 2000, stepMs = 20 } = {}) {
   }
 }
 
-async function startLocalApp({ reclaimGraceMs } = {}) {
+async function startLocalApp() {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pv-term-test-'));
-  const storage = createLocalStorage({
-    workspaceDir,
-    ...(reclaimGraceMs !== undefined ? { reclaimGraceMs } : {}),
-  });
+  const storage = createLocalStorage({ workspaceDir });
   const core = createPulseVaultCore({
     basePath: PREFIX,
     storage,
@@ -77,7 +73,7 @@ async function startLocalApp({ reclaimGraceMs } = {}) {
   };
 }
 
-async function startS3App({ reclaimGraceMs } = {}) {
+async function startS3App() {
   const storage = await createS3Storage({
     bucket: BUCKET,
     endpoint,
@@ -85,7 +81,6 @@ async function startS3App({ reclaimGraceMs } = {}) {
     accessKeyId: 'MOCKS3',
     secretAccessKey: 'MOCKS3',
     forcePathStyle: true,
-    ...(reclaimGraceMs !== undefined ? { reclaimGraceMs } : {}),
     clientConfig: {
       requestChecksumCalculation: 'WHEN_REQUIRED',
       responseChecksumValidation: 'WHEN_REQUIRED',
@@ -172,22 +167,22 @@ test('local: TUS DELETE after completion removes bytes, sidecar, and serving', a
   }
 });
 
-// ---------- local: reserve reclaims debris, still 409s live state ----------
+// ---------- local: single-use ids — every repeat create 409s ----------
 
-test("local: reserve reclaims an aged 'uploading' sidecar with no datastore state (crash debris)", async () => {
-  const ctx = await startLocalApp({ reclaimGraceMs: 10 });
+test("local: an aged 'uploading' sidecar with no datastore state still 409s (single-use, no reclaim)", async () => {
+  const ctx = await startLocalApp();
   const id = randomUUID();
   try {
     // Simulate a kill between reserveUpload and the datastore's create: the
-    // sidecar lands, the datastore `.json` never does. Wait out the (test-tuned)
-    // reclaim grace so the debris is old enough to reclaim.
+    // sidecar lands, the datastore `.json` never does. However old it gets,
+    // the id stays burned — the client mints a fresh id; retention frees this one.
     await ctx.storage.reserveUpload({
       artifactId: id,
       filename: 'clip.mp4',
       ext: '.mp4',
       kind: 'video',
     });
-    assert.ok(await fileExists(ctx.sidecarPath(id)), 'debris sidecar in place');
+    assert.ok(await fileExists(ctx.sidecarPath(id)), 'abandoned sidecar in place');
     await new Promise((r) => setTimeout(r, 40));
 
     const recreate = await tusCreate(ctx.baseUrl, PREFIX, {
@@ -195,15 +190,13 @@ test("local: reserve reclaims an aged 'uploading' sidecar with no datastore stat
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(recreate.status, 201, 'debris reclaimed instead of 409');
+    assert.equal(recreate.status, 409, 'abandoned reservation still conflicts');
   } finally {
     await ctx.teardown();
   }
 });
 
-test('local: a FRESH datastore-less sidecar still 409s (concurrent create, not debris)', async () => {
-  // Default grace (60s): a sidecar written milliseconds ago must conflict — it may
-  // be a concurrent create that simply hasn't written its datastore state yet.
+test('local: a FRESH datastore-less sidecar 409s (reserve is one-winner-atomic)', async () => {
   const ctx = await startLocalApp();
   const id = randomUUID();
   try {
@@ -218,7 +211,7 @@ test('local: a FRESH datastore-less sidecar still 409s (concurrent create, not d
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(dup.status, 409, 'within-grace sidecar still conflicts');
+    assert.equal(dup.status, 409, 'reservation without datastore state still conflicts');
   } finally {
     await ctx.teardown();
   }
@@ -287,26 +280,27 @@ test('s3: TUS DELETE mid-upload sweeps the sidecar object and frees the artifact
   }
 });
 
-test('s3: reserve reclaims aged crash debris but 409s live, fresh, and ready uploads', async () => {
-  const ctx = await startS3App({ reclaimGraceMs: 10 });
-  const debris = randomUUID();
+test('s3: repeat creates 409 against abandoned, live, and ready uploads alike (single-use)', async () => {
+  const ctx = await startS3App();
+  const abandoned = randomUUID();
   const inflight = randomUUID();
   const finished = randomUUID();
   try {
-    // Debris: sidecar object only, no datastore `.info`, aged past the grace.
+    // Abandoned: sidecar object only, no datastore `.info`, aged — stays 409
+    // (single-use; retention frees it, not a contested create).
     await ctx.storage.reserveUpload({
-      artifactId: debris,
+      artifactId: abandoned,
       filename: 'clip.mp4',
       ext: '.mp4',
       kind: 'video',
     });
     await new Promise((r) => setTimeout(r, 40));
-    const reclaimed = await tusCreate(ctx.baseUrl, PREFIX, {
-      artifactId: debris,
+    const retried = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: abandoned,
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(reclaimed.status, 201, 'aged debris reclaimed instead of 409');
+    assert.equal(retried.status, 409, 'abandoned reservation still conflicts');
 
     // Live in-flight: real create → duplicate create conflicts (has `.info`,
     // regardless of age).
@@ -337,8 +331,8 @@ test('s3: reserve reclaims aged crash debris but 409s live, fresh, and ready upl
   }
 });
 
-test('s3: a FRESH datastore-less sidecar still 409s (concurrent create, not debris)', async () => {
-  const ctx = await startS3App(); // default 60s grace
+test('s3: a FRESH datastore-less sidecar 409s (reserve is one-winner-atomic)', async () => {
+  const ctx = await startS3App();
   const id = randomUUID();
   try {
     await ctx.storage.reserveUpload({
@@ -352,7 +346,7 @@ test('s3: a FRESH datastore-less sidecar still 409s (concurrent create, not debr
       filename: 'clip.mp4',
       size: 1024,
     });
-    assert.equal(dup.status, 409, 'within-grace sidecar still conflicts');
+    assert.equal(dup.status, 409, 'reservation without datastore state still conflicts');
   } finally {
     await ctx.teardown();
   }

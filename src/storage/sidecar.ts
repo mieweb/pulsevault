@@ -4,21 +4,18 @@ import { parseUploadKind } from './types.js';
 
 /**
  * Everything the two storage adapters share about per-artifact metadata
- * sidecars — the schema, its parsing/normalization, the in-memory cache, the
- * debris-staleness gate, and the reserve-collision error. The local adapter
- * persists a sidecar as a JSON file under `.pulsevault/`, the S3 adapter as a
- * JSON object under the `.pulsevault/` key prefix; the CONTENT and semantics
- * are identical by design, and this module is what keeps them identical —
- * before it existed, every sidecar change had to be hand-mirrored across both
- * adapters.
+ * sidecars — the schema, its parsing/normalization, the in-memory cache, and
+ * the reserve-collision error. The local adapter persists a sidecar as a JSON
+ * file under `.pulsevault/`, the S3 adapter as a JSON object under the
+ * `.pulsevault/` key prefix; the CONTENT and semantics are identical by
+ * design, and this module is what keeps them identical — before it existed,
+ * every sidecar change had to be hand-mirrored across both adapters.
  */
 
 /** Sidecar schema version. Increment for breaking changes. */
 const SIDECAR_VERSION = 1 as const;
 /** Default cap on an adapter's in-memory metadata cache before evicting the oldest entry. */
 export const DEFAULT_META_CACHE_LIMIT = 10_000;
-/** Default minimum age before an orphaned `"uploading"` sidecar may be reclaimed. */
-export const DEFAULT_RECLAIM_GRACE_MS = 60_000;
 
 /**
  * Per-artifact metadata sidecar. Lets `resolve()` recover an artifact's
@@ -47,11 +44,13 @@ export type Sidecar = {
   /** Optional human-facing display name. See `ReserveUploadParams.name`. */
   name?: string;
   /**
-   * Epoch-ms timestamp of the `reserveUpload` that wrote this sidecar. Used to
-   * age-gate crash-debris reclaim (see `sidecarIsStale`); carried in the JSON
-   * (not derived from file mtimes) so it survives backup/restore and works
-   * identically on object storage. Absent on sidecars written before this
-   * field existed — those are by definition old enough to reclaim.
+   * Epoch-ms timestamp of the `reserveUpload` that wrote this sidecar.
+   * ArtifactIds are single-use — a reservation that never reaches `"ready"`
+   * is abandoned, not reused — so this exists for retention tooling: an
+   * operator sweep (or object-storage lifecycle rule) can age out abandoned
+   * `"uploading"` sidecars by this timestamp. Carried in the JSON (not
+   * derived from file mtimes) so it survives backup/restore and works
+   * identically on object storage.
    */
   reservedAt?: number;
   /** Expected total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
@@ -154,30 +153,6 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
     expectedSize: sidecar.expectedSize,
     objectSuffix: sidecar.objectSuffix,
   };
-}
-
-/**
- * Whether a sidecar is old enough to be reclaimable debris. A sidecar younger
- * than the grace window may belong to a concurrent create that hasn't written
- * its datastore state yet — those must still 409, or two simultaneous creates
- * for the same artifactId would both "win". Sidecars without a `reservedAt`
- * (written before the field existed) are old by definition.
- *
- * Direct reservations (`expectedSize` present) NEVER have datastore state —
- * "no `.info`" is their normal live shape, not a crash signature — so their
- * grace must additionally cover `directGraceMs` (the presigned-URL lifetime):
- * reclaiming one mid-grant would yank a legitimate in-flight PUT's
- * reservation out from under it after only `reclaimGraceMs` of quiet.
- */
-export function sidecarIsStale(
-  sidecar: Sidecar,
-  reclaimGraceMs: number,
-  directGraceMs = 0,
-): boolean {
-  if (sidecar.reservedAt === undefined) return true;
-  const grace =
-    sidecar.expectedSize !== undefined ? Math.max(reclaimGraceMs, directGraceMs) : reclaimGraceMs;
-  return Date.now() - sidecar.reservedAt > grace;
 }
 
 /** The reserve-collision error both adapters throw — surfaces as HTTP 409 via @tus/server. */

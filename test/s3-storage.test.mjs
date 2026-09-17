@@ -193,12 +193,10 @@ test('two truly concurrent reserves for the same artifactId: exactly one 201, on
   }
 });
 
-// Reclaim race: a STALE sidecar (grace elapsed, no live `.info`) is debris both
-// concurrent reserves may try to reclaim. The reclaim path deletes the debris
-// sidecar and RETRIES the conditional create instead of plainly overwriting —
-// so rival reclaimers collapse to one winner and one 409, same as fresh
-// concurrent reserves.
-test('two concurrent reclaims of one stale sidecar: exactly one wins, one 409', async () => {
+// Single-use ids: an aged abandoned reservation is NOT reclaimable — both
+// concurrent retried creates must lose to the planted sidecar. Retention (see
+// OPERATIONS.md) is what frees the id, never a contested create.
+test('an aged abandoned reservation still 409s concurrent retried creates (single-use, no reclaim)', async () => {
   const storage = await createS3Storage({
     bucket: BUCKET,
     endpoint,
@@ -206,17 +204,14 @@ test('two concurrent reclaims of one stale sidecar: exactly one wins, one 409', 
     accessKeyId: 'MOCKS3',
     secretAccessKey: 'MOCKS3',
     forcePathStyle: true,
-    reclaimGraceMs: 30_000,
     clientConfig: {
       requestChecksumCalculation: 'WHEN_REQUIRED',
       responseChecksumValidation: 'WHEN_REQUIRED',
     },
   });
   const id = randomUUID();
-  // Plant an aged debris sidecar directly: a reservation whose grant expired an
-  // hour ago with no bytes and no `.info` — exactly what reclaim is for. (A
-  // zero grace can't model this: the winner's FRESH sidecar would itself be
-  // instantly reclaimable, making a second winner correct behaviour.)
+  // Plant an aged abandoned sidecar directly: a reservation whose grant
+  // expired an hour ago with no bytes and no `.info`.
   const planted = await fetch(`${endpoint}/${BUCKET}/.pulsevault/${id}.json`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -233,12 +228,10 @@ test('two concurrent reclaims of one stale sidecar: exactly one wins, one 409', 
   const reserve = () =>
     storage.reserveUpload({ artifactId: id, kind: 'video', ext: '.mp4', filename: 'clip.mp4' });
   const results = await Promise.allSettled([reserve(), reserve()]);
-  const winners = results.filter((r) => r.status === 'fulfilled').length;
   const conflicts = results.filter(
     (r) => r.status === 'rejected' && r.reason?.statusCode === 409,
   ).length;
-  assert.equal(winners, 1);
-  assert.equal(conflicts, 1);
+  assert.equal(conflicts, 2, 'both retried creates lose to the abandoned reservation');
 });
 
 // The degraded-backend branch: a store that rejects `If-None-Match` outright

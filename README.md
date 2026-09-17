@@ -588,7 +588,6 @@ import { createLocalStorage } from "@mieweb/pulsevault";
 const storage = createLocalStorage({
   workspaceDir: "./data",   // directory for uploads; created if absent
   metaCacheLimit: 10_000,   // optional — bounds the in-memory metadata cache
-  reclaimGraceMs: 60_000,   // optional — age before an orphaned "uploading" sidecar is reclaimable
 });
 ```
 
@@ -719,7 +718,6 @@ Credentials are optional — omit `accessKeyId`/`secretAccessKey` to use the AWS
 | `maxMultipartParts` | `10000` | Forwarded to `@tus/s3-store`. Lower for stores with tighter limits (e.g. Scaleway: 1000). |
 | `useTags` | `true`; `false` on R2 | Whether `@tus/s3-store` may tag objects (its `Tus-Completed` tag powers lifecycle cleanup). |
 | `metaCacheLimit` | `10000` | Caps the in-memory metadata cache before evicting the oldest entry. |
-| `reclaimGraceMs` | `60000` | Age an orphaned `"uploading"` sidecar with no datastore state must reach before a retried create reclaims it instead of 409ing. |
 | `clientConfig` | — | Advanced: extra `S3ClientConfig` merged into the client. |
 
 > **Cloudflare R2 is auto-configured**: when `endpoint` is an `*.r2.cloudflarestorage.com` URL, the adapter defaults `partSize`/`minPartSize` to 8 MiB (R2 requires all non-trailing multipart parts to be the same size) and `useTags` to `false` (R2 does not implement object tagging). Explicit options always win. On R2, prefer [bucket lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) to clean up incomplete multipart uploads (R2 aborts them after 7 days by default).
@@ -753,8 +751,10 @@ With the S3/R2 adapter, the server automatically advertises the
 The trade, stated plainly: a direct upload is one `PUT` — retryable from
 zero, **not resumable mid-file**. TUS stays the default and is always served
 alongside; the client picks per `/capabilities`. Uploads that never complete
-are cleaned up by your bucket lifecycle rules plus the reserve
-debris-reclaim (`reclaimGraceMs`). Local-filesystem deployments answer `501`
+are cleaned up by your bucket lifecycle rules plus a retention sweep (see
+*Retention* in `OPERATIONS.md`) — artifactIds are single-use, so an
+abandoned reservation is never re-contested by a client, only aged out.
+Local-filesystem deployments answer `501`
 and don't advertise the profile. For browser `PUT`s add a CORS rule on the
 bucket allowing `PUT` from your origin.
 
@@ -794,10 +794,10 @@ edges live in bucket configuration, not code:
   them after 7 days by default); on AWS, `@tus/s3-store`'s `Tus-Completed`
   tag (`useTags`, default on) can additionally drive tag-filtered expiry.
   *Direct* uploads that `PUT` but never `complete` leave a full object at the
-  reservation's key with its sidecar stuck at `"uploading"` — the reservation
-  itself is freed by debris-reclaim (`reclaimGraceMs`), but if the client
-  never returns, only a prefix-scoped expiry rule (or your own
-  `listArtifactIds`-based sweep, see *Retention* in `OPERATIONS.md`) removes
+  reservation's key with its sidecar stuck at `"uploading"` — artifactIds are
+  single-use, so nothing contends for the id again; a prefix-scoped expiry
+  rule (or your own `listArtifactIds`-based sweep, see *Retention* in
+  `OPERATIONS.md`) removes
   the bytes.
 - **Each direct reservation writes to its own object key.** A presigned URL
   can't be revoked by deleting its reservation, so grants are fenced by KEY:
