@@ -47,14 +47,6 @@ function insideDataDir(...segments) {
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "0.0.0.0";
 
-// Deployment-wide default advertised via GET /pulsevault/capabilities — purely
-// advisory; the plugin never enforces "segment" vs "merged", it just reports
-// whichever value this server passes at registration (README "Upload unit").
-// Default "merged" here so this demo exercises the full merged pipeline
-// (video + captions + beat manifest + thumbnail); set UPLOAD_UNIT=segment to
-// test per-clip uploads instead.
-const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
-
 const app = Fastify({
   // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
   // -Host). Trust it so `request.ip` is the real client rather than the shared
@@ -327,26 +319,15 @@ app.get("/videos", {
 // `${server}/<path>` with no prefix concept of its own. With no auth there's
 // no issuer to stay consistent with, so deriving `server` from request
 // headers is fine here.
-//
-// `?uploadUnit=segment|merged` lets this *one* pairing link override the
-// deployment-wide default set above (PROTOCOL.md §3, §8) — handy for testing
-// both modes without restarting the server. Omit it and the link carries no
-// override; the client falls back to whatever `/capabilities` reports.
 app.get("/deeplinks", { schema: { tags: ["demo"], summary: "Mint a pairing deep link + QR code" } }, async (req, reply) => {
   const proto = req.headers["x-forwarded-proto"] ?? "http";
   const requestHost = req.headers["x-forwarded-host"] ?? req.headers.host;
   const server = `${proto}://${requestHost}/pulsevault`;
   const artifactId = randomUUID();
 
-  const requestedUploadUnit = req.query?.uploadUnit;
-  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "segment" && requestedUploadUnit !== "merged") {
-    return reply.code(400).send({ error: '`uploadUnit` query param must be "segment" or "merged"' });
-  }
-
   const upload = buildUploadLink({
     server,
     artifactId,
-    ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
   });
   const qrUpload = await QRCode.toDataURL(upload, {
     width: 224,
@@ -368,11 +349,9 @@ await app.register(pulseVault, {
   // (`Tus-Max-Size`) than the infra accepts means clients get promised sizes
   // that 413 mid-flight. Raise only if the edge limit is raised.
   maxUploadSize: 2 * 1024 * 1024 * 1024, // 2 GiB
-  uploadUnit,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside the video; rejecting any of those
+  // would make this a broken pairing target.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],

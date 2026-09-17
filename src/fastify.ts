@@ -9,7 +9,6 @@ import {
   normalizeAllowedExtensions,
   validateBasePath,
   validateMaxUploadSize,
-  validateUploadUnit,
   validateAllowedExtensions,
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
@@ -42,15 +41,6 @@ export type PulseVaultPluginOptions = {
    * explicit cap for their deployment. Use `Infinity` for no cap.
    */
   maxUploadSize: number;
-  /**
-   * Which upload strategy this deployment expects: `"segment"` uploads each
-   * clip individually (no client-side merge/re-encode pass) plus a manifest
-   * artifact for ordering, while `"merged"` expects one pre-merged video per
-   * pulse (plus its captions, beat manifest and thumbnail). Purely advertised
-   * via `GET /capabilities` for the client to branch on — `pulsevault` doesn't
-   * enforce either. Defaults to `"segment"`.
-   */
-  uploadUnit?: 'segment' | 'merged';
   /**
    * Fastify instance decorator name under which the storage adapter is
    * exposed. Defaults to `"pulseVault"`. Override when registering this
@@ -155,7 +145,6 @@ const DEFAULT_DECORATOR_NAME = 'pulseVault';
 const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) => {
   validateBasePath(opts.prefix, 'prefix');
   validateMaxUploadSize(opts.maxUploadSize);
-  validateUploadUnit(opts.uploadUnit);
   validateAllowedExtensions(opts.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(opts);
 
@@ -176,7 +165,6 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     prefix: opts.prefix,
     storage: opts.storage,
     maxUploadSize: opts.maxUploadSize,
-    uploadUnit: opts.uploadUnit ?? 'segment',
     allowedExtensions,
     cache: opts.cache,
     authorize: opts.authorize,

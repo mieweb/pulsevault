@@ -423,11 +423,10 @@ test("onUploadComplete fires exactly once with the right ctx", async () => {
   }
 });
 
-test("GET /capabilities is unauthenticated and reports the configured uploadUnit", async () => {
+test("GET /capabilities is unauthenticated", async () => {
   const authorizeCalls = [];
   const ctx = await startApp({
     coreOptions: {
-      uploadUnit: "merged",
       authorize: async (_req, ctx) => {
         authorizeCalls.push(ctx.phase);
       },
@@ -438,7 +437,6 @@ test("GET /capabilities is unauthenticated and reports the configured uploadUnit
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.protocolVersion, 1);
-    assert.equal(body.uploadUnit, "merged");
     assert.deepEqual(body.kinds.sort(), ["captions", "project", "thumbnail", "video"]);
     assert.equal(body.maxUploadSize, 10 * 1024 * 1024);
     assert.ok(Array.isArray(body.checksum.algorithms));

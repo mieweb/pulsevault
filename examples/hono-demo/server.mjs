@@ -26,7 +26,6 @@ const vault = createPulseVaultWebHandler({
   basePath: "/pulsevault",
   storage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  uploadUnit: "merged",
 });
 
 const app = new Hono();
@@ -46,7 +45,6 @@ app.get("/deeplinks", (c) => {
   const link = buildUploadLink({
     artifactId,
     server: `${proto}://${host}/pulsevault`,
-    uploadUnit: "merged",
   });
   return c.json({ artifactId, link });
 });

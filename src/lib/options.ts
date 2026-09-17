@@ -76,12 +76,6 @@ export function validateMaxUploadSize(maxUploadSize: number): void {
   }
 }
 
-export function validateUploadUnit(uploadUnit: 'segment' | 'merged' | undefined): void {
-  if (uploadUnit && uploadUnit !== 'segment' && uploadUnit !== 'merged') {
-    throw new TypeError('`uploadUnit` must be "segment" or "merged"');
-  }
-}
-
 export function validateAllowedExtensions(
   allowedExtensions: PulseVaultAllowedExtensionsInput | undefined,
 ): void {

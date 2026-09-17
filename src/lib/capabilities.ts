@@ -8,7 +8,6 @@ const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
 const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
 
 export type CapabilitiesPayloadInput = {
-  uploadUnit: 'segment' | 'merged';
   allowedExtensions: PulseVaultAllowedExtensions;
   maxUploadSize: number;
   storage: PulseVaultStorage;
@@ -26,7 +25,6 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
   protocolVersion: number;
   minSupportedVersion: number;
   maxSupportedVersion: number;
-  uploadUnit: 'segment' | 'merged';
   kinds: UploadKind[];
   allowedExtensions: PulseVaultAllowedExtensions;
   maxUploadSize: number;
@@ -39,7 +37,6 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
     protocolVersion: PROTOCOL_VERSION,
     minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
     maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
-    uploadUnit: input.uploadUnit,
     kinds: [...UPLOAD_KINDS],
     allowedExtensions: input.allowedExtensions,
     maxUploadSize: input.maxUploadSize,

@@ -29,13 +29,6 @@ import {
 // Defaults to a tmpdir; set PULSEVAULT_DIR to persist uploads somewhere durable.
 const workspaceDir = process.env.PULSEVAULT_DIR || path.join(os.tmpdir(), "pulsevault-meteor-demo-data");
 
-// Deployment-wide default advertised via GET /pulsevault/capabilities — purely
-// advisory; the core never enforces "segment" vs "merged", it just reports
-// whichever value this server passes at registration. Default "merged" so this
-// demo exercises the full merged pipeline (video + captions + thumbnail); set
-// UPLOAD_UNIT=segment to test per-clip uploads instead.
-const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
-
 // The route params say `format: "uuid"` but nothing here runs Ajv, so routes
 // that embed a request-supplied id in a filesystem path validate it explicitly.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -212,27 +205,15 @@ WebApp.connectHandlers.use("/videos", async (_req, res) => {
 // so it stays the source of truth. `server` must include the core's `basePath`
 // ("/pulsevault") — the client builds every request as `${server}/<path>` with
 // no prefix concept of its own.
-//
-// `?uploadUnit=segment|merged` lets this one pairing link override the
-// deployment-wide default (PROTOCOL.md §8) — handy for testing both modes
-// without restarting. Omit it and the link carries no override; the client
-// falls back to whatever `/capabilities` reports.
 WebApp.connectHandlers.use("/deeplinks", async (req, res) => {
   const proto = req.headers["x-forwarded-proto"] ?? "http";
   const host = req.headers["x-forwarded-host"] ?? req.headers.host;
   const server = `${proto}://${host}/pulsevault`;
   const artifactId = randomUUID();
 
-  const requestedUploadUnit = new URL(req.url, "http://localhost").searchParams.get("uploadUnit") ?? undefined;
-  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "segment" && requestedUploadUnit !== "merged") {
-    json(res, 400, { error: '`uploadUnit` query param must be "segment" or "merged"' });
-    return;
-  }
-
   const upload = buildUploadLink({
     server,
     artifactId,
-    ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
   });
 
   const qrUpload = await QRCode.toDataURL(upload, {
@@ -257,11 +238,9 @@ const pulseVault = createPulseVaultCore({
   stripBasePath: false,
   storage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  uploadUnit,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside the video; rejecting any of those
+  // would make this a broken pairing target.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],
@@ -278,7 +257,6 @@ Meteor.startup(() => {
   console.log(`PulseVault Meteor demo — pulsevault mounted at /pulsevault`);
   console.log(`  pairing page: /   ·   feed: /library`);
   console.log(`  workspaceDir: ${workspaceDir}`);
-  console.log(`  upload unit:  ${uploadUnit} (set UPLOAD_UNIT=segment to switch)`);
 });
 
 process.on("SIGINT", async () => {

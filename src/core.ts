@@ -35,7 +35,6 @@ import {
   normalizeAllowedExtensions,
   validateBasePath,
   validateMaxUploadSize,
-  validateUploadUnit,
   validateAllowedExtensions,
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
@@ -78,8 +77,6 @@ export type PulseVaultCoreOptions = {
   stripBasePath?: boolean;
   /** Max TUS upload size in bytes. Required — consumers must choose an explicit cap. Use `Infinity` for no cap. */
   maxUploadSize: number;
-  /** Which upload strategy this deployment expects. Purely advertised via `GET /capabilities`. Defaults to `"segment"`. */
-  uploadUnit?: 'segment' | 'merged';
   /** File extensions allowed per artifact kind. See the Fastify plugin's `allowedExtensions` for the full shape. */
   allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /** Cache-control options forwarded to `@fastify/send` for the GET route. */
@@ -194,13 +191,11 @@ function stashPulseVaultContext(req: IncomingMessage, ctx: PulseVaultRequestCont
 export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVaultCore {
   validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
-  validateUploadUnit(options.uploadUnit);
   validateAllowedExtensions(options.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(options);
 
   const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
   const stripBasePath = options.stripBasePath ?? true;
-  const uploadUnit = options.uploadUnit ?? 'segment';
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   const validatePayload = composeValidatePayload(
     options.validatePayload,
@@ -341,7 +336,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       writeJson(
         res,
         200,
-        buildCapabilitiesPayload({ uploadUnit, allowedExtensions, maxUploadSize, storage }),
+        buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }),
       );
     } catch (err) {
       failClosed(res, err, 'capabilities');

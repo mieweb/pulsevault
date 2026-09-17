@@ -166,7 +166,6 @@ async function handleCapabilities() {
     protocolVersion: 1,
     minSupportedVersion: 1,
     maxSupportedVersion: 1,
-    uploadUnit: "merged",
     kinds: KINDS,
     allowedExtensions: ALLOWED,
     maxUploadSize: MAX_UPLOAD,
@@ -254,7 +253,7 @@ async function handleDeeplink(request, env) {
   const token = await issueToken(artifactId, env);
   const origin = new URL(request.url).origin;
   const server = `${origin}${PREFIX}`;
-  const link = `pulsecam://?v=1&artifactId=${artifactId}&server=${encodeURIComponent(server)}&token=${encodeURIComponent(token)}&uploadUnit=merged`;
+  const link = `pulsecam://?v=1&artifactId=${artifactId}&server=${encodeURIComponent(server)}&token=${encodeURIComponent(token)}`;
   return json(200, { artifactId, link });
 }
 

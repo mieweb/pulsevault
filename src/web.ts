@@ -28,7 +28,6 @@ import {
   normalizeAllowedExtensions,
   validateBasePath,
   validateMaxUploadSize,
-  validateUploadUnit,
   validateAllowedExtensions,
   type PulseVaultAllowedExtensionsInput,
 } from './lib/options.js';
@@ -66,8 +65,6 @@ export type PulseVaultWebOptions = {
   basePath: string;
   /** Max TUS upload size in bytes. Required. Use `Infinity` for no cap. */
   maxUploadSize: number;
-  /** Advertised via `GET /capabilities`. Defaults to `"segment"`. */
-  uploadUnit?: 'segment' | 'merged';
   /** File extensions allowed per artifact kind. Same shape as the Node core. */
   allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /** Optional authorization hook — same contract as the Node core. */
@@ -129,11 +126,9 @@ function stampProtocolVersion(res: Response): Response {
 export function createPulseVaultWebHandler(options: PulseVaultWebOptions): PulseVaultWebHandler {
   validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
-  validateUploadUnit(options.uploadUnit);
   validateAllowedExtensions(options.allowedExtensions);
 
   const { storage, basePath, maxUploadSize, authorize, onArtifactEvent } = options;
-  const uploadUnit = options.uploadUnit ?? 'segment';
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   // The web surface is new — it never had the deprecated per-kind hooks, so
   // there's nothing to compose or warn about.
@@ -385,7 +380,7 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     if (pathname === '/capabilities' && request.method === 'GET') {
       return json(
         200,
-        buildCapabilitiesPayload({ uploadUnit, allowedExtensions, maxUploadSize, storage }),
+        buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }),
       );
     }
     if (pathname === '/direct-uploads' && request.method === 'POST') {

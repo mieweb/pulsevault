@@ -38,8 +38,6 @@ export type PulseVaultRoutesOptions = {
   storage: PulseVaultStorage;
   maxUploadSize: number;
   allowedExtensions: PulseVaultAllowedExtensions;
-  /** Advertised via `GET /capabilities` so the client knows which upload strategy this server expects. */
-  uploadUnit: 'segment' | 'merged';
   cache?: PulseVaultCoreCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;
@@ -165,7 +163,7 @@ const capabilitiesSchema: OpenApiRouteSchema = {
   tags: ['pulsevault'],
   summary: "Discover this deployment's protocol version and configuration",
   description:
-    'Unauthenticated — the response carries no secrets. Lets a client detect protocol compatibility before pairing, and which upload strategy (`uploadUnit`) this server expects.',
+    'Unauthenticated — the response carries no secrets. Lets a client detect protocol compatibility before pairing.',
   response: {
     200: {
       type: 'object',
@@ -173,7 +171,6 @@ const capabilitiesSchema: OpenApiRouteSchema = {
         protocolVersion: { type: 'number' },
         minSupportedVersion: { type: 'number' },
         maxSupportedVersion: { type: 'number' },
-        uploadUnit: { type: 'string', enum: ['segment', 'merged'] },
         kinds: { type: 'array', items: { type: 'string' } },
         allowedExtensions: {
           type: 'object',
@@ -254,7 +251,6 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     storage,
     maxUploadSize,
     allowedExtensions,
-    uploadUnit,
     cache,
     authorize,
     validatePayload,
@@ -271,7 +267,6 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     // `fastify.prefix` is `""` when the plugin is mounted at the root.
     basePath: fastify.prefix,
     maxUploadSize,
-    uploadUnit,
     allowedExtensions,
     cache,
     authorize,

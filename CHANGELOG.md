@@ -7,6 +7,21 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking: the `uploadUnit` concept is gone.** There is one way to upload a
+  pulse — the video plus its related artifacts (captions, beat manifest,
+  thumbnail) under a single session token. The per-clip "segment" strategy
+  carried no information the beat manifest doesn't (beats are timecode ranges
+  in the manifest, not separate uploads), so it was removed rather than
+  maintained in parallel. Concretely: the `uploadUnit` option is removed from
+  the Fastify plugin, the Node core, and the web handler; `buildUploadLink`
+  no longer accepts or emits an `uploadUnit` param (clients ignore it on old
+  links); `GET /capabilities` no longer returns an `uploadUnit` field; and
+  PROTOCOL.md §8 now defines the single upload set. Operators who set
+  `uploadUnit` must simply delete the option; clients that branched on it
+  should upload the one defined set.
+
 ### Documentation
 
 - README grew a **Deployment caveats (AWS S3 & R2)** section: the 5 GiB

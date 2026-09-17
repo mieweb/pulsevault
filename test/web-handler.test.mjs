@@ -171,7 +171,6 @@ test("web: capabilities payload — no directUpload for local storage", async ()
     assert.equal(res.status, 200);
     const caps = await res.json();
     assert.equal(caps.protocolVersion, 1);
-    assert.equal(caps.uploadUnit, "segment");
     assert.deepEqual(caps.kinds, ["video", "project", "captions", "thumbnail"]);
     assert.equal(caps.directUpload, undefined, "local storage cannot presign");
   } finally {

@@ -124,8 +124,8 @@ async function main() {
     assert.equal(typeof caps.protocolVersion, "number");
     assert.ok(caps.minSupportedVersion <= caps.protocolVersion);
     assert.ok(caps.protocolVersion <= caps.maxSupportedVersion);
-    assert.ok(["segment", "merged"].includes(caps.uploadUnit));
-    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
+    assert.equal(caps.protocolVersion, 1);
+    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}`);
 
     // 2a. Dashboard routes are Better Auth-protected: no session -> 401.
     const unauthed = await fetch(`${BASE}/deeplinks`);
