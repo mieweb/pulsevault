@@ -1,15 +1,20 @@
 {
   "name": "@mieweb/pulsevault",
   "version": "0.3.0",
-  "description": "Resumable video uploads via TUS for Fastify (plugin) or any Node backend (framework-agnostic core), with a pluggable storage adapter and a filesystem-first local-storage default.",
+  "description": "Resumable video uploads via TUS for any Node backend — framework-agnostic core with a filesystem-first local adapter, an S3/R2 adapter with presigned playback, and a first-party Fastify plugin adapter.",
   "type": "module",
-  "main": "./dist/app.js",
-  "types": "./dist/app.d.ts",
+  "main": "./dist/core.js",
+  "types": "./dist/core.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/app.d.ts",
-      "import": "./dist/app.js",
-      "default": "./dist/app.js"
+      "types": "./dist/core.d.ts",
+      "import": "./dist/core.js",
+      "default": "./dist/core.js"
+    },
+    "./fastify": {
+      "types": "./dist/fastify.d.ts",
+      "import": "./dist/fastify.js",
+      "default": "./dist/fastify.js"
     },
     "./augment": {
       "types": "./dist/augment.d.ts",
@@ -26,6 +31,8 @@
     "dist",
     "core.js",
     "core.d.ts",
+    "fastify.js",
+    "fastify.d.ts",
     "augment.js",
     "augment.d.ts",
     "README.md",

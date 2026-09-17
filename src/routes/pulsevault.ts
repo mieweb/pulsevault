@@ -5,8 +5,11 @@ import type {
   FastifyRequest,
   FastifySchema,
 } from 'fastify';
-import type { PulseVaultCacheOptions } from '../app.js';
-import { createPulseVaultCore, PROTOCOL_VERSION } from '../core.js';
+import {
+  createPulseVaultCore,
+  PROTOCOL_VERSION,
+  type PulseVaultCoreCacheOptions,
+} from '../core.js';
 import type {
   PulseVaultOnUploadComplete,
   PulseVaultOnArtifactEvent,
@@ -37,7 +40,7 @@ export type PulseVaultRoutesOptions = {
   allowedExtensions: PulseVaultAllowedExtensions;
   /** Advertised via `GET /capabilities` so the client knows which upload strategy this server expects. */
   uploadUnit: 'segment' | 'merged';
-  cache?: PulseVaultCacheOptions;
+  cache?: PulseVaultCoreCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;
   onUploadComplete?: PulseVaultOnUploadComplete;

@@ -8,7 +8,7 @@
 import path from "node:path";
 import os from "node:os";
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
@@ -34,7 +34,7 @@ import pulseVault, {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
@@ -180,52 +180,34 @@ const artifactIndex = {
     })),
 };
 
-/** Reads one finished artifact's metadata from its filesystem sidecars, or null. */
+/** Reads one finished artifact's metadata via the storage adapter, or null. */
 async function readArtifactFromDisk(artifactId) {
-  let sidecar;
-  try {
-    sidecar = JSON.parse(await readFile(path.join(dataDir, ".pulsevault", `${artifactId}.json`), "utf8"));
-  } catch {
-    return null;
-  }
-  if (sidecar.status !== "ready") return null;
+  const meta = await pulseStorage.getMetadata(artifactId);
+  if (!meta || !meta.ready) return null;
 
-  const kind = sidecar.kind ?? "video";
-  const ext = sidecar.ext ?? ".mp4";
-  const artifactPath = path.join(dataDir, kind, `${artifactId}${ext}`);
-  const [artifactStat, tusMeta] = await Promise.all([
-    stat(artifactPath).catch(() => null),
-    readFile(`${artifactPath}.json`, "utf8").then(JSON.parse).catch(() => null),
-  ]);
+  const artifactStat = await stat(
+    path.join(dataDir, meta.kind, `${artifactId}${meta.ext}`),
+  ).catch(() => null);
   if (!artifactStat || artifactStat.size === 0) return null;
 
   return {
     artifactId,
-    kind,
-    filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? `${artifactId}${ext}`,
-    ext,
+    kind: meta.kind,
+    filename: meta.filename,
+    ext: meta.ext,
     size: artifactStat.size,
-    relatedTo: sidecar.relatedTo ?? null,
-    checksumVerified: Boolean(sidecar.checksum),
-    creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
+    relatedTo: meta.relatedTo ?? null,
+    checksumVerified: Boolean(meta.checksum),
+    creation_date: meta.reservedAt
+      ? new Date(meta.reservedAt).toISOString()
+      : artifactStat.birthtime.toISOString(),
   };
 }
 
-/** Boot-time reconcile: index sidecars the table doesn't know, drop rows whose files are gone. */
+/** Boot-time reconcile: index artifacts the table doesn't know, drop rows whose files are gone. */
 async function reconcileArtifactIndex() {
-  const metaDir = path.join(dataDir, ".pulsevault");
-  let entries = [];
-  try {
-    entries = await readdir(metaDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code !== "ENOENT") throw err;
-  }
   const onDisk = (
-    await Promise.all(
-      entries
-        .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-        .map((e) => readArtifactFromDisk(e.name.slice(0, -".json".length))),
-    )
+    await Promise.all((await pulseStorage.listArtifactIds()).map(readArtifactFromDisk))
   ).filter(Boolean);
 
   for (const row of onDisk) await artifactIndex.upsert(row);

@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
 
-import pulseVault, { createLocalStorage } from "../dist/app.js";
+import pulseVault, { createLocalStorage } from "../dist/fastify.js";
 
 const PREFIX = "/pulsevault";
 const ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";

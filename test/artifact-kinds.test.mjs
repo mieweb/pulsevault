@@ -12,7 +12,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import Fastify from "fastify";
-import pulseVault, { createLocalStorage } from "../dist/app.js";
+import pulseVault, { createLocalStorage } from "../dist/fastify.js";
 import { makeMp4 } from "./helpers.mjs";
 
 const ID1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";

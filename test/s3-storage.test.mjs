@@ -11,7 +11,7 @@ import pulseVault, {
   createS3Storage,
   createS3Mp4Sniffer,
   createS3ChecksumValidator,
-} from "../dist/app.js";
+} from "../dist/fastify.js";
 import { makeMp4, tusCreate, tusPatch, tusHead, uploadFull } from "./helpers.mjs";
 import { startMockS3 } from "./mock-s3.mjs";
 

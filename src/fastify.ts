@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
+import type { PulseVaultCoreCacheOptions } from './core.js';
 import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultStorage } from './storage/types.js';
@@ -17,25 +18,13 @@ import {
 } from './lib/options.js';
 
 /**
- * Subset of `@fastify/send`'s cache-related options forwarded to the GET
- * route. All upload filenames are content-addressable (keyed by the upload
- * UUID), so `immutable: true` is safe whenever you also set a non-zero
- * `maxAge`.
+ * Cache-control options forwarded to `@fastify/send` for the GET route — the
+ * same shape the framework-agnostic core takes; aliased here so plugin
+ * consumers keep the established name. All upload filenames are
+ * content-addressable (keyed by the upload UUID), so `immutable: true` is safe
+ * whenever you also set a non-zero `maxAge`.
  */
-export type PulseVaultCacheOptions = {
-  /** Enable the `Cache-Control` response header. Defaults to `true`. */
-  cacheControl?: boolean;
-  /**
-   * `max-age` for the `Cache-Control` header. Accepts a number of
-   * milliseconds or an `ms`-style string such as `"1y"`. Defaults to `0`.
-   */
-  maxAge?: string | number;
-  /**
-   * Add the `immutable` directive to `Cache-Control`. Requires `maxAge > 0`
-   * to take effect. Defaults to `false`.
-   */
-  immutable?: boolean;
-};
+export type PulseVaultCacheOptions = PulseVaultCoreCacheOptions;
 
 export type PulseVaultPluginOptions = {
   /** Storage adapter. Use `createLocalStorage(...)` for filesystem-backed deployments. */

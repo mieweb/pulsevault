@@ -1,6 +1,6 @@
 # @mieweb/pulsevault
 
-Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. Ships as a Fastify plugin (`@mieweb/pulsevault`) and as a framework-agnostic core (`@mieweb/pulsevault/core`) for Express, Meteor, or plain `http.createServer` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
+Resumable video uploads via the [TUS protocol](https://tus.io/), with filesystem-first local storage and deep link helpers for the [Pulse](https://github.com/mieweb/pulse) mobile app. The main entry point (`@mieweb/pulsevault`) is a **framework-agnostic core** — a connect-style handler for Express, Meteor, Hono-on-Node, or plain `http.createServer` — with a first-party **Fastify plugin adapter** at `@mieweb/pulsevault/fastify`. See [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 See also: [`PROTOCOL.md`](PROTOCOL.md) (the wire contract, independent of this implementation — read this if you're building a Pulse-compatible server *without* this package) and [`OPERATIONS.md`](OPERATIONS.md) (scaling, secrets, retention, monitoring).
 
@@ -28,9 +28,9 @@ The local storage adapter writes to a stable on-disk layout (see [Local storage]
 ## Requirements
 
 - Node.js `>=22`
-- Fastify `^5.x` — only if you use the default `@mieweb/pulsevault` (Fastify
-  plugin) entry point. The framework-agnostic `@mieweb/pulsevault/core` entry
-  point (Express, Meteor, or plain `http.createServer`) has no Fastify
+- Fastify `^5.x` — only if you use the `@mieweb/pulsevault/fastify` plugin
+  adapter. The main `@mieweb/pulsevault` entry point (the framework-agnostic
+  core — Express, Meteor, or plain `http.createServer`) has no Fastify
   dependency at all — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http).
 
 ## Installation
@@ -44,7 +44,7 @@ npm install @mieweb/pulsevault
 ```ts
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage } from "@mieweb/pulsevault/fastify";
 
 const app = Fastify();
 
@@ -70,11 +70,12 @@ for a secure-by-default option, and `OPERATIONS.md` for the full production chec
 
 Everything above the Fastify-specific route/hook wiring — the authorize/
 validatePayload/onUploadComplete orchestration, the TUS glue, the
-capabilities payload, artifact GET/DELETE — lives in a framework-agnostic
-core that the Fastify plugin itself is a thin adapter over. That core is
-published as a separate entry point, `@mieweb/pulsevault/core`, with no
-Fastify dependency, so a non-Fastify backend gets full protocol parity for
-about the same amount of code as the Fastify quick-start above.
+capabilities payload, artifact GET/DELETE — lives in the framework-agnostic
+core that the Fastify plugin itself is a thin adapter over. The core IS the
+main `@mieweb/pulsevault` entry point (the legacy `@mieweb/pulsevault/core`
+subpath resolves to the same module), with no Fastify dependency, so a
+non-Fastify backend gets full protocol parity for about the same amount of
+code as the Fastify quick-start above.
 
 `createPulseVaultCore(...)` returns a connect-style `handler(req, res, next?)`
 you can mount directly:
@@ -83,7 +84,7 @@ you can mount directly:
 // Express
 import express from "express";
 import { randomUUID } from "node:crypto";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const app = express();
 const pulseVault = createPulseVaultCore({
@@ -107,7 +108,7 @@ app.listen(3030);
 ```ts
 // Meteor (server-only module)
 import { WebApp } from "meteor/webapp";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
@@ -141,7 +142,7 @@ leave `stripBasePath` at its default (`true`):
 
 ```ts
 import http from "node:http";
-import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault/core";
+import { createPulseVaultCore, createLocalStorage } from "@mieweb/pulsevault";
 
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
@@ -394,7 +395,7 @@ import pulseVault, {
   createLocalStorage,
   createMp4Sniffer,
   createChecksumValidator,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
 
@@ -495,7 +496,7 @@ import pulseVault, {
   createCapabilityAuthorize,
   issueCapabilityToken,
   buildUploadLink,
-} from "@mieweb/pulsevault";
+} from "@mieweb/pulsevault/fastify";
 import { randomUUID } from "node:crypto";
 
 const keys = { "2026-06": process.env.PULSEVAULT_KEY_2026_06! }; // add the previous key during rotation
@@ -586,7 +587,7 @@ The filesystem layout is the integration surface. Use the `onUploadComplete` hoo
 ```ts
 import path from "node:path";
 import { ArtiPod, ArtiMount } from "@mieweb/artipod";
-import pulseVault, { createLocalStorage } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage } from "@mieweb/pulsevault/fastify";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
 
@@ -626,7 +627,7 @@ npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @tus/s3-store
 **Cloudflare R2:**
 
 ```ts
-import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault";
+import pulseVault, { createS3Storage, createS3Mp4Sniffer } from "@mieweb/pulsevault/fastify";
 
 const storage = await createS3Storage({
   bucket: "pulse-videos",

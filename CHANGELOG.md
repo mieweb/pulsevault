@@ -7,6 +7,21 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the package entry points are flipped to match what the library
+  actually is.** `@mieweb/pulsevault` (the `.` export / `main`) is now the
+  **framework-agnostic core** — `createPulseVaultCore`, the storage adapters,
+  and every helper; it has no Fastify dependency. The Fastify plugin moved to
+  **`@mieweb/pulsevault/fastify`** (same default export, options, and
+  behavior). Migration is a one-line import change:
+  `import pulseVault from "@mieweb/pulsevault"` →
+  `import pulseVault from "@mieweb/pulsevault/fastify"`.
+  The legacy `@mieweb/pulsevault/core` subpath is kept indefinitely as an
+  alias of `.` so existing core consumers (including Meteor's
+  exports-map-unaware bundler, via the root `core.js` stub) are unaffected.
+  `@mieweb/pulsevault/augment` is unchanged.
+
 ### Fixed
 
 - **TUS termination (`DELETE /upload/<id>`) now sweeps the adapter's own
@@ -44,6 +59,24 @@ breaking changes, called out explicitly below.
   of protocol version 1, together with the client-side `409` recovery it
   enables (derive the resource URL, confirm with `HEAD`, resume) and the
   server-side debris-reclaim recommendation.
+- **`getMetadata(artifactId)`** on both storage adapters (and the optional
+  `PulseVaultStorage` contract) returns the whole artifact record — kind, ext,
+  filename, ready, relatedTo, checksum, name, reservedAt — in one read, and
+  **`LocalStorage.listArtifactIds()`** enumerates known artifacts. Together
+  they replace consumers hand-parsing `.pulsevault` sidecar files (all four
+  example servers now use them; the sidecar schema is no longer part of any
+  consumer's code).
+
+### Internal
+
+- Storage adapters now share one sidecar module (`storage/sidecar.ts`):
+  schema, parsing/normalization, bounded metadata cache, staleness gate, and
+  the reserve-conflict error were previously hand-mirrored between the local
+  and S3 adapters. Upload-Metadata normalization — including the
+  security-relevant artifactId alias precedence that the authorize and
+  reserve paths must agree on — is likewise single-sourced in
+  `lib/upload-metadata.ts`, and all HTTP-mapped throws share
+  `httpError(status, message)`.
 
 ## [0.3.0] - 2026-09-16
 

@@ -7,7 +7,7 @@
 
 import path from "node:path";
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
@@ -20,7 +20,7 @@ import {
   createS3Storage,
   createS3Mp4Sniffer,
   buildUploadLink,
-} from "@mieweb/pulsevault/core";
+} from "@mieweb/pulsevault";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(__dirname, "public/index.html"), "utf8");
@@ -44,57 +44,34 @@ app.post("/reserve", (_req, res) => {
   res.json({ artifactId: randomUUID() });
 });
 
-// List all uploads under dataDir. Reads each upload's sidecar to determine
-// kind and subdir rather than hard-coding "video/" — handles video/project/captions.
+// List all uploads. Uses the adapter's own listing/metadata API rather than
+// hand-parsing sidecar files — the adapter owns the sidecar schema.
 app.get("/videos", async (_req, res) => {
-  const pulsevaultMetaDir = path.join(dataDir, ".pulsevault");
-  let entries;
-  try {
-    entries = await readdir(pulsevaultMetaDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code === "ENOENT") return res.json([]);
-    throw err;
-  }
+  // The S3 adapter has no cheap listing (index uploads in a DB via
+  // onUploadComplete instead — see ../fastify-auth-demo); local-only here.
+  if (typeof pulseStorage.listArtifactIds !== "function") return res.json([]);
 
   const uploads = await Promise.all(
-    entries
-      .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-      .map(async (e) => {
-        const artifactId = e.name.slice(0, -".json".length);
-        const sidecarFilePath = path.join(pulsevaultMetaDir, e.name);
-        let sidecar;
-        try {
-          sidecar = JSON.parse(await readFile(sidecarFilePath, "utf8"));
-        } catch {
-          return null;
-        }
-        // Only list ready uploads; skip in-progress ones.
-        if (sidecar.status !== "ready") return null;
+    (await pulseStorage.listArtifactIds()).map(async (artifactId) => {
+      const meta = await pulseStorage.getMetadata(artifactId);
+      // Only list ready uploads; skip in-progress ones.
+      if (!meta || !meta.ready) return null;
+      const artifactStat = await stat(
+        path.join(dataDir, meta.kind, `${artifactId}${meta.ext}`),
+      ).catch(() => null);
+      if (!artifactStat || artifactStat.size === 0) return null;
 
-        const kind = sidecar.kind ?? "video";
-        const ext = sidecar.ext ?? ".mp4";
-        const artifactFile = `${artifactId}${ext}`;
-        const artifactPath = path.join(dataDir, kind, artifactFile);
-        const tusJsonPath = `${artifactPath}.json`;
-
-        const [artifactStat, tusMeta] = await Promise.all([
-          stat(artifactPath).catch(() => null),
-          readFile(tusJsonPath, "utf8")
-            .then(JSON.parse)
-            .catch(() => null),
-        ]);
-        if (!artifactStat || artifactStat.size === 0) return null;
-
-        return {
-          artifactId,
-          kind,
-          filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
-          ext,
-          size: artifactStat.size,
-          creation_date:
-            tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
-        };
-      }),
+      return {
+        artifactId,
+        kind: meta.kind,
+        filename: meta.filename,
+        ext: meta.ext,
+        size: artifactStat.size,
+        creation_date: meta.reservedAt
+          ? new Date(meta.reservedAt).toISOString()
+          : artifactStat.birthtime.toISOString(),
+      };
+    }),
   );
 
   res.json(

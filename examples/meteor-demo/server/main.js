@@ -13,7 +13,7 @@ import { Meteor } from "meteor/meteor";
 import { WebApp } from "meteor/webapp";
 import os from "node:os";
 import path from "node:path";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 
 import QRCode from "qrcode";
@@ -21,14 +21,13 @@ import {
   createPulseVaultCore,
   createLocalStorage,
   buildUploadLink,
-} from "@mieweb/pulsevault/core";
+} from "@mieweb/pulsevault";
 
 // Meteor bundles run from a generated build directory, not the source tree
 // (and production bundles don't even ship the source tree) — so, unlike
 // ../fastify-demo, this demo does not write uploads next to its own source.
 // Defaults to a tmpdir; set PULSEVAULT_DIR to persist uploads somewhere durable.
 const workspaceDir = process.env.PULSEVAULT_DIR || path.join(os.tmpdir(), "pulsevault-meteor-demo-data");
-const pulsevaultMetaDir = path.join(workspaceDir, ".pulsevault");
 
 // Deployment-wide default advertised via GET /pulsevault/capabilities — purely
 // advisory; the core never enforces "segment" vs "merged", it just reports
@@ -122,24 +121,21 @@ WebApp.connectHandlers.use("/subtitles", async (req, res) => {
     res.end();
     return;
   }
-  let sidecar;
+  let meta;
   try {
-    sidecar = JSON.parse(await readFile(insideWorkspace(".pulsevault", `${artifactId}.json`), "utf8"));
+    meta = await storage.getMetadata(artifactId);
   } catch {
-    res.writeHead(404);
-    res.end();
-    return;
+    meta = null;
   }
   // Only serve real, finished captions uploads — never hand a video body to text/vtt.
-  if (sidecar.kind !== "captions" || sidecar.status !== "ready") {
+  if (!meta || meta.kind !== "captions" || !meta.ready) {
     res.writeHead(404);
     res.end();
     return;
   }
-  const ext = sidecar.ext ?? ".vtt";
   let text;
   try {
-    text = await readFile(insideWorkspace("captions", `${artifactId}${ext}`), "utf8");
+    text = await readFile(insideWorkspace("captions", `${artifactId}${meta.ext}`), "utf8");
   } catch {
     res.writeHead(404);
     res.end();
@@ -149,58 +145,35 @@ WebApp.connectHandlers.use("/subtitles", async (req, res) => {
   res.end(text);
 });
 
-// List all uploads under workspaceDir. Reads each upload's sidecar to determine
-// kind and subdir rather than hard-coding "video/" — handles video/project/captions/thumbnail.
+// List all uploads. Uses the adapter's own listing/metadata API rather than
+// hand-parsing sidecar files — the adapter owns the sidecar schema.
 WebApp.connectHandlers.use("/videos", async (_req, res) => {
-  let entries;
-  try {
-    entries = await readdir(pulsevaultMetaDir, { withFileTypes: true });
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      json(res, 200, []);
-      return;
-    }
-    throw err;
-  }
-
   const uploads = await Promise.all(
-    entries
-      .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
-      .map(async (e) => {
-        const artifactId = e.name.slice(0, -".json".length);
-        let sidecar;
-        try {
-          sidecar = JSON.parse(await readFile(path.join(pulsevaultMetaDir, e.name), "utf8"));
-        } catch {
-          return null;
-        }
-        // Only list ready uploads; skip in-progress ones.
-        if (sidecar.status !== "ready") return null;
+    (await storage.listArtifactIds()).map(async (artifactId) => {
+      const meta = await storage.getMetadata(artifactId);
+      // Only list ready uploads; skip in-progress ones.
+      if (!meta || !meta.ready) return null;
+      const artifactStat = await stat(
+        path.join(workspaceDir, meta.kind, `${artifactId}${meta.ext}`),
+      ).catch(() => null);
+      if (!artifactStat || artifactStat.size === 0) return null;
 
-        const kind = sidecar.kind ?? "video";
-        const ext = sidecar.ext ?? ".mp4";
-        const artifactFile = `${artifactId}${ext}`;
-        const artifactPath = path.join(workspaceDir, kind, artifactFile);
-        const [artifactStat, tusMeta] = await Promise.all([
-          stat(artifactPath).catch(() => null),
-          readFile(`${artifactPath}.json`, "utf8").then(JSON.parse).catch(() => null),
-        ]);
-        if (!artifactStat || artifactStat.size === 0) return null;
-
-        return {
-          artifactId,
-          kind,
-          filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
-          ext,
-          size: artifactStat.size,
-          // Session anchor this artifact belongs to (a segment session's clips point at
-          // their ordering manifest; a merged video's captions/thumbnail point at the
-          // video) — lets the page group one pulse's artifacts together.
-          relatedTo: sidecar.relatedTo ?? null,
-          playbackUrl: `/pulsevault/artifacts/${artifactId}`,
-          creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
-        };
-      }),
+      return {
+        artifactId,
+        kind: meta.kind,
+        filename: meta.filename,
+        ext: meta.ext,
+        size: artifactStat.size,
+        // Session anchor this artifact belongs to (a segment session's clips point at
+        // their ordering manifest; a merged video's captions/thumbnail point at the
+        // video) — lets the page group one pulse's artifacts together.
+        relatedTo: meta.relatedTo ?? null,
+        playbackUrl: `/pulsevault/artifacts/${artifactId}`,
+        creation_date: meta.reservedAt
+          ? new Date(meta.reservedAt).toISOString()
+          : artifactStat.birthtime.toISOString(),
+      };
+    }),
   );
 
   const ready = uploads.filter(Boolean);
@@ -278,10 +251,11 @@ WebApp.connectHandlers.use("/deeplinks", async (req, res) => {
 // req.url before calling the handler (same as Express); basePath is still used
 // to build the tus Location header. This is the smallest working mount — no
 // authorize, no validatePayload, no hooks.
+const storage = createLocalStorage({ workspaceDir });
 const pulseVault = createPulseVaultCore({
   basePath: "/pulsevault",
   stripBasePath: false,
-  storage: createLocalStorage({ workspaceDir }),
+  storage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
   uploadUnit,
   // All kinds stay enabled — a merged-mode session uploads a .pulse beat

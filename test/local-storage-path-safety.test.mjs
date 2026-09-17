@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createLocalStorage } from "../dist/app.js";
+import { createLocalStorage } from "../dist/fastify.js";
 
 const VALID_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 

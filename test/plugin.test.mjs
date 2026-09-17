@@ -16,7 +16,7 @@ import pulseVault, {
   createChecksumValidator,
   issueCapabilityToken,
   createCapabilityAuthorize,
-} from "../dist/app.js";
+} from "../dist/fastify.js";
 import {
   makeMp4,
   tusCreate as tusCreateRaw,
