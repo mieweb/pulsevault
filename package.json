@@ -91,6 +91,11 @@
   "peerDependencies": {
     "fastify": "^5.12.1"
   },
+  "peerDependenciesMeta": {
+    "fastify": {
+      "optional": true
+    }
+  },
   "dependencies": {
     "@fastify/send": "^4.1.1",
     "@tus/file-store": "2.0.0",

@@ -1,10 +1,7 @@
 import { statusCodeOf } from './errors.js';
 import type { PulseVaultLogger, PulseVaultRequest } from './request.js';
 import type { PulseVaultValidatePayload } from './magic.js';
-import type {
-  PulseVaultOnArtifactEvent,
-  PulseVaultOnUploadComplete,
-} from './pulsevaultTus.js';
+import type { PulseVaultOnArtifactEvent, PulseVaultOnUploadComplete } from './pulsevaultTus.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
 export type FinalizeDeps = {
@@ -25,9 +22,7 @@ export type FinalizeInput = {
   localPath: string | null;
 };
 
-export type FinalizeResult =
-  | { ok: true }
-  | { ok: false; statusCode: number; message: string };
+export type FinalizeResult = { ok: true } | { ok: false; statusCode: number; message: string };
 
 /**
  * THE completion sequence for a fully-written upload, shared by the TUS

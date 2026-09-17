@@ -10,6 +10,7 @@
   "dependencies": {
     "@mieweb/pulsevault": "file:../..",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "qrcode": "^1.5.4"
   }
 }

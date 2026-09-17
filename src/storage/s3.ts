@@ -161,9 +161,7 @@ export function deriveDatastoreOptions(
   return {
     ...(partSize !== undefined ? { partSize } : {}),
     ...(minPartSize !== undefined ? { minPartSize } : {}),
-    ...(opts.maxMultipartParts !== undefined
-      ? { maxMultipartParts: opts.maxMultipartParts }
-      : {}),
+    ...(opts.maxMultipartParts !== undefined ? { maxMultipartParts: opts.maxMultipartParts } : {}),
     ...(useTags !== undefined ? { useTags } : {}),
   };
 }
@@ -206,8 +204,8 @@ export type S3Storage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
-  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract. */
-  getMetadata(artifactId: string): Promise<ArtifactMetadata | null>;
+  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract (incl. `{ fresh }`). */
+  getMetadata(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
   /**
    * Reserve an artifact and mint a presigned PUT URL the client uploads the
    * bytes to directly — the data plane bypasses the app server entirely (the
@@ -311,6 +309,21 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   /** Object key for the artifact bytes — also the TUS file id / multipart key. */
   const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
+  /**
+   * The key the artifact's bytes actually live at. TUS uploads (and pre-suffix
+   * sidecars) use the deterministic `artifactKey`; direct uploads carry a
+   * per-reservation `objectSuffix` so a superseded reservation's still-valid
+   * presigned PUT targets a key no newer reservation — and no ready artifact —
+   * reads from (deleting a reservation cannot revoke its presigned URLs; fencing
+   * the KEY is what actually retires them). See `Sidecar.objectSuffix`.
+   */
+  const dataKey = (
+    artifactId: string,
+    meta: { kind?: UploadKind; ext: string; objectSuffix?: string },
+  ): string =>
+    meta.objectSuffix
+      ? `${meta.kind ?? 'video'}/${artifactId}.${meta.objectSuffix}${meta.ext}`
+      : artifactKey(artifactId, meta.kind ?? 'video', meta.ext);
 
   /**
    * Whether `@tus/s3-store` still has live upload state (the `<key>.info`
@@ -355,7 +368,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     if (!existing) return false;
     if (existing.status === 'ready') return true;
     if (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) return true;
-    return !sidecarIsStale(existing, reclaimGraceMs);
+    return !sidecarIsStale(existing, reclaimGraceMs, presignTtl * 1000);
   };
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
@@ -384,19 +397,58 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return parseSidecar(raw);
   };
 
-  const loadMeta = async (artifactId: string) => {
-    const cached = metaCache.get(artifactId);
-    if (cached) return cached;
+  /**
+   * `readSidecar` + the object's ETag — the reclaim path claims debris atomically
+   * via `IfMatch`. `meta` is null for an unparseable-but-present sidecar (the
+   * claim still works; there's just no kind/ext to clean a stale object with).
+   */
+  const readSidecarWithEtag = async (
+    artifactId: string,
+  ): Promise<{ meta: Sidecar | null; etag: string } | null> => {
+    try {
+      const res = await client.send(
+        new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
+      );
+      const raw = (await bodyToBuffer(res.Body)).toString('utf8');
+      if (!res.ETag) return null;
+      return { meta: parseSidecar(raw), etag: res.ETag };
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
+  };
+
+  const loadMeta = async (artifactId: string, opts?: { fresh?: boolean }) => {
+    if (!opts?.fresh) {
+      const cached = metaCache.get(artifactId);
+      if (cached) return cached;
+    }
+    // Capture the deletion epoch BEFORE the bucket read: if a `remove` lands
+    // while this read is in flight, the epoch moves and the stale fill below
+    // is discarded instead of resurrecting a deleted artifact's metadata.
+    const asOf = metaCache.epoch();
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
     const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    metaCache.set(artifactId, meta);
+    metaCache.set(artifactId, meta, asOf);
     return meta;
+  };
+
+  /** Delete the (possibly present) data object at a reservation's key — reclaim hygiene. */
+  const deleteArtifactObject = async (artifactId: string, stale: Sidecar): Promise<void> => {
+    try {
+      await client.send(
+        new DeleteObjectCommand({ Bucket: bucket, Key: dataKey(artifactId, stale) }),
+      );
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
   };
 
   const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
     const { artifactId, kind, ext } = params;
     const sidecar = buildSidecar(params);
+    const asOf = metaCache.epoch();
 
     const conflict = (): never => {
       throw reserveConflictError(artifactId);
@@ -413,22 +465,73 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     // (PreconditionFailed) if a sidecar object already exists for this artifactId. Because
     // debris sidecars legitimately exist (and were cleared for reclaim above), a
     // PreconditionFailed re-runs the reclaim check: still-not-conflicting means the
-    // existing object is debris — overwrite it plainly; conflicting means a concurrent
-    // reserve won the race — 409, same as before.
-    try {
-      await client.send(
+    // existing object is debris — claim it atomically below; conflicting means a
+    // concurrent reserve won the race — 409, same as before.
+    const putSidecarConditional = (cond: { IfNoneMatch?: string; IfMatch?: string }) =>
+      client.send(
         new PutObjectCommand({
           Bucket: bucket,
           Key: sidecarKey(artifactId),
           Body: JSON.stringify(sidecar),
           ContentType: 'application/json',
-          IfNoneMatch: '*',
+          ...cond,
         }),
       );
+    try {
+      await putSidecarConditional({ IfNoneMatch: '*' });
     } catch (err) {
       if (isPreconditionFailed(err)) {
-        if (await conflictingUpload(artifactId)) conflict();
-        await writeSidecar(artifactId, sidecar);
+        // ONE read supplies both the liveness verdict and the claim etag. A
+        // separate check-then-read pair (the previous shape) reopened the
+        // TOCTOU the conditional claim exists to close: a rival reclaimer's
+        // FRESH sidecar written between the two reads would pass the stale
+        // check on the first read yet hand its own etag to the second — and
+        // be claimed right back, electing two winners. Evaluating staleness
+        // on the same object version the `IfMatch` pins makes the claim
+        // decide against exactly the state that was judged reclaimable.
+        const stale = await readSidecarWithEtag(artifactId);
+        if (!stale) {
+          // Vanished between the failed create and this read (rival reclaim in
+          // flight): retry the conditional create — a rival's fresh sidecar
+          // fails it, one winner.
+          try {
+            await putSidecarConditional({ IfNoneMatch: '*' });
+          } catch (retryErr) {
+            if (isPreconditionFailed(retryErr)) conflict();
+            throw retryErr;
+          }
+        } else {
+          const live =
+            stale.meta &&
+            (stale.meta.status === 'ready' ||
+              (await datastoreInfoExists(
+                artifactId,
+                stale.meta.kind ?? 'video',
+                stale.meta.ext,
+              )) ||
+              !sidecarIsStale(stale.meta, reclaimGraceMs, presignTtl * 1000));
+          if (live) conflict();
+          try {
+            await putSidecarConditional({ IfMatch: stale.etag });
+          } catch (claimErr) {
+            // Rival won the claim (etag changed) or deleted the sidecar under us.
+            if (isPreconditionFailed(claimErr) || isNotFound(claimErr)) conflict();
+            if (!isConditionalWriteUnsupported(claimErr)) throw claimErr;
+            // Backend supports `If-None-Match` but not `If-Match`: same degraded
+            // check-then-write fallback as below, warned once per process.
+            warnAboutConditionalWriteFallbackOnce();
+            await writeSidecar(artifactId, sidecar);
+          }
+          // Only the claim winner reaches here. A direct-upload reservation has
+          // no `.info` but MAY have already PUT its object at its reservation's
+          // key — delete it (at the STALE sidecar's key, which can differ from
+          // this reservation's) so a later `complete` can never mark the
+          // previous attempt's bytes ready under the new reservation. Skipped
+          // when the stale sidecar was unparseable (no key to locate it with).
+          if (stale.meta) {
+            await deleteArtifactObject(artifactId, stale.meta);
+          }
+        }
       } else if (isConditionalWriteUnsupported(err)) {
         // Some S3-compatible backends don't support conditional writes — fall back to the
         // check-then-write already performed above. Weaker (the original TOCTOU window
@@ -443,9 +546,10 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       }
     }
 
-    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false));
+    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false), asOf);
     // @tus/s3-store uses this as the object key for the multipart upload, so
-    // the finished object lands at `<kind>/<artifactId><ext>`.
+    // the finished object lands at `<kind>/<artifactId><ext>`. (Direct uploads
+    // ignore this return and PUT to their suffixed key — see `dataKey`.)
     return artifactKey(artifactId, kind, ext);
   };
 
@@ -454,7 +558,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     // Only serve ready uploads — an object that exists but is mid-upload or
     // failed validation stays hidden.
     if (!meta || !meta.ready) return null;
-    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    const key = dataKey(artifactId, meta);
     const url = await getSignedUrl(
       client,
       new GetObjectCommand({
@@ -470,6 +574,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   };
 
   const markReady = async (artifactId: string): Promise<void> => {
+    const asOf = metaCache.epoch();
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) {
       throw new Error(
@@ -479,36 +584,50 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     const next = sidecarToCachedMeta(sidecar, true);
     if (sidecar.status === 'ready') {
       // Idempotent: already ready, just keep the cache consistent.
-      metaCache.set(artifactId, next);
+      metaCache.set(artifactId, next, asOf);
       return;
     }
     await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    metaCache.set(artifactId, next);
+    metaCache.set(artifactId, next, asOf);
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
-    const meta = await loadMeta(artifactId);
+    // Disk truth, not the cache — another instance's reclaim may have moved the
+    // bytes to a different reservation key since this instance last looked.
+    const meta = await loadMeta(artifactId, { fresh: true });
     // Evict before deleting so a racing `resolve` can't hand back a stale key.
     metaCache.delete(artifactId);
     if (!meta) return false;
-    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    const key = dataKey(artifactId, meta);
     // Abort any still-in-progress multipart upload (no-op / best-effort once
     // the upload has completed) so we never orphan an open multipart session.
+    // TUS is the only multipart writer and always writes the base key.
     await Promise.allSettled([
-      (datastore as { remove?: (id: string) => Promise<void> }).remove?.(key),
+      (datastore as { remove?: (id: string) => Promise<void> }).remove?.(
+        artifactKey(artifactId, meta.kind, meta.ext),
+      ),
     ]);
-    // Delete the finalized object, the @tus/s3-store `.info` sidecar, and our
-    // metadata sidecar. DeleteObject is idempotent, so this is safe whether or
-    // not the multipart abort above already removed some of them.
+    // Delete the artifact bytes and the @tus/s3-store `.info` sidecar FIRST,
+    // and only then our metadata sidecar: the sidecar is the reservation lock
+    // (while it exists, `reserveUpload` conflicts or claims it atomically), so
+    // deleting it last guarantees no new reservation can re-create the same
+    // deterministic keys while these deletes are still in flight. TUS never
+    // suffixes, so the `.info` lives at the base key. DeleteObject is
+    // idempotent — safe whether or not the multipart abort removed some.
     await Promise.all([
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
-      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
-      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
+      client.send(
+        new DeleteObjectCommand({
+          Bucket: bucket,
+          Key: `${artifactKey(artifactId, meta.kind, meta.ext)}.info`,
+        }),
+      ),
     ]);
-    // Evict again AFTER the deletes: these are HTTP round-trips, so a read racing
-    // between the pre-delete eviction and the DeleteObjects completing re-populates
-    // the cache from the still-present sidecar object — and that resurrected entry
-    // would outlive the deletion forever without this second eviction.
+    await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }));
+    // Evict again AFTER the deletes — and bump the deletion epoch — so neither a
+    // read racing the HTTP round-trips above nor an in-flight `loadMeta` fill
+    // can resurrect the deleted artifact's metadata (fills capture the epoch
+    // before reading and are discarded on mismatch).
     metaCache.delete(artifactId);
     return true;
   };
@@ -516,7 +635,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   const readHeader = async (artifactId: string, n: number): Promise<Buffer | null> => {
     const meta = await loadMeta(artifactId);
     if (!meta) return null;
-    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    const key = dataKey(artifactId, meta);
     try {
       const res = await client.send(
         new GetObjectCommand({
@@ -535,7 +654,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   const readAll = async (artifactId: string): Promise<Buffer | null> => {
     const meta = await loadMeta(artifactId);
     if (!meta) return null;
-    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    const key = dataKey(artifactId, meta);
     try {
       const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
       return await bodyToBuffer(res.Body);
@@ -551,7 +670,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   ): Promise<string | null> => {
     const meta = await loadMeta(artifactId);
     if (!meta) return null;
-    const key = artifactKey(artifactId, meta.kind, meta.ext);
+    const key = dataKey(artifactId, meta);
     try {
       const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
       return await digestBody(res.Body, algorithm);
@@ -581,8 +700,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta?.name ?? null;
   };
 
-  const getMetadata = async (artifactId: string): Promise<ArtifactMetadata | null> => {
-    const meta = await loadMeta(artifactId);
+  const getMetadata = async (
+    artifactId: string,
+    opts?: { fresh?: boolean },
+  ): Promise<ArtifactMetadata | null> => {
+    const meta = await loadMeta(artifactId, opts);
     if (!meta) return null;
     return {
       artifactId,
@@ -620,14 +742,24 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     size: number,
     ttlSeconds = presignTtl,
   ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }> => {
-    const meta = await loadMeta(artifactId);
+    // Disk truth: a re-grant must sign for the CURRENT reservation's key — a
+    // stale cached entry could re-arm a superseded reservation's key instead.
+    const meta = await loadMeta(artifactId, { fresh: true });
     if (!meta) throw new Error(`presignPut: unknown artifactId ${artifactId}`);
+    // Re-validate at mint time, not just in the caller's earlier check: the
+    // reservation can complete (another instance's `complete`) or change shape
+    // (reclaim + re-reserve) between that read and this one, and a PUT grant
+    // against a ready object or a different declared size must lose the race
+    // as a 409, never be armed.
+    if (meta.ready || (meta.expectedSize !== undefined && meta.expectedSize !== size)) {
+      throw reserveConflictError(artifactId);
+    }
     const contentType = extToContentType(meta.ext);
     const uploadUrl = await getSignedUrl(
       client,
       new PutObjectCommand({
         Bucket: bucket,
-        Key: artifactKey(artifactId, meta.kind, meta.ext),
+        Key: dataKey(artifactId, meta),
         ContentType: contentType,
         ContentLength: size,
       }),
@@ -641,13 +773,13 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   };
 
   const headObjectSize = async (artifactId: string): Promise<number | null> => {
-    const meta = await loadMeta(artifactId);
+    const meta = await loadMeta(artifactId, { fresh: true });
     if (!meta) return null;
     try {
       const res = await client.send(
         new HeadObjectCommand({
           Bucket: bucket,
-          Key: artifactKey(artifactId, meta.kind, meta.ext),
+          Key: dataKey(artifactId, meta),
         }),
       );
       return typeof res.ContentLength === 'number' ? res.ContentLength : null;

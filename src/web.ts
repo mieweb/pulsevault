@@ -1,9 +1,7 @@
 import parseRange from 'range-parser';
-import {
-  createPulsevaultTusServer,
-  pulseVaultTusContext,
-  type PulseVaultOnUploadComplete,
-  type PulseVaultOnArtifactEvent,
+import type {
+  PulseVaultOnUploadComplete,
+  PulseVaultOnArtifactEvent,
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
@@ -50,9 +48,16 @@ import {
  * ```
  *
  * Caveats vs the Node core:
+ * - The TUS surface (`/upload`) requires a Node-compatible runtime: the tus
+ *   stack (`@tus/server` + the datastores) needs `node:async_hooks`,
+ *   `node:path`, and — for local storage — `node:fs`. It is loaded lazily on
+ *   the first TUS request, so on a runtime without those modules this handler
+ *   still serves capabilities, direct uploads, and artifact playback (with the
+ *   S3/R2 adapter, whose playback is a presigned redirect); TUS requests fail
+ *   with a 500 there. For a pure V8 isolate (Cloudflare Workers), use the
+ *   direct-upload control-plane pattern in `examples/workers-demo` instead.
  * - Local-filesystem serving needs `node:fs` (Node/Bun/Deno; on
- *   filesystem-less edge runtimes use the S3/R2 adapter, whose playback is a
- *   presigned redirect and never touches a local file).
+ *   filesystem-less edge runtimes use the S3/R2 adapter).
  * - Uses its own minimal Range implementation (via the maintained
  *   `range-parser`) rather than `@fastify/send` — single ranges only, which
  *   is what real video players send.
@@ -85,6 +90,36 @@ export type PulseVaultWebHandler = {
   /** One-time teardown — calls `storage.shutdown?.()`. */
   shutdown: () => Promise<void>;
 };
+
+/** Cap for small JSON request bodies — mirrors the Node core's `readJsonBody` limit. */
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+class BodyTooLarge extends Error {}
+
+/** Buffer a request body, aborting with `BodyTooLarge` once it exceeds `limit` bytes. */
+async function readBodyCapped(request: Request, limit: number): Promise<ArrayBuffer> {
+  if (!request.body) return new ArrayBuffer(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => {});
+      throw new BodyTooLarge();
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
+}
 
 /** Project a web `Request`'s headers into the `{ headers }` record shape every hook takes. */
 function toPulseVaultRequest(request: Request): PulseVaultRequest {
@@ -136,16 +171,30 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
   const onUploadComplete = options.onUploadComplete;
   const logger = options.logger ?? consoleLogger;
 
-  const tusServer = createPulsevaultTusServer({
-    storage,
-    tusPath: `${basePath}/upload`,
-    maxSize: maxUploadSize,
-    allowedExtensions,
-    validatePayload,
-    onUploadComplete,
-    onArtifactEvent,
-    logger,
-  });
+  // The tus stack is the one piece of this module with hard Node-API
+  // dependencies (`@tus/server` → node:async_hooks/node:path). Loading it
+  // lazily — once, on the first TUS request — keeps this entry importable on
+  // runtimes without Node compatibility, where the capabilities, direct-upload,
+  // and artifact routes (S3/R2 redirects) are fully serviceable on their own.
+  type TusModule = typeof import('./lib/pulsevaultTus.js');
+  let tusRuntime: Promise<{
+    tusServer: ReturnType<TusModule['createPulsevaultTusServer']>;
+    tusContext: TusModule['pulseVaultTusContext'];
+  }> | null = null;
+  const loadTusRuntime = () =>
+    (tusRuntime ??= import('./lib/pulsevaultTus.js').then((m) => ({
+      tusServer: m.createPulsevaultTusServer({
+        storage,
+        tusPath: `${basePath}/upload`,
+        maxSize: maxUploadSize,
+        allowedExtensions,
+        validatePayload,
+        onUploadComplete,
+        onArtifactEvent,
+        logger,
+      }),
+      tusContext: m.pulseVaultTusContext,
+    })));
 
   const directDeps: DirectUploadDeps = {
     storage,
@@ -183,8 +232,13 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     if (!artifactId && phase === 'patch') {
       // PROTOCOL.md §5.2: an unresolvable artifactId on an in-flight request
       // is an authorization failure, not a pass.
-      logger.info({ url: pathname, phase }, 'pulsevault authorize rejected: unresolvable artifactId');
-      return { response: json(403, pulseVaultError('Unable to resolve artifact for authorization')) };
+      logger.info(
+        { url: pathname, phase },
+        'pulsevault authorize rejected: unresolvable artifactId',
+      );
+      return {
+        response: json(403, pulseVaultError('Unable to resolve artifact for authorization')),
+      };
     }
     if (!artifactId) return { response: null, artifactId };
 
@@ -204,9 +258,10 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
 
   const handleTus = async (request: Request, pathname: string): Promise<Response> => {
     try {
+      const { tusServer, tusContext } = await loadTusRuntime();
       const authz = await runTusAuthorize(request, pathname);
       if (authz.response) return authz.response;
-      const response = await pulseVaultTusContext.run(
+      const response = await tusContext.run(
         { request: toPulseVaultRequest(request), artifactId: authz.artifactId },
         () => tusServer.handleWeb(request),
       );
@@ -270,6 +325,8 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
 
     const baseHeaders: Record<string, string> = {
       'content-type': contentType,
+      // Serving user-uploaded bytes — never let a browser second-guess the vetted type.
+      'x-content-type-options': 'nosniff',
       'accept-ranges': 'bytes',
       'Protocol-Version': String(PROTOCOL_VERSION),
     };
@@ -287,8 +344,12 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
           headers: { ...baseHeaders, 'content-range': `bytes */${size}` },
         });
       }
-      // -2 (malformed) or a non-bytes unit: ignore the header, serve 200.
-      if (parsed !== -2 && parsed.type === 'bytes' && parsed.length > 0) {
+      // -2 (malformed) or a non-bytes unit: ignore the header, serve 200. A
+      // disjoint multi-range request (`combine: true` already merged adjacent/
+      // overlapping ones) also gets the full 200 — this handler serves single
+      // ranges only, and answering 206 with just the first range would silently
+      // drop the rest.
+      if (parsed !== -2 && parsed.type === 'bytes' && parsed.length === 1) {
         const first = parsed[0]!;
         start = first.start;
         end = first.end;
@@ -299,6 +360,13 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     baseHeaders['content-length'] = String(end - start + 1);
 
     if (request.method === 'HEAD') {
+      return new Response(null, { status, headers: baseHeaders });
+    }
+
+    // Nothing to stream for a zero-byte artifact (a valid TUS upload) — and
+    // `fs.createReadStream` rejects `end: -1` outright — so return the empty
+    // body the headers above already describe.
+    if (end < start) {
       return new Response(null, { status, headers: baseHeaders });
     }
 
@@ -378,16 +446,31 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
       return handleTus(request, url.pathname);
     }
     if (pathname === '/capabilities' && request.method === 'GET') {
-      return json(
-        200,
-        buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }),
-      );
+      return json(200, buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }));
     }
     if (pathname === '/direct-uploads' && request.method === 'POST') {
       try {
+        // Same 64 KiB cap as the Node core's readJsonBody — these bodies are a
+        // few hundred bytes, and an uncapped request.json() would buffer an
+        // arbitrarily large body into memory before parsing (worst on the edge
+        // runtimes this handler exists for). Content-Length-declared bodies
+        // fail fast; chunked ones are capped while streaming.
+        const declared = Number(request.headers.get('content-length'));
+        if (Number.isFinite(declared) && declared > MAX_JSON_BODY_BYTES) {
+          return json(413, pulseVaultError('Request body too large'));
+        }
+        let raw: Uint8Array;
+        try {
+          raw = new Uint8Array(await readBodyCapped(request, MAX_JSON_BODY_BYTES));
+        } catch (err) {
+          if (err instanceof BodyTooLarge) {
+            return json(413, pulseVaultError('Request body too large'));
+          }
+          throw err;
+        }
         let body: unknown;
         try {
-          body = await request.json();
+          body = JSON.parse(new TextDecoder().decode(raw));
         } catch {
           return json(400, pulseVaultError('Request body must be JSON'));
         }
@@ -404,7 +487,9 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
         const result = await directUploadComplete(
           directDeps,
           toPulseVaultRequest(request),
-          decodeURIComponent(completeMatch[1]),
+          // No decode: valid ids are plain UUIDs, and decodeURIComponent on a
+          // malformed escape would throw into the 500 path for what is 400 input.
+          completeMatch[1],
         );
         return json(result.statusCode, result.body);
       } catch (err) {
@@ -414,7 +499,8 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
-      const artifactId = decodeURIComponent(artifactMatch[1]);
+      // No decode — same reasoning as the complete route above.
+      const artifactId = artifactMatch[1];
       if (request.method === 'GET' || request.method === 'HEAD') {
         return handleArtifactGet(request, artifactId, url.searchParams.get('token') ?? undefined);
       }

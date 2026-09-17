@@ -202,7 +202,12 @@ export type {
 export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export type {
+  WebReadyAction,
+  WebReadyOptions,
+  WebReadyResult,
+  MoovPosition,
+} from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {

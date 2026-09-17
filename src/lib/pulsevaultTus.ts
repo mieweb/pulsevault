@@ -88,14 +88,11 @@ export type PulsevaultTusOptions = {
  */
 const tusError = httpError;
 
-/** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
-export function artifactIdFromUploadId(id: string): string | undefined {
-  const [, nameWithExt] = id.split('/');
-  if (!nameWithExt) return undefined;
-  const ext = path.extname(nameWithExt);
-  const candidate = ext ? nameWithExt.slice(0, -ext.length) : nameWithExt;
-  return isUuid(candidate) ? candidate : undefined;
-}
+// Single parser for `<kind>/<artifactId><ext>` upload ids, shared with the
+// always-loaded request-interpretation module (which must stay Node-free —
+// this module is the lazily-loaded Node-only side). Re-exported for the core.
+import { artifactIdFromUploadId } from './tus-request.js';
+export { artifactIdFromUploadId };
 
 /**
  * Extract and normalize the fields `namingFunction` cares about from raw
@@ -223,14 +220,21 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
   // to @tus/server, so without this hook every cancelled upload left a permanent
   // `"uploading"` sidecar behind and its artifactId stayed 409-reserved forever (the
   // client's only escape was re-pairing for a fresh id). POST_TERMINATE fires after the
-  // 204 is already on the wire; `storage.remove` is idempotent (rm/delete with force on
-  // already-gone datastore files), so this just sweeps the sidecar and adapter caches.
+  // 204 is already on the wire, so the sweep is asynchronous — and therefore generation-
+  // gated: if the artifactId was already RE-RESERVED by the time the sweep runs (the
+  // freed id is immediately reusable by design), the fresh reservation's `reservedAt`
+  // postdates the termination and the sweep must not delete the new upload's state.
   // Cleanup failures are logged, never thrown — the client's DELETE has already succeeded.
   server.on(EVENTS.POST_TERMINATE, (_req, _res, id: string) => {
     const artifactId = artifactIdFromUploadId(id);
     if (!artifactId) return;
+    const terminatedAt = Date.now();
     void Promise.resolve()
-      .then(() => storage.remove?.(artifactId))
+      .then(async () => {
+        const meta = await storage.getMetadata?.(artifactId, { fresh: true });
+        if (meta?.reservedAt !== undefined && meta.reservedAt > terminatedAt) return;
+        await storage.remove?.(artifactId);
+      })
       .catch((err) => {
         logger.error(
           { err, artifactId },
@@ -265,8 +269,7 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
   const handlers = (server as unknown as { handlers?: Record<string, unknown> }).handlers ?? {};
   for (const method of ['PATCH', 'POST'] as const) {
     const handler = handlers[method] as
-      | { writeToStore?: (data: NodeJS.ReadableStream, ...rest: unknown[]) => unknown }
-      | undefined;
+      { writeToStore?: (data: NodeJS.ReadableStream, ...rest: unknown[]) => unknown } | undefined;
     if (!handler || typeof handler.writeToStore !== 'function') {
       logger.info(
         { method },

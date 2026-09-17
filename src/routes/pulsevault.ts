@@ -186,6 +186,13 @@ const capabilitiesSchema: OpenApiRouteSchema = {
           type: 'object',
           properties: { algorithms: { type: 'array', items: { type: 'string' } } },
         },
+        // Present only when the storage adapter supports the §9 direct-upload
+        // profile — without this declaration Fastify's response serializer
+        // strips the field and clients never see the capability.
+        directUpload: {
+          type: 'object',
+          properties: { enabled: { type: 'boolean' } },
+        },
       },
     },
   },
@@ -217,7 +224,10 @@ const directUploadCreateSchema: OpenApiRouteSchema = {
     403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
     409: { description: 'artifactId already has an upload.', ...pulseVaultErrorResponse },
     413: { description: '`size` exceeds the maximum upload size.', ...pulseVaultErrorResponse },
-    501: { description: 'Storage adapter has no direct-upload support.', ...pulseVaultErrorResponse },
+    501: {
+      description: 'Storage adapter has no direct-upload support.',
+      ...pulseVaultErrorResponse,
+    },
   },
 };
 
@@ -235,9 +245,18 @@ const directUploadCompleteSchema: OpenApiRouteSchema = {
     400: { description: 'Invalid artifactId.', ...pulseVaultErrorResponse },
     403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
     404: { description: 'Unknown artifactId.', ...pulseVaultErrorResponse },
-    409: { description: 'No uploaded object found for this artifactId.', ...pulseVaultErrorResponse },
-    422: { description: 'Stored object failed validation (size/checksum/sniff).', ...pulseVaultErrorResponse },
-    501: { description: 'Storage adapter has no direct-upload support.', ...pulseVaultErrorResponse },
+    409: {
+      description: 'No uploaded object found for this artifactId.',
+      ...pulseVaultErrorResponse,
+    },
+    422: {
+      description: 'Stored object failed validation (size/checksum/sniff).',
+      ...pulseVaultErrorResponse,
+    },
+    501: {
+      description: 'Storage adapter has no direct-upload support.',
+      ...pulseVaultErrorResponse,
+    },
   },
 };
 

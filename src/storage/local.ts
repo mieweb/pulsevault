@@ -92,8 +92,8 @@ export type LocalStorage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
-  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract. */
-  getMetadata(artifactId: string): Promise<ArtifactMetadata | null>;
+  /** Satisfies the optional `PulseVaultStorage.getMetadata` contract (incl. `{ fresh }`). */
+  getMetadata(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
   /**
    * All artifactIds with a readable sidecar, ready or not — one readdir of the
    * metadata directory. Complements `getMetadata` so a consumer can list
@@ -152,8 +152,12 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     try {
       await fs.access(path.join(workspaceRoot, `${artifactRelPath(artifactId, kind, ext)}.json`));
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      // Only a confirmed absence means "no datastore state". EACCES/EIO etc.
+      // must propagate — mapping them to `false` would let a permissions blip
+      // reclassify a LIVE upload as reclaimable debris.
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+      throw err;
     }
   };
 
@@ -162,6 +166,37 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    * `sidecarIsStale` in `./sidecar.js`; this just binds the configured grace.
    */
   const isStale = (sidecar: Sidecar): boolean => sidecarIsStale(sidecar, reclaimGraceMs);
+
+  /**
+   * Per-artifact critical sections for the mutating operations (reserve's
+   * reclaim, remove, markReady). The exclusive `wx` create keeps plain
+   * concurrent creates one-winner-atomic even across processes, but the
+   * multi-step reclaim/remove sequences (read → liveness check → delete →
+   * write) can interleave: two reclaimers could each unlink-and-recreate, the
+   * slower one erasing the winner's fresh reservation; a remove's deletes
+   * could land on files a concurrent reclaim just re-reserved. Serializing
+   * per artifactId closes every such interleave in one move. In-process is
+   * the honest scope: multiple server processes sharing one local workspace
+   * are not a supported topology (the underlying @tus/file-store has no
+   * cross-process coordination either) — use the S3 adapter, whose
+   * conditional writes arbitrate across instances, for shared storage.
+   */
+  const locks = new Map<string, Promise<void>>();
+  const withArtifactLock = async <T>(artifactId: string, fn: () => Promise<T>): Promise<T> => {
+    const prev = locks.get(artifactId) ?? Promise.resolve();
+    const run = prev.then(fn);
+    // The stored tail never rejects, so a failed operation can't poison the chain.
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    locks.set(artifactId, tail);
+    try {
+      return await run;
+    } finally {
+      if (locks.get(artifactId) === tail) locks.delete(artifactId);
+    }
+  };
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     // Atomic tmp + rename so a crash mid-write can never leave a truncated
@@ -197,13 +232,19 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return parseSidecar(raw);
   };
 
-  const loadMeta = async (artifactId: string) => {
-    const cached = metaCache.get(artifactId);
-    if (cached) return cached;
+  const loadMeta = async (artifactId: string, opts?: { fresh?: boolean }) => {
+    if (!opts?.fresh) {
+      const cached = metaCache.get(artifactId);
+      if (cached) return cached;
+    }
+    // Capture the deletion epoch BEFORE the disk read: if a `remove` lands
+    // while this read is in flight, the epoch moves and the stale fill below
+    // is discarded instead of resurrecting a deleted artifact's metadata.
+    const asOf = metaCache.epoch();
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
     const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    metaCache.set(artifactId, meta);
+    metaCache.set(artifactId, meta, asOf);
     return meta;
   };
 
@@ -217,53 +258,82 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     await fs.chmod(workspaceRoot, 0o750).catch(() => {});
   };
 
-  const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
-    const { artifactId, kind, ext } = params;
-    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
-    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
+  const reserveUpload = async (params: ReserveUploadParams): Promise<string> =>
+    withArtifactLock(params.artifactId, async () => {
+      const { artifactId, kind, ext } = params;
+      await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
+      await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
 
-    const sidecar = buildSidecar(params);
+      const sidecar = buildSidecar(params);
+      const asOf = metaCache.epoch();
 
-    // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
-    // this artifactId, rather than the previous read-then-write (`loadMeta` then
-    // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
-    // the check before either had written — letting the second silently clobber the first's
-    // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
-    // @tus/server's error path, same as before.
-    try {
-      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      // A file already exists at this path. Four cases, in order:
-      //  - unreadable/malformed sidecar (crash mid-write debris) → safe to overwrite;
-      //  - readable `"ready"` sidecar, or `"uploading"` with live datastore state →
-      //    genuine collision, 409 (an in-flight upload is resumable via HEAD+PATCH,
-      //    a finished artifact must never be silently replaced);
-      //  - readable `"uploading"` sidecar with no datastore `.json` but YOUNGER than
-      //    the reclaim grace → a concurrent create that hasn't written its datastore
-      //    state yet → still a 409 (preserves one-winner atomicity under races);
-      //  - readable `"uploading"` sidecar with no datastore `.json`, older than the
-      //    grace → crash/termination debris (see `datastoreInfoExists`) → reclaim so
-      //    the client's retried create succeeds instead of 409-poisoning the
-      //    artifactId forever.
-      const existing = await readSidecar(artifactId);
-      if (existing) {
-        const live =
-          existing.status === 'ready' ||
-          (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) ||
-          !isStale(existing);
-        if (live) {
-          throw reserveConflictError(artifactId);
+      // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
+      // this artifactId, rather than the previous read-then-write (`loadMeta` then
+      // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
+      // the check before either had written — letting the second silently clobber the first's
+      // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
+      // @tus/server's error path, same as before.
+      try {
+        await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        // A file already exists at this path. Four cases, in order:
+        //  - unreadable/malformed sidecar (crash mid-write debris) → safe to overwrite;
+        //  - readable `"ready"` sidecar, or `"uploading"` with live datastore state →
+        //    genuine collision, 409 (an in-flight upload is resumable via HEAD+PATCH,
+        //    a finished artifact must never be silently replaced);
+        //  - readable `"uploading"` sidecar with no datastore `.json` but YOUNGER than
+        //    the reclaim grace → a concurrent create that hasn't written its datastore
+        //    state yet → still a 409 (preserves one-winner atomicity under races);
+        //  - readable `"uploading"` sidecar with no datastore `.json`, older than the
+        //    grace → crash/termination debris (see `datastoreInfoExists`) → reclaim so
+        //    the client's retried create succeeds instead of 409-poisoning the
+        //    artifactId forever.
+        const existing = await readSidecar(artifactId);
+        if (existing) {
+          const live =
+            existing.status === 'ready' ||
+            (await datastoreInfoExists(artifactId, existing.kind ?? 'video', existing.ext)) ||
+            !isStale(existing);
+          if (live) {
+            throw reserveConflictError(artifactId);
+          }
+        }
+        // Reclaim (stale debris) or overwrite (unreadable/corrupt sidecar): sweep
+        // the debris, then retry the exclusive `wx` create. The sweep covers the
+        // stale reservation's BYTES and datastore `.json` too (when the sidecar
+        // was readable enough to locate them) — @tus/file-store writes at offsets,
+        // so a fresh upload over leftover longer bytes would otherwise keep the
+        // stale tail. The artifact lock serializes rival reclaimers and removes in
+        // this process, so these deletes can never erase a rival's fresh
+        // reservation; the `wx` retry still arbitrates against plain concurrent
+        // creates, which take the lock-free fast path above.
+        if (existing) {
+          const stalePath = path.join(
+            workspaceRoot,
+            artifactRelPath(artifactId, existing.kind ?? 'video', existing.ext),
+          );
+          await Promise.all([
+            fs.rm(stalePath, { force: true }),
+            fs.rm(`${stalePath}.json`, { force: true }),
+          ]);
+        }
+        await fs.rm(sidecarPath(artifactId), { force: true });
+        try {
+          await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+        } catch (retryErr) {
+          if ((retryErr as NodeJS.ErrnoException)?.code === 'EEXIST') {
+            throw reserveConflictError(artifactId);
+          }
+          throw retryErr;
         }
       }
-      await writeSidecar(artifactId, sidecar);
-    }
 
-    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false));
-    // @tus/file-store joins this onto its configured `directory`, so the
-    // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
-    return artifactRelPath(artifactId, kind, ext);
-  };
+      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false), asOf);
+      // @tus/file-store joins this onto its configured `directory`, so the
+      // actual file lands at `<workspaceRoot>/<kind>/<artifactId><ext>`.
+      return artifactRelPath(artifactId, kind, ext);
+    });
 
   const resolve = async (artifactId: string): Promise<PulseVaultResolution | null> => {
     const meta = await loadMeta(artifactId);
@@ -286,42 +356,49 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     };
   };
 
-  const markReady = async (artifactId: string): Promise<void> => {
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) {
-      // No sidecar means no `reserveUpload` happened for this artifactId —
-      // this is a contract violation by the caller, not a recoverable state.
-      throw new Error(
-        `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
-      );
-    }
-    if (sidecar.status === 'ready') {
-      // Idempotent: already ready is fine, keep the cache consistent.
-      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
-      return;
-    }
-    await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true));
-  };
+  const markReady = async (artifactId: string): Promise<void> =>
+    withArtifactLock(artifactId, async () => {
+      const asOf = metaCache.epoch();
+      const sidecar = await readSidecar(artifactId);
+      if (!sidecar) {
+        // No sidecar means no `reserveUpload` happened for this artifactId —
+        // this is a contract violation by the caller, not a recoverable state.
+        throw new Error(
+          `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
+        );
+      }
+      if (sidecar.status === 'ready') {
+        // Idempotent: already ready is fine, keep the cache consistent.
+        metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true), asOf);
+        return;
+      }
+      await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
+      metaCache.set(artifactId, sidecarToCachedMeta(sidecar, true), asOf);
+    });
 
-  const remove = async (artifactId: string): Promise<boolean> => {
-    const meta = await loadMeta(artifactId);
-    // Drop from cache before rm so a racing `resolve` arriving after the
-    // rm but before cache eviction can't hand back a stale path.
-    metaCache.delete(artifactId);
-    if (!meta) return false;
-    const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
-    await Promise.all([
-      fs.rm(artifactPath, { force: true }),
-      fs.rm(`${artifactPath}.json`, { force: true }),
-      fs.rm(sidecarPath(artifactId), { force: true }),
-    ]);
-    // Evict again AFTER the deletes: a read racing between the eviction above and the
-    // rm completing re-populates the cache from the still-on-disk sidecar, and without
-    // this second eviction that resurrected entry would outlive the deletion forever.
-    metaCache.delete(artifactId);
-    return true;
-  };
+  const remove = async (artifactId: string): Promise<boolean> =>
+    withArtifactLock(artifactId, async () => {
+      // Read disk truth under the lock — a reclaim that just re-reserved this id
+      // must not lose its files to a remove aimed at the PREVIOUS reservation
+      // (the lock serializes them; the fresh read sees the current kind/ext).
+      const meta = await loadMeta(artifactId, { fresh: true });
+      // Drop from cache before rm so a racing `resolve` arriving after the
+      // rm but before cache eviction can't hand back a stale path.
+      metaCache.delete(artifactId);
+      if (!meta) return false;
+      const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+      await Promise.all([
+        fs.rm(artifactPath, { force: true }),
+        fs.rm(`${artifactPath}.json`, { force: true }),
+        fs.rm(sidecarPath(artifactId), { force: true }),
+      ]);
+      // Evict again AFTER the deletes — and bump the deletion epoch — so neither a
+      // read that landed between the first eviction and the deletes nor an
+      // in-flight `loadMeta` fill can resurrect the deleted artifact's metadata
+      // (fills capture the epoch before reading and are discarded on mismatch).
+      metaCache.delete(artifactId);
+      return true;
+    });
 
   const getLocalPath = async (artifactId: string): Promise<string | null> => {
     const meta = await loadMeta(artifactId);
@@ -349,8 +426,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return meta?.name ?? null;
   };
 
-  const getMetadata = async (artifactId: string): Promise<ArtifactMetadata | null> => {
-    const meta = await loadMeta(artifactId);
+  const getMetadata = async (
+    artifactId: string,
+    opts?: { fresh?: boolean },
+  ): Promise<ArtifactMetadata | null> => {
+    const meta = await loadMeta(artifactId, opts);
     if (!meta) return null;
     return {
       artifactId,

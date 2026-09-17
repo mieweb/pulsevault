@@ -206,6 +206,12 @@ export interface PulseVaultStorage {
    * `null` if the artifactId is unknown. Prefer this over chaining the
    * per-field getters when rendering listings or feeds — and over parsing
    * sidecar files by hand, which couples the consumer to the sidecar schema.
+   *
+   * `opts.fresh` asks the adapter to bypass any in-memory metadata cache and
+   * read storage truth. On shared object storage another server instance may
+   * have just changed an artifact's state (e.g. marked it ready) — decisions
+   * that must not act on a stale snapshot (the direct-upload re-grant check)
+   * pass `{ fresh: true }`. Adapters without a cache may ignore it.
    */
-  getMetadata?(artifactId: string): Promise<ArtifactMetadata | null>;
+  getMetadata?(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
 }

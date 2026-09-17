@@ -120,10 +120,14 @@ export async function scanMoovPosition(filePath: string): Promise<MoovPosition> 
 async function probeVideoCodec(filePath: string, ffprobePath: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(ffprobePath, [
-      '-v', 'error',
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=codec_name',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
+      '-v',
+      'error',
+      '-select_streams',
+      'v:0',
+      '-show_entries',
+      'stream=codec_name',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
       filePath,
     ]);
     const codec = stdout.trim();
@@ -229,14 +233,25 @@ export async function ensureWebReady(
   if (codecHostile && transcode) {
     try {
       await rewriteInPlace(filePath, ffmpegPath, [
-        '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'copy',
-        '-movflags', '+faststart',
+        '-c:v',
+        'libx264',
+        '-preset',
+        preset,
+        '-crf',
+        String(crf),
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'copy',
+        '-movflags',
+        '+faststart',
       ]);
       return { action: 'transcoded', reason: `video codec ${codec} → h264 (+faststart)` };
     } catch (err) {
-      options.logger?.error({ err, filePath }, 'pulsevault web-ready: transcode failed; serving original bytes');
+      options.logger?.error(
+        { err, filePath },
+        'pulsevault web-ready: transcode failed; serving original bytes',
+      );
       return { action: 'skipped', reason: `transcode failed: ${(err as Error).message}` };
     }
   }
@@ -246,7 +261,10 @@ export async function ensureWebReady(
       await rewriteInPlace(filePath, ffmpegPath, ['-c', 'copy', '-movflags', '+faststart']);
       return { action: 'remuxed', reason: 'moov was at end of file; remuxed to faststart' };
     } catch (err) {
-      options.logger?.error({ err, filePath }, 'pulsevault web-ready: faststart remux failed; serving original bytes');
+      options.logger?.error(
+        { err, filePath },
+        'pulsevault web-ready: faststart remux failed; serving original bytes',
+      );
       return { action: 'skipped', reason: `remux failed: ${(err as Error).message}` };
     }
   }

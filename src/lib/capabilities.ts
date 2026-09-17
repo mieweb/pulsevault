@@ -1,5 +1,6 @@
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 import { UPLOAD_KINDS } from '../storage/types.js';
+import { supportsDirectUpload } from './direct-upload.js';
 import type { PulseVaultAllowedExtensions } from './options.js';
 
 /** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
@@ -31,8 +32,7 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
   checksum: { algorithms: string[] };
   directUpload?: { enabled: true };
 } {
-  const supportsDirectUpload =
-    typeof (input.storage as { createDirectUpload?: unknown }).createDirectUpload === 'function';
+  const advertiseDirectUpload = supportsDirectUpload(input.storage);
   return {
     protocolVersion: PROTOCOL_VERSION,
     minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -41,6 +41,6 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
     allowedExtensions: input.allowedExtensions,
     maxUploadSize: input.maxUploadSize,
     checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
-    ...(supportsDirectUpload ? { directUpload: { enabled: true as const } } : {}),
+    ...(advertiseDirectUpload ? { directUpload: { enabled: true as const } } : {}),
   };
 }

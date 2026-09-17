@@ -11,11 +11,7 @@ import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
 import { httpError, pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
-import {
-  type PulseVaultLogger,
-  type PulseVaultRequest,
-  consoleLogger,
-} from './lib/request.js';
+import { type PulseVaultLogger, type PulseVaultRequest, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
 import { buildCapabilitiesPayload, PROTOCOL_VERSION } from './lib/capabilities.js';
 import {
@@ -260,7 +256,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       // PROTOCOL.md §5.2: failing to resolve the artifactId for an in-flight
       // upload request is an authorization failure — reject, don't fall
       // through to "no artifactId to check, so allow".
-      logger.info({ url: req.url, phase }, 'pulsevault authorize rejected: unresolvable artifactId');
+      logger.info(
+        { url: req.url, phase },
+        'pulsevault authorize rejected: unresolvable artifactId',
+      );
       writeJson(res, 403, pulseVaultError('Unable to resolve artifact for authorization'));
       return { ok: false };
     }
@@ -333,11 +332,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     try {
-      writeJson(
-        res,
-        200,
-        buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }),
-      );
+      writeJson(res, 200, buildCapabilitiesPayload({ allowedExtensions, maxUploadSize, storage }));
     } catch (err) {
       failClosed(res, err, 'capabilities');
     }
@@ -370,6 +365,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         total += chunk.length;
         if (total > limitBytes) {
           req.removeAllListeners('data');
+          // Drain the rest so a keep-alive connection isn't left with an
+          // unread body stalling reuse (or bleeding into the next request).
+          req.resume();
           reject(httpError(413, 'Request body too large'));
           return;
         }
@@ -520,6 +518,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       }
 
       const headers = { ...result.headers };
+      // Serving user-uploaded bytes — never let a browser second-guess the vetted type.
+      headers['x-content-type-options'] = 'nosniff';
       // If the storage adapter provided an explicit content type (e.g. for
       // non-standard extensions like `.pulse`), override what @fastify/send
       // would otherwise infer from the filename.
@@ -600,7 +600,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     }
     const completeMatch = pathname.match(/^\/direct-uploads\/([^/]+)\/complete$/);
     if (completeMatch?.[1] && req.method === 'POST') {
-      await handleDirectUploadComplete(req, res, decodeURIComponent(completeMatch[1]));
+      // No decode: valid ids are plain UUIDs, and decodeURIComponent on a
+      // malformed escape would throw outside the handler's error mapping.
+      await handleDirectUploadComplete(req, res, completeMatch[1]);
       return;
     }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
@@ -660,7 +662,12 @@ export type {
 export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export type {
+  WebReadyAction,
+  WebReadyOptions,
+  WebReadyResult,
+  MoovPosition,
+} from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
@@ -684,8 +691,5 @@ export { type PulseVaultRequest, type PulseVaultLogger } from './lib/request.js'
 export { createPulseVaultWebHandler } from './web.js';
 export type { PulseVaultWebHandler, PulseVaultWebOptions } from './web.js';
 export { supportsDirectUpload } from './lib/direct-upload.js';
-export type {
-  DirectUploadCapableStorage,
-  DirectUploadResult,
-} from './lib/direct-upload.js';
+export type { DirectUploadCapableStorage, DirectUploadResult } from './lib/direct-upload.js';
 export type { ArtifactMetadata } from './storage/types.js';

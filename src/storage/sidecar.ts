@@ -56,6 +56,17 @@ export type Sidecar = {
   reservedAt?: number;
   /** Expected total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
   expectedSize?: number;
+  /**
+   * Per-reservation object-key suffix (direct uploads only). A presigned PUT
+   * outlives the reservation that minted it — deleting the reservation cannot
+   * revoke the URL — so each direct reservation writes its bytes to its own
+   * key (`<kind>/<id>.<suffix><ext>`). A superseded grant then targets a key
+   * no other reservation (and no ready artifact) reads from, instead of
+   * silently overwriting the deterministic final key. Absent on TUS uploads
+   * (the server writes those itself) and on pre-suffix sidecars — both read
+   * the base `<kind>/<id><ext>` key.
+   */
+  objectSuffix?: string;
 };
 
 /** The subset of a sidecar the adapters keep in their in-memory cache. */
@@ -69,9 +80,12 @@ export type CachedMeta = {
   name?: string;
   reservedAt?: number;
   expectedSize?: number;
+  objectSuffix?: string;
 };
 
-/** Fresh `"uploading"` sidecar for a reserve, stamped with the reservation time. */
+/** Fresh `"uploading"` sidecar for a reserve, stamped with the reservation time. A declared
+ * size marks a direct upload (see `ReserveUploadParams.size`), which also gets its
+ * per-reservation `objectSuffix` — see that field's doc for why. */
 export function buildSidecar(params: ReserveUploadParams): Sidecar {
   return {
     version: SIDECAR_VERSION,
@@ -83,8 +97,15 @@ export function buildSidecar(params: ReserveUploadParams): Sidecar {
     checksum: params.checksum,
     name: params.name,
     reservedAt: Date.now(),
-    ...(params.size !== undefined ? { expectedSize: params.size } : {}),
+    ...(params.size !== undefined
+      ? { expectedSize: params.size, objectSuffix: newObjectSuffix() }
+      : {}),
   };
+}
+
+/** Short random token for `Sidecar.objectSuffix` — uniqueness per reservation, not secrecy. */
+function newObjectSuffix(): string {
+  return `g${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
 }
 
 /**
@@ -115,6 +136,7 @@ export function parseSidecar(raw: string): Sidecar | null {
     name: typeof parsed.name === 'string' ? parsed.name : undefined,
     reservedAt: typeof parsed.reservedAt === 'number' ? parsed.reservedAt : undefined,
     expectedSize: typeof parsed.expectedSize === 'number' ? parsed.expectedSize : undefined,
+    objectSuffix: typeof parsed.objectSuffix === 'string' ? parsed.objectSuffix : undefined,
   };
 }
 
@@ -130,6 +152,7 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
     name: sidecar.name,
     reservedAt: sidecar.reservedAt,
     expectedSize: sidecar.expectedSize,
+    objectSuffix: sidecar.objectSuffix,
   };
 }
 
@@ -139,9 +162,22 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
  * its datastore state yet — those must still 409, or two simultaneous creates
  * for the same artifactId would both "win". Sidecars without a `reservedAt`
  * (written before the field existed) are old by definition.
+ *
+ * Direct reservations (`expectedSize` present) NEVER have datastore state —
+ * "no `.info`" is their normal live shape, not a crash signature — so their
+ * grace must additionally cover `directGraceMs` (the presigned-URL lifetime):
+ * reclaiming one mid-grant would yank a legitimate in-flight PUT's
+ * reservation out from under it after only `reclaimGraceMs` of quiet.
  */
-export function sidecarIsStale(sidecar: Sidecar, reclaimGraceMs: number): boolean {
-  return sidecar.reservedAt === undefined || Date.now() - sidecar.reservedAt > reclaimGraceMs;
+export function sidecarIsStale(
+  sidecar: Sidecar,
+  reclaimGraceMs: number,
+  directGraceMs = 0,
+): boolean {
+  if (sidecar.reservedAt === undefined) return true;
+  const grace =
+    sidecar.expectedSize !== undefined ? Math.max(reclaimGraceMs, directGraceMs) : reclaimGraceMs;
+  return Date.now() - sidecar.reservedAt > grace;
 }
 
 /** The reserve-collision error both adapters throw — surfaces as HTTP 409 via @tus/server. */
@@ -170,7 +206,16 @@ export function extToContentType(ext: string): string {
 
 export type MetaCache = {
   get(artifactId: string): CachedMeta | undefined;
-  set(artifactId: string, meta: CachedMeta): void;
+  /**
+   * Deletion epoch — capture it BEFORE starting an async storage read, then
+   * pass it to `set`: a fill whose read straddled any deletion is discarded
+   * instead of cached, so a slow read can never resurrect a just-deleted
+   * artifact's metadata (the point-in-time double-eviction the adapters used
+   * before could still lose to a fill that began before the delete and
+   * finished after the second eviction).
+   */
+  epoch(): number;
+  set(artifactId: string, meta: CachedMeta, asOfEpoch?: number): void;
   delete(artifactId: string): void;
 };
 
@@ -179,13 +224,20 @@ export type MetaCache = {
  * (a `Map` preserves insertion order; re-setting a key moves it to the end,
  * so eviction always drops the least-recently-set entry). A cache miss falls
  * back to reading the sidecar from storage, so eviction only costs an extra
- * read, never correctness.
+ * read, never correctness — and a `set` carrying a stale `asOfEpoch` is
+ * skipped for the same reason (see `MetaCache.epoch`).
  */
 export function createMetaCache(limit: number): MetaCache {
   const cache = new Map<string, CachedMeta>();
+  // One counter for the whole cache, not per key: deletions are rare, a
+  // skipped fill only costs one extra read, and this keeps the guard O(1)
+  // in memory with no per-key bookkeeping to leak.
+  let deletionEpoch = 0;
   return {
     get: (artifactId) => cache.get(artifactId),
-    set: (artifactId, meta) => {
+    epoch: () => deletionEpoch,
+    set: (artifactId, meta, asOfEpoch) => {
+      if (asOfEpoch !== undefined && asOfEpoch !== deletionEpoch) return;
       cache.delete(artifactId);
       cache.set(artifactId, meta);
       if (cache.size > limit) {
@@ -194,6 +246,7 @@ export function createMetaCache(limit: number): MetaCache {
       }
     },
     delete: (artifactId) => {
+      deletionEpoch += 1;
       cache.delete(artifactId);
     },
   };

@@ -794,11 +794,21 @@ edges live in bucket configuration, not code:
   them after 7 days by default); on AWS, `@tus/s3-store`'s `Tus-Completed`
   tag (`useTags`, default on) can additionally drive tag-filtered expiry.
   *Direct* uploads that `PUT` but never `complete` leave a full object at the
-  final key with its sidecar stuck at `"uploading"` — the reservation itself
-  is freed by debris-reclaim (`reclaimGraceMs`) and the object is overwritten
-  on retry, but if the client never returns, only a prefix-scoped expiry rule
-  (or your own `listArtifactIds`-based sweep, see *Retention* in
-  `OPERATIONS.md`) removes the bytes.
+  reservation's key with its sidecar stuck at `"uploading"` — the reservation
+  itself is freed by debris-reclaim (`reclaimGraceMs`), but if the client
+  never returns, only a prefix-scoped expiry rule (or your own
+  `listArtifactIds`-based sweep, see *Retention* in `OPERATIONS.md`) removes
+  the bytes.
+- **Each direct reservation writes to its own object key.** A presigned URL
+  can't be revoked by deleting its reservation, so grants are fenced by KEY:
+  every direct reservation gets a random per-reservation suffix
+  (`<kind>/<id>.<suffix><ext>`), and a superseded grant firing late lands on
+  a key nothing reads from instead of overwriting a newer reservation's (or a
+  ready artifact's) bytes. Those late-PUT orphans are covered by the same
+  prefix-scoped expiry rule as never-completed uploads. Within one
+  reservation, the grant holder can still overwrite its own object until the
+  URL's TTL lapses (PROTOCOL.md §9.1 *Grant fencing*) — keep
+  `presignTtlSeconds` short if you need immutable-after-ready bytes.
 
 ## Custom storage adapter
 

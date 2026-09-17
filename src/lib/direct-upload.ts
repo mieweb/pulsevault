@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { isUuid } from './uuid.js';
 import { statusCodeOf } from './errors.js';
 import { finalizeArtifact, type FinalizeDeps } from './finalize.js';
@@ -29,11 +28,32 @@ export type DirectUploadCapableStorage = PulseVaultStorage & {
   headObjectSize(artifactId: string): Promise<number | null>;
 };
 
+/**
+ * `path.extname(...).toLowerCase()` without `node:path` — this module is in
+ * the web entry's direct-upload dependency graph, which must stay loadable on
+ * runtimes without Node builtins (the TUS stack is already lazy for the same
+ * reason). Matches `path.extname` semantics: no dot (or only a leading dot,
+ * a dotfile) → `""`.
+ */
+function extnameLower(filename: string): string {
+  const base = filename.slice(filename.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return '';
+  return base.slice(dot).toLowerCase();
+}
+
 export function supportsDirectUpload(
   storage: PulseVaultStorage,
 ): storage is DirectUploadCapableStorage {
   const s = storage as Partial<DirectUploadCapableStorage>;
-  return typeof s.createDirectUpload === 'function' && typeof s.headObjectSize === 'function';
+  // getMetadata is part of the working surface too — complete() and re-grants
+  // are unusable without it, so a partial adapter must not advertise the
+  // profile (the capabilities payload uses this same predicate).
+  return (
+    typeof s.createDirectUpload === 'function' &&
+    typeof s.headObjectSize === 'function' &&
+    typeof s.getMetadata === 'function'
+  );
 }
 
 export type DirectUploadDeps = FinalizeDeps & {
@@ -91,7 +111,7 @@ export async function directUploadCreate(
   if (!isUuid(normalized.artifactId)) {
     return err(400, '`artifactId` must be a valid UUID');
   }
-  const ext = path.extname(normalized.filename).toLowerCase();
+  const ext = extnameLower(normalized.filename);
   const allowed = allowedExtensions[normalized.kind];
   if (!ext || !allowed.includes(ext)) {
     return err(
@@ -167,15 +187,25 @@ export async function directUploadCreate(
       // incomplete direct upload (authorized above, same declared shape), a
       // fresh presigned URL is the correct answer — the client lost or
       // outlived the previous grant (app kill, URL TTL) and needs a new one
-      // to retry the PUT. A finished artifact, or a reservation with a
-      // different shape (size/kind/ext), stays a genuine conflict.
-      const existing = await storage.getMetadata?.(normalized.artifactId);
+      // to retry the PUT. A finished artifact, a reservation with a different
+      // shape (size/kind/ext), or a TUS reservation (no `expectedSize` — the
+      // two profiles share the artifactId space but must never cross) stays a
+      // genuine conflict. Read storage truth, not the per-process cache: on
+      // shared object storage another instance may have JUST marked this
+      // artifact ready, and re-granting a PUT against a ready object would
+      // let a client overwrite finished, validated bytes.
+      const existing = await storage.getMetadata?.(normalized.artifactId, { fresh: true });
       const sameShape =
         existing &&
         !existing.ready &&
         existing.kind === normalized.kind &&
         existing.ext === ext &&
-        (existing.expectedSize === undefined || existing.expectedSize === size);
+        existing.expectedSize === size &&
+        // The session anchor is part of the reservation's identity, not just its
+        // shape: without this, a token authorized for anchor A could submit
+        // anchor B's known artifactId with `relatedTo: A`, pass authorize, and
+        // walk away with a fresh PUT grant for B's artifact.
+        existing.relatedTo === normalized.relatedTo;
       if (sameShape) {
         try {
           const regrant = await regrantDirectUpload(storage, normalized.artifactId, size);
@@ -192,6 +222,16 @@ export async function directUploadCreate(
             };
           }
         } catch (regrantErr) {
+          // `presignPut` re-validates at mint time and throws 409 when it loses
+          // a race (reservation completed / reshaped since the check above) —
+          // pass 4xx through as the conflict it is; only genuine server
+          // failures become an opaque 500.
+          const regrantStatus = statusCodeOf(regrantErr, 500);
+          if (regrantStatus < 500) {
+            const message =
+              regrantErr instanceof Error && regrantErr.message ? regrantErr.message : 'Conflict';
+            return err(regrantStatus, message);
+          }
           logger.error(
             { err: regrantErr, artifactId: normalized.artifactId },
             'pulsevault direct-upload regrant failed',
@@ -248,7 +288,11 @@ export async function directUploadComplete(
     return err(400, '`artifactId` must be a valid UUID');
   }
 
-  const meta = await storage.getMetadata?.(artifactId);
+  // Storage truth for the pre-lock read too — not just the serialized re-read:
+  // a stale cached `ready` (another instance deleted + re-reserved this id)
+  // would otherwise take the idempotent-200 fast path below and report a NEW
+  // reservation complete without ever verifying its bytes.
+  const meta = await storage.getMetadata?.(artifactId, { fresh: true });
   if (!meta) return err(404, 'Unknown artifactId — create the direct upload first');
 
   if (authorize) {
@@ -275,6 +319,64 @@ export async function directUploadComplete(
   if (meta.ready) {
     return { statusCode: 200, body: { ok: true, artifactId } };
   }
+  // A reservation without a declared size is a TUS upload — the two profiles
+  // share the artifactId space but must never cross: completing a TUS
+  // reservation here would bypass the tus datastore's own completion.
+  if (meta.expectedSize === undefined) {
+    return err(409, 'artifactId belongs to a TUS upload — complete it via the TUS protocol');
+  }
+
+  // Serialize completes per artifactId in this process: two concurrent
+  // `complete` calls (lost-response retry racing the original) must not both
+  // observe "not ready" and run finalize — onUploadComplete firing twice would
+  // contradict the documented idempotency. The loser re-reads the sidecar
+  // under the lock and takes the idempotent-200 path. Cross-instance races
+  // remain possible on shared object storage; consumers should treat
+  // onUploadComplete as at-least-once (PROTOCOL §9.2).
+  const run = (completing.get(artifactId) ?? Promise.resolve()).then(
+    async (): Promise<DirectUploadResult> => {
+      // Storage truth, not the per-process cache: a rival instance's complete
+      // may have already marked this artifact ready — taking the idempotent
+      // 200 path here (instead of re-running finalize on a stale "uploading"
+      // snapshot) is what keeps cross-instance retries at-least-once rather
+      // than duplicating hooks unnecessarily.
+      const fresh = await storage.getMetadata?.(artifactId, { fresh: true });
+      if (!fresh) return err(404, 'Unknown artifactId — create the direct upload first');
+      if (fresh.ready) {
+        return { statusCode: 200, body: { ok: true, artifactId } };
+      }
+      // `storage` was narrowed by the supportsDirectUpload guard at entry.
+      return completeUnlocked(
+        deps as DirectUploadDeps & { storage: DirectUploadCapableStorage },
+        request,
+        artifactId,
+        fresh,
+      );
+    },
+  );
+  // The stored tail never rejects, so a failed complete can't poison the chain.
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  completing.set(artifactId, tail);
+  try {
+    return await run;
+  } finally {
+    if (completing.get(artifactId) === tail) completing.delete(artifactId);
+  }
+}
+
+/** In-flight completion locks, keyed by artifactId (per-process). */
+const completing = new Map<string, Promise<void>>();
+
+async function completeUnlocked(
+  deps: DirectUploadDeps & { storage: DirectUploadCapableStorage },
+  request: PulseVaultRequest,
+  artifactId: string,
+  meta: NonNullable<Awaited<ReturnType<NonNullable<PulseVaultStorage['getMetadata']>>>>,
+): Promise<DirectUploadResult> {
+  const { storage, onArtifactEvent, logger } = deps;
 
   const storedSize = await storage.headObjectSize(artifactId);
   if (storedSize === null) {

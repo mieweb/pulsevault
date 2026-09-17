@@ -52,6 +52,90 @@ breaking changes, called out explicitly below.
 
 ### Fixed
 
+- **Direct-upload re-grants require the same session anchor.** The same-shape
+  predicate compared kind/ext/size but not `relatedTo`, so a token authorized
+  for anchor A could submit anchor B's known artifactId with `relatedTo: A`,
+  pass authorization, and receive a fresh PUT grant for B's incomplete
+  reservation. The relation is now part of the reservation's identity in the
+  core and the Workers demo, and `presignPut` re-validates at mint time
+  (ready or reshaped reservations lose the race as a 409, never armed as a
+  grant; the create path passes such 4xx conflicts through instead of
+  masking them as 500s).
+- **The web entry's always-loaded graph is fully Node-builtin-free** —
+  verified by walking the compiled static import graph. `artifactIdFromUploadId`
+  moved from the tus module into the request-interpretation module (same
+  single parser, dependency reversed), so importing
+  `@mieweb/pulsevault/web` on a V8 isolate works for capabilities, direct
+  uploads, and S3/R2 playback; only an actual TUS request loads the tus
+  stack.
+- **Direct reservations are no longer reclaimable mid-grant.** The debris
+  check treated "no TUS `.info`" as a crash signature, but that is a direct
+  reservation's normal live shape — after the default 60 s grace a retried
+  create could yank a legitimate in-flight PUT's reservation. Staleness for
+  direct reservations now also covers the presigned-URL lifetime.
+- **Terminate cleanup is generation-gated.** The `POST_TERMINATE` sweep runs
+  after the 204; if the freed artifactId was already re-reserved by the time
+  it ran, it could delete the NEW reservation's state. The sweep now reads
+  storage truth first and skips reservations younger than the termination.
+- **Local storage: reclaim sweeps the stale reservation's bytes** (and its
+  datastore `.json`) before re-reserving — `@tus/file-store` writes at
+  offsets, so a fresh upload over longer leftover bytes would have kept the
+  stale tail. And `datastoreInfoExists` only treats `ENOENT` as "absent":
+  an `EACCES`/`EIO` blip can no longer reclassify a live upload as debris.
+- **The direct-upload module is Node-builtin-free** (`path.extname` replaced
+  with a pure helper), completing the web entry's loadability on runtimes
+  without Node compatibility.
+- **Workers demo:** presigned PUTs now sign the grant's `Content-Type` into
+  `X-Amz-SignedHeaders` (the declared size stays enforced at `complete` —
+  `Content-Length` is a fetch-forbidden header runtimes may strip before
+  signing), and object URLs are path-style, matching the S3 adapter's R2
+  convention.
+- **Direct-upload grants are fenced by per-reservation object keys.** A
+  presigned `PUT` URL outlives the reservation that minted it (deleting the
+  reservation cannot revoke the URL), so each direct reservation now writes
+  its bytes to its own key (`<kind>/<id>.<suffix><ext>`, recorded in the
+  sidecar). A superseded grant firing late lands on a key nothing reads from
+  instead of silently overwriting a newer reservation's — or a ready
+  artifact's — object. TUS uploads are unaffected (deterministic base key,
+  written server-side). PROTOCOL.md §9.1 now specifies the fencing
+  requirement and the residual same-reservation TTL window.
+- **Direct-upload re-grant and complete decisions now read storage truth, not
+  the per-process metadata cache.** On multi-instance deployments sharing one
+  bucket, a stale cached `"uploading"` entry could re-grant a `PUT` against
+  an artifact another instance had just completed and validated;
+  `getMetadata` gained an opt-in `{ fresh: true }` read used by both
+  decision points.
+- **The adapters' metadata caches can no longer resurrect a deleted
+  artifact.** A cache fill that started before a `remove()` and finished
+  after its evictions could re-insert the deleted artifact's metadata and
+  serve it indefinitely; fills now capture a deletion epoch before reading
+  and are discarded if any deletion landed meanwhile.
+- **Local storage serializes reclaim/remove per artifactId.** The multi-step
+  reclaim (read → liveness check → unlink → exclusive re-create) and
+  `remove()`'s deletes could interleave across concurrent callers — two
+  reclaimers could both "win" (the slower unlink erasing the winner's fresh
+  reservation), and a remove could delete files a concurrent reclaim had just
+  re-reserved. A per-artifact in-process lock closes every such interleave;
+  plain concurrent creates keep the lock-free atomic `wx` fast path.
+  (In-process is the honest scope: multiple processes sharing one local
+  workspace were never a supported topology — use the S3 adapter for that.)
+- **The web handler serves zero-byte artifacts.** A valid zero-length upload
+  previously crashed the streaming path (`fs.createReadStream` rejects
+  `end: -1`); it now returns the empty `200` the headers describe, and
+  unsatisfiable ranges over it get the correct `416`.
+- **The web entry no longer hard-requires Node built-ins at import time.**
+  The tus stack (`@tus/server` → `node:async_hooks`/`node:path`) is loaded
+  lazily on the first TUS request, so `createPulseVaultWebHandler` can boot
+  on runtimes without Node compatibility and still serve capabilities,
+  direct uploads, and S3/R2 artifact redirects; the docstring now states the
+  TUS surface's runtime requirements honestly.
+- **Workers demo hardening:** capability-token signatures are verified with
+  `crypto.subtle.verify` (constant-time) instead of a string compare; the
+  reservation write is atomic via a signed S3-API `PUT` with
+  `If-None-Match: "*"` (two concurrent creates can no longer both claim
+  `201`); object keys carry the same per-reservation fencing suffix as the
+  S3 adapter; `DELETE /artifacts/:id` (PROTOCOL §6.2) is implemented; and
+  the TUS `501` / prefixed `404` responses carry `Protocol-Version`.
 - **TUS termination (`DELETE /upload/<id>`) now sweeps the adapter's own
   artifact metadata** (the `.pulsevault` sidecar and caches) via
   `@tus/server`'s `POST_TERMINATE` event. Previously only the datastore's

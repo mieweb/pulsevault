@@ -304,10 +304,36 @@ export async function startMockS3({ buckets = [], conditionalWrites = 'supported
       }
 
       if (req.method === 'PUT' && key) {
-        // PutObject — enforces `If-None-Match: *` (the reserve collision guard).
-        // `conditionalWrites: 'unsupported'` emulates S3-compatibles that reject
-        // the header outright (what s3rver silently ignored) — the 501 drives
+        // PutObject — enforces `If-None-Match: *` (the reserve collision guard)
+        // and `If-Match: <etag>` (the reclaim claim). `conditionalWrites:
+        // 'unsupported'` emulates S3-compatibles that reject the headers
+        // outright (what s3rver silently ignored) — the 501 drives
         // reserveUpload's check-then-write fallback.
+        const ifMatch = req.headers['if-match'];
+        if (ifMatch) {
+          if (conditionalWrites === 'unsupported') {
+            await readBody(req);
+            sendError(
+              res,
+              501,
+              'NotImplemented',
+              'A header you provided implies functionality that is not implemented',
+            );
+            return;
+          }
+          const existing = objects.get(objKey(bucket, key));
+          if (!existing) {
+            // Real S3 answers If-Match on a missing key with 404 NoSuchKey.
+            await readBody(req);
+            sendError(res, 404, 'NoSuchKey', 'The specified key does not exist.');
+            return;
+          }
+          if (existing.etag !== ifMatch) {
+            await readBody(req);
+            sendError(res, 412, 'PreconditionFailed', 'ETag mismatch');
+            return;
+          }
+        }
         if (req.headers['if-none-match'] === '*' && conditionalWrites === 'unsupported') {
           await readBody(req);
           sendError(

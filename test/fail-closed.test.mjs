@@ -5,20 +5,20 @@
 // client gets a prompt, well-formed status (a bounded fetch timeout turns a
 // regression into a failure instead of a hung suite).
 
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import Fastify from "fastify";
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import Fastify from 'fastify';
 
-import pulseVault, { createLocalStorage } from "../dist/fastify.js";
+import pulseVault, { createLocalStorage } from '../dist/fastify.js';
 
-const PREFIX = "/pulsevault";
-const ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const PREFIX = '/pulsevault';
+const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
 async function startApp({ wrapStorage = (s) => s, ...pluginOptions } = {}) {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-failclosed-"));
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pv-failclosed-'));
   const base = createLocalStorage({ workspaceDir });
   const app = Fastify({ logger: false });
   await app.register(pulseVault, {
@@ -27,7 +27,7 @@ async function startApp({ wrapStorage = (s) => s, ...pluginOptions } = {}) {
     maxUploadSize: 10 * 1024 * 1024,
     ...pluginOptions,
   });
-  const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+  const baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
   return {
     baseUrl,
     teardown: async () => {
@@ -49,12 +49,12 @@ async function fetchWithTimeout(url, options = {}, ms = 5000) {
   }
 }
 
-test("GET returns 500 (not a hung socket) when storage.resolve throws", async () => {
+test('GET returns 500 (not a hung socket) when storage.resolve throws', async () => {
   const ctx = await startApp({
     wrapStorage: (base) => ({
       ...base,
       resolve: async () => {
-        throw new Error("storage boom");
+        throw new Error('storage boom');
       },
     }),
   });
@@ -66,18 +66,18 @@ test("GET returns 500 (not a hung socket) when storage.resolve throws", async ()
   }
 });
 
-test("DELETE returns 500 (not a hung socket) when storage.remove throws", async () => {
+test('DELETE returns 500 (not a hung socket) when storage.remove throws', async () => {
   const ctx = await startApp({
     wrapStorage: (base) => ({
       ...base,
       remove: async () => {
-        throw new Error("storage boom");
+        throw new Error('storage boom');
       },
     }),
   });
   try {
     const res = await fetchWithTimeout(`${ctx.baseUrl}${PREFIX}/artifacts/${ID}`, {
-      method: "DELETE",
+      method: 'DELETE',
     });
     assert.equal(res.status, 500);
   } finally {
@@ -85,12 +85,12 @@ test("DELETE returns 500 (not a hung socket) when storage.remove throws", async 
   }
 });
 
-test("an authorize error with an out-of-range statusCode degrades to 403, not a writeHead crash", async () => {
+test('an authorize error with an out-of-range statusCode degrades to 403, not a writeHead crash', async () => {
   const ctx = await startApp({
     authorize: async () => {
       // A consumer hook throwing a bogus status (42 is not a valid HTTP status)
       // must degrade to the fallback, not crash res.writeHead with a RangeError.
-      throw Object.assign(new Error("bogus status"), { statusCode: 42 });
+      throw Object.assign(new Error('bogus status'), { statusCode: 42 });
     },
   });
   try {
@@ -101,7 +101,7 @@ test("an authorize error with an out-of-range statusCode degrades to 403, not a 
   }
 });
 
-test("GET still 404s for an unknown artifact when storage behaves normally", async () => {
+test('GET still 404s for an unknown artifact when storage behaves normally', async () => {
   const ctx = await startApp();
   try {
     const res = await fetchWithTimeout(`${ctx.baseUrl}${PREFIX}/artifacts/${ID}`);

@@ -409,7 +409,19 @@ but is not yet complete, with the same declared shape (`kind`, extension,
 `size`), MUST return a fresh grant with status `200` rather than `409` —
 this is how a client that lost its grant (killed mid-session) or outlived
 its `expiresAt` retries without a dead end. A create for a **ready**
-artifact, or with a different declared shape, remains `409`.
+artifact, or with a different declared shape, remains `409`. The re-grant
+decision MUST be made against current storage state, not a per-instance
+cache — another instance may have just completed the artifact.
+
+**Grant fencing.** A presigned URL cannot be revoked by deleting its
+reservation — it stays valid until `expiresAt`. Servers MUST therefore
+ensure a grant issued for one reservation cannot write into the object a
+*different* (later) reservation of the same artifactId completes and
+serves, e.g. by giving each reservation its own storage key. Within a
+single reservation the holder of an unexpired grant can by construction
+still overwrite its own object until `expiresAt` — including briefly after
+`complete` — so operators requiring strictly immutable-after-ready bytes
+SHOULD use short grant TTLs or the TUS profile.
 
 ### 9.2 Complete
 
@@ -424,7 +436,16 @@ The server MUST verify the stored object exists and matches the declared
 
 - `200 { "ok": true }` — artifact is ready. Completing an already-ready
   artifact MUST return `200` again without re-running hooks (idempotent, so
-  a client can retry a complete whose response it lost).
+  a client can retry a complete whose response it lost). Servers SHOULD
+  serialize concurrent completes for one artifactId; across multiple server
+  instances sharing object storage that cannot be guaranteed, so consumer
+  hooks (`onUploadComplete` and equivalents) MUST tolerate at-least-once
+  delivery. If a consumer hook fails AFTER the artifact was marked ready,
+  the server returns `5xx` but a retried complete takes the idempotent
+  `200` path without re-running the hook — a consumer that must never lose
+  its side effect should make the hook atomic (`storage.remove` + throw on
+  failure, which frees the artifactId for a clean re-create) or reconcile
+  from artifact listings.
 - `409` — no stored object yet (the `PUT` didn't happen or didn't finish).
   The client retries the `PUT`, then completes again.
 - `422` — the stored object failed verification (size mismatch or §6

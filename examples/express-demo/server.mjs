@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 import express from "express";
+import rateLimit from "express-rate-limit";
 import QRCode from "qrcode";
 import {
   createPulseVaultCore,
@@ -32,6 +33,20 @@ const DEMO_TOKEN = process.env.DEMO_TOKEN || null;
 
 const app = express();
 app.disable("x-powered-by");
+
+// Rate-limit the demo's own routes — the same operator-owned policy OPERATIONS.md
+// recommends (pulsevault deliberately ships none). Upload PATCHes under /pulsevault
+// get a higher ceiling than the cheap JSON routes; the default limiter skips them
+// so the two never stack.
+app.use("/pulsevault", rateLimit({ windowMs: 60_000, limit: 6000, standardHeaders: true }));
+app.use(
+  rateLimit({
+    windowMs: 60_000,
+    limit: 300,
+    standardHeaders: true,
+    skip: (req) => req.path.startsWith("/pulsevault"),
+  }),
+);
 
 // Serve pairing page before the plugin so it isn't swallowed by /pulsevault/artifacts/:artifactId
 app.get("/", (_req, res) => {

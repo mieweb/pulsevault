@@ -1,6 +1,5 @@
 import { isUuid } from './uuid.js';
 import { decodeUploadMetadataHeader, normalizeUploadMetadata } from './upload-metadata.js';
-import { artifactIdFromUploadId } from './pulsevaultTus.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
 /**
@@ -55,6 +54,23 @@ function tusLastUrlSegment(url: string): string | undefined {
   const trimmed = url.endsWith('/') ? url.slice(0, -1) : url;
   const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
   return segment.length > 0 ? segment : undefined;
+}
+
+/**
+ * Parse the artifactId UUID from a tus upload id of the form
+ * `<kind>/<artifactId><ext>` (the shape `namingFunction` in `pulsevaultTus.ts`
+ * produces). Lives HERE — not in `pulsevaultTus.ts` — because this module is
+ * in the web entry's always-loaded dependency graph, which must stay free of
+ * Node-only imports; `pulsevaultTus.ts` (→ `@tus/server`, `node:async_hooks`)
+ * imports it back so the two parsers are one function.
+ */
+export function artifactIdFromUploadId(id: string): string | undefined {
+  const [, nameWithExt] = id.split('/');
+  if (!nameWithExt) return undefined;
+  // `path.extname` semantics without `node:path`: no dot / only a leading dot → no ext.
+  const dot = nameWithExt.lastIndexOf('.');
+  const candidate = dot > 0 ? nameWithExt.slice(0, dot) : nameWithExt;
+  return isUuid(candidate) ? candidate : undefined;
 }
 
 /**
