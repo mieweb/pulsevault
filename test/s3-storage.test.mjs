@@ -193,6 +193,48 @@ test("two truly concurrent reserves for the same artifactId: exactly one 201, on
   }
 });
 
+// The degraded-backend branch: a store that rejects `If-None-Match` outright
+// (501 NotImplemented) must fall back to check-then-write — reserve keeps
+// working, duplicates still 409 via the check, and the operator is warned
+// exactly once per process. This branch was untestable against s3rver (it
+// silently ignored the header) and is the one path the reserve rewrite in
+// this release touches without conditional-write protection.
+test("conditional-write-unsupported backend: fallback reserves, still 409s duplicates, warns once", async () => {
+  const degraded = await startMockS3({ buckets: [BUCKET], conditionalWrites: "unsupported" });
+  const warns = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => warns.push(args.join(" "));
+  try {
+    const storage = await createS3Storage({
+      bucket: BUCKET,
+      endpoint: degraded.endpoint,
+      region: "us-east-1",
+      accessKeyId: "MOCKS3",
+      secretAccessKey: "MOCKS3",
+      forcePathStyle: true,
+      clientConfig: {
+        requestChecksumCalculation: "WHEN_REQUIRED",
+        responseChecksumValidation: "WHEN_REQUIRED",
+      },
+    });
+    const reserve = (artifactId) =>
+      storage.reserveUpload({ artifactId, kind: "video", ext: ".mp4", filename: "clip.mp4" });
+
+    // Fallback path still reserves (no hard 5xx on a degraded backend)…
+    await reserve(randomUUID());
+    // …a duplicate is still rejected 409 via the check-then-write check…
+    const dup = randomUUID();
+    await reserve(dup);
+    await assert.rejects(() => reserve(dup), (err) => err?.statusCode === 409);
+    // …and the degraded-mode warning fired exactly once across all fallbacks.
+    const fallbackWarns = warns.filter((w) => w.includes("conditional writes"));
+    assert.equal(fallbackWarns.length, 1);
+  } finally {
+    console.warn = realWarn;
+    await degraded.close();
+  }
+});
+
 test("createS3Mp4Sniffer rejects non-MP4 bytes and removes the object", async () => {
   const ctx = await startApp({ withSniffer: true });
   const id = randomUUID();

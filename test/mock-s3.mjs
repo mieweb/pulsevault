@@ -142,7 +142,7 @@ function parseRange(header, size) {
  * Start the mock. Returns `{ endpoint, port, close() }`. State is per-instance
  * and in-memory only — a fresh instance is a clean bucket.
  */
-export async function startMockS3({ buckets = [] } = {}) {
+export async function startMockS3({ buckets = [], conditionalWrites = 'supported' } = {}) {
   /** @type {Map<string, { body: Buffer, etag: string, contentType: string, metadata: Record<string, string> }>} key: `<bucket> <key>` (space-separated; S3 bucket names cannot contain spaces) */
   const objects = new Map();
   /** @type {Map<string, { bucket: string, key: string, contentType: string, metadata: Record<string, string>, parts: Map<number, { body: Buffer, etag: string }> }>} */
@@ -305,6 +305,19 @@ export async function startMockS3({ buckets = [] } = {}) {
 
       if (req.method === 'PUT' && key) {
         // PutObject — enforces `If-None-Match: *` (the reserve collision guard).
+        // `conditionalWrites: 'unsupported'` emulates S3-compatibles that reject
+        // the header outright (what s3rver silently ignored) — the 501 drives
+        // reserveUpload's check-then-write fallback.
+        if (req.headers['if-none-match'] === '*' && conditionalWrites === 'unsupported') {
+          await readBody(req);
+          sendError(
+            res,
+            501,
+            'NotImplemented',
+            'A header you provided implies functionality that is not implemented',
+          );
+          return;
+        }
         if (req.headers['if-none-match'] === '*' && objects.has(objKey(bucket, key))) {
           // Drain the body first so the client isn't left writing into a closed socket.
           await readBody(req);

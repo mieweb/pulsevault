@@ -17,7 +17,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -27,7 +26,7 @@ import {
   createS3Storage,
 } from "../dist/core.js";
 import { deriveDatastoreOptions } from "../dist/storage/s3.js";
-import { makeMp4, tusCreate, tusPatch, uploadFull } from "./helpers.mjs";
+import { makeMp4, serveCore, tusCreate, tusPatch, uploadFull } from "./helpers.mjs";
 import { startMockS3 } from "./mock-s3.mjs";
 
 const PREFIX = "/pulsevault";
@@ -68,21 +67,14 @@ async function startLocalApp({ reclaimGraceMs } = {}) {
     storage,
     maxUploadSize: 10 * 1024 * 1024,
   });
-  const server = http.createServer((req, res) => {
-    core.handler(req, res).catch(() => {
-      res.writeHead(500);
-      res.end();
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
+  const { baseUrl, close } = await serveCore(core);
   return {
     storage,
     workspaceDir,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl,
     sidecarPath: (id) => path.join(workspaceDir, ".pulsevault", `${id}.json`),
     teardown: async () => {
-      await new Promise((resolve) => server.close(resolve));
+      await close();
       await core.shutdown();
       await fs.rm(workspaceDir, { recursive: true, force: true });
     },
@@ -108,19 +100,12 @@ async function startS3App({ reclaimGraceMs } = {}) {
     storage,
     maxUploadSize: 10 * 1024 * 1024,
   });
-  const server = http.createServer((req, res) => {
-    core.handler(req, res).catch(() => {
-      res.writeHead(500);
-      res.end();
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
+  const { baseUrl, close } = await serveCore(core);
   return {
     storage,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl,
     teardown: async () => {
-      await new Promise((resolve) => server.close(resolve));
+      await close();
       await core.shutdown();
     },
   };

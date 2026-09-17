@@ -9,15 +9,28 @@ import {
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
-import { pulseVaultError, statusCodeOf } from './lib/errors.js';
+import { httpError, pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
-import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
-import type { PulseVaultStorage, UploadKind } from './storage/types.js';
-import { UPLOAD_KINDS } from './storage/types.js';
 import {
-  decodeUploadMetadataHeader,
-  normalizeUploadMetadata,
-} from './lib/upload-metadata.js';
+  type PulseVaultLogger,
+  type PulseVaultRequest,
+  consoleLogger,
+} from './lib/request.js';
+import type { PulseVaultStorage, UploadKind } from './storage/types.js';
+import { buildCapabilitiesPayload, PROTOCOL_VERSION } from './lib/capabilities.js';
+import {
+  directUploadCreate,
+  directUploadComplete,
+  type DirectUploadDeps,
+  type DirectUploadResult,
+} from './lib/direct-upload.js';
+import {
+  artifactIdFromTusUrl,
+  extractAuthzMessage,
+  parseUploadMetadataHeader,
+  resolveStorageKind,
+  resolveStorageRelatedTo,
+} from './lib/tus-request.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -30,10 +43,8 @@ import {
   type PulseVaultAllowedExtensionsInput,
 } from './lib/options.js';
 
-/** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
-export const PROTOCOL_VERSION = 1;
-const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
-const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
+/** Re-exported for consumers and the adapters; defined once in `lib/capabilities.ts`. */
+export { PROTOCOL_VERSION };
 
 export type PulseVaultCoreCacheOptions = {
   cacheControl?: boolean;
@@ -119,105 +130,32 @@ export type PulseVaultCore = {
     res: ServerResponse,
     artifactId: string,
   ) => Promise<void>;
+  /** Handles `POST /direct-uploads` (reads + parses the JSON body itself). */
+  handleDirectUploadCreate: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  /** Handles `POST /direct-uploads/:artifactId/complete`. */
+  handleDirectUploadComplete: (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+  ) => Promise<void>;
+  /**
+   * Data-level direct-upload create — for host adapters that already parsed
+   * the JSON body (e.g. Fastify). Returns the status/body to send.
+   */
+  directUploadCreate: (request: PulseVaultRequest, body: unknown) => Promise<DirectUploadResult>;
+  /** Data-level direct-upload complete — see `directUploadCreate`. */
+  directUploadComplete: (
+    request: PulseVaultRequest,
+    artifactId: string,
+  ) => Promise<DirectUploadResult>;
 };
 
 /**
- * Pull `artifactId` (or the legacy `videoid`/`projectid` aliases), `kind`,
- * and `relatedTo` out of a raw `Upload-Metadata` header. Decoding and alias
- * precedence live in `lib/upload-metadata.ts`, shared with `namingFunction`
- * in `lib/pulsevaultTus.ts` — the function that decides what's actually
- * reserved/written to storage — so the artifactId `authorize()` validates can
- * never diverge from the one the upload lands under.
+ * Request interpretation (which artifact is this request about?) is shared
+ * with the web-standard core via `lib/tus-request.ts` — see that module for
+ * the URL-smuggling rationale behind `artifactIdFromTusUrl`.
  */
-function parseUploadMetadata(header: string): {
-  artifactId: string | undefined;
-  kind: UploadKind;
-  relatedTo: string | undefined;
-} {
-  const normalized = normalizeUploadMetadata(decodeUploadMetadataHeader(header));
-  return {
-    artifactId: isUuid(normalized.artifactId) ? normalized.artifactId : undefined,
-    kind: normalized.kind,
-    relatedTo: normalized.relatedTo,
-  };
-}
-
-/**
- * `@tus/server`'s `BaseHandler.getFileIdFromRequest` — the function that
- * ultimately decides which upload a PATCH/HEAD/DELETE actually operates on —
- * extracts its file id from the request URL's *last* `/`-delimited segment
- * (`reExtractFileID = /([^/]+)\/?$/`), not from the first segment after
- * `/upload/`. This MUST mirror that exact regex: a URL with extra path
- * segments after the real id (Fastify's `/upload/*` route accepts them) would
- * otherwise let `authorize()` see and approve one artifactId (whichever this
- * function resolved) while `@tus/server` writes the request body against a
- * *different* one (whichever it resolved) — an attacker holding a valid
- * token for their own artifact could smuggle a second, victim artifactId as
- * a trailing path segment and have their bytes land there instead, fully
- * bypassing authorization for the artifact actually written to.
- *
- * Implemented with plain string ops (not the regex itself) because the
- * unanchored-start regex is polynomial on adversarial inputs (CodeQL
- * js/polynomial-redos). Semantics are identical: after stripping at most one
- * trailing `/`, the match is the non-empty run of non-`/` characters at the
- * end of the string, or no match if that run is empty (e.g. `a//`).
- */
-function tusLastUrlSegment(url: string): string | undefined {
-  const trimmed = url.endsWith('/') ? url.slice(0, -1) : url;
-  const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
-  return segment.length > 0 ? segment : undefined;
-}
-
-/**
- * Decode the tus file id (base64url-encoded, shaped `<kind>/<artifactId><ext>`
- * by `namingFunction` in `lib/pulsevaultTus.ts`) that `@tus/server` itself
- * will resolve a PATCH/HEAD/DELETE request to, and recover the artifactId via
- * the exact same parser `onUploadFinish` uses — so this can never drift from
- * what `@tus/server` actually operates on. See `tusLastUrlSegment` above
- * for why this must match the *last* URL segment, not the first one after
- * `/upload/`.
- */
-function artifactIdFromTusUrl(url: string): string | undefined {
-  const rawSegment = tusLastUrlSegment(url);
-  if (!rawSegment) return undefined;
-  let lastSegment: string;
-  try {
-    lastSegment = decodeURIComponent(rawSegment);
-  } catch {
-    return undefined;
-  }
-  let decoded: string;
-  try {
-    decoded = Buffer.from(lastSegment, 'base64url').toString('utf8');
-  } catch {
-    return undefined;
-  }
-  return artifactIdFromUploadId(decoded);
-}
-
-/**
- * Resolve the artifact kind for an artifactId from storage. Adapters without
- * `getKind` (or that don't know the id) resolve to `"video"`.
- */
-async function resolveStorageKind(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<UploadKind> {
-  return (await storage.getKind?.(artifactId)) ?? 'video';
-}
-
-/** Resolve the `relatedTo` artifact for an artifactId from storage, if the adapter supports it. */
-async function resolveStorageRelatedTo(
-  storage: PulseVaultStorage,
-  artifactId: string,
-): Promise<string | undefined> {
-  return (await storage.getRelatedTo?.(artifactId)) ?? undefined;
-}
-
-function extractAuthzMessage(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  return 'Forbidden';
-}
+const parseUploadMetadata = parseUploadMetadataHeader;
 
 function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
@@ -400,18 +338,95 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     try {
-      writeJson(res, 200, {
-        protocolVersion: PROTOCOL_VERSION,
-        minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
-        maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
-        uploadUnit,
-        kinds: [...UPLOAD_KINDS],
-        allowedExtensions,
-        maxUploadSize,
-        checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
-      });
+      writeJson(
+        res,
+        200,
+        buildCapabilitiesPayload({ uploadUnit, allowedExtensions, maxUploadSize, storage }),
+      );
     } catch (err) {
       failClosed(res, err, 'capabilities');
+    }
+  };
+
+  const directDeps: DirectUploadDeps = {
+    storage,
+    allowedExtensions,
+    maxUploadSize,
+    authorize,
+    validatePayload,
+    onUploadComplete,
+    onArtifactEvent,
+    logger,
+  };
+
+  // Data-level entry points (no req/res) so host adapters with their own body
+  // parsing (Fastify) can call straight in without double-reading the stream.
+  const directCreate = (request: PulseVaultRequest, body: unknown) =>
+    directUploadCreate(directDeps, request, body);
+  const directComplete = (request: PulseVaultRequest, artifactId: string) =>
+    directUploadComplete(directDeps, request, artifactId);
+
+  /** Collect a small JSON request body; 413s beyond the cap (these bodies are a few hundred bytes). */
+  const readJsonBody = (req: IncomingMessage, limitBytes = 64 * 1024): Promise<unknown> =>
+    new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      req.on('data', (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > limitBytes) {
+          req.removeAllListeners('data');
+          reject(httpError(413, 'Request body too large'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        } catch {
+          reject(httpError(400, 'Request body must be JSON'));
+        }
+      });
+      req.on('error', reject);
+    });
+
+  const handleDirectUploadCreate = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    req.on('error', () => {});
+    res.on('error', () => {});
+    try {
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch (bodyErr) {
+        writeJson(
+          res,
+          statusCodeOf(bodyErr, 400),
+          pulseVaultError(bodyErr instanceof Error ? bodyErr.message : 'Bad Request'),
+        );
+        return;
+      }
+      const result = await directCreate(req, body);
+      writeJson(res, result.statusCode, result.body);
+    } catch (err) {
+      failClosed(res, err, 'direct-upload create');
+    }
+  };
+
+  const handleDirectUploadComplete = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    try {
+      const result = await directComplete(req, artifactId);
+      writeJson(res, result.statusCode, result.body);
+    } catch (err) {
+      failClosed(res, err, 'direct-upload complete');
     }
   };
 
@@ -584,6 +599,15 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await handleCapabilities(req, res);
       return;
     }
+    if (pathname === '/direct-uploads' && req.method === 'POST') {
+      await handleDirectUploadCreate(req, res);
+      return;
+    }
+    const completeMatch = pathname.match(/^\/direct-uploads\/([^/]+)\/complete$/);
+    if (completeMatch?.[1] && req.method === 'POST') {
+      await handleDirectUploadComplete(req, res, decodeURIComponent(completeMatch[1]));
+      return;
+    }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
@@ -608,6 +632,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     handleCapabilities,
     handleArtifactGet,
     handleArtifactDelete,
+    handleDirectUploadCreate,
+    handleDirectUploadComplete,
+    directUploadCreate: directCreate,
+    directUploadComplete: directComplete,
   };
 }
 
@@ -658,3 +686,11 @@ export {
 } from './lib/checksum.js';
 export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
 export { type PulseVaultRequest, type PulseVaultLogger } from './lib/request.js';
+export { createPulseVaultWebHandler } from './web.js';
+export type { PulseVaultWebHandler, PulseVaultWebOptions } from './web.js';
+export { supportsDirectUpload } from './lib/direct-upload.js';
+export type {
+  DirectUploadCapableStorage,
+  DirectUploadResult,
+} from './lib/direct-upload.js';
+export type { ArtifactMetadata } from './storage/types.js';

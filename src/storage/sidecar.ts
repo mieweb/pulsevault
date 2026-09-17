@@ -14,7 +14,7 @@ import { parseUploadKind } from './types.js';
  */
 
 /** Sidecar schema version. Increment for breaking changes. */
-export const SIDECAR_VERSION = 1 as const;
+const SIDECAR_VERSION = 1 as const;
 /** Default cap on an adapter's in-memory metadata cache before evicting the oldest entry. */
 export const DEFAULT_META_CACHE_LIMIT = 10_000;
 /** Default minimum age before an orphaned `"uploading"` sidecar may be reclaimed. */
@@ -54,6 +54,8 @@ export type Sidecar = {
    * field existed — those are by definition old enough to reclaim.
    */
   reservedAt?: number;
+  /** Expected total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
+  expectedSize?: number;
 };
 
 /** The subset of a sidecar the adapters keep in their in-memory cache. */
@@ -66,6 +68,7 @@ export type CachedMeta = {
   checksum?: string;
   name?: string;
   reservedAt?: number;
+  expectedSize?: number;
 };
 
 /** Fresh `"uploading"` sidecar for a reserve, stamped with the reservation time. */
@@ -80,6 +83,7 @@ export function buildSidecar(params: ReserveUploadParams): Sidecar {
     checksum: params.checksum,
     name: params.name,
     reservedAt: Date.now(),
+    ...(params.size !== undefined ? { expectedSize: params.size } : {}),
   };
 }
 
@@ -110,6 +114,7 @@ export function parseSidecar(raw: string): Sidecar | null {
     checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
     name: typeof parsed.name === 'string' ? parsed.name : undefined,
     reservedAt: typeof parsed.reservedAt === 'number' ? parsed.reservedAt : undefined,
+    expectedSize: typeof parsed.expectedSize === 'number' ? parsed.expectedSize : undefined,
   };
 }
 
@@ -124,6 +129,7 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
     checksum: sidecar.checksum,
     name: sidecar.name,
     reservedAt: sidecar.reservedAt,
+    expectedSize: sidecar.expectedSize,
   };
 }
 

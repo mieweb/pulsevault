@@ -3,6 +3,28 @@
 // local-filesystem tests and the S3/R2 tests.
 
 import assert from "node:assert/strict";
+import http from "node:http";
+
+/**
+ * Boot a framework-agnostic core on an ephemeral localhost port — the boot
+ * boilerplate every core-level suite repeats. Returns the base URL and a
+ * close function; storage construction/teardown stays with the caller (it
+ * differs meaningfully per suite).
+ */
+export async function serveCore(core) {
+  const server = http.createServer((req, res) => {
+    core.handler(req, res).catch(() => {
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
 
 export function b64(str) {
   return Buffer.from(str, "utf8").toString("base64");

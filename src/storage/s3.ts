@@ -208,6 +208,30 @@ export type S3Storage = PulseVaultStorage & {
   getName(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getMetadata` contract. */
   getMetadata(artifactId: string): Promise<ArtifactMetadata | null>;
+  /**
+   * Reserve an artifact and mint a presigned PUT URL the client uploads the
+   * bytes to directly — the data plane bypasses the app server entirely (the
+   * PROTOCOL.md §9 direct-upload profile). Runs the same `reserveUpload`
+   * bookkeeping as a TUS create (sidecar, collision/debris handling), so the
+   * artifactId space is shared with TUS uploads. `Content-Type` and
+   * `Content-Length` are baked into the signature so the URL can only upload
+   * the declared payload shape.
+   */
+  createDirectUpload(
+    params: ReserveUploadParams & { size: number },
+    opts?: { ttlSeconds?: number },
+  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
+  /**
+   * Fresh presigned PUT for an existing reservation — the §9 re-grant path.
+   * Throws if the artifactId is unknown.
+   */
+  presignPut(
+    artifactId: string,
+    size: number,
+    ttlSeconds?: number,
+  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
+  /** Size in bytes of the stored object for an artifactId, or `null` when absent. */
+  headObjectSize(artifactId: string): Promise<number | null>;
 };
 
 /**
@@ -570,7 +594,67 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       checksum: meta.checksum,
       name: meta.name,
       reservedAt: meta.reservedAt,
+      expectedSize: meta.expectedSize,
     };
+  };
+
+  const createDirectUpload = async (
+    params: ReserveUploadParams & { size: number },
+    opts?: { ttlSeconds?: number },
+  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }> => {
+    // Same reservation as a TUS create — sidecar written, collisions/debris
+    // handled identically — so a direct upload and a TUS upload can never
+    // silently share an artifactId.
+    await reserveUpload(params);
+    return presignPut(params.artifactId, params.size, opts?.ttlSeconds);
+  };
+
+  /**
+   * Fresh presigned PUT for an EXISTING reservation — the §9 re-grant path: a
+   * client that lost or outlived its grant (app kill, URL TTL) retries the
+   * PUT with a new URL. ContentType + ContentLength are signed, so the URL
+   * can upload exactly the declared bytes as the declared type, nothing else.
+   */
+  const presignPut = async (
+    artifactId: string,
+    size: number,
+    ttlSeconds = presignTtl,
+  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) throw new Error(`presignPut: unknown artifactId ${artifactId}`);
+    const contentType = extToContentType(meta.ext);
+    const uploadUrl = await getSignedUrl(
+      client,
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: artifactKey(artifactId, meta.kind, meta.ext),
+        ContentType: contentType,
+        ContentLength: size,
+      }),
+      { expiresIn: ttlSeconds },
+    );
+    return {
+      uploadUrl,
+      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      headers: { 'Content-Type': contentType, 'Content-Length': String(size) },
+    };
+  };
+
+  const headObjectSize = async (artifactId: string): Promise<number | null> => {
+    const meta = await loadMeta(artifactId);
+    if (!meta) return null;
+    try {
+      const res = await client.send(
+        new HeadObjectCommand({
+          Bucket: bucket,
+          Key: artifactKey(artifactId, meta.kind, meta.ext),
+        }),
+      );
+      return typeof res.ContentLength === 'number' ? res.ContentLength : null;
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
+    }
   };
 
   const shutdown = async (): Promise<void> => {
@@ -592,6 +676,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     getChecksum,
     getName,
     getMetadata,
+    createDirectUpload,
+    presignPut,
+    headObjectSize,
     shutdown,
   };
 }

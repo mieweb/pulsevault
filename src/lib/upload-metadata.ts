@@ -22,7 +22,7 @@ import { parseUploadKind } from '../storage/types.js';
  * still leaves generous headroom under typical proxy header limits. The client
  * should cap first; this is belt-and-suspenders so the server never trusts it.
  */
-export const MAX_ARTIFACT_NAME_LENGTH = 512;
+const MAX_ARTIFACT_NAME_LENGTH = 512;
 
 export type NormalizedUploadMetadata = {
   /**

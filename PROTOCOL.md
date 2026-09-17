@@ -65,6 +65,9 @@ The response body MUST be a JSON object with at least the following fields:
   describes capability, not whether verification is actually wired in for
   every upload — a server MAY list an algorithm it's capable of checking
   even for a deployment where the operator hasn't enabled that check.
+- `directUpload` (object, OPTIONAL): present iff the server supports the
+  presigned direct-upload profile (§9). Currently `{ "enabled": true }`.
+  Absent means TUS (§4) is the only ingestion path.
 
 A server response to this endpoint MUST NOT include any secret. Every other
 response from the server MUST include a `Protocol-Version` header carrying
@@ -369,7 +372,97 @@ graph is a query/relational concern for the operator's own systems, built
 from `relatedTo` and whatever additional metadata the operator chooses to
 record — not something a Pulse-compatible server is required to implement.
 
-## 9. Compatibility notes
+## 9. Direct upload profile (presigned data plane)
+
+An OPTIONAL ingestion profile for deployments where upload bytes should go
+straight to object storage (S3/R2) instead of through the application server
+— serverless/edge control planes, or operators avoiding double bandwidth.
+Advertised via the `directUpload` capability field (§2); a client MUST NOT
+attempt these endpoints against a server that doesn't advertise it.
+
+Trade-off vs TUS, stated plainly: a direct upload is a single HTTP `PUT` —
+retryable from zero but **not resumable mid-file**. TUS remains the default
+and the right choice for large files on flaky mobile networks; this profile
+is an operator opt-in. Servers supporting this profile MUST still support
+TUS (§4).
+
+### 9.1 Create
+
+`POST {prefix}/direct-uploads` with a JSON body carrying the same fields as
+the TUS `Upload-Metadata` (§4.1) plus a mandatory exact byte count:
+
+```json
+{
+  "artifactId": "<uuid>",
+  "filename": "clip.mp4",
+  "kind": "video",
+  "relatedTo": "<uuid, optional>",
+  "checksum": "<algorithm>:<hex, optional>",
+  "name": "<display title, optional>",
+  "size": 12345678
+}
+```
+
+Authentication and authorization are identical to a TUS create (§5): the
+same bearer token, checked against the same `artifactId`/`relatedTo` scope.
+The reservation shares the artifactId space and collision rules with TUS
+(§4.2.1) — a 409 means the id already has an upload, and the same
+debris-reclaim recommendation applies.
+
+Success is `201`:
+
+```json
+{
+  "ok": true,
+  "artifactId": "<uuid>",
+  "uploadUrl": "https://… presigned PUT URL …",
+  "expiresAt": "2026-09-16T12:00:00.000Z",
+  "headers": { "Content-Type": "video/mp4", "Content-Length": "12345678" }
+}
+```
+
+The client MUST `PUT` the exact bytes to `uploadUrl` before `expiresAt`,
+sending the returned `headers` verbatim (the server SHOULD sign them into
+the grant so the URL can only upload the declared payload shape). The
+`uploadUrl` is a bearer credential — the client MUST NOT log it or send it
+anywhere but the storage host it names.
+
+Errors: `400` invalid body, `401`/`403` per §5, `409` id already in use,
+`413` `size` over `maxUploadSize`, `501` profile not supported.
+
+**Re-grant.** A repeated create for an artifactId whose reservation exists
+but is not yet complete, with the same declared shape (`kind`, extension,
+`size`), MUST return a fresh grant with status `200` rather than `409` —
+this is how a client that lost its grant (killed mid-session) or outlived
+its `expiresAt` retries without a dead end. A create for a **ready**
+artifact, or with a different declared shape, remains `409`.
+
+### 9.2 Complete
+
+After the `PUT` succeeds, the client MUST confirm:
+
+`POST {prefix}/direct-uploads/{artifactId}/complete` (no body; same bearer
+token — authorized like a TUS `PATCH`).
+
+The server MUST verify the stored object exists and matches the declared
+`size`, MUST run the same post-upload validation it applies to TUS uploads
+(§6), and only then mark the artifact ready. Responses:
+
+- `200 { "ok": true }` — artifact is ready. Completing an already-ready
+  artifact MUST return `200` again without re-running hooks (idempotent, so
+  a client can retry a complete whose response it lost).
+- `409` — no stored object yet (the `PUT` didn't happen or didn't finish).
+  The client retries the `PUT`, then completes again.
+- `422` — the stored object failed verification (size mismatch or §6
+  validation). The server MUST delete the stored bytes and free the
+  artifactId, exactly like a failed TUS validation; the client re-creates
+  with a fresh grant.
+
+An artifact for which `complete` never arrives MUST NOT be served (§6.1);
+operators SHOULD reclaim such reservations per §4.2.1 and expire the
+underlying stored object via storage lifecycle rules.
+
+## 10. Compatibility notes
 
 A client or server MAY support additional, non-normative extensions to this
 contract (additional `Upload-Metadata` keys, additional kinds, additional

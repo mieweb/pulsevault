@@ -7,6 +7,19 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Documentation
+
+- README grew a **Deployment caveats (AWS S3 & R2)** section: the 5 GiB
+  single-`PUT` cap on direct uploads, why bucket policies that enforce
+  SSE-KMS per request reject presigned grant `PUT`s (use default bucket
+  encryption instead), conditional-write (`If-None-Match`) support and the
+  fallback's consequences, the expired-grant re-grant behavior, presigned-URL
+  TTL ceilings (7 days on both AWS and R2; no custom domains on R2), and
+  which lifecycle rules clean up TUS-multipart vs direct-upload debris.
+- The `OPERATIONS.md` retention sample now uses the public
+  `listArtifactIds()`/`getMetadata()` API instead of hand-parsing sidecar
+  files.
+
 ### Changed
 
 - **Breaking: the package entry points are flipped to match what the library
@@ -47,6 +60,32 @@ breaking changes, called out explicitly below.
 
 ### Added
 
+- **Web-standard core: `@mieweb/pulsevault/web`.** `createPulseVaultWebHandler`
+  serves the whole protocol as a WHATWG `Request → Response` handler — one-line
+  mounts under Hono (any runtime), Bun, Deno, and fetch-style meta-framework
+  routes, with its own single-`Range`/`HEAD` artifact serving (via the
+  maintained `range-parser`) instead of Node streaming internals. New
+  [`examples/hono-demo`](examples/hono-demo). tus uploads still need a
+  `node:fs`-capable runtime for the datastore; pure V8 isolates use the
+  direct-upload profile below.
+- **Direct-upload profile (PROTOCOL.md §9): presigned PUT data plane.**
+  `POST {prefix}/direct-uploads` authorizes + reserves (same artifactId
+  space/collision/debris rules as TUS) and returns a presigned `PUT` URL with
+  `Content-Type`/`Content-Length` signed in; `POST
+  {prefix}/direct-uploads/:artifactId/complete` verifies the stored object's
+  size and runs the exact same validate → markReady → onUploadComplete
+  sequence as TUS (shared `lib/finalize.ts`, so the two ingestion paths cannot
+  diverge). Served by the Node core, the web core, and the Fastify adapter;
+  advertised via the new `directUpload` capability field only when the storage
+  adapter supports it (the S3/R2 adapter's new
+  `createDirectUpload`/`headObjectSize`; local storage answers `501`).
+  Explicitly single-`PUT` (retryable, not mid-file resumable) — TUS remains
+  the default transport.
+- **[`examples/workers-demo`](examples/workers-demo)**: a Cloudflare Workers
+  control plane implementing the wire contract from PROTOCOL.md alone —
+  WebCrypto capability tokens, direct uploads against R2 via `aws4fetch`
+  presigning, presigned playback redirects — documenting the recommended
+  V8-isolate deployment shape.
 - **Cloudflare R2 auto-configuration in `createS3Storage`.** When `endpoint`
   is an `*.r2.cloudflarestorage.com` URL, the `@tus/s3-store` datastore now
   defaults to `partSize`/`minPartSize` of 8 MiB (R2 requires all non-trailing

@@ -174,7 +174,43 @@ diagnostics — the Fastify plugin always uses `request.log` for these
 automatically, but a non-Fastify host has no equivalent to infer one from,
 so it falls back to `console` when omitted.
 
-Four runnable example servers live under [`examples/`](examples):
+## Web-standard handler (Hono, Bun, Deno, meta-frameworks)
+
+`@mieweb/pulsevault/web` exposes the same server as a WHATWG
+`Request → Response` handler — no `http.IncomingMessage` anywhere — so it
+mounts in one line under anything that speaks fetch primitives:
+
+```ts
+import { createPulseVaultWebHandler } from "@mieweb/pulsevault/web";
+import { createLocalStorage } from "@mieweb/pulsevault";
+
+const vault = createPulseVaultWebHandler({
+  basePath: "/pulsevault",
+  storage: createLocalStorage({ workspaceDir: "./data" }),
+  maxUploadSize: 5 * 1024 * 1024 * 1024,
+});
+
+// Hono — identical on Node (@hono/node-server), Bun, and Deno:
+app.all("/pulsevault/*", (c) => vault.handler(c.req.raw));
+// Bun without a framework:
+Bun.serve({ fetch: (req) => vault.handler(req) });
+// Next.js/Nuxt/SvelteKit-style route handlers: export the handler for every
+// method on a catch-all route under /pulsevault.
+```
+
+Same options and hooks as `createPulseVaultCore` (minus `stripBasePath` —
+web requests carry absolute URLs, and minus `cache`). Artifact serving
+implements single-`Range` requests (206/416) and `HEAD` itself — what real
+video players send — instead of delegating to a Node streaming library.
+Local-filesystem serving needs a runtime with `node:fs` (Node, Bun, Deno);
+on filesystem-less edge runtimes use the S3/R2 adapter, whose playback is a
+presigned redirect and never touches a local file. Note tus uploads still
+require the datastore stack (`@tus/file-store`/`@tus/s3-store`, which need
+`node:fs`), so a pure V8-isolate deployment should use the
+[direct-upload profile](#direct-uploads-presigned-put-data-plane) instead —
+see [`examples/workers-demo`](examples/workers-demo).
+
+Six runnable example servers live under [`examples/`](examples):
 
 - [`examples/fastify-demo`](examples/fastify-demo) — the smallest runnable
   server: Fastify plugin mount, QR pairing, flat upload listing, no auth,
@@ -191,11 +227,19 @@ Four runnable example servers live under [`examples/`](examples):
   live feed.
 - [`examples/express-demo`](examples/express-demo) and
   [`examples/meteor-demo`](examples/meteor-demo) — the same demo on
-  `@mieweb/pulsevault/core` instead of the plugin, proving the core needs
+  the framework-agnostic core instead of the plugin, proving the core needs
   about the same amount of glue code under a different framework. Both are
   verified against the real frameworks, not just the test suite —
   `meteor-demo` in particular against a real `meteor create` app, since
   Meteor's bundler needed the compatibility fixes described above.
+- [`examples/hono-demo`](examples/hono-demo) — the web-standard handler
+  mounted under Hono in one wildcard route; the same app object serves on
+  Node, Bun, and Deno unchanged.
+- [`examples/workers-demo`](examples/workers-demo) — a Cloudflare Workers
+  control plane implementing the wire contract **from PROTOCOL.md alone**
+  (capabilities, capability tokens via WebCrypto, direct-upload profile with
+  R2 as the data plane, presigned playback). Documents honestly why the tus
+  stack itself can't run on a V8 isolate.
 
 ## How a pairing + upload session flows
 
@@ -700,6 +744,72 @@ The default `createMp4Sniffer`/`createChecksumValidator` read a local file path,
 ### Direct playback & CORS
 
 Because playback is a 302 redirect to a presigned URL, a browser fetching it goes **directly** to R2/S3. If you play back from a web origin, add a bucket CORS rule allowing your origin (`GET`, and `Range` for seeking). Native clients that follow redirects need no CORS.
+
+Presigned-URL limits to know: R2 caps presigned TTLs at **7 days** and does not serve presigned URLs over custom domains (they always use the `*.r2.cloudflarestorage.com` endpoint you signed against). AWS SigV4 has the same 7-day ceiling. `presignTtlSeconds` past that will fail at request time, not at config time.
+
+### Direct uploads (presigned PUT data plane)
+
+With the S3/R2 adapter, the server automatically advertises the
+[PROTOCOL.md §9](PROTOCOL.md) direct-upload profile via `/capabilities`
+(`directUpload: { enabled: true }`) and serves two extra routes:
+
+- `POST {prefix}/direct-uploads` — authorize + reserve (same collision rules
+  as a TUS create) + return a presigned `PUT` URL with `Content-Type` and the
+  exact `Content-Length` signed in. Bytes go straight to the bucket.
+- `POST {prefix}/direct-uploads/:artifactId/complete` — verify the stored
+  object matches the declared size, then run the exact same
+  `validatePayload → markReady → onUploadComplete` sequence as a finished TUS
+  upload. Idempotent on retry.
+
+The trade, stated plainly: a direct upload is one `PUT` — retryable from
+zero, **not resumable mid-file**. TUS stays the default and is always served
+alongside; the client picks per `/capabilities`. Uploads that never complete
+are cleaned up by your bucket lifecycle rules plus the reserve
+debris-reclaim (`reclaimGraceMs`). Local-filesystem deployments answer `501`
+and don't advertise the profile. For browser `PUT`s add a CORS rule on the
+bucket allowing `PUT` from your origin.
+
+### Deployment caveats (AWS S3 & R2)
+
+Everything above works against plain AWS S3 unchanged — omit `endpoint`, set
+`region`, and the R2 auto-configuration simply never activates. The sharp
+edges live in bucket configuration, not code:
+
+- **Single-`PUT` size cap.** A direct-upload grant is one `PUT`, and both
+  AWS S3 and R2 cap a single `PUT` at **5 GiB**. Larger artifacts must go
+  through TUS (multipart under the hood). Set `maxUploadSize` accordingly if
+  you rely on direct uploads.
+- **Bucket policies that require extra signed headers break grants.** The
+  presigned `PUT` signs exactly `Content-Type` and `Content-Length`. A bucket
+  policy that *demands* another header — the classic one is a `Deny` unless
+  `s3:x-amz-server-side-encryption: aws:kms` — rejects the client's `PUT`
+  with `403`, because the client can't add headers that weren't signed.
+  Default bucket encryption (SSE-S3 on AWS, R2's built-in encryption) is fine:
+  it applies server-side without any request header. If you must have
+  SSE-KMS, set it as the bucket **default** encryption instead of enforcing
+  it per-request in a policy.
+- **Atomic reservation needs conditional writes.** The collision guard uses
+  `If-None-Match: "*"` on `PutObject`. AWS S3 supports this (since
+  Nov 2024), R2 supports it; older S3-compatibles may not and fall back to a
+  weaker check-then-write — see *S3-compatible backend collision-guard
+  fallback* in `OPERATIONS.md` for what that reopens and the one-time warning
+  to watch for.
+- **Expired or lost grants are cheap.** Grants inherit `presignTtlSeconds`.
+  If the app is killed or the URL expires before the `PUT` lands, the client
+  just re-`POST`s the same create: an incomplete same-shape reservation is
+  re-granted with a fresh URL (`200`, PROTOCOL.md §9) — no operator action,
+  no 409.
+- **Lifecycle rules are the cleanup backstop.** Two distinct kinds of debris:
+  *TUS* uploads that die mid-flight leave incomplete **multipart** uploads —
+  on AWS add an `AbortIncompleteMultipartUpload` lifecycle rule (R2 aborts
+  them after 7 days by default); on AWS, `@tus/s3-store`'s `Tus-Completed`
+  tag (`useTags`, default on) can additionally drive tag-filtered expiry.
+  *Direct* uploads that `PUT` but never `complete` leave a full object at the
+  final key with its sidecar stuck at `"uploading"` — the reservation itself
+  is freed by debris-reclaim (`reclaimGraceMs`) and the object is overwritten
+  on retry, but if the client never returns, only a prefix-scoped expiry rule
+  (or your own `listArtifactIds`-based sweep, see *Retention* in
+  `OPERATIONS.md`) removes the bytes.
 
 ## Custom storage adapter
 

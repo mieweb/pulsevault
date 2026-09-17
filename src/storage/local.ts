@@ -362,6 +362,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       checksum: meta.checksum,
       name: meta.name,
       reservedAt: meta.reservedAt,
+      expectedSize: meta.expectedSize,
     };
   };
 

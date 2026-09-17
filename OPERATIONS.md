@@ -103,6 +103,46 @@ await app.register(rateLimit, {
 
 Under `@mieweb/pulsevault/core` (Express, Meteor, plain `http`), use the equivalent middleware for your host — e.g. `express-rate-limit` mounted ahead of `pulseVault.handler`, scoped the same way.
 
+### One valid token can create many artifacts (`relatedTo` amplification)
+
+A capability token authorizes its `artifactId` **and** any artifact whose
+`relatedTo` metadata points at it — that's the session-anchor design that lets
+one pairing upload a video plus its captions, thumbnail, and project file.
+The flip side: a single leaked or hoarded token permits **unbounded artifact
+creation** under that anchor, and pulsevault imposes no count. With no rate
+limit that's a disk-fill amplifier from one credential — and under the
+direct-upload profile (PROTOCOL.md §9) the amplified bytes go straight to
+your bucket without ever transiting the server, so server-side body limits
+never see them.
+
+Mitigate in your `authorize` hook, where the policy belongs: cap artifacts
+per anchor (count existing `relatedTo` matches before allowing a `create`),
+constrain which `kind`s a related artifact may use, and keep token TTLs short
+(a deep-link token only needs to outlive one upload session). The rate-limit
+example above bounds the request *rate*; the per-anchor cap bounds the
+*total*.
+
+### Tokens ride in URLs — treat request logs as sensitive
+
+Two places a capability token legitimately appears in a URL, by design:
+pairing deep links (`pulsecam://…&token=…`) and the `?token=` fallback on
+artifact `GET`s (for `<video>` tags and native players that can't set an
+`Authorization` header). Consequences to plan for:
+
+- **Reverse-proxy and access logs** capture query strings by default — scrub
+  or truncate them (nginx: log `$uri`, not `$request`/`$args`) or the logs
+  become a token store with a longer retention than the tokens.
+- **`Referer` leakage**: a browser page that links out after loading a
+  tokenized URL can leak it. Serve any web player pages with
+  `Referrer-Policy: no-referrer` (or `same-origin`).
+- Prefer the `Authorization` header everywhere a client can set one; treat
+  `?token=` as the fallback it is. Short TTLs bound the damage of any single
+  leaked URL.
+
+The S3/R2 presigned redirect has the same property one hop later (the
+presigned URL embeds its own signature); its lifetime is `presignTtlSeconds`
+(default 900 s) — keep it short for the same reason.
+
 ## Monitoring and audit logging
 
 Wire `onArtifactEvent` once to get both ops metrics and a compliance audit
@@ -233,27 +273,28 @@ cron script for the local adapter, deleting artifacts whose sidecar has been
 `"uploading"` for longer than a cutoff (abandoned uploads) or that are older
 than a retention window (compliance-driven deletion):
 
+> **Direct uploads (PROTOCOL.md §9).** A direct-upload reservation whose
+> `complete` never arrives leaves an `"uploading"` sidecar plus (possibly) a
+> stored object the client PUT but never confirmed. The abandoned-upload
+> cutoff below covers the sidecar; on S3/R2 also add a bucket lifecycle rule
+> for unconfirmed objects, and rely on the built-in reserve debris-reclaim
+> (`reclaimGraceMs`, default 60 s) to free the artifactId for a retried
+> create.
+
 ```ts
-import { readdir, readFile, stat } from "node:fs/promises";
-import path from "node:path";
 import { createLocalStorage } from "@mieweb/pulsevault";
 
 const storage = createLocalStorage({ workspaceDir: "./data" });
-const sidecarDir = path.join(storage.workspaceRoot, ".pulsevault");
 const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000; // 24h stuck "uploading"
 const RETAIN_FOR_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
-for (const file of await readdir(sidecarDir)) {
-  if (!file.endsWith(".json")) continue;
-  const artifactId = file.slice(0, -".json".length);
-  const sidecarPath = path.join(sidecarDir, file);
-  const [sidecar, stats] = await Promise.all([
-    readFile(sidecarPath, "utf8").then(JSON.parse),
-    stat(sidecarPath),
-  ]);
-  const ageMs = Date.now() - stats.mtimeMs;
-  const stuckUploading = sidecar.status === "uploading" && ageMs > ABANDONED_AFTER_MS;
-  const pastRetention = sidecar.status === "ready" && ageMs > RETAIN_FOR_MS;
+for (const artifactId of await storage.listArtifactIds()) {
+  const meta = await storage.getMetadata(artifactId);
+  if (!meta) continue;
+  // reservedAt is absent on sidecars written before v0.3; treat those as old.
+  const ageMs = Date.now() - (meta.reservedAt ?? 0);
+  const stuckUploading = !meta.ready && ageMs > ABANDONED_AFTER_MS;
+  const pastRetention = meta.ready && ageMs > RETAIN_FOR_MS;
   if (stuckUploading || pastRetention) {
     await storage.remove(artifactId);
     console.log(`removed ${artifactId} (${stuckUploading ? "abandoned" : "retention"})`);

@@ -2,7 +2,8 @@ import { Server, EVENTS } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
-import { httpError, statusCodeOf } from './errors.js';
+import { httpError } from './errors.js';
+import { finalizeArtifact } from './finalize.js';
 import { normalizeUploadMetadata } from './upload-metadata.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
@@ -85,7 +86,7 @@ export type PulsevaultTusOptions = {
  * conventions (camelCase) or the tus convention (snake_case) surface with the
  * right HTTP status.
  */
-export const tusError = httpError;
+const tusError = httpError;
 
 /** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
 export function artifactIdFromUploadId(id: string): string | undefined {
@@ -190,72 +191,25 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       const kind: UploadKind = store.kind ?? (await resolveKind(storage, artifactId));
       const checksum = store.checksum ?? (await resolveChecksum(storage, artifactId));
 
-      // 1. Validate payload (magic bytes, checksum, virus scan, etc.). If
-      //    this throws we wipe the bytes from storage — the client gets a
-      //    4xx, the sidecar is gone, and they can safely retry with a
-      //    corrected file. The same hook runs for every kind; consumers that
-      //    want kind-specific behavior branch on `ctx.kind` themselves.
-      if (validatePayload) {
-        try {
-          await validatePayload(store.request, {
-            artifactId,
-            size,
-            uploadId,
-            localPath: await resolveLocalPath(storage, artifactId),
-            ...(checksum ? { checksum } : {}),
-            kind,
-          });
-        } catch (err) {
-          const status = statusCodeOf(err, 422);
-          const message = err instanceof Error ? err.message : 'Payload validation failed';
-          try {
-            await storage.remove?.(artifactId);
-          } catch (rmErr) {
-            logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
-          }
-          await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
-          // 4xx rejection reasons are the client's business (e.g. "Checksum
-          // mismatch: …"); 5xx means *our* side broke — log the real error and
-          // return a generic body so internals (adapter wiring, stack detail)
-          // never reach the client.
-          if (status >= 500) {
-            logger.error({ err, artifactId, kind }, 'pulsevault payload validation errored');
-            throw tusError(status, 'Payload validation failed\n');
-          }
-          throw tusError(status, `${message}\n`);
-        }
+      // The completion sequence (validate → markReady → consumer hook →
+      // event) lives in `finalize.ts`, shared with the direct-upload complete
+      // endpoint so the two ingestion paths can't diverge. Failures map to a
+      // tus error here; the direct endpoint maps the same result to JSON.
+      const result = await finalizeArtifact(
+        { storage, validatePayload, onUploadComplete, onArtifactEvent, logger },
+        store.request,
+        {
+          artifactId,
+          kind,
+          size,
+          uploadId,
+          checksum,
+          localPath: await resolveLocalPath(storage, artifactId),
+        },
+      );
+      if (!result.ok) {
+        throw tusError(result.statusCode, `${result.message}\n`);
       }
-
-      // 2. Flip the sidecar to "ready" so `resolve` will serve the bytes.
-      //    Done *before* the consumer hook so a downstream service that
-      //    reacts to `onUploadComplete` can immediately GET the artifact.
-      try {
-        await storage.markReady?.(artifactId);
-      } catch (err) {
-        // Internal failure — log the real error server-side, return a generic
-        // body (a storage error message can leak paths/config to the client).
-        logger.error({ err, artifactId, kind }, 'pulsevault markReady failed');
-        throw tusError(500, 'Upload finalization failed\n');
-      }
-
-      // 3. Consumer hook — business logic (DB writes, queue jobs).
-      if (onUploadComplete) {
-        try {
-          await onUploadComplete(store.request, { artifactId, kind, size, uploadId });
-        } catch (err) {
-          // Propagate as a tus error so the client sees a non-2xx and can
-          // distinguish "bytes stored but completion hook failed" from
-          // success. The artifact is marked ready at this point — consumers
-          // who want "all-or-nothing" should `storage.remove` before
-          // throwing.
-          // The real error (often a consumer DB failure whose message can leak
-          // schema/infra detail) stays in the server log, not the client body.
-          logger.error({ err, artifactId, kind }, 'pulsevault onUploadComplete failed');
-          throw tusError(500, 'Upload completion hook failed\n');
-        }
-      }
-
-      await onArtifactEvent?.({ phase: 'complete', artifactId, kind, size });
 
       return {};
     },

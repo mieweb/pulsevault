@@ -63,6 +63,8 @@ export type ArtifactMetadata = {
   name?: string;
   /** Epoch-ms timestamp of the reservation that created this artifact, when known. */
   reservedAt?: number;
+  /** Declared total size in bytes (direct uploads only). See `ReserveUploadParams.size`. */
+  expectedSize?: number;
 };
 
 export type ReserveUploadParams = {
@@ -109,6 +111,13 @@ export type ReserveUploadParams = {
    * consumers MUST escape it for their own output context (HTML, shell, etc.).
    */
   name?: string;
+  /**
+   * Expected total size in bytes, when known at reserve time. Sent by direct
+   * (presigned PUT) uploads so completion can verify the stored object matches
+   * what the client declared; TUS uploads leave it unset (the tus offset
+   * protocol already owns byte accounting).
+   */
+  size?: number;
 };
 
 /**

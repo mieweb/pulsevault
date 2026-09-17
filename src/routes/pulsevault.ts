@@ -197,6 +197,53 @@ const capabilitiesSchema: OpenApiRouteSchema = {
 // Fastify doesn't type route params from the schema alone, so `:artifactId` comes through as `unknown`.
 type ArtifactIdParams = { artifactId?: unknown };
 
+const directUploadCreateSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: 'Create a presigned direct upload (PROTOCOL.md §9)',
+  description:
+    'Reserves an artifactId (same collision rules as a TUS create) and returns a presigned PUT URL the client uploads the bytes to directly — the data plane bypasses this server. Requires a storage adapter with direct-upload support (the S3/R2 adapter); local-filesystem deployments return 501.',
+  body: {
+    type: 'object',
+    required: ['artifactId', 'filename', 'size'],
+    properties: {
+      artifactId: { type: 'string', format: 'uuid' },
+      filename: { type: 'string' },
+      kind: { type: 'string', enum: ['video', 'project', 'captions', 'thumbnail'] },
+      relatedTo: { type: 'string', format: 'uuid' },
+      checksum: { type: 'string', description: '`<algorithm>:<hex digest>` of the finished file.' },
+      name: { type: 'string', description: 'Free-form display title (session anchor only).' },
+      size: { type: 'integer', minimum: 1, description: 'Exact byte count; signed into the URL.' },
+    },
+  },
+  response: {
+    400: { description: 'Invalid request.', ...pulseVaultErrorResponse },
+    403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
+    409: { description: 'artifactId already has an upload.', ...pulseVaultErrorResponse },
+    413: { description: '`size` exceeds the maximum upload size.', ...pulseVaultErrorResponse },
+    501: { description: 'Storage adapter has no direct-upload support.', ...pulseVaultErrorResponse },
+  },
+};
+
+const directUploadCompleteSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: 'Confirm a presigned direct upload (PROTOCOL.md §9)',
+  description:
+    'Verifies the stored object matches the declared size, then runs the same validate → markReady → onUploadComplete sequence as a finished TUS upload. Idempotent: completing an already-ready artifact returns 200 without re-running hooks.',
+  params: {
+    type: 'object',
+    properties: { artifactId: { type: 'string', format: 'uuid' } },
+    required: ['artifactId'],
+  },
+  response: {
+    400: { description: 'Invalid artifactId.', ...pulseVaultErrorResponse },
+    403: { description: 'Authorize hook rejected the request.', ...pulseVaultErrorResponse },
+    404: { description: 'Unknown artifactId.', ...pulseVaultErrorResponse },
+    409: { description: 'No uploaded object found for this artifactId.', ...pulseVaultErrorResponse },
+    422: { description: 'Stored object failed validation (size/checksum/sniff).', ...pulseVaultErrorResponse },
+    501: { description: 'Storage adapter has no direct-upload support.', ...pulseVaultErrorResponse },
+  },
+};
+
 /** Coerce the raw route param to a string; an invalid UUID is rejected by the core's own check either way. */
 function paramToString(value: unknown): string {
   return typeof value === 'string' ? value : '';
@@ -280,7 +327,30 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     reply.hijack();
     await core.handleArtifactGet(request.raw, reply.raw, artifactId, token);
   });
+
+  // Direct-upload profile (PROTOCOL.md §9). Fastify already parsed the JSON
+  // body, so these call the core's data-level entry points instead of the raw
+  // handlers (which would try to re-read the drained request stream).
+  fastify.post('/direct-uploads', { schema: directUploadCreateSchema }, async (request, reply) => {
+    const result = await core.directUploadCreate(request, request.body);
+    return reply
+      .header('Protocol-Version', String(PROTOCOL_VERSION))
+      .code(result.statusCode)
+      .send(result.body);
+  });
+
+  fastify.post(
+    '/direct-uploads/:artifactId/complete',
+    { schema: directUploadCompleteSchema },
+    async (request, reply) => {
+      const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
+      const result = await core.directUploadComplete(request, artifactId);
+      return reply
+        .header('Protocol-Version', String(PROTOCOL_VERSION))
+        .code(result.statusCode)
+        .send(result.body);
+    },
+  );
 };
 
 export default pulseVaultRoutes;
-export { PROTOCOL_VERSION };
