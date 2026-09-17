@@ -270,6 +270,25 @@ export async function startMockS3({ buckets = [], conditionalWrites = 'supported
         return;
       }
 
+      if (req.method === 'GET' && !key && q.get('list-type') === '2') {
+        // ListObjectsV2 — `listArtifactIds` on the S3 adapter. Single page.
+        const prefix = q.get('prefix') ?? '';
+        const items = [...objects.entries()]
+          .map(([k, o]) => ({ key: k.slice(bucket.length + 1), size: o.body.length }))
+          .filter(({ key: k }) => k.startsWith(prefix))
+          .map(
+            ({ key: k, size }) =>
+              `<Contents><Key>${xmlEscape(k)}</Key><Size>${size}</Size></Contents>`,
+          )
+          .join('');
+        sendXml(
+          res,
+          200,
+          `<ListBucketResult><Name>${xmlEscape(bucket)}</Name><Prefix>${xmlEscape(prefix)}</Prefix><KeyCount>${items.length}</KeyCount><IsTruncated>false</IsTruncated>${items}</ListBucketResult>`,
+        );
+        return;
+      }
+
       if (req.method === 'GET' && !key && q.has('uploads')) {
         // ListMultipartUploads — only used by @tus/s3-store's expiration sweep.
         const items = [...uploads.entries()]
@@ -344,10 +363,22 @@ export async function startMockS3({ buckets = [], conditionalWrites = 'supported
           );
           return;
         }
-        if (req.headers['if-none-match'] === '*' && objects.has(objKey(bucket, key))) {
+        // `conditionalWrites: 'ignored'` emulates backends that accept the header and
+        // silently don't honor it (older MinIO, some gateways) — the adapter's boot probe
+        // must catch that. `'conflict-409'` answers a lost conditional write the way AWS
+        // does for CONCURRENT writes to one key: 409 ConditionalRequestConflict, not 412.
+        if (
+          req.headers['if-none-match'] === '*' &&
+          conditionalWrites !== 'ignored' &&
+          objects.has(objKey(bucket, key))
+        ) {
           // Drain the body first so the client isn't left writing into a closed socket.
           await readBody(req);
-          sendError(res, 412, 'PreconditionFailed', 'Object already exists');
+          if (conditionalWrites === 'conflict-409') {
+            sendError(res, 409, 'ConditionalRequestConflict', 'Conditional request conflict');
+          } else {
+            sendError(res, 412, 'PreconditionFailed', 'Object already exists');
+          }
           return;
         }
         const body = await readBody(req);

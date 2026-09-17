@@ -22,6 +22,11 @@ export function httpError(status: number, message: string): Error {
   });
 }
 
+/** The message a thrown error surfaces to the client, or `fallback` when it carries none. */
+export function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 /** A usable HTTP status: an integer in 100–599. Anything else would make `res.writeHead` throw. */
 function isHttpStatus(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599;

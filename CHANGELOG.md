@@ -55,6 +55,11 @@ breaking changes, called out explicitly below.
 
 ### Changed
 
+- **Breaking for custom direct-upload adapters:** `presignPut(artifactId,
+  expected, ttl?)` takes the full expected identity instead of a bare size,
+  `createDirectUpload` lost its unused options argument, and
+  `DirectUploadCapableStorage` requires `getMetadata` (the runtime guard
+  already did). `DirectUploadGrant` is exported as the one grant type.
 - **Breaking: the package entry points are flipped to match what the library
   actually is.** `@mieweb/pulsevault` (the `.` export / `main`) is now the
   **framework-agnostic core** — `createPulseVaultCore`, the storage adapters,
@@ -70,6 +75,65 @@ breaking changes, called out explicitly below.
 
 ### Fixed
 
+- **The OPTIONS-preflight bypass now holds on every surface.** It had landed
+  only in the web core; the Node core (and so the Fastify plugin) still
+  classified a browser's CORS preflight as an in-flight `patch`, failed to
+  resolve an artifactId from `/upload`, and answered 403 whenever `authorize`
+  was configured — blocking every browser tus client at the preflight. The
+  authorize decision for TUS requests and for the artifact routes now lives
+  once, in `lib/tus-request.ts` (`authorizeTusRequest`,
+  `authorizeArtifactRequest`), and both cores only render its result — so
+  the phase derivation, the §5.2 unresolvable-id rule, the preflight bypass,
+  the rejection mapping and the event can no longer drift between them.
+- **`HEAD /artifacts/:id` on the Node core** answers like `GET`, headers only
+  (it 404'd; the web core and the Fastify plugin already served it).
+- **AWS's answer to a lost conditional write is honored.** S3 answers two
+  *concurrent* `If-None-Match: "*"` writes to one key with `409
+  ConditionalRequestConflict`, not `412`; the adapter mapped only 412, so a
+  racing duplicate create surfaced as a tus 500 (with the SDK message in the
+  body) instead of the promised 409.
+- **Conditional-write support is decided once, by a boot-time probe, and
+  backends that silently ignore `If-None-Match` are caught.** The adapter
+  used to infer the degraded path per request from a 501; a backend that
+  accepts the header and ignores it (older MinIO, some gateways) never hit
+  that branch and would overwrite a finished artifact's sidecar on every
+  collision with no warning. `initialize()` (or the first reserve) now
+  writes a probe key twice and requires the 412/409 — anything else is the
+  documented check-then-write mode, warned about once per adapter.
+- **A corrupt sidecar is no longer a permanently burned id.** An
+  existing-but-unparseable sidecar (crash mid-write on an older build, a
+  foreign schema) read as absent everywhere, so `DELETE /artifacts/:id`
+  404'd, the retention sweep skipped it, and `reserveUpload` kept 409ing
+  forever. `remove` now clears the sidecar when it exists but doesn't parse,
+  and the local adapter's reserve writes the sidecar whole to a temp file and
+  hard-links it into place (atomic *and* exclusive), so a crash mid-write
+  can't leave debris under the real name in the first place.
+- **The re-grant identity check is one read, in the adapter.** `presignPut`
+  takes the full expected identity (`size`, `kind`, `ext`, `relatedTo`),
+  reads storage truth once at mint time and compares every field; the core
+  no longer does a separate same-shape read that a remove + re-reserve could
+  race between.
+- **`complete` decides "is this a TUS reservation" under its lock**, on the
+  serialized re-read, not on the pre-lock snapshot a racing 422-cleanup +
+  TUS re-create could invalidate.
+- **The S3 byte readers that feed `validatePayload` read the sidecar fresh**
+  — on shared storage a rival instance may have removed + re-reserved the id
+  since this process cached its per-reservation object key, and validating
+  (then wiping) the wrong object turned a good upload into a 500.
+- **The Fastify surface accepts what the other surfaces accept.** Its Ajv
+  body schema for `POST /direct-uploads` was stricter than the core's
+  normalization (no `videoid`/`projectid` aliases, case-sensitive `kind`,
+  non-UUID `relatedTo` rejected instead of dropped); the schema is now
+  documentation only and the core is the one rulebook. `POST …/complete`
+  under a `Content-Type: application/json` header with no body (the common
+  fetch/axios default) was a 400 from Fastify's JSON parser where the Node
+  and web cores return 200; the plugin scopes its own tolerant parser.
+- **Direct-upload grants really pin the content type.** The presigner leaves
+  `content-type` unsigned by default; it is now named as signable, so the
+  grant's `headers` are what the URL will accept, as documented.
+- **Passing the removed `uploadUnit` option is a `TypeError` at boot** on
+  the plugin, the core and the web handler, instead of silent acceptance
+  that quietly changed wire behavior for not-yet-upgraded clients.
 - **Direct-upload re-grants require the same session anchor.** The same-shape
   predicate compared kind/ext/size but not `relatedTo`, so a token authorized
   for anchor A could submit anchor B's known artifactId with `relatedTo: A`,
@@ -157,6 +221,10 @@ breaking changes, called out explicitly below.
 
 ### Added
 
+- **`listArtifactIds()` on the S3/R2 adapter** (a paginated
+  `ListObjectsV2` over the metadata prefix), so the OPERATIONS.md retention
+  sweep — the only thing besides tus `DELETE` that frees an abandoned
+  single-use id — can run on object storage, not just the local adapter.
 - **Web-standard core: `@mieweb/pulsevault/web`.** `createPulseVaultWebHandler`
   serves the whole protocol as a WHATWG `Request → Response` handler — one-line
   mounts under Hono (any runtime), Bun, Deno, and fetch-style meta-framework

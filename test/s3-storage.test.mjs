@@ -260,42 +260,88 @@ test('presignPut refuses a TUS-shaped reservation under the same artifactId', as
 // exactly once per process. This branch was untestable against s3rver (it
 // silently ignored the header) and is the one path the reserve rewrite in
 // this release touches without conditional-write protection.
-test('conditional-write-unsupported backend: fallback reserves, still 409s duplicates, warns once', async () => {
-  const degraded = await startMockS3({ buckets: [BUCKET], conditionalWrites: 'unsupported' });
+/** An adapter against a fresh mock with the given conditional-write personality, plus its captured warnings. */
+async function degradedAdapter(conditionalWrites) {
+  const mock = await startMockS3({ buckets: [BUCKET], conditionalWrites });
   const warns = [];
   const realWarn = console.warn;
   console.warn = (...args) => warns.push(args.join(' '));
-  try {
-    const storage = await createS3Storage({
-      bucket: BUCKET,
-      endpoint: degraded.endpoint,
-      region: 'us-east-1',
-      accessKeyId: 'MOCKS3',
-      secretAccessKey: 'MOCKS3',
-      forcePathStyle: true,
-      clientConfig: {
-        requestChecksumCalculation: 'WHEN_REQUIRED',
-        responseChecksumValidation: 'WHEN_REQUIRED',
-      },
-    });
-    const reserve = (artifactId) =>
-      storage.reserveUpload({ artifactId, kind: 'video', ext: '.mp4', filename: 'clip.mp4' });
+  const storage = await createS3Storage({
+    bucket: BUCKET,
+    endpoint: mock.endpoint,
+    region: 'us-east-1',
+    accessKeyId: 'MOCKS3',
+    secretAccessKey: 'MOCKS3',
+    forcePathStyle: true,
+    clientConfig: {
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
+    },
+  });
+  const reserve = (artifactId) =>
+    storage.reserveUpload({ artifactId, kind: 'video', ext: '.mp4', filename: 'clip.mp4' });
+  return {
+    storage,
+    reserve,
+    warns,
+    close: async () => {
+      console.warn = realWarn;
+      await mock.close();
+    },
+  };
+}
 
-    // Fallback path still reserves (no hard 5xx on a degraded backend)…
-    await reserve(randomUUID());
-    // …a duplicate is still rejected 409 via the check-then-write check…
-    const dup = randomUUID();
-    await reserve(dup);
+// The degraded-backend branch is decided ONCE, by a boot-time probe, for both kinds
+// of backend that can't be trusted with `If-None-Match`: those that reject the
+// header (501) and — the dangerous ones — those that accept it and silently
+// ignore it. Both fall back to check-then-write: reserve keeps working,
+// duplicates still 409 via the check, and the operator is warned exactly once.
+for (const personality of ['unsupported', 'ignored']) {
+  test(`conditional-write-${personality} backend: probe degrades once, still 409s duplicates, warns once`, async () => {
+    const { reserve, warns, close } = await degradedAdapter(personality);
+    try {
+      await reserve(randomUUID());
+      const dup = randomUUID();
+      await reserve(dup);
+      await assert.rejects(
+        () => reserve(dup),
+        (err) => err?.statusCode === 409,
+      );
+      assert.equal(warns.filter((w) => w.includes('conditional writes')).length, 1);
+    } finally {
+      await close();
+    }
+  });
+}
+
+test('a lost conditional write answered the AWS way (409 ConditionalRequestConflict) is the reserve 409', async () => {
+  const { reserve, warns, close } = await degradedAdapter('conflict-409');
+  try {
+    const id = randomUUID();
+    await reserve(id);
     await assert.rejects(
-      () => reserve(dup),
+      () => reserve(id),
       (err) => err?.statusCode === 409,
     );
-    // …and the degraded-mode warning fired exactly once across all fallbacks.
-    const fallbackWarns = warns.filter((w) => w.includes('conditional writes'));
-    assert.equal(fallbackWarns.length, 1);
+    // A backend that honors the header (just with the other status) is not degraded.
+    assert.equal(warns.filter((w) => w.includes('conditional writes')).length, 0);
   } finally {
-    console.warn = realWarn;
-    await degraded.close();
+    await close();
+  }
+});
+
+test('listArtifactIds enumerates every sidecar (reserved or ready) — the retention sweep input on S3', async () => {
+  const { storage, reserve, close } = await degradedAdapter('supported');
+  try {
+    const ids = [randomUUID(), randomUUID()];
+    for (const id of ids) await reserve(id);
+    await storage.markReady(ids[0]);
+    const listed = await storage.listArtifactIds();
+    assert.deepEqual(listed.filter((id) => ids.includes(id)).sort(), [...ids].sort());
+    await storage.remove(ids[1]);
+    assert.ok(!(await storage.listArtifactIds()).includes(ids[1]));
+  } finally {
+    await close();
   }
 });
 

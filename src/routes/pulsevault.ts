@@ -16,6 +16,8 @@ import type {
 } from '../lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import { type PulseVaultAuthorize } from '../lib/authorize.js';
+import { errorMessage, pulseVaultError, statusCodeOf } from '../lib/errors.js';
+import { MAX_DIRECT_UPLOAD_BODY_BYTES } from '../lib/direct-upload.js';
 import type { PulseVaultAllowedExtensions } from '../lib/options.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
@@ -206,17 +208,19 @@ const directUploadCreateSchema: OpenApiRouteSchema = {
   summary: 'Create a presigned direct upload (PROTOCOL.md §9)',
   description:
     'Reserves an artifactId (same collision rules as a TUS create) and returns a presigned PUT URL the client uploads the bytes to directly — the data plane bypasses this server. Requires a storage adapter with direct-upload support (the S3/R2 adapter); local-filesystem deployments return 501.',
+  // Documentation only — no `required`, formats, or enums: the core validates the
+  // body with the same rulebook as TUS `Upload-Metadata` (aliases, case-folded kind,
+  // non-UUID `relatedTo` dropped), and Ajv must not reject what the other surfaces accept.
   body: {
     type: 'object',
-    required: ['artifactId', 'filename', 'size'],
     properties: {
-      artifactId: { type: 'string', format: 'uuid' },
-      filename: { type: 'string' },
-      kind: { type: 'string', enum: ['video', 'project', 'captions', 'thumbnail'] },
-      relatedTo: { type: 'string', format: 'uuid' },
+      artifactId: { type: 'string', description: 'UUID. Required.' },
+      filename: { type: 'string', description: 'Required; the extension selects the content type.' },
+      kind: { type: 'string', description: '`video` (default), `project`, `captions`, or `thumbnail`.' },
+      relatedTo: { type: 'string', description: 'UUID of the session anchor this artifact belongs to.' },
       checksum: { type: 'string', description: '`<algorithm>:<hex digest>` of the finished file.' },
       name: { type: 'string', description: 'Free-form display title (session anchor only).' },
-      size: { type: 'integer', minimum: 1, description: 'Exact byte count; signed into the URL.' },
+      size: { type: 'integer', description: 'Exact byte count; required, signed into the URL.' },
     },
   },
   response: {
@@ -352,20 +356,33 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
   // answer in the protocol's error shape, Protocol-Version stamped, with 5xx
   // internals kept server-side.
   fastify.setErrorHandler((error, request, reply) => {
-    const e = error as { statusCode?: unknown; message?: unknown };
-    const statusCode = typeof e.statusCode === 'number' && e.statusCode >= 400 ? e.statusCode : 500;
+    const code = statusCodeOf(error, 500);
+    const statusCode = code >= 400 ? code : 500;
     if (statusCode >= 500) request.log.error({ err: error }, 'pulsevault route failed');
-    const message =
-      statusCode >= 500
-        ? 'Internal Server Error'
-        : typeof e.message === 'string' && e.message
-          ? e.message
-          : 'Bad Request';
+    const message = statusCode >= 500 ? 'Internal Server Error' : errorMessage(error, 'Bad Request');
     return reply
       .header('Protocol-Version', String(PROTOCOL_VERSION))
       .code(statusCode)
-      .send({ ok: false, error: message });
+      .send(pulseVaultError(message));
   });
+
+  // PROTOCOL §9.2's `complete` has no body, but clients commonly send a default
+  // `Content-Type: application/json` on every POST — Fastify's stock JSON parser
+  // 400s an empty body under that header, where the Node and web cores (which
+  // never read it) return 200. Scoped to this plugin's encapsulation context.
+  fastify.removeContentTypeParser('application/json');
+  fastify.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string', bodyLimit: MAX_DIRECT_UPLOAD_BODY_BYTES },
+    (_request, body, done) => {
+      if (!body) return done(null, undefined);
+      try {
+        done(null, JSON.parse(String(body)));
+      } catch {
+        done(Object.assign(new Error('Request body must be JSON'), { statusCode: 400 }), undefined);
+      }
+    },
+  );
 
   fastify.post('/direct-uploads', { schema: directUploadCreateSchema }, async (request, reply) => {
     const result = await core.directUploadCreate(request, request.body);

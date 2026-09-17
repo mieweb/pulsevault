@@ -12,6 +12,7 @@ import type {
 import {
   buildSidecar,
   createMetaCache,
+  createSidecarReader,
   DEFAULT_META_CACHE_LIMIT,
   extToContentType,
   parseSidecar,
@@ -180,26 +181,13 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
       throw err;
     }
-    // Malformed sidecars parse to null — treated as absent; `reserveUpload`
-    // rewrites them on the next create.
+    // Malformed sidecars parse to null — absent for readers, but the file still
+    // burns the id for `reserveUpload` (exclusive create) until `remove` clears it.
     return parseSidecar(raw);
   };
 
-  const loadMeta = async (artifactId: string, opts?: { fresh?: boolean }) => {
-    if (!opts?.fresh) {
-      const cached = metaCache.get(artifactId);
-      if (cached) return cached;
-    }
-    // Capture the deletion epoch BEFORE the disk read: if a `remove` lands
-    // while this read is in flight, the epoch moves and the stale fill below
-    // is discarded instead of resurrecting a deleted artifact's metadata.
-    const asOf = metaCache.epoch();
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) return null;
-    const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
-    metaCache.set(artifactId, meta, asOf);
-    return meta;
-  };
+  const { loadMeta, getKind, getRelatedTo, getChecksum, getName, getMetadata } =
+    createSidecarReader({ cache: metaCache, readSidecar });
 
   const initialize = async (): Promise<void> => {
     // Dirs PulseVault creates itself get mode 0o750 directly (mkdir's mode caps
@@ -219,17 +207,24 @@ const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
     const sidecar = buildSidecar(params);
     const asOf = metaCache.epoch();
 
-    // ArtifactIds are single-use: the exclusive `wx` create fails atomically
-    // with EEXIST if a sidecar already exists for this artifactId — whether
-    // the previous upload finished, is still in flight, or died halfway.
-    // Every collision is a plain 409 (via @tus/server's error path); clients
-    // mint a fresh id per attempt, and abandoned reservations age out via
-    // operator retention (see OPERATIONS.md), not an in-band reclaim.
+    // ArtifactIds are single-use: the sidecar is written whole to a temp file
+    // and then hard-linked into place — `link` is atomic AND exclusive (EEXIST
+    // if any sidecar, even crash debris, already holds the name), so a
+    // collision is a plain 409 whether the previous upload finished, is still
+    // in flight, or died halfway, and a crash mid-write can never leave a
+    // truncated sidecar under the real name. Clients mint a fresh id per
+    // attempt; abandoned reservations age out via operator retention (see
+    // OPERATIONS.md), not an in-band reclaim.
+    const finalPath = sidecarPath(artifactId);
+    const tmpPath = `${finalPath}.${crypto.randomUUID()}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(sidecar));
     try {
-      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+      await fs.link(tmpPath, finalPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
       throw reserveConflictError(artifactId);
+    } finally {
+      await fs.rm(tmpPath, { force: true });
     }
 
     metaCache.set(artifactId, sidecarToCachedMeta(sidecar, false), asOf);
@@ -281,13 +276,27 @@ const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
 
   const remove = async (artifactId: string): Promise<boolean> =>
     withArtifactLock(artifactId, async () => {
+      // `readSidecar` gates every path below on a real UUID; the debris branch
+      // touches the filesystem directly, so gate here too.
+      if (!isUuid(artifactId)) return false;
       // Read disk truth under the lock — the current kind/ext decide which
       // files the deletes below target, and a cached entry could be stale.
       const meta = await loadMeta(artifactId, { fresh: true });
-      // Drop from cache before rm so a racing `resolve` arriving after the
-      // rm but before cache eviction can't hand back a stale path.
-      metaCache.delete(artifactId);
-      if (!meta) return false;
+      if (!meta) {
+        // An existing-but-unparseable sidecar (crash mid-write on an older
+        // build, a foreign schema) still burns the id — clear it here rather
+        // than leave an id no API can free. Its bytes, if any, are unknowable
+        // without kind/ext; retention covers those.
+        const cleared = await fs.rm(sidecarPath(artifactId)).then(
+          () => true,
+          (err) => {
+            if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+            throw err;
+          },
+        );
+        metaCache.delete(artifactId);
+        return cleared;
+      }
       const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
       // Bytes and datastore state first, sidecar LAST (mirroring the S3
       // adapter): the sidecar is the reservation lock — while it exists,
@@ -298,10 +307,11 @@ const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
         fs.rm(`${artifactPath}.json`, { force: true }),
       ]);
       await fs.rm(sidecarPath(artifactId), { force: true });
-      // Evict again AFTER the deletes — and bump the deletion epoch — so neither a
-      // read that landed between the first eviction and the deletes nor an
-      // in-flight `loadMeta` fill can resurrect the deleted artifact's metadata
-      // (fills capture the epoch before reading and are discarded on mismatch).
+      // Evict AFTER the sidecar is gone — and bump the deletion epoch — so an
+      // in-flight `loadMeta` fill that read the sidecar before the rm can't
+      // resurrect it (fills capture the epoch before reading and are discarded
+      // on mismatch). Evicting earlier would buy nothing: the sidecar is still
+      // on disk until this point, so a racing read just refills from it.
       metaCache.delete(artifactId);
       return true;
     });
@@ -312,45 +322,6 @@ const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
     return path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
   };
 
-  const getKind = async (artifactId: string): Promise<UploadKind | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta ? meta.kind : null;
-  };
-
-  const getRelatedTo = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.relatedTo ?? null;
-  };
-
-  const getChecksum = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.checksum ?? null;
-  };
-
-  const getName = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    return meta?.name ?? null;
-  };
-
-  const getMetadata = async (
-    artifactId: string,
-    opts?: { fresh?: boolean },
-  ): Promise<ArtifactMetadata | null> => {
-    const meta = await loadMeta(artifactId, opts);
-    if (!meta) return null;
-    return {
-      artifactId,
-      kind: meta.kind,
-      ext: meta.ext,
-      filename: meta.filename ?? `${artifactId}${meta.ext}`,
-      ready: meta.ready,
-      relatedTo: meta.relatedTo,
-      checksum: meta.checksum,
-      name: meta.name,
-      reservedAt: meta.reservedAt,
-      expectedSize: meta.expectedSize,
-    };
-  };
 
   const listArtifactIds = async (): Promise<string[]> => {
     let entries: string[];

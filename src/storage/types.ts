@@ -67,6 +67,13 @@ export type ArtifactMetadata = {
   expectedSize?: number;
 };
 
+/** A presigned direct-upload grant — the PROTOCOL.md §9.1 response body's data-plane half. */
+export type DirectUploadGrant = {
+  uploadUrl: string;
+  expiresAt: string;
+  headers: Record<string, string>;
+};
+
 export type ReserveUploadParams = {
   /** UUID from `Upload-Metadata.artifactId` (or the `videoid`/`projectid` legacy aliases). */
   artifactId: string;

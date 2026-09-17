@@ -1,5 +1,5 @@
 import { httpError } from '../lib/errors.js';
-import type { ReserveUploadParams, UploadKind } from './types.js';
+import type { ArtifactMetadata, ReserveUploadParams, UploadKind } from './types.js';
 import { parseUploadKind } from './types.js';
 
 /**
@@ -157,6 +157,72 @@ export function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMet
     reservedAt: sidecar.reservedAt,
     expectedSize: sidecar.expectedSize,
     objectSuffix: sidecar.objectSuffix,
+  };
+}
+
+/** Project a cached entry into the public `ArtifactMetadata` shape the storage contract exposes. */
+export function cachedMetaToArtifactMetadata(artifactId: string, meta: CachedMeta): ArtifactMetadata {
+  return {
+    artifactId,
+    kind: meta.kind,
+    ext: meta.ext,
+    filename: meta.filename ?? `${artifactId}${meta.ext}`,
+    ready: meta.ready,
+    relatedTo: meta.relatedTo,
+    checksum: meta.checksum,
+    name: meta.name,
+    reservedAt: meta.reservedAt,
+    expectedSize: meta.expectedSize,
+  };
+}
+
+/**
+ * The read side every adapter shares: a cached `loadMeta` over the adapter's
+ * own `readSidecar`, plus the per-field getters and the `ArtifactMetadata`
+ * projection of the storage contract. Adapters spread this into their storage
+ * object, so the cache's epoch protocol (capture BEFORE the read, hand it to
+ * `set`) and the projection exist exactly once instead of once per adapter.
+ */
+export function createSidecarReader(deps: {
+  cache: MetaCache;
+  readSidecar: (artifactId: string) => Promise<Sidecar | null>;
+}) {
+  const { cache, readSidecar } = deps;
+  const loadMeta = async (
+    artifactId: string,
+    opts?: { fresh?: boolean },
+  ): Promise<CachedMeta | null> => {
+    if (!opts?.fresh) {
+      const cached = cache.get(artifactId);
+      if (cached) return cached;
+    }
+    // Capture the deletion epoch BEFORE the storage read: if a `remove` lands
+    // while this read is in flight, the epoch moves and the stale fill below
+    // is discarded instead of resurrecting a deleted artifact's metadata.
+    const asOf = cache.epoch();
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) return null;
+    const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
+    cache.set(artifactId, meta, asOf);
+    return meta;
+  };
+  return {
+    loadMeta,
+    getKind: async (artifactId: string): Promise<UploadKind | null> =>
+      (await loadMeta(artifactId))?.kind ?? null,
+    getRelatedTo: async (artifactId: string): Promise<string | null> =>
+      (await loadMeta(artifactId))?.relatedTo ?? null,
+    getChecksum: async (artifactId: string): Promise<string | null> =>
+      (await loadMeta(artifactId))?.checksum ?? null,
+    getName: async (artifactId: string): Promise<string | null> =>
+      (await loadMeta(artifactId))?.name ?? null,
+    getMetadata: async (
+      artifactId: string,
+      opts?: { fresh?: boolean },
+    ): Promise<ArtifactMetadata | null> => {
+      const meta = await loadMeta(artifactId, opts);
+      return meta ? cachedMetaToArtifactMetadata(artifactId, meta) : null;
+    },
   };
 }
 

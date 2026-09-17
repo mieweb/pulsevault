@@ -3,32 +3,30 @@ import send from '@fastify/send';
 import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
-  artifactIdFromUploadId,
   type PulseVaultOnUploadComplete,
   type PulseVaultOnArtifactEvent,
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
 import { httpError, pulseVaultError, statusCodeOf } from './lib/errors.js';
-import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, type PulseVaultRequest, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
 import { buildCapabilitiesPayload, PROTOCOL_VERSION } from './lib/capabilities.js';
 import {
   directUploadCreate,
   directUploadComplete,
+  MAX_DIRECT_UPLOAD_BODY_BYTES,
   type DirectUploadDeps,
   type DirectUploadResult,
 } from './lib/direct-upload.js';
 import {
-  artifactIdFromTusUrl,
-  extractAuthzMessage,
-  parseUploadMetadataHeader,
-  resolveStorageKind,
-  resolveStorageRelatedTo,
+  authorizeArtifactRequest,
+  authorizeTusRequest,
+  type AuthorizeDeps,
 } from './lib/tus-request.js';
 import {
   normalizeAllowedExtensions,
+  rejectRemovedOptions,
   validateBasePath,
   validateMaxUploadSize,
   validateAllowedExtensions,
@@ -143,13 +141,6 @@ export type PulseVaultCore = {
   ) => Promise<DirectUploadResult>;
 };
 
-/**
- * Request interpretation (which artifact is this request about?) is shared
- * with the web-standard core via `lib/tus-request.ts` — see that module for
- * the URL-smuggling rationale behind `artifactIdFromTusUrl`.
- */
-const parseUploadMetadata = parseUploadMetadataHeader;
-
 function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
@@ -185,6 +176,7 @@ function stashPulseVaultContext(req: IncomingMessage, ctx: PulseVaultRequestCont
  * `lib/pulsevaultTus.js` tus server, so behavior can't drift between them.
  */
 export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVaultCore {
+  rejectRemovedOptions(options);
   validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
   validateAllowedExtensions(options.allowedExtensions);
@@ -216,72 +208,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   });
 
   /**
-   * Run the consumer's `authorize` hook (if any) for a TUS request. Returns
-   * `true` iff the request may proceed; on rejection, this function already
-   * wrote the response.
+   * The authorize decision itself lives in `lib/tus-request.ts`, shared with
+   * the web core; this surface only renders it and stashes the request
+   * context for the host framework.
    */
-  const runAuthorize = async (
-    req: IncomingMessage,
-    res: ServerResponse,
-    phase: 'create' | 'patch',
-  ): Promise<
-    | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
-    | { ok: false }
-  > => {
-    let artifactId: string | undefined;
-    let kind: UploadKind = 'video';
-    let relatedTo: string | undefined;
-    if (phase === 'create') {
-      const meta = req.headers['upload-metadata'];
-      if (typeof meta === 'string') {
-        ({ artifactId, kind, relatedTo } = parseUploadMetadata(meta));
-      }
-    } else {
-      artifactId = artifactIdFromTusUrl(req.url ?? '');
-      if (artifactId) {
-        kind = await resolveStorageKind(storage, artifactId);
-        relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-      }
-    }
-
-    if (artifactId) {
-      stashPulseVaultContext(req, { artifactId, kind, relatedTo });
-    }
-
-    if (!authorize) {
-      return { ok: true, artifactId, kind, relatedTo };
-    }
-
-    if (!artifactId && phase === 'patch') {
-      // PROTOCOL.md §5.2: failing to resolve the artifactId for an in-flight
-      // upload request is an authorization failure — reject, don't fall
-      // through to "no artifactId to check, so allow".
-      logger.info(
-        { url: req.url, phase },
-        'pulsevault authorize rejected: unresolvable artifactId',
-      );
-      writeJson(res, 403, pulseVaultError('Unable to resolve artifact for authorization'));
-      return { ok: false };
-    }
-
-    if (!artifactId) {
-      return { ok: true, artifactId, kind, relatedTo };
-    }
-
-    try {
-      await authorize(req, { phase, artifactId, kind, relatedTo });
-      return { ok: true, artifactId, kind, relatedTo };
-    } catch (err) {
-      const statusCode = statusCodeOf(err, 403);
-      const message = extractAuthzMessage(err);
-      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      if (phase === 'create') {
-        await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
-      }
-      writeJson(res, statusCode, pulseVaultError(message));
-      return { ok: false };
-    }
-  };
+  const authzDeps: AuthorizeDeps = { storage, authorize, onArtifactEvent, logger };
 
   /**
    * Fail closed on an unexpected handler error. Host frameworks call these
@@ -313,17 +244,23 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     // the client resumes from the last persisted byte on its next PATCH.
     req.on('error', () => {});
     res.on('error', () => {});
-    const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
     try {
-      // Inside the try: runAuthorize does storage I/O (kind/relatedTo resolution)
-      // and header writes of its own — an adapter fault or a consumer error with
-      // a bogus statusCode there must fail closed too, not hang the hijacked socket.
-      const authz = await runAuthorize(req, res, phase);
-      if (!authz.ok) return;
-
-      await pulseVaultTusContext.run({ request: req, artifactId: authz.artifactId }, () =>
-        tusServer.handle(req, res),
-      );
+      // Inside the try: the authorize decision does storage I/O (identity
+      // resolution) — an adapter fault or a consumer error with a bogus
+      // statusCode there must fail closed too, not hang the hijacked socket.
+      const meta = req.headers['upload-metadata'];
+      const decision = await authorizeTusRequest(authzDeps, req, {
+        method: req.method,
+        url: req.url ?? '',
+        uploadMetadata: typeof meta === 'string' ? meta : undefined,
+      });
+      if (!decision.ok) {
+        writeJson(res, decision.statusCode, decision.body);
+        return;
+      }
+      const { artifactId, kind, relatedTo } = decision;
+      if (artifactId) stashPulseVaultContext(req, { artifactId, kind, relatedTo });
+      await pulseVaultTusContext.run({ request: req }, () => tusServer.handle(req, res));
     } catch (err) {
       failClosed(res, err, 'tus handler');
     }
@@ -357,7 +294,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     directUploadComplete(directDeps, request, artifactId);
 
   /** Collect a small JSON request body; 413s beyond the cap (these bodies are a few hundred bytes). */
-  const readJsonBody = (req: IncomingMessage, limitBytes = 64 * 1024): Promise<unknown> =>
+  const readJsonBody = (
+    req: IncomingMessage,
+    limitBytes = MAX_DIRECT_UPLOAD_BODY_BYTES,
+  ): Promise<unknown> =>
     new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let total = 0;
@@ -424,10 +364,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   };
 
   /**
-   * Shared prelude for the artifact GET/DELETE handlers: resolve `kind`/
-   * `relatedTo` from storage, stash the request context, then run `authorize`
-   * (if configured) for the given phase. Returns `undefined` (having already
-   * written the response) when validation fails or `authorize` rejects.
+   * Shared prelude for the artifact GET/HEAD/DELETE handlers — the decision is
+   * `authorizeArtifactRequest` (shared with the web core); this renders a
+   * rejection and stashes the request context. Returns `undefined` (having
+   * already written the response) on rejection.
    */
   const prepareArtifactRequest = async (
     req: IncomingMessage,
@@ -436,28 +376,14 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     phase: 'resolve' | 'delete',
     token?: string,
   ): Promise<{ kind: UploadKind; relatedTo: string | undefined } | undefined> => {
-    if (!isUuid(artifactId)) {
-      writeJson(res, 400, pulseVaultError('`artifactId` must be a valid UUID'));
+    const decision = await authorizeArtifactRequest(authzDeps, req, { artifactId, phase, token });
+    if (!decision.ok) {
+      writeJson(res, decision.statusCode, decision.body);
       return undefined;
     }
-
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
+    const { kind, relatedTo } = decision;
     stashPulseVaultContext(req, { artifactId, kind, relatedTo });
-
-    if (!authorize) return { kind, relatedTo };
-
-    try {
-      await authorize(req, { phase, artifactId, kind, relatedTo, token });
-      return { kind, relatedTo };
-    } catch (err) {
-      const statusCode = statusCodeOf(err, 403);
-      const message = extractAuthzMessage(err);
-      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
-      writeJson(res, statusCode, pulseVaultError(message));
-      return undefined;
-    }
+    return { kind, relatedTo };
   };
 
   const handleArtifactDelete = async (
@@ -525,6 +451,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       // would otherwise infer from the filename.
       if (resolved.contentType) {
         headers['content-type'] = resolved.contentType;
+      }
+      if (req.method === 'HEAD') {
+        result.stream.destroy();
+        res.writeHead(result.statusCode, headers);
+        res.end();
+        return;
       }
       res.writeHead(result.statusCode, headers);
       // Headers are on the wire now, so a mid-stream read error (file removed
@@ -608,7 +540,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
-      if (req.method === 'GET') {
+      if (req.method === 'GET' || req.method === 'HEAD') {
         await handleArtifactGet(req, res, artifactId, url.searchParams.get('token') ?? undefined);
         return;
       }

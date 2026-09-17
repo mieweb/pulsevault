@@ -1,5 +1,9 @@
 import { isUuid } from './uuid.js';
 import { decodeUploadMetadataHeader, normalizeUploadMetadata } from './upload-metadata.js';
+import { errorMessage, pulseVaultError, statusCodeOf, type PulseVaultErrorBody } from './errors.js';
+import type { PulseVaultAuthorize } from './authorize.js';
+import type { PulseVaultLogger, PulseVaultRequest } from './request.js';
+import type { PulseVaultOnArtifactEvent } from './pulsevaultTus.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
 /**
@@ -123,7 +127,121 @@ export async function resolveStorageRelatedTo(
 }
 
 /** Message an authorize rejection surfaces to the client. */
-export function extractAuthzMessage(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  return 'Forbidden';
+export const extractAuthzMessage = (err: unknown): string => errorMessage(err, 'Forbidden');
+
+/** The identity of the artifact a request is about — one storage read where the adapter has `getMetadata`. */
+export type ArtifactIdentity = { kind: UploadKind; relatedTo: string | undefined };
+
+export async function resolveArtifactIdentity(
+  storage: PulseVaultStorage,
+  artifactId: string,
+): Promise<ArtifactIdentity> {
+  if (storage.getMetadata) {
+    const meta = await storage.getMetadata(artifactId);
+    return { kind: meta?.kind ?? 'video', relatedTo: meta?.relatedTo };
+  }
+  return {
+    kind: await resolveStorageKind(storage, artifactId),
+    relatedTo: await resolveStorageRelatedTo(storage, artifactId),
+  };
+}
+
+/** What an authorize decision needs: the hook, the storage identity comes from, and the ops sinks. */
+export type AuthorizeDeps = {
+  storage: PulseVaultStorage;
+  authorize?: PulseVaultAuthorize;
+  onArtifactEvent?: PulseVaultOnArtifactEvent;
+  logger: PulseVaultLogger;
+};
+
+/** An authorize outcome as data — each transport renders the rejection in its own response type. */
+export type AuthorizeDecision<T> =
+  | ({ ok: true } & T)
+  | { ok: false; statusCode: number; body: PulseVaultErrorBody };
+
+async function runAuthorize(
+  deps: AuthorizeDeps,
+  request: PulseVaultRequest,
+  ctx: Parameters<PulseVaultAuthorize>[1],
+  emitEvent: boolean,
+): Promise<{ ok: true } | { ok: false; statusCode: number; body: PulseVaultErrorBody }> {
+  try {
+    await deps.authorize?.(request, ctx);
+    return { ok: true };
+  } catch (err) {
+    const statusCode = statusCodeOf(err, 403);
+    const message = extractAuthzMessage(err);
+    const { artifactId, phase, kind } = ctx;
+    deps.logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
+    if (emitEvent) {
+      await deps.onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
+    }
+    return { ok: false, statusCode, body: pulseVaultError(message) };
+  }
+}
+
+/**
+ * The authorize decision for a TUS request — ONE function for every surface,
+ * so the phase derivation, the OPTIONS preflight bypass, the PROTOCOL §5.2
+ * unresolvable-id rule, the rejection mapping, the log line, and the event
+ * can't drift between the Node core and the web core (two hand-mirrored
+ * copies is how the preflight bypass ended up on only one of them).
+ * Transport glue renders the result; it makes no decisions of its own.
+ */
+export async function authorizeTusRequest(
+  deps: AuthorizeDeps,
+  request: PulseVaultRequest,
+  input: { method: string | undefined; url: string; uploadMetadata: string | undefined },
+): Promise<AuthorizeDecision<{ artifactId: string | undefined } & ArtifactIdentity>> {
+  const none = { artifactId: undefined, kind: 'video' as const, relatedTo: undefined };
+  // OPTIONS is the tus capabilities/CORS preflight — no artifact, no bytes,
+  // and browsers can't attach the bearer header to it. Let @tus/server answer.
+  if (input.method === 'OPTIONS') return { ok: true, ...none };
+  const phase = input.method === 'POST' ? 'create' : 'patch';
+  let identity: { artifactId: string | undefined } & ArtifactIdentity = none;
+  if (phase === 'create') {
+    if (input.uploadMetadata) identity = parseUploadMetadataHeader(input.uploadMetadata);
+  } else {
+    const artifactId = artifactIdFromTusUrl(input.url);
+    if (artifactId) {
+      identity = { artifactId, ...(await resolveArtifactIdentity(deps.storage, artifactId)) };
+    }
+  }
+  if (!deps.authorize) return { ok: true, ...identity };
+  const { artifactId, kind, relatedTo } = identity;
+  if (!artifactId) {
+    if (phase === 'create') return { ok: true, ...identity };
+    // PROTOCOL.md §5.2: an unresolvable artifactId on an in-flight request is
+    // an authorization failure — reject, don't fall through to "nothing to check".
+    deps.logger.info({ url: input.url, phase }, 'pulsevault authorize rejected: unresolvable artifactId');
+    return {
+      ok: false,
+      statusCode: 403,
+      body: pulseVaultError('Unable to resolve artifact for authorization'),
+    };
+  }
+  // Rejections at create are events (the client is asking for a new artifact); per-chunk
+  // PATCH rejections are not, or a rejected upload would spam one event per chunk.
+  const decision = await runAuthorize(
+    deps,
+    request,
+    { phase, artifactId, kind, relatedTo },
+    phase === 'create',
+  );
+  return decision.ok ? { ok: true, ...identity } : decision;
+}
+
+/** The same decision for the artifact GET/HEAD/DELETE routes: UUID check, identity, `authorize` for the phase. */
+export async function authorizeArtifactRequest(
+  deps: AuthorizeDeps,
+  request: PulseVaultRequest,
+  input: { artifactId: string; phase: 'resolve' | 'delete'; token?: string },
+): Promise<AuthorizeDecision<ArtifactIdentity>> {
+  const { artifactId, phase, token } = input;
+  if (!isUuid(artifactId)) {
+    return { ok: false, statusCode: 400, body: pulseVaultError('`artifactId` must be a valid UUID') };
+  }
+  const identity = await resolveArtifactIdentity(deps.storage, artifactId);
+  const decision = await runAuthorize(deps, request, { phase, artifactId, ...identity, token }, true);
+  return decision.ok ? { ok: true, ...identity } : decision;
 }

@@ -303,6 +303,40 @@ test('OPTIONS /upload (tus preflight) is handled, not 404', async () => {
   }
 });
 
+test('OPTIONS /upload passes with `authorize` configured — a preflight carries no bearer and names no artifact', async () => {
+  const ctx = await startApp({
+    coreOptions: {
+      authorize: async () => {
+        throw Object.assign(new Error('no'), { statusCode: 403 });
+      },
+    },
+  });
+  try {
+    const res = await fetch(`${ctx.baseUrl}${PREFIX}/upload`, {
+      method: 'OPTIONS',
+      headers: { 'Tus-Resumable': '1.0.0' },
+    });
+    assert.notEqual(res.status, 403);
+    assert.equal(res.headers.get('tus-version'), '1.0.0');
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test('HEAD /artifacts/:id answers like GET, headers only', async () => {
+  const ctx = await startApp();
+  try {
+    const { body } = await uploadFullMp4(ctx, ID1);
+    const head = await fetch(artifactUrl(ctx, ID1), { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-length'), String(body.length));
+    assert.equal(head.headers.get('accept-ranges'), 'bytes');
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test('trailing slash on /upload/ still routes to the tus handler', async () => {
   const ctx = await startApp();
   try {

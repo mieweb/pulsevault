@@ -1,12 +1,19 @@
 import { isUuid } from './uuid.js';
-import { statusCodeOf } from './errors.js';
+import { errorMessage, pulseVaultError, statusCodeOf } from './errors.js';
 import { finalizeArtifact, type FinalizeDeps } from './finalize.js';
+import { extractAuthzMessage } from './tus-request.js';
 import { normalizeUploadMetadata } from './upload-metadata.js';
 import type { PulseVaultAuthorize } from './authorize.js';
 import type { PulseVaultAllowedExtensions } from './options.js';
 import type { PulseVaultLogger, PulseVaultRequest } from './request.js';
 import type { PulseVaultOnArtifactEvent } from './pulsevaultTus.js';
-import type { PulseVaultStorage, ReserveUploadParams } from '../storage/types.js';
+import type {
+  ArtifactMetadata,
+  DirectUploadGrant,
+  PulseVaultStorage,
+  ReserveUploadParams,
+  UploadKind,
+} from '../storage/types.js';
 
 /**
  * Transport-agnostic orchestration for the PROTOCOL.md §9 direct-upload
@@ -19,20 +26,30 @@ import type { PulseVaultStorage, ReserveUploadParams } from '../storage/types.js
  * behave differently across surfaces.
  */
 
-/** The storage surface direct uploads need — implemented by the S3/R2 adapter. */
+/**
+ * The FULL §9 working surface — implemented by the S3/R2 adapter. Every member
+ * is required (that is what `supportsDirectUpload` checks), so nothing below
+ * has to re-ask whether a method exists.
+ */
 export type DirectUploadCapableStorage = PulseVaultStorage & {
-  createDirectUpload(
-    params: ReserveUploadParams & { size: number },
-    opts?: { ttlSeconds?: number },
-  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
+  createDirectUpload(params: ReserveUploadParams & { size: number }): Promise<DirectUploadGrant>;
   headObjectSize(artifactId: string): Promise<number | null>;
+  getMetadata(artifactId: string, opts?: { fresh?: boolean }): Promise<ArtifactMetadata | null>;
+  /** Re-grant for an existing reservation; the adapter reads storage truth once and compares every identity field. */
   presignPut(
     artifactId: string,
-    size: number,
+    expected: { size: number; kind: UploadKind; ext: string; relatedTo?: string },
     ttlSeconds?: number,
-  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
+  ): Promise<DirectUploadGrant>;
   remove(artifactId: string): Promise<boolean>;
 };
+
+/**
+ * Cap on the JSON bodies this profile reads (a create is a few hundred bytes).
+ * Owned here — with the endpoint's semantics — and consumed by every transport,
+ * so the three surfaces can't enforce three different limits.
+ */
+export const MAX_DIRECT_UPLOAD_BODY_BYTES = 64 * 1024;
 
 /**
  * `path.extname(...).toLowerCase()` without `node:path` — this module is in
@@ -78,7 +95,7 @@ export type DirectUploadResult = { statusCode: number; body: Record<string, unkn
 
 const err = (statusCode: number, error: string): DirectUploadResult => ({
   statusCode,
-  body: { ok: false, error },
+  body: pulseVaultError(error),
 });
 
 /**
@@ -145,7 +162,7 @@ export async function directUploadCreate(
       });
     } catch (authErr) {
       const statusCode = statusCodeOf(authErr, 403);
-      const message = authErr instanceof Error && authErr.message ? authErr.message : 'Forbidden';
+      const message = extractAuthzMessage(authErr);
       logger.info(
         { err: authErr, artifactId: normalized.artifactId, phase: 'create', statusCode },
         'pulsevault authorize rejected',
@@ -171,16 +188,7 @@ export async function directUploadCreate(
       name: normalized.name,
       size,
     });
-    return {
-      statusCode: 201,
-      body: {
-        ok: true,
-        artifactId: normalized.artifactId,
-        uploadUrl: grant.uploadUrl,
-        expiresAt: grant.expiresAt,
-        headers: grant.headers,
-      },
-    };
+    return { statusCode: 201, body: { ok: true, artifactId: normalized.artifactId, ...grant } };
   } catch (reserveErr) {
     const statusCode = statusCodeOf(reserveErr, 500);
     if (statusCode >= 500) {
@@ -190,89 +198,36 @@ export async function directUploadCreate(
       );
       return err(500, 'Could not create the direct upload');
     }
-    if (statusCode === 409) {
-      // Re-grant: the reservation already exists. If it's THIS client's own
-      // incomplete direct upload (authorized above, same declared shape), a
-      // fresh presigned URL is the correct answer — the client lost or
-      // outlived the previous grant (app kill, URL TTL) and needs a new one
-      // to retry the PUT. A finished artifact, a reservation with a different
-      // shape (size/kind/ext), or a TUS reservation (no `expectedSize` — the
-      // two profiles share the artifactId space but must never cross) stays a
-      // genuine conflict. Read storage truth, not the per-process cache: on
-      // shared object storage another instance may have JUST marked this
-      // artifact ready, and re-granting a PUT against a ready object would
-      // let a client overwrite finished, validated bytes.
-      const existing = await storage.getMetadata?.(normalized.artifactId, { fresh: true });
-      const sameShape =
-        existing &&
-        !existing.ready &&
-        existing.kind === normalized.kind &&
-        existing.ext === ext &&
-        existing.expectedSize === size &&
-        // The session anchor is part of the reservation's identity, not just its
-        // shape: without this, a token authorized for anchor A could submit
-        // anchor B's known artifactId with `relatedTo: A`, pass authorize, and
-        // walk away with a fresh PUT grant for B's artifact.
-        existing.relatedTo === normalized.relatedTo;
-      if (sameShape) {
-        try {
-          const regrant = await regrantDirectUpload(storage, normalized.artifactId, size);
-          if (regrant) {
-            return {
-              statusCode: 200,
-              body: {
-                ok: true,
-                artifactId: normalized.artifactId,
-                uploadUrl: regrant.uploadUrl,
-                expiresAt: regrant.expiresAt,
-                headers: regrant.headers,
-              },
-            };
-          }
-        } catch (regrantErr) {
-          // `presignPut` re-validates at mint time and throws 409 when it loses
-          // a race (reservation completed / reshaped since the check above) —
-          // pass 4xx through as the conflict it is; only genuine server
-          // failures become an opaque 500.
-          const regrantStatus = statusCodeOf(regrantErr, 500);
-          if (regrantStatus < 500) {
-            const message =
-              regrantErr instanceof Error && regrantErr.message ? regrantErr.message : 'Conflict';
-            return err(regrantStatus, message);
-          }
-          logger.error(
-            { err: regrantErr, artifactId: normalized.artifactId },
-            'pulsevault direct-upload regrant failed',
-          );
-          return err(500, 'Could not create the direct upload');
-        }
-      }
+    if (statusCode !== 409) return err(statusCode, errorMessage(reserveErr, 'Conflict'));
+    // Re-grant: the reservation already exists. If it's THIS client's own
+    // incomplete direct upload (authorized above, same declared shape AND the
+    // same session anchor — without that clause a token authorized for anchor
+    // A could submit anchor B's known artifactId with `relatedTo: A` and walk
+    // away with a PUT grant for B's artifact), a fresh presigned URL is the
+    // correct answer: the client lost or outlived its grant (app kill, URL
+    // TTL) and needs a new one to retry the PUT. The adapter reads storage
+    // truth ONCE, at mint time, and compares every identity field itself — a
+    // finished artifact, a TUS reservation, or any mismatch is a 409 — so
+    // there is no window between "checked" and "signed".
+    try {
+      const regrant = await storage.presignPut(normalized.artifactId, {
+        size,
+        kind: normalized.kind,
+        ext,
+        relatedTo: normalized.relatedTo,
+      });
+      return { statusCode: 200, body: { ok: true, artifactId: normalized.artifactId, ...regrant } };
+    } catch (regrantErr) {
+      // 4xx is the conflict it is; only genuine server failures become an opaque 500.
+      const regrantStatus = statusCodeOf(regrantErr, 500);
+      if (regrantStatus < 500) return err(regrantStatus, errorMessage(regrantErr, 'Conflict'));
+      logger.error(
+        { err: regrantErr, artifactId: normalized.artifactId },
+        'pulsevault direct-upload regrant failed',
+      );
+      return err(500, 'Could not create the direct upload');
     }
-    const message =
-      reserveErr instanceof Error && reserveErr.message ? reserveErr.message : 'Conflict';
-    return err(statusCode, message);
   }
-}
-
-/**
- * Mint a fresh presigned PUT for an existing, incomplete reservation without
- * re-reserving. Duck-typed on an optional adapter method (`presignPut`, which
- * looks the reservation up itself) so the S3 adapter can expose it without
- * widening the required storage contract.
- */
-async function regrantDirectUpload(
-  storage: PulseVaultStorage,
-  artifactId: string,
-  size: number,
-): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> } | null> {
-  const candidate = (storage as { presignPut?: unknown }).presignPut;
-  if (typeof candidate !== 'function') return null;
-  return (
-    candidate as (
-      artifactId: string,
-      size: number,
-    ) => Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>
-  )(artifactId, size);
 }
 
 /**
@@ -288,7 +243,7 @@ export async function directUploadComplete(
   request: PulseVaultRequest,
   artifactId: string,
 ): Promise<DirectUploadResult> {
-  const { storage, authorize, onArtifactEvent, logger } = deps;
+  const { storage, authorize, logger } = deps;
   if (!supportsDirectUpload(storage)) {
     return err(501, 'This deployment does not support direct uploads');
   }
@@ -300,7 +255,7 @@ export async function directUploadComplete(
   // a stale cached `ready` (another instance deleted + re-reserved this id)
   // would otherwise take the idempotent-200 fast path below and report a NEW
   // reservation complete without ever verifying its bytes.
-  const meta = await storage.getMetadata?.(artifactId, { fresh: true });
+  const meta = await storage.getMetadata(artifactId, { fresh: true });
   if (!meta) return err(404, 'Unknown artifactId — create the direct upload first');
 
   if (authorize) {
@@ -315,7 +270,7 @@ export async function directUploadComplete(
       });
     } catch (authErr) {
       const statusCode = statusCodeOf(authErr, 403);
-      const message = authErr instanceof Error && authErr.message ? authErr.message : 'Forbidden';
+      const message = extractAuthzMessage(authErr);
       logger.info(
         { err: authErr, artifactId, phase: 'patch', statusCode },
         'pulsevault authorize rejected',
@@ -326,12 +281,6 @@ export async function directUploadComplete(
 
   if (meta.ready) {
     return { statusCode: 200, body: { ok: true, artifactId } };
-  }
-  // A reservation without a declared size is a TUS upload — the two profiles
-  // share the artifactId space but must never cross: completing a TUS
-  // reservation here would bypass the tus datastore's own completion.
-  if (meta.expectedSize === undefined) {
-    return err(409, 'artifactId belongs to a TUS upload — complete it via the TUS protocol');
   }
 
   // Serialize completes per artifactId in this process: two concurrent
@@ -348,18 +297,12 @@ export async function directUploadComplete(
       // 200 path here (instead of re-running finalize on a stale "uploading"
       // snapshot) is what keeps cross-instance retries at-least-once rather
       // than duplicating hooks unnecessarily.
-      const fresh = await storage.getMetadata?.(artifactId, { fresh: true });
+      const fresh = await storage.getMetadata(artifactId, { fresh: true });
       if (!fresh) return err(404, 'Unknown artifactId — create the direct upload first');
       if (fresh.ready) {
         return { statusCode: 200, body: { ok: true, artifactId } };
       }
-      // `storage` was narrowed by the supportsDirectUpload guard at entry.
-      return completeUnlocked(
-        deps as DirectUploadDeps & { storage: DirectUploadCapableStorage },
-        request,
-        artifactId,
-        fresh,
-      );
+      return completeUnlocked({ ...deps, storage }, request, artifactId, fresh);
     },
   );
   // The stored tail never rejects, so a failed complete can't poison the chain.
@@ -382,20 +325,27 @@ async function completeUnlocked(
   deps: DirectUploadDeps & { storage: DirectUploadCapableStorage },
   request: PulseVaultRequest,
   artifactId: string,
-  meta: NonNullable<Awaited<ReturnType<NonNullable<PulseVaultStorage['getMetadata']>>>>,
+  meta: ArtifactMetadata,
 ): Promise<DirectUploadResult> {
   const { storage, onArtifactEvent, logger } = deps;
 
+  // Decided on the serialized re-read, not the pre-lock snapshot: a reservation
+  // without a declared size is a TUS upload — the two profiles share the
+  // artifactId space but must never cross, and completing a TUS reservation
+  // here would run finalize behind the tus datastore's own completion.
+  if (meta.expectedSize === undefined) {
+    return err(409, 'artifactId belongs to a TUS upload — complete it via the TUS protocol');
+  }
   const storedSize = await storage.headObjectSize(artifactId);
   if (storedSize === null) {
     return err(409, 'No uploaded object found — PUT the bytes to the upload URL first');
   }
-  if (meta.expectedSize !== undefined && storedSize !== meta.expectedSize) {
+  if (storedSize !== meta.expectedSize) {
     // Wrong bytes landed (truncated PUT, or a different payload). Same
     // fail-closed cleanup as a validation failure: wipe and let the client
     // re-create with a fresh grant.
     try {
-      await storage.remove?.(artifactId);
+      await storage.remove(artifactId);
     } catch (rmErr) {
       // The 422 contract promises the id is freed for a re-create — if the
       // wipe failed it is NOT, so report a server failure instead of a

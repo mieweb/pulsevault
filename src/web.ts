@@ -5,25 +5,24 @@ import type {
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
-import { pulseVaultError, statusCodeOf } from './lib/errors.js';
-import { isUuid } from './lib/uuid.js';
+import { pulseVaultError } from './lib/errors.js';
 import { type PulseVaultLogger, type PulseVaultRequest, consoleLogger } from './lib/request.js';
-import type { PulseVaultStorage, UploadKind } from './storage/types.js';
+import type { PulseVaultStorage } from './storage/types.js';
 import { buildCapabilitiesPayload, PROTOCOL_VERSION } from './lib/capabilities.js';
 import {
-  artifactIdFromTusUrl,
-  extractAuthzMessage,
-  parseUploadMetadataHeader,
-  resolveStorageKind,
-  resolveStorageRelatedTo,
+  authorizeArtifactRequest,
+  authorizeTusRequest,
+  type AuthorizeDeps,
 } from './lib/tus-request.js';
 import {
   directUploadCreate,
   directUploadComplete,
+  MAX_DIRECT_UPLOAD_BODY_BYTES,
   type DirectUploadDeps,
 } from './lib/direct-upload.js';
 import {
   normalizeAllowedExtensions,
+  rejectRemovedOptions,
   validateBasePath,
   validateMaxUploadSize,
   validateAllowedExtensions,
@@ -91,9 +90,6 @@ export type PulseVaultWebHandler = {
   shutdown: () => Promise<void>;
 };
 
-/** Cap for small JSON request bodies — mirrors the Node core's `readJsonBody` limit. */
-const MAX_JSON_BODY_BYTES = 64 * 1024;
-
 class BodyTooLarge extends Error {}
 
 /** Buffer a request body, aborting with `BodyTooLarge` once it exceeds `limit` bytes. */
@@ -159,6 +155,7 @@ function stampProtocolVersion(res: Response): Response {
 }
 
 export function createPulseVaultWebHandler(options: PulseVaultWebOptions): PulseVaultWebHandler {
+  rejectRemovedOptions(options);
   validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
   validateAllowedExtensions(options.allowedExtensions);
@@ -207,66 +204,24 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     logger,
   };
 
-  /** Run `authorize` for a TUS request; returns a rejection Response, or null to proceed. */
-  const runTusAuthorize = async (
-    request: Request,
-    pathname: string,
-  ): Promise<{ response: Response | null; artifactId?: string }> => {
-    // OPTIONS is the tus capabilities/CORS preflight — no artifact, no bytes,
-    // and browsers can't attach the bearer header to it. Let @tus/server answer.
-    if (request.method === 'OPTIONS') return { response: null };
-    const phase: 'create' | 'patch' = request.method === 'POST' ? 'create' : 'patch';
-    let artifactId: string | undefined;
-    let kind: UploadKind = 'video';
-    let relatedTo: string | undefined;
-    if (phase === 'create') {
-      const meta = request.headers.get('upload-metadata');
-      if (meta) ({ artifactId, kind, relatedTo } = parseUploadMetadataHeader(meta));
-    } else {
-      artifactId = artifactIdFromTusUrl(pathname);
-      if (artifactId) {
-        kind = await resolveStorageKind(storage, artifactId);
-        relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-      }
-    }
-
-    if (!authorize) return { response: null, artifactId };
-
-    if (!artifactId && phase === 'patch') {
-      // PROTOCOL.md §5.2: an unresolvable artifactId on an in-flight request
-      // is an authorization failure, not a pass.
-      logger.info(
-        { url: pathname, phase },
-        'pulsevault authorize rejected: unresolvable artifactId',
-      );
-      return {
-        response: json(403, pulseVaultError('Unable to resolve artifact for authorization')),
-      };
-    }
-    if (!artifactId) return { response: null, artifactId };
-
-    try {
-      await authorize(toPulseVaultRequest(request), { phase, artifactId, kind, relatedTo });
-      return { response: null, artifactId };
-    } catch (err) {
-      const statusCode = statusCodeOf(err, 403);
-      const message = extractAuthzMessage(err);
-      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      if (phase === 'create') {
-        await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
-      }
-      return { response: json(statusCode, pulseVaultError(message)) };
-    }
-  };
+  /**
+   * The authorize decision itself lives in `lib/tus-request.ts`, shared with
+   * the Node core; this surface only renders it as a `Response`.
+   */
+  const authzDeps: AuthorizeDeps = { storage, authorize, onArtifactEvent, logger };
 
   const handleTus = async (request: Request, pathname: string): Promise<Response> => {
     try {
       const { tusServer, tusContext } = await loadTusRuntime();
-      const authz = await runTusAuthorize(request, pathname);
-      if (authz.response) return authz.response;
-      const response = await tusContext.run(
-        { request: toPulseVaultRequest(request), artifactId: authz.artifactId },
-        () => tusServer.handleWeb(request),
+      const pvRequest = toPulseVaultRequest(request);
+      const decision = await authorizeTusRequest(authzDeps, pvRequest, {
+        method: request.method,
+        url: pathname,
+        uploadMetadata: request.headers.get('upload-metadata') ?? undefined,
+      });
+      if (!decision.ok) return json(decision.statusCode, decision.body);
+      const response = await tusContext.run({ request: pvRequest }, () =>
+        tusServer.handleWeb(request),
       );
       return stampProtocolVersion(response);
     } catch (err) {
@@ -275,29 +230,19 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     }
   };
 
-  /** Shared authorize prelude for artifact GET/HEAD/DELETE. */
+  /** Shared authorize prelude for artifact GET/HEAD/DELETE: a rejection Response, or null to proceed. */
   const prepareArtifactRequest = async (
     request: Request,
     artifactId: string,
     phase: 'resolve' | 'delete',
     token?: string,
   ): Promise<Response | null> => {
-    if (!isUuid(artifactId)) {
-      return json(400, pulseVaultError('`artifactId` must be a valid UUID'));
-    }
-    if (!authorize) return null;
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
-    try {
-      await authorize(toPulseVaultRequest(request), { phase, artifactId, kind, relatedTo, token });
-      return null;
-    } catch (err) {
-      const statusCode = statusCodeOf(err, 403);
-      const message = extractAuthzMessage(err);
-      logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
-      return json(statusCode, pulseVaultError(message));
-    }
+    const decision = await authorizeArtifactRequest(authzDeps, toPulseVaultRequest(request), {
+      artifactId,
+      phase,
+      token,
+    });
+    return decision.ok ? null : json(decision.statusCode, decision.body);
   };
 
   /**
@@ -459,12 +404,12 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
         // runtimes this handler exists for). Content-Length-declared bodies
         // fail fast; chunked ones are capped while streaming.
         const declared = Number(request.headers.get('content-length'));
-        if (Number.isFinite(declared) && declared > MAX_JSON_BODY_BYTES) {
+        if (Number.isFinite(declared) && declared > MAX_DIRECT_UPLOAD_BODY_BYTES) {
           return json(413, pulseVaultError('Request body too large'));
         }
         let raw: Uint8Array;
         try {
-          raw = new Uint8Array(await readBodyCapped(request, MAX_JSON_BODY_BYTES));
+          raw = new Uint8Array(await readBodyCapped(request, MAX_DIRECT_UPLOAD_BODY_BYTES));
         } catch (err) {
           if (err instanceof BodyTooLarge) {
             return json(413, pulseVaultError('Request body too large'));

@@ -583,15 +583,78 @@ test('malformed sidecar: absent for readers, burned for writes (single-use)', as
     assert.equal(get.status, 404);
 
     // Writers still conflict — the file occupies the id, and ids are
-    // single-use: the client mints a fresh id; retention cleans this one up.
+    // single-use: the client mints a fresh id.
     const create = await tusCreate(ctx.baseUrl, {
       artifactId: ID1,
       filename: 'clip.mp4',
       size: 1024,
     });
     assert.equal(create.status, 409);
+
+    // …but the debris is not a life sentence: DELETE clears an existing-but-
+    // unparseable sidecar (there is nothing else an operator could call), after
+    // which the id is a plain fresh reservation again.
+    const del = await fetch(artifactUrl(ctx, ID1), { method: 'DELETE' });
+    assert.equal(del.status, 204);
+    const recreate = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: 'clip.mp4',
+      size: 1024,
+    });
+    assert.equal(recreate.status, 201);
   } finally {
     await ctx.teardown();
+  }
+});
+
+test('direct-upload routes accept what the core accepts: alias bodies and a body-less complete under application/json', async () => {
+  const ctx = await startApp();
+  try {
+    // Local storage has no §9 profile, so the core answers 501 — which is exactly
+    // the proof that the Fastify layer (Ajv schema, JSON parser) let both requests
+    // through to the core instead of 400ing them where the other surfaces don't.
+    const aliased = await fetch(`${ctx.baseUrl}${PREFIX}/direct-uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ videoid: ID1, filename: 'clip.mp4', kind: 'Video', size: 10 }),
+    });
+    assert.equal(aliased.status, 501);
+    const complete = await fetch(`${ctx.baseUrl}${PREFIX}/direct-uploads/${ID1}/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    assert.equal(complete.status, 501);
+    // A body that is not JSON is still a 400, in the protocol error shape.
+    const garbage = await fetch(`${ctx.baseUrl}${PREFIX}/direct-uploads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not json',
+    });
+    assert.equal(garbage.status, 400);
+    assert.equal((await garbage.json()).ok, false);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test('the removed `uploadUnit` option is a TypeError at register, not silently ignored', async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pv-test-'));
+  const app = Fastify({ logger: false });
+  try {
+    await assert.rejects(
+      async () => {
+        await app.register(pulseVault, {
+          prefix: PREFIX,
+          storage: createLocalStorage({ workspaceDir }),
+          maxUploadSize: 1024,
+          uploadUnit: 'merged',
+        });
+      },
+      (err) => err instanceof TypeError && /uploadUnit/.test(err.message),
+    );
+  } finally {
+    await app.close();
+    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 

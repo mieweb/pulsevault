@@ -412,6 +412,9 @@ type PulseVaultValidatePayload = (
   ctx: {
     artifactId: string;
     size: number;
+    /** The tus upload id (`<kind>/<artifactId><ext>`). For direct uploads it is the same
+     * logical id, NOT the stored object's key — reach the bytes through `storage.resolve()`
+     * or the id-keyed adapter accessors, never by building a key from this. */
     uploadId: string;
     kind: "video" | "project" | "captions";
     /** Absolute path to finalized bytes for adapters that expose `getLocalPath`. */
@@ -461,6 +464,7 @@ Optional async hook fired once the final byte is written, `validatePayload` has 
 ```ts
 type PulseVaultOnUploadComplete = (
   request: PulseVaultRequest, // see the note under `authorize` above
+  // `uploadId` is the logical upload id, not a storage key — see `validatePayload` above.
   ctx: { artifactId: string; kind: "video" | "project" | "captions"; size: number; uploadId: string },
 ) => void | Promise<void>;
 ```
@@ -779,10 +783,12 @@ edges live in bucket configuration, not code:
   it per-request in a policy.
 - **Atomic reservation needs conditional writes.** The collision guard uses
   `If-None-Match: "*"` on `PutObject`. AWS S3 supports this (since
-  Nov 2024), R2 supports it; older S3-compatibles may not and fall back to a
-  weaker check-then-write — see *S3-compatible backend collision-guard
-  fallback* in `OPERATIONS.md` for what that reopens and the one-time warning
-  to watch for.
+  Nov 2024), R2 supports it. The adapter probes the bucket once at
+  `initialize()` (or on the first reserve) — writing a throwaway key twice
+  and requiring the 412/409 — so a backend that rejects the header *or
+  silently ignores it* is detected, falls back to a weaker check-then-write,
+  and is warned about once. See *S3-compatible backend collision-guard
+  fallback* in `OPERATIONS.md` for what that reopens.
 - **Expired or lost grants are cheap.** Grants inherit `presignTtlSeconds`.
   If the app is killed or the URL expires before the `PUT` lands, the client
   just re-`POST`s the same create: an incomplete same-shape reservation is

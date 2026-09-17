@@ -7,6 +7,7 @@ import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultStorage } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
+  rejectRemovedOptions,
   validateBasePath,
   validateMaxUploadSize,
   validateAllowedExtensions,
@@ -143,6 +144,7 @@ export type PulseVaultPluginOptions = {
 const DEFAULT_DECORATOR_NAME = 'pulseVault';
 
 const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) => {
+  rejectRemovedOptions(opts);
   validateBasePath(opts.prefix, 'prefix');
   validateMaxUploadSize(opts.maxUploadSize);
   validateAllowedExtensions(opts.allowedExtensions);

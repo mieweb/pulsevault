@@ -18,11 +18,8 @@ import type { UploadKind } from '../storage/types.js';
  */
 export type PulseVaultTusContext = {
   request: PulseVaultRequest;
-  artifactId?: string;
   /** Kind resolved during TUS create; available on the same request only. */
   kind?: UploadKind;
-  /** `relatedTo` resolved during TUS create; available on the same request only. */
-  relatedTo?: string;
   /** Raw `checksum` metadata value (`<algorithm>:<hex>`), if the client sent one. */
   checksum?: string;
 };
@@ -91,7 +88,7 @@ const tusError = httpError;
 // Single parser for `<kind>/<artifactId><ext>` upload ids, shared with the
 // always-loaded request-interpretation module (which must stay Node-free —
 // this module is the lazily-loaded Node-only side). Re-exported for the core.
-import { artifactIdFromUploadId } from './tus-request.js';
+import { artifactIdFromUploadId, resolveStorageKind } from './tus-request.js';
 export { artifactIdFromUploadId };
 
 /**
@@ -136,13 +133,11 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         );
       }
 
-      // Store kind/relatedTo/checksum in the AsyncLocalStorage context so the
-      // authorize hook (already running) and onUploadFinish (same-request
-      // uploads) can read them without a storage round-trip.
+      // Store kind/checksum in the AsyncLocalStorage context so onUploadFinish
+      // (same-request uploads) can read them without a storage round-trip.
       const store = pulseVaultTusContext.getStore();
       if (store) {
         store.kind = kind;
-        store.relatedTo = relatedTo;
         store.checksum = checksum;
       }
 
@@ -185,7 +180,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       // requests (create, then patch), where `onUploadFinish` runs on the
       // PATCH request's own fresh context, not the one `namingFunction`
       // populated during the earlier POST.
-      const kind: UploadKind = store.kind ?? (await resolveKind(storage, artifactId));
+      const kind: UploadKind = store.kind ?? (await resolveStorageKind(storage, artifactId));
       const checksum = store.checksum ?? (await resolveChecksum(storage, artifactId));
 
       // The completion sequence (validate → markReady → consumer hook →
@@ -233,7 +228,9 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       .then(async () => {
         const meta = await storage.getMetadata?.(artifactId, { fresh: true });
         if (meta?.reservedAt !== undefined && meta.reservedAt > terminatedAt) return;
-        await storage.remove?.(artifactId);
+        if (!(await storage.remove?.(artifactId))) {
+          logger.info({ artifactId }, 'pulsevault terminated upload had no metadata to sweep');
+        }
       })
       .catch((err) => {
         logger.error(
@@ -295,19 +292,8 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
 }
 
 /**
- * Resolve the artifact kind from storage for a known artifactId. Used by
- * `onUploadFinish` for chunked uploads where the kind is not in the current
- * request's context. Defaults to `"video"` for adapters that don't implement
- * `getKind` or when the artifactId is not found.
- */
-async function resolveKind(storage: PulseVaultStorage, artifactId: string): Promise<UploadKind> {
-  const result = await storage.getKind?.(artifactId);
-  return result ?? 'video';
-}
-
-/**
  * Resolve the `checksum` metadata from storage for a known artifactId. Same
- * rationale as `resolveKind` — `namingFunction`'s in-memory context doesn't
+ * rationale as `resolveStorageKind` — `namingFunction`'s in-memory context doesn't
  * survive past the request it ran on, so completion (which may run on a
  * later, separate request) needs a storage-backed fallback.
  */
