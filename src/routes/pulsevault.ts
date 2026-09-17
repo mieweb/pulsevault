@@ -345,6 +345,28 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
   // Direct-upload profile (PROTOCOL.md §9). Fastify already parsed the JSON
   // body, so these call the core's data-level entry points instead of the raw
   // handlers (which would try to re-read the drained request stream).
+  //
+  // Plugin-scoped error shaping: schema-validation rejections fire BEFORE the
+  // handlers (so their `.header(...)` chains never run), and a rejected core
+  // promise would otherwise hit Fastify's default handler — both must still
+  // answer in the protocol's error shape, Protocol-Version stamped, with 5xx
+  // internals kept server-side.
+  fastify.setErrorHandler((error, request, reply) => {
+    const e = error as { statusCode?: unknown; message?: unknown };
+    const statusCode = typeof e.statusCode === 'number' && e.statusCode >= 400 ? e.statusCode : 500;
+    if (statusCode >= 500) request.log.error({ err: error }, 'pulsevault route failed');
+    const message =
+      statusCode >= 500
+        ? 'Internal Server Error'
+        : typeof e.message === 'string' && e.message
+          ? e.message
+          : 'Bad Request';
+    return reply
+      .header('Protocol-Version', String(PROTOCOL_VERSION))
+      .code(statusCode)
+      .send({ ok: false, error: message });
+  });
+
   fastify.post('/direct-uploads', { schema: directUploadCreateSchema }, async (request, reply) => {
     const result = await core.directUploadCreate(request, request.body);
     return reply

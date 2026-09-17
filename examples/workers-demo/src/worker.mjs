@@ -267,6 +267,10 @@ async function handleDirectCreate(request, env) {
   } catch {
     return fail(400, 'Request body must be JSON');
   }
+  // `"null"`/`"[]"`/`"\"str\""` parse fine but aren't objects — 400, not a 500 on field access.
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return fail(400, 'Request body must be a JSON object');
+  }
   const artifactId = String(body.artifactId ?? '').trim();
   if (!UUID_RE.test(artifactId)) return fail(400, '`artifactId` must be a valid UUID');
   const kind = KINDS.includes(body.kind) ? body.kind : 'video';

@@ -289,11 +289,15 @@ const reserveUpload = async (params: ReserveUploadParams): Promise<string> => {
       metaCache.delete(artifactId);
       if (!meta) return false;
       const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+      // Bytes and datastore state first, sidecar LAST (mirroring the S3
+      // adapter): the sidecar is the reservation lock — while it exists,
+      // `reserveUpload` still conflicts — so a new reservation can't be created
+      // (and then clobbered) while these deletes are in flight.
       await Promise.all([
         fs.rm(artifactPath, { force: true }),
         fs.rm(`${artifactPath}.json`, { force: true }),
-        fs.rm(sidecarPath(artifactId), { force: true }),
       ]);
+      await fs.rm(sidecarPath(artifactId), { force: true });
       // Evict again AFTER the deletes — and bump the deletion epoch — so neither a
       // read that landed between the first eviction and the deletes nor an
       // in-flight `loadMeta` fill can resurrect the deleted artifact's metadata

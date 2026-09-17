@@ -53,7 +53,8 @@ The response body MUST be a JSON object with at least the following fields:
   "this server needs an update") rather than a generic error.
 - `kinds` (array of string, REQUIRED): artifact kinds this server accepts.
 - `allowedExtensions` (object, REQUIRED): allowed file extensions per kind.
-- `maxUploadSize` (integer, REQUIRED): maximum artifact size in bytes.
+- `maxUploadSize` (integer or `null`, REQUIRED): maximum artifact size in
+  bytes; `null` means the deployment declares no cap.
 - `checksum.algorithms` (array of string, OPTIONAL): digest algorithms this
   server can verify (§6.3). Absent or empty means the server does not
   support checksum verification. Note for implementers: this field

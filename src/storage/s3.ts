@@ -391,7 +391,18 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         // operators know their backend can't fully guarantee collision safety
         // under concurrent/retried creates for the same artifactId.
         warnAboutConditionalWriteFallbackOnce();
-        if (await readSidecar(artifactId)) {
+        // Existence, not parsed metadata: a malformed sidecar reads as null but
+        // the id is still burned (single-use) — overwriting it would reuse it.
+        const exists = await client
+          .send(new HeadObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }))
+          .then(
+            () => true,
+            (headErr) => {
+              if (isNotFound(headErr)) return false;
+              throw headErr;
+            },
+          );
+        if (exists) {
           throw reserveConflictError(artifactId);
         }
         await writeSidecar(artifactId, sidecar);
@@ -602,10 +613,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     if (!meta) throw new Error(`presignPut: unknown artifactId ${artifactId}`);
     // Re-validate at mint time, not just in the caller's earlier check: the
     // reservation can complete (another instance's `complete`) or change shape
-    // (remove + re-reserve) between that read and this one, and a PUT grant
-    // against a ready object or a different declared size must lose the race
-    // as a 409, never be armed.
-    if (meta.ready || (meta.expectedSize !== undefined && meta.expectedSize !== size)) {
+    // (remove + re-reserve) between that read and this one. The sidecar must
+    // BE a direct reservation of exactly this size — ready artifacts, TUS
+    // re-creations under the same id (no `expectedSize`), and different
+    // declared sizes all lose as a 409, never get armed with a grant.
+    if (meta.ready || meta.expectedSize !== size) {
       throw reserveConflictError(artifactId);
     }
     const contentType = extToContentType(meta.ext);

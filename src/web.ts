@@ -212,6 +212,9 @@ export function createPulseVaultWebHandler(options: PulseVaultWebOptions): Pulse
     request: Request,
     pathname: string,
   ): Promise<{ response: Response | null; artifactId?: string }> => {
+    // OPTIONS is the tus capabilities/CORS preflight — no artifact, no bytes,
+    // and browsers can't attach the bearer header to it. Let @tus/server answer.
+    if (request.method === 'OPTIONS') return { response: null };
     const phase: 'create' | 'patch' = request.method === 'POST' ? 'create' : 'patch';
     let artifactId: string | undefined;
     let kind: UploadKind = 'video';

@@ -122,6 +122,11 @@ export function parseSidecar(raw: string): Sidecar | null {
   }
   if (typeof parsed.ext !== 'string') return null;
   if (typeof parsed.filename !== 'string') return null;
+  // Fail closed on an unknown explicit status — only a MISSING status reads as
+  // "ready" (pre-status sidecars), never a corrupted value.
+  if (parsed.status !== undefined && parsed.status !== 'uploading' && parsed.status !== 'ready') {
+    return null;
+  }
   const status: Sidecar['status'] = parsed.status === 'uploading' ? 'uploading' : 'ready';
   const kind = parseUploadKind(parsed.kind);
   return {

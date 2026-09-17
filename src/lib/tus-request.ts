@@ -65,8 +65,12 @@ function tusLastUrlSegment(url: string): string | undefined {
  * imports it back so the two parsers are one function.
  */
 export function artifactIdFromUploadId(id: string): string | undefined {
-  const [, nameWithExt] = id.split('/');
-  if (!nameWithExt) return undefined;
+  // Exactly the two segments `namingFunction` generates — anything longer
+  // (e.g. `video/<uuid>.mp4/extra`) would make this parser authorize one id
+  // while @tus/server's datastore operates on the full decoded string.
+  const segments = id.split('/');
+  if (segments.length !== 2 || !segments[1]) return undefined;
+  const nameWithExt = segments[1];
   // `path.extname` semantics without `node:path`: no dot / only a leading dot → no ext.
   const dot = nameWithExt.lastIndexOf('.');
   const candidate = dot > 0 ? nameWithExt.slice(0, dot) : nameWithExt;

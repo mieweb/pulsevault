@@ -234,6 +234,26 @@ test('an aged abandoned reservation still 409s concurrent retried creates (singl
   assert.equal(conflicts, 2, 'both retried creates lose to the abandoned reservation');
 });
 
+// `presignPut` must only arm grants for a DIRECT reservation of exactly the
+// declared size. A TUS reservation under the same artifactId (no
+// `expectedSize`) must 409 — minting a PUT grant against it would target the
+// TUS upload's own object key.
+test('presignPut refuses a TUS-shaped reservation under the same artifactId', async () => {
+  const ctx = await startApp();
+  const id = randomUUID();
+  try {
+    await ctx.storage.reserveUpload({
+      artifactId: id,
+      kind: 'video',
+      ext: '.mp4',
+      filename: 'clip.mp4',
+    });
+    await assert.rejects(ctx.storage.presignPut(id, 1024), (err) => err?.statusCode === 409);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 // The degraded-backend branch: a store that rejects `If-None-Match` outright
 // (501 NotImplemented) must fall back to check-then-write — reserve keeps
 // working, duplicates still 409 via the check, and the operator is warned

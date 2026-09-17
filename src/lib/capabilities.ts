@@ -28,7 +28,7 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
   maxSupportedVersion: number;
   kinds: UploadKind[];
   allowedExtensions: PulseVaultAllowedExtensions;
-  maxUploadSize: number;
+  maxUploadSize: number | null;
   checksum: { algorithms: string[] };
   directUpload?: { enabled: true };
 } {
@@ -39,7 +39,9 @@ export function buildCapabilitiesPayload(input: CapabilitiesPayloadInput): {
     maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
     kinds: [...UPLOAD_KINDS],
     allowedExtensions: input.allowedExtensions,
-    maxUploadSize: input.maxUploadSize,
+    // `Infinity` (a legal option meaning "no cap") is not JSON — the wire
+    // representation for an uncapped deployment is an explicit `null`.
+    maxUploadSize: Number.isFinite(input.maxUploadSize) ? input.maxUploadSize : null,
     checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
     ...(advertiseDirectUpload ? { directUpload: { enabled: true as const } } : {}),
   };

@@ -16,7 +16,9 @@ export type FinalizeInput = {
   artifactId: string;
   kind: UploadKind;
   size: number;
-  /** Datastore id / object key of the upload (tus upload id, or the object key for direct uploads). */
+  /** Datastore id of the upload (the tus upload id). For direct uploads this is the
+   * deterministic id-shaped key, NOT necessarily the stored object's key (direct objects
+   * may be suffix-fenced) — locate bytes via the id-keyed adapter accessors, never this. */
   uploadId: string;
   checksum?: string;
   localPath: string | null;
@@ -67,7 +69,11 @@ export async function finalizeArtifact(
       try {
         await storage.remove?.(artifactId);
       } catch (rmErr) {
+        // A 4xx rejection promises the id is freed for a corrected retry — if
+        // the wipe failed it is NOT, so surface a server failure instead.
         logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
+        await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
+        return { ok: false, statusCode: 500, message: 'Upload was rejected but cleanup failed' };
       }
       await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
       // 4xx rejection reasons are the client's business (e.g. "Checksum

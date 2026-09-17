@@ -26,6 +26,12 @@ export type DirectUploadCapableStorage = PulseVaultStorage & {
     opts?: { ttlSeconds?: number },
   ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
   headObjectSize(artifactId: string): Promise<number | null>;
+  presignPut(
+    artifactId: string,
+    size: number,
+    ttlSeconds?: number,
+  ): Promise<{ uploadUrl: string; expiresAt: string; headers: Record<string, string> }>;
+  remove(artifactId: string): Promise<boolean>;
 };
 
 /**
@@ -46,13 +52,15 @@ export function supportsDirectUpload(
   storage: PulseVaultStorage,
 ): storage is DirectUploadCapableStorage {
   const s = storage as Partial<DirectUploadCapableStorage>;
-  // getMetadata is part of the working surface too — complete() and re-grants
-  // are unusable without it, so a partial adapter must not advertise the
-  // profile (the capabilities payload uses this same predicate).
+  // The FULL §9 working surface, not just create: re-grants need `presignPut`
+  // and `getMetadata`, and the failure paths need `remove` to free the id — a
+  // partial adapter must not advertise a profile it can't complete.
   return (
     typeof s.createDirectUpload === 'function' &&
     typeof s.headObjectSize === 'function' &&
-    typeof s.getMetadata === 'function'
+    typeof s.getMetadata === 'function' &&
+    typeof s.presignPut === 'function' &&
+    typeof s.remove === 'function'
   );
 }
 
@@ -389,7 +397,11 @@ async function completeUnlocked(
     try {
       await storage.remove?.(artifactId);
     } catch (rmErr) {
+      // The 422 contract promises the id is freed for a re-create — if the
+      // wipe failed it is NOT, so report a server failure instead of a
+      // retryable-looking rejection the client can't act on.
       logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove mismatched upload');
+      return err(500, 'Upload was rejected but cleanup failed — try again later');
     }
     await onArtifactEvent?.({
       phase: 'reject',
