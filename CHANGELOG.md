@@ -7,6 +7,24 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking: `uploadUnit` is gone — a pulse uploads as one video; beats are
+  timestamps within it** (#64). A pulse is one video (the artifact named by
+  the pairing link) plus its related captions, beat manifest and thumbnail;
+  a beat is a `startMs`/`endMs` range inside that video, not an upload
+  strategy (`PROTOCOL.md` §8). Concretely:
+  - The `uploadUnit` option is removed from the Fastify plugin and from
+    `createPulseVaultCore`. Passing it now throws a `TypeError` at boot
+    ("`uploadUnit` was removed — delete the option") instead of being
+    silently ignored — delete the option from your config.
+  - `buildUploadLink` no longer accepts or emits an `uploadUnit` param.
+    Links minted by older releases stay valid: clients ignore unknown params
+    (`PROTOCOL.md` §3).
+  - `GET /capabilities` no longer returns an `uploadUnit` field.
+  - Ship this together with the Pulse app update for mieweb/pulse#213 —
+    older Pulse builds require `uploadUnit` in `/capabilities`.
+
 ## [0.3.0] - 2026-09-16
 
 ### Changed

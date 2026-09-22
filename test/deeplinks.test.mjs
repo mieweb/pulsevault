@@ -65,27 +65,17 @@ test("rejects a malformed server URL", () => {
   assert.throws(() => buildUploadLink({ server: "not a url", artifactId: ARTIFACT_ID }));
 });
 
-test("includes uploadUnit when provided, omits it when not", () => {
-  const withUnit = buildUploadLink({
+test("never carries an uploadUnit param, even if one is passed", () => {
+  const params = (link) => new URLSearchParams(link.split("?")[1]);
+  const plain = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID });
+  assert.equal(params(plain).get("uploadUnit"), null);
+
+  // A stale caller still passing the removed field gets a link without it.
+  const stale = buildUploadLink({
     server: "https://vault.example.org/pulsevault",
     artifactId: ARTIFACT_ID,
     uploadUnit: "merged",
   });
-  assert.equal(new URLSearchParams(withUnit.split("?")[1]).get("uploadUnit"), "merged");
-
-  const withoutUnit = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID });
-  assert.equal(new URLSearchParams(withoutUnit.split("?")[1]).get("uploadUnit"), null);
-});
-
-test("accepts both uploadUnit values", () => {
-  for (const uploadUnit of ["segment", "merged"]) {
-    const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, uploadUnit });
-    assert.equal(new URLSearchParams(link.split("?")[1]).get("uploadUnit"), uploadUnit);
-  }
-});
-
-test("rejects an invalid uploadUnit", () => {
-  assert.throws(() =>
-    buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, uploadUnit: "bogus" }),
-  );
+  assert.equal(params(stale).get("uploadUnit"), null);
+  assert.deepEqual([...params(stale).keys()].sort(), ["artifactId", "server", "v"]);
 });

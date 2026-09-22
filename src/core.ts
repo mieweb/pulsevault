@@ -13,23 +13,21 @@ import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
-import { parseUploadKind, UPLOAD_KINDS } from './storage/types.js';
+import { parseUploadKind } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
   validateMaxUploadSize,
-  validateUploadUnit,
+  rejectRemovedOptions,
   validateAllowedExtensions,
   warnIfUsingDeprecatedProjectHooks,
   composeValidatePayload,
   composeOnUploadComplete,
   type PulseVaultAllowedExtensionsInput,
 } from './lib/options.js';
+import { buildCapabilities, PROTOCOL_VERSION } from './lib/capabilities.js';
 
-/** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
-export const PROTOCOL_VERSION = 1;
-const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
-const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
+export { PROTOCOL_VERSION };
 
 export type PulseVaultCoreCacheOptions = {
   cacheControl?: boolean;
@@ -63,8 +61,6 @@ export type PulseVaultCoreOptions = {
   stripBasePath?: boolean;
   /** Max TUS upload size in bytes. Required — consumers must choose an explicit cap. Use `Infinity` for no cap. */
   maxUploadSize: number;
-  /** Which upload strategy this deployment expects. Purely advertised via `GET /capabilities`. Defaults to `"segment"`. */
-  uploadUnit?: 'segment' | 'merged';
   /** File extensions allowed per artifact kind. See the Fastify plugin's `allowedExtensions` for the full shape. */
   allowedExtensions?: PulseVaultAllowedExtensionsInput;
   /** Cache-control options forwarded to `@fastify/send` for the GET route. */
@@ -288,15 +284,14 @@ function stashPulseVaultContext(req: IncomingMessage, ctx: PulseVaultRequestCont
  * `lib/pulsevaultTus.js` tus server, so behavior can't drift between them.
  */
 export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVaultCore {
+  rejectRemovedOptions(options);
   validateBasePath(options.basePath, 'basePath');
   validateMaxUploadSize(options.maxUploadSize);
-  validateUploadUnit(options.uploadUnit);
   validateAllowedExtensions(options.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(options);
 
   const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
   const stripBasePath = options.stripBasePath ?? true;
-  const uploadUnit = options.uploadUnit ?? 'segment';
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   const validatePayload = composeValidatePayload(
     options.validatePayload,
@@ -434,16 +429,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     try {
-      writeJson(res, 200, {
-        protocolVersion: PROTOCOL_VERSION,
-        minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
-        maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
-        uploadUnit,
-        kinds: [...UPLOAD_KINDS],
-        allowedExtensions,
-        maxUploadSize,
-        checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
-      });
+      writeJson(res, 200, buildCapabilities({ allowedExtensions, maxUploadSize }));
     } catch (err) {
       failClosed(res, err, 'capabilities');
     }

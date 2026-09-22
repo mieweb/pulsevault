@@ -37,7 +37,6 @@ The response body MUST be a JSON object with at least the following fields:
   "protocolVersion": 1,
   "minSupportedVersion": 1,
   "maxSupportedVersion": 1,
-  "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
@@ -52,10 +51,6 @@ The response body MUST be a JSON object with at least the following fields:
   SHOULD refuse to pair if its own version falls outside this range, and
   SHOULD show the user an actionable message ("update the app" /
   "this server needs an update") rather than a generic error.
-- `uploadUnit` (`"segment"` or `"merged"`, REQUIRED): which upload strategy this
-  deployment expects (§8). The client MUST read this before doing any
-  merge/upload work and branch accordingly. (Note: "beat" no longer refers to
-  an upload unit — it now names a timecode range on the merged timeline; see §8.)
 - `kinds` (array of string, REQUIRED): artifact kinds this server accepts.
 - `allowedExtensions` (object, REQUIRED): allowed file extensions per kind.
 - `maxUploadSize` (integer, REQUIRED): maximum artifact size in bytes.
@@ -75,7 +70,7 @@ the integer from `protocolVersion`.
 A server presents a pairing link or QR code of the form:
 
 ```
-pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>&uploadUnit=<segment|merged>
+pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
 ```
 
 - `v` (REQUIRED): the deep-link schema version. A client MUST refuse and
@@ -97,17 +92,9 @@ pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>&uploadUnit=<seg
   `artifactId` (or a session it anchors, §5.4), not a standing general
   credential — see §5.4 for the recommended (but not required) capability-
   token shape.
-- `uploadUnit` (OPTIONAL, `"segment"` or `"merged"`): per-session override of the
-  deployment-wide value reported by `GET /capabilities` (§2, §8). When
-  present, a client MUST use this value for the session anchored to this
-  link instead of whatever `/capabilities` currently reports, and MUST NOT
-  perform a separate `/capabilities` fetch just to decide merge/upload
-  strategy for it. When absent, a client MUST fall back to `/capabilities`
-  exactly as before this field existed — an operator that never sets it sees
-  no change in client behavior. This lets one deployment run "segment" and
-  "merged" sessions concurrently (e.g. a staged rollout) without racing a
-  single, deployment-wide `/capabilities` value against whichever moment a
-  client happened to fetch it.
+
+A client SHOULD ignore query params it does not recognize, so links minted by
+an older or newer server stay valid.
 
 A client SHOULD display the server's origin (and, where feasible, its TLS
 certificate fingerprint) to the user before uploading anything, rather than
@@ -246,9 +233,8 @@ expired token. `issuer` prevents a token minted by one deployment from being
 replayed against a different one that happens to share a secret. A token MAY
 authorize an artifact other than the one it names if that artifact declares
 the token's `artifactId` as its `relatedTo` (§8) — this lets one token cover
-an entire upload session (a merged video plus its captions, beat manifest and
-thumbnail, or every clip plus the ordering manifest under
-`uploadUnit: "segment"`) rather than requiring one token per artifact.
+an entire upload session (a pulse's video plus its captions, beat manifest and
+thumbnail) rather than requiring one token per artifact.
 
 This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
@@ -288,55 +274,36 @@ every response. A client encountering a server whose supported range
 excludes its own version MUST NOT attempt to pair, and SHOULD surface a
 clear, specific message rather than a generic failure.
 
-## 8. Artifact relationships (`relatedTo`) and `uploadUnit`
+## 8. Artifact relationships (`relatedTo`)
 
-A pulse (a short composed of one or more recorded **segments**) MAY be uploaded
-as a single pre-merged video (`uploadUnit: "merged"`) or as individual
-per-segment artifacts plus an ordering manifest (`uploadUnit: "segment"`) — the
-operator declares which via `/capabilities` (§2), optionally overridden per
-session via the pairing link's `uploadUnit` param (§3); this document does not
-prefer one over the other.
-
-> **Terminology:** a **segment** is a recorded clip (the source unit). A
-> **beat** is a *timecode range on the merged timeline* — one recorded
-> segment's start/end within the merged video — carried only in the merged
-> mode's beat manifest below. (Earlier revisions used "beat" for what is now
-> called the `segment` upload unit; that meaning is retired.)
-
-Under `uploadUnit: "segment"`, a client uploads each segment under its own
-`artifactId`, plus exactly one **ordering manifest** artifact (`kind:
-"project"`, e.g. `<draftId>-segments.pulse`, a JSON document listing the
-ordered segment `artifactId`s). Segmented mode carries **no** captions and
-**no** thumbnail.
-
-```json
-{ "version": 1, "segments": [ { "artifactId": "<uuid>", "order": 0 } ] }
-```
-
-Under `uploadUnit: "merged"`, a client uploads one pre-merged video as the
-session anchor, plus (all as related artifacts):
+A pulse (a short composed of one or more recorded clips) uploads as **one
+video** — the session anchor, named by the pairing link's `artifactId` (§3) —
+plus these related artifacts:
 
 - **captions** (`kind: "captions"`, `<draftId>.vtt`) — WebVTT for the whole
-  merged video, OPTIONAL (absent when the video has no speech or no on-device
-  model was available); MAY carry word-level inline cue timestamps like
+  video, OPTIONAL (absent when the video has no speech or no on-device model
+  was available); MAY carry word-level inline cue timestamps like
   `<00:00:01.500>word` for karaoke rendering;
-- a **beat manifest** (`kind: "project"`, e.g. `<draftId>-beats.pulse`) giving
-  each recorded segment's precise `startMs`/`endMs` on the merged timeline,
-  contiguous and summing to the true merged `durationMs` (groundwork for
-  keyframe-aligned deep links / HLS);
+- a **beat manifest** (`kind: "project"`, e.g. `<draftId>-beats.pulse`)
+  listing the pulse's beats (below);
 - a **thumbnail** (`kind: "thumbnail"`, `<draftId>.jpg`) — the pulse's poster
   frame.
+
+A **beat** is a timestamp range inside the video: where one recorded clip
+starts and ends (`startMs`/`endMs`). A pulse's beats are contiguous and sum to
+the video's `durationMs`. The beat manifest is groundwork for keyframe-aligned
+deep links / HLS; it does not change how the video is uploaded.
 
 ```json
 { "version": 1, "type": "beat-manifest", "durationMs": 47320,
   "beats": [ { "segmentId": "<local id>", "order": 0, "startMs": 0, "endMs": 4210 } ] }
 ```
 
-Every non-anchor artifact in either session SHOULD declare `relatedTo` pointing
-at the session's anchor `artifactId` (the one named in the pairing link) so a
-single capability token can authorize the whole session (§5.4).
+Every non-anchor artifact SHOULD declare `relatedTo` pointing at the anchor
+`artifactId` so a single capability token can authorize the whole session
+(§5.4).
 
-The relational graph of replies between segments/pulses (who replied to what,
+The relational graph of replies between pulses (who replied to what,
 rendering a thread) is explicitly **out of scope** for this document. That
 graph is a query/relational concern for the operator's own systems, built
 from `relatedTo` and whatever additional metadata the operator chooses to

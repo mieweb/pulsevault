@@ -645,11 +645,10 @@ test("old root-level plugin paths return 404", async () => {
   }
 });
 
-test("GET /capabilities is unauthenticated and reports the configured uploadUnit", async () => {
+test("GET /capabilities is unauthenticated and carries no uploadUnit", async () => {
   const authorizeCalls = [];
   const ctx = await startApp({
     pluginOptions: {
-      uploadUnit: "merged",
       authorize: async (_req, ctx) => {
         authorizeCalls.push(ctx.phase);
       },
@@ -662,13 +661,35 @@ test("GET /capabilities is unauthenticated and reports the configured uploadUnit
     assert.equal(body.protocolVersion, 1);
     assert.equal(body.minSupportedVersion, 1);
     assert.equal(body.maxSupportedVersion, 1);
-    assert.equal(body.uploadUnit, "merged");
+    assert.equal("uploadUnit" in body, false, "uploadUnit was removed from /capabilities");
     assert.deepEqual(body.kinds.sort(), ["captions", "project", "thumbnail", "video"]);
     assert.equal(body.maxUploadSize, 10 * 1024 * 1024);
     assert.ok(Array.isArray(body.checksum.algorithms));
     assert.equal(authorizeCalls.length, 0, "capabilities must not run authorize");
   } finally {
     await ctx.teardown();
+  }
+});
+
+test("passing the removed uploadUnit option throws at boot", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
+  try {
+    for (const uploadUnit of ["segment", "merged"]) {
+      const app = Fastify({ logger: false });
+      await assert.rejects(
+        async () =>
+          app.register(pulseVault, {
+            prefix: PREFIX,
+            storage: createLocalStorage({ workspaceDir }),
+            maxUploadSize: 10 * 1024 * 1024,
+            uploadUnit,
+          }),
+        { name: "TypeError", message: /`uploadUnit` was removed — delete the option/ },
+      );
+      await app.close().catch(() => {});
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 

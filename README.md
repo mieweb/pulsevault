@@ -218,13 +218,15 @@ sequenceDiagram
     Org->>Pulse: ready for playback and captions fetch
 ```
 
+A pulse uploads as **one video** — the artifact named by the pairing link — plus related artifacts that declare `relatedTo` it, all under the same session token: WebVTT captions (`kind=captions`, optional), a beat manifest (`kind=project`, `<draftId>-beats.pulse`) and a poster frame (`kind=thumbnail`). A **beat** is a timestamp range inside that video — where each recorded clip starts and ends (`{ segmentId, order, startMs, endMs }`), contiguous and summing to the video's `durationMs`. The beat manifest is groundwork for HLS / deep links into a pulse; it doesn't change how anything is uploaded. See `PROTOCOL.md` §8.
+
 ## Routes
 
 The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core` mounts the identical set under `basePath` — see [Non-Fastify hosts](#non-fastify-hosts-express-meteor-plain-http)):
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, `uploadUnit`, allowed extensions, limits |
+| `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, artifact kinds, allowed extensions, limits |
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
 | `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
@@ -243,7 +245,6 @@ type PulseVaultPluginOptions = {
   storage: PulseVaultStorage;
   prefix: string;
   maxUploadSize: number;
-  uploadUnit?: "segment" | "merged";           // default: "segment" — see "Upload unit"
   decoratorName?: string;                      // default: "pulseVault"
   allowedExtensions?:
     | string[]                                                                              // legacy — treated as video-only
@@ -274,19 +275,6 @@ URL prefix for all plugin routes. Set to `"/pulsevault"` for the standard namesp
 ### `maxUploadSize`
 
 Maximum upload size in bytes. Use `Infinity` for no cap.
-
-### Upload unit
-
-`uploadUnit: "segment" | "merged"` — purely advertised via `GET /pulsevault/capabilities`; **the plugin doesn't enforce either.** It tells the client which upload strategy this deployment expects:
-
-- `"segment"` (default): the client uploads each recorded clip individually (no merge/re-encode pass), plus one `kind=project` ordering manifest (`<draftId>-segments.pulse`). No captions or thumbnail. Lower client-side cost, finer-grained resumability.
-- `"merged"`: the client pre-merges a pulse's clips into one video before uploading, alongside its captions (`kind=captions`), a beat-timecode manifest (`kind=project`, `<draftId>-beats.pulse` — per-segment `startMs`/`endMs` on the merged timeline), and a poster `kind=thumbnail`. Simpler server-side mental model (one primary artifact per pulse), more client-side work.
-
-(A "beat" is a timecode range on the merged timeline — one recorded segment's placement within the merged video — not an upload unit. The old `"beat"` upload unit was renamed to `"segment"`.)
-
-A client reads `uploadUnit` at pairing time, before doing any merge or upload work, and branches accordingly. See `PROTOCOL.md` §8 for the full contract.
-
-Need both strategies live at once instead of one fixed value for the whole deployment? Pass `uploadUnit` to [`buildUploadLink`](#deep-link-helper) per session — it overrides `/capabilities` for that pairing only, with no server-side option to change.
 
 ### `decoratorName`
 
@@ -473,7 +461,6 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "protocolVersion": 1,
   "minSupportedVersion": 1,
   "maxSupportedVersion": 1,
-  "uploadUnit": "segment",
   "kinds": ["video", "project", "captions", "thumbnail"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
@@ -522,7 +509,7 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a merged video also covers its captions, beat manifest and thumbnail (or, under `uploadUnit: "segment"`, every clip and the ordering manifest) in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
 
 ## Upload-Metadata protocol
 
@@ -761,12 +748,9 @@ const uploadLink = buildUploadLink({
   server: "https://example.com/pulsevault",
   artifactId: randomUUID(), // generate server-side; skip POST /reserve on the app
   token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
-  uploadUnit: "merged", // optional — see "Upload unit" below
 });
-// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret&uploadUnit=merged
+// pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
-
-`uploadUnit` on the link is a **per-session override** of whatever `GET /capabilities` currently reports (PROTOCOL.md §3, §8). Omit it and nothing changes — the client falls back to `/capabilities` exactly as before. Set it when you want "segment" and "merged" sessions live at the same time (staged rollout, A/B test, per-tenant policy) instead of one fixed value for the whole deployment — `/capabilities` can only ever report one current value, and a client reading it separately from opening the link is racing whatever the server happened to be serving at that moment, not the value this specific session was paired under.
 
 ## Tests
 
