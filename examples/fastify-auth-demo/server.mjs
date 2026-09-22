@@ -267,24 +267,6 @@ function recordEvent(event) {
   if (recentEvents.length > MAX_EVENTS) recentEvents.length = MAX_EVENTS;
 }
 
-// ---------------------------------------------------------------------------
-// Upload-unit deployment default (README "Upload unit") — purely advisory
-// via `GET /pulsevault/capabilities`; the plugin never enforces "segment" vs
-// "merged", it just reports whichever value this server passes at
-// registration. The plugin bakes this in as a fixed option captured once at
-// `register()` time — there's no live setter for it, so changing this
-// deployment-wide default means restarting with a different env var
-// (`UPLOAD_UNIT=segment npm start`), not a runtime toggle. To test both
-// "segment" and "merged" without restarting, use the per-link `uploadUnit`
-// override on `GET /deeplinks` / `buildUploadLink` instead (PROTOCOL.md §3,
-// §8) — the pairing page's "Upload unit for this link" selector drives it.
-//
-// Default "merged" here (mirrors ../fastify-demo) so this demo exercises the
-// full merged pipeline — video + captions + beat manifest + thumbnail; set
-// UPLOAD_UNIT=segment to test per-clip uploads instead.
-// ---------------------------------------------------------------------------
-const uploadUnitDefault = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
-
 const app = Fastify({
   // Behind the opensource-server edge nginx (which sets X-Forwarded-For/-Proto/
   // -Host). Trust it so `request.ip` is the real client rather than the shared
@@ -700,7 +682,7 @@ app.get(
 
     // Pair each video with its subtitles (kind "captions" on the wire) exactly
     // as ../fastify-demo does: within a pulse (shared `relatedTo ?? artifactId`
-    // anchor), the app names the merged video's VTT after the video, so matching
+    // anchor), the app names the video's VTT after the video, so matching
     // filename stems pair them. Fallback: a pulse with exactly one video and one
     // subtitles file is an unambiguous pair even if the stems drifted. The
     // caption URL carries the same anchor token — /captions authorizes it via
@@ -743,13 +725,6 @@ app.get(
 // `issuer` claim uses — never derived from request headers, or verification
 // would fail for every request that didn't happen to arrive on the exact
 // host header the token was issued under.
-//
-// `?uploadUnit=segment|merged` lets this *one* pairing link override the
-// deployment-wide default set above — demonstrates running "segment" and
-// "merged" sessions concurrently (README "Upload unit") instead of one fixed
-// value for every pairing. Omit it and behavior is unchanged: the link
-// carries no override, and the client falls back to whatever `/capabilities`
-// reports.
 app.get(
   "/deeplinks",
   {
@@ -759,16 +734,6 @@ app.get(
       summary: "Mint a pairing deep link + QR code",
       description:
         "Generates a fresh artifactId, issues a session-scoped capability token, and returns the `pulsecam://` deep link (plus a QR data URL) the Pulse app pairs with.",
-      querystring: {
-        type: "object",
-        properties: {
-          uploadUnit: {
-            type: "string",
-            enum: ["segment", "merged"],
-            description: "Per-link override of the deployment-wide upload-unit default.",
-          },
-        },
-      },
       response: {
         200: {
           description: "One pairing link and its QR code.",
@@ -787,10 +752,9 @@ app.get(
       },
     },
   },
-  async (req, reply) => {
+  async (_req, reply) => {
     const server = `${ISSUER}/pulsevault`;
     const artifactId = randomUUID();
-    const requestedUploadUnit = req.query?.uploadUnit;
 
     const token = issueCapabilityToken(artifactId, PULSEVAULT_SECRET, {
       keyId: PULSEVAULT_KEY_ID,
@@ -798,12 +762,7 @@ app.get(
       expirySeconds: TOKEN_TTL_SECONDS,
     });
 
-    const upload = buildUploadLink({
-      server,
-      artifactId,
-      token,
-      ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
-    });
+    const upload = buildUploadLink({ server, artifactId, token });
 
     const qrUpload = await QRCode.toDataURL(upload, {
       width: 224,
@@ -842,11 +801,9 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  uploadUnit: uploadUnitDefault,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target. Mirrors ../fastify-demo.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside its video; rejecting any of those
+  // would make this a broken pairing target. Mirrors ../fastify-demo.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],

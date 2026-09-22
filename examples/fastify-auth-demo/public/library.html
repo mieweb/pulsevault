@@ -88,7 +88,7 @@
       .badge.token { background: rgba(16, 185, 129, 0.18); border-color: rgba(16, 185, 129, 0.4); }
       .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.68rem; word-break: break-all; color: var(--text-2); }
 
-      /* The uploaded `kind: "thumbnail"` artifact (merged mode only), shown as a
+      /* The uploaded `kind: "thumbnail"` artifact (the pulse's poster frame), shown as a
          small labeled preview so the demo visibly exercises the poster kind. */
       .thumb { display: inline-flex; flex-direction: column; gap: 0.2rem; margin: 0 0 0.5rem; }
       .thumb-label { font-size: 0.55rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); }
@@ -156,10 +156,10 @@
         return text.replace(/([?&]token=)[^&"']*/g, "$1");
       }
 
-      // One pulse = every artifact sharing a session anchor. Segment sessions upload each clip
-      // under its own artifactId with `relatedTo` pointing at the session's ordering manifest
-      // (kind "project"); a merged session is one video whose captions/thumbnail point at it.
-      // Anchoring on `relatedTo ?? artifactId` puts each artifact in exactly one group either way.
+      // One pulse = every artifact sharing a session anchor: one video plus the captions, beat
+      // manifest and thumbnail whose `relatedTo` points at it. (Uploads from older Pulse builds
+      // can hold several clip videos under one anchor; those play back to back.) Anchoring on
+      // `relatedTo ?? artifactId` puts each artifact in exactly one group.
       function groupUploads(uploads) {
         const groups = new Map();
         for (const u of uploads) {
@@ -254,16 +254,16 @@
 
       // ── The smart player: one <video> per pulse that plays its clips back to
       // back (manifest order), swaps subtitles per clip, and reports progress.
-      // Segment sessions have many clips; a merged session is one looping video. ──
+      // A pulse is one looping video; older multi-clip uploads play clip by clip. ──
       function SmartPlayer({ pulse, active, near, muted, onToggleMute }) {
         const { anchorId, items } = pulse;
         const videos = items.filter((u) => u.kind === "video");
         const manifest = items.find((u) => u.kind === "project");
-        const poster = items.find((u) => u.kind === "thumbnail"); // merged-mode poster frame
+        const poster = items.find((u) => u.kind === "thumbnail"); // the pulse's poster frame
         const subtitlesCount = items.filter((u) => u.kind === "captions").length; // "captions" is the wire kind
-        // A merged session is a single video (it also ships a beat manifest + thumbnail, so
-        // "has a manifest" can't tell the modes apart); >1 video means a segment session.
-        const isSegmented = videos.length > 1;
+        // A pulse is a single video (plus a beat manifest + thumbnail); >1 video only happens
+        // for uploads from older Pulse builds that sent each clip separately.
+        const isMultiClip = videos.length > 1;
         const totalSize = items.reduce((sum, u) => sum + u.size, 0);
 
         const videoRef = useRef(null);
@@ -273,11 +273,11 @@
         const [cues, setCues] = useState(null);
         const [cuePos, setCuePos] = useState(null); // { cueIdx, wordIdx }
 
-        // Clip order comes from a segment session's ordering manifest
+        // For older multi-clip uploads, clip order comes from their ordering manifest
         // (`{ segments: [{ artifactId, order }] }`) — authoritative; upload timestamps are
-        // only the fallback while/if it's missing. (A merged session's `-beats.pulse` is a
-        // timecode manifest keyed by local segmentId, not an ordering, and it has a single
-        // video anyway — so `m.segments` is absent there and order stays null, which is fine.)
+        // only the fallback while/if it's missing. (A pulse's `-beats.pulse` lists timestamp
+        // ranges inside its one video, not an ordering — so `m.segments` is absent there and
+        // order stays null, which is fine.)
         const [order, setOrder] = useState(null);
         useEffect(() => {
           if (!manifest) return;
@@ -318,7 +318,7 @@
           if (video.src !== src) {
             video.src = src;
             video.preload = "auto";
-            // A single merged video loops natively; segment sessions advance on `ended`.
+            // A single video loops natively; older multi-clip uploads advance on `ended`.
             video.loop = clipCount === 1;
             if (active && !halted) video.play().catch(() => setHalted(true));
           }
@@ -354,9 +354,8 @@
           return () => video.removeEventListener("ended", onEnded);
         }, []);
 
-        // The merged video carries its captions starting at 0:00 (segment clips carry
-        // none), so the cue set swaps wholesale when the active clip changes — no
-        // timeline offset math needed.
+        // A pulse's video carries its captions starting at 0:00, so the cue set swaps
+        // wholesale when the active clip changes — no timeline offset math needed.
         useEffect(() => {
           setCues(null);
           setCuePos(null);
@@ -369,7 +368,7 @@
           return () => { cancelled = true; };
         }, [clip?.subtitlesUrl]);
 
-        // One rAF loop while active drives both the segment bar and the karaoke
+        // One rAF loop while active drives both the progress bar and the karaoke
         // highlight. setState is change-gated so 60fps polling ≠ 60fps renders.
         useEffect(() => {
           if (!active) return;
@@ -422,7 +421,7 @@
                   <img src=${poster.playbackUrl} alt="Pulse thumbnail" />
                 </div>`}
               <p style=${{ margin: "0 0 0.4rem", display: "flex", gap: "0.35rem", flexWrap: "wrap" }}>
-                <span className="badge">${isSegmented ? `pulse · ${clipCount} segments` : "merged"}</span>
+                <span className="badge">${isMultiClip ? `pulse · ${clipCount} clips` : "pulse"}</span>
                 <span className="badge token">🔒 capability token</span>
               </p>
               <p className="mono" style=${{ margin: 0 }}>
