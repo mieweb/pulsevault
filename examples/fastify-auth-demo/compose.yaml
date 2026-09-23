@@ -50,7 +50,6 @@ services:
       PULSEVAULT_SECRET: ${PULSEVAULT_SECRET:?required — generate with `openssl rand -hex 32`}
       PULSEVAULT_KEY_ID: ${PULSEVAULT_KEY_ID:-demo-1}
       PULSEVAULT_ISSUER: ${PULSEVAULT_ISSUER:-http://localhost:3000}
-      UPLOAD_UNIT: ${UPLOAD_UNIT:-merged}
       # Security & delivery middleware knobs (optional — see .env.example).
       CORS_ORIGIN: ${CORS_ORIGIN:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}

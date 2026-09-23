@@ -137,7 +137,7 @@ sequenceDiagram
     User->>Demo: open this page
     Demo->>User: QR + pulsecam:// deep link (artifactId minted server-side)
     User->>Pulse: scan / open link
-    Pulse->>Vault: GET /capabilities (protocol version, upload unit)
+    Pulse->>Vault: GET /capabilities (protocol version, limits)
     Pulse->>Vault: POST /upload -> 201 + Location
     Pulse->>Vault: PATCH chunks, HEAD before resume
     Vault->>Vault: finished upload marked ready in ./data
@@ -186,7 +186,6 @@ graph LR
         return html`
           <div className="status-bar">
             <span className="chip"><span className="dot"></span>Protocol <b>v${caps.protocolVersion}</b></span>
-            <span className="chip">Upload unit default <b>${caps.uploadUnit}</b></span>
             <span className="chip">Auth <b>open (no auth)</b></span>
           </div>`;
       }
@@ -256,19 +255,12 @@ graph LR
           </section>`;
       }
 
-      function PairPanel({ caps }) {
-        const [override, setOverride] = useState("");
+      function PairPanel() {
         const [link, setLink] = useState(null);
-        const serverDefault = caps ? caps.uploadUnit : null;
         const refresh = useCallback(() => {
-          const qs = override ? `?uploadUnit=${override}` : "";
-          fetch(`/deeplinks${qs}`).then((r) => r.json()).then(setLink);
-        }, [override]);
-        // Changing the selector regenerates the link immediately.
+          fetch("/deeplinks").then((r) => r.json()).then(setLink);
+        }, []);
         useEffect(() => { refresh(); }, [refresh]);
-
-        // Read straight off the generated link — this is what the app will honor.
-        const linkUploadUnit = link ? new URL(link.upload).searchParams.get("uploadUnit") : null;
 
         return html`
           <section>
@@ -278,25 +270,6 @@ graph LR
               <p className="mono">${link ? link.upload : "Loading…"}</p>
               <label>Artifact ID</label>
               <p className="mono">${link ? link.artifactId : ""}</p>
-              <label>Upload unit on this link</label>
-              <p className="mono">
-                ${linkUploadUnit
-                  ? `${linkUploadUnit} (per-link override)`
-                  : `${serverDefault ?? "?"} (server default, no override on this link)`}
-              </p>
-
-              <label htmlFor="uploadUnitOverride">Upload unit for this link</label>
-              <select
-                id="uploadUnitOverride"
-                className="btn btn-ghost"
-                style=${{ marginBottom: "0.6rem" }}
-                value=${override}
-                onChange=${(e) => setOverride(e.target.value)}
-              >
-                <option value="">Use server default${serverDefault ? ` (${serverDefault})` : ""}</option>
-                <option value="segment">Force "segment" for this link</option>
-                <option value="merged">Force "merged" for this link</option>
-              </select>
               <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
 
               ${link && html`<img className="qr" width="200" height="200" src=${link.qrUpload} alt="Pairing QR code" />`}
@@ -311,8 +284,8 @@ graph LR
       function UploadsLink() {
         const [count, setCount] = useState(null);
         useEffect(() => {
-          // Count PULSES (feed items), not raw artifacts — a 6-segment session is six
-          // clip videos + an ordering manifest on the wire, but one item in the feed.
+          // Count PULSES (feed items), not raw artifacts — a pulse is one video plus
+          // its captions, beat manifest and thumbnail on the wire, but one feed item.
           // Same grouping as the feed page: one pulse per session anchor
           // (`relatedTo ?? artifactId`), counted only if it actually has video.
           const refresh = () =>
@@ -357,7 +330,7 @@ graph LR
           <${StatusBar} caps=${caps} />
           <${HowItWorks} />
           <${ScalingPanel} />
-          <${PairPanel} caps=${caps} />
+          <${PairPanel} />
           <footer>
             <span>@mieweb/pulsevault</span>
             <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>

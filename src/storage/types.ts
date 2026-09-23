@@ -56,8 +56,7 @@ export type ReserveUploadParams = {
    * Optional UUID of another artifact this one belongs to, from
    * `Upload-Metadata.relatedTo`. Lets a single capability token scoped to one
    * "session" artifact (e.g. a video) authorize related artifacts uploaded in
-   * the same session (a merged video's captions, beat manifest and thumbnail,
-   * or — under `uploadUnit: "segment"` — each clip plus the ordering manifest)
+   * the same session (the video's captions, beat manifest and thumbnail)
    * without minting a token per artifact.
    * The storage layer itself only stores and returns this value — it does not
    * validate that the referenced artifact exists or was created by the same

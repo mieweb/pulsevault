@@ -30,13 +30,6 @@ import {
 const workspaceDir = process.env.PULSEVAULT_DIR || path.join(os.tmpdir(), "pulsevault-meteor-demo-data");
 const pulsevaultMetaDir = path.join(workspaceDir, ".pulsevault");
 
-// Deployment-wide default advertised via GET /pulsevault/capabilities — purely
-// advisory; the core never enforces "segment" vs "merged", it just reports
-// whichever value this server passes at registration. Default "merged" so this
-// demo exercises the full merged pipeline (video + captions + thumbnail); set
-// UPLOAD_UNIT=segment to test per-clip uploads instead.
-const uploadUnit = process.env.UPLOAD_UNIT === "segment" ? "segment" : "merged";
-
 // The route params say `format: "uuid"` but nothing here runs Ajv, so routes
 // that embed a request-supplied id in a filesystem path validate it explicitly.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -193,9 +186,9 @@ WebApp.connectHandlers.use("/videos", async (_req, res) => {
           filename: sidecar.filename ?? tusMeta?.metadata?.filename ?? artifactFile,
           ext,
           size: artifactStat.size,
-          // Session anchor this artifact belongs to (a segment session's clips point at
-          // their ordering manifest; a merged video's captions/thumbnail point at the
-          // video) — lets the page group one pulse's artifacts together.
+          // Session anchor this artifact belongs to (a pulse's captions, beat manifest
+          // and thumbnail point at its video) — lets the page group one pulse's
+          // artifacts together.
           relatedTo: sidecar.relatedTo ?? null,
           playbackUrl: `/pulsevault/artifacts/${artifactId}`,
           creation_date: tusMeta?.creation_date ?? artifactStat.birthtime.toISOString(),
@@ -205,31 +198,16 @@ WebApp.connectHandlers.use("/videos", async (_req, res) => {
 
   const ready = uploads.filter(Boolean);
 
-  // Pair each video with its subtitles (kind "captions" on the wire) the same
-  // way fastify-demo does: within a pulse (shared `relatedTo ?? artifactId`
-  // anchor), the app names the merged video's VTT after the video, so matching
-  // filename stems pair them. Fallback: a pulse with exactly one video and one
-  // subtitles file is an unambiguous pair even if the stems drifted.
-  const stem = (filename) => filename.replace(/\.[^.]+$/, "");
-  const byAnchor = new Map();
+  // Pair each video with its subtitles (kind "captions" on the wire): a pulse's
+  // captions declare `relatedTo` its video, so the pairing is direct.
+  const captionsByVideo = new Map();
   for (const u of ready) {
-    const anchorId = u.relatedTo ?? u.artifactId;
-    if (!byAnchor.has(anchorId)) byAnchor.set(anchorId, []);
-    byAnchor.get(anchorId).push(u);
+    if (u.kind === "captions" && u.relatedTo) captionsByVideo.set(u.relatedTo, u);
   }
-  for (const group of byAnchor.values()) {
-    const videos = group.filter((u) => u.kind === "video");
-    const subsPool = group.filter((u) => u.kind === "captions");
-    for (const video of videos) {
-      const idx = subsPool.findIndex((s) => stem(s.filename) === stem(video.filename));
-      const matched =
-        idx >= 0
-          ? subsPool.splice(idx, 1)[0]
-          : videos.length === 1 && subsPool.length === 1
-            ? subsPool.pop()
-            : null;
-      video.subtitlesUrl = matched ? `/subtitles/${matched.artifactId}` : null;
-    }
+  for (const u of ready) {
+    if (u.kind !== "video") continue;
+    const captions = captionsByVideo.get(u.artifactId);
+    u.subtitlesUrl = captions ? `/subtitles/${captions.artifactId}` : null;
   }
 
   json(res, 200, ready.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));
@@ -239,28 +217,13 @@ WebApp.connectHandlers.use("/videos", async (_req, res) => {
 // so it stays the source of truth. `server` must include the core's `basePath`
 // ("/pulsevault") — the client builds every request as `${server}/<path>` with
 // no prefix concept of its own.
-//
-// `?uploadUnit=segment|merged` lets this one pairing link override the
-// deployment-wide default (PROTOCOL.md §8) — handy for testing both modes
-// without restarting. Omit it and the link carries no override; the client
-// falls back to whatever `/capabilities` reports.
 WebApp.connectHandlers.use("/deeplinks", async (req, res) => {
   const proto = req.headers["x-forwarded-proto"] ?? "http";
   const host = req.headers["x-forwarded-host"] ?? req.headers.host;
   const server = `${proto}://${host}/pulsevault`;
   const artifactId = randomUUID();
 
-  const requestedUploadUnit = new URL(req.url, "http://localhost").searchParams.get("uploadUnit") ?? undefined;
-  if (requestedUploadUnit !== undefined && requestedUploadUnit !== "segment" && requestedUploadUnit !== "merged") {
-    json(res, 400, { error: '`uploadUnit` query param must be "segment" or "merged"' });
-    return;
-  }
-
-  const upload = buildUploadLink({
-    server,
-    artifactId,
-    ...(requestedUploadUnit && { uploadUnit: requestedUploadUnit }),
-  });
+  const upload = buildUploadLink({ server, artifactId });
 
   const qrUpload = await QRCode.toDataURL(upload, {
     width: 224,
@@ -283,11 +246,9 @@ const pulseVault = createPulseVaultCore({
   stripBasePath: false,
   storage: createLocalStorage({ workspaceDir }),
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
-  uploadUnit,
-  // All kinds stay enabled — a merged-mode session uploads a .pulse beat
-  // manifest, .vtt captions and a .jpg thumbnail alongside the video (and a
-  // segment-mode session uploads a .pulse ordering manifest); rejecting any of
-  // those would make this a broken pairing target.
+  // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
+  // captions and a .jpg thumbnail alongside its video; rejecting any of those
+  // would make this a broken pairing target.
   allowedExtensions: {
     video: [".mp4"],
     project: [".pulse", ".zip"],
@@ -304,7 +265,6 @@ Meteor.startup(() => {
   console.log(`PulseVault Meteor demo — pulsevault mounted at /pulsevault`);
   console.log(`  pairing page: /   ·   feed: /library`);
   console.log(`  workspaceDir: ${workspaceDir}`);
-  console.log(`  upload unit:  ${uploadUnit} (set UPLOAD_UNIT=segment to switch)`);
 });
 
 process.on("SIGINT", async () => {

@@ -23,7 +23,7 @@ const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
 // WebVTT only — it's what the Pulse app uploads, and it carries word-level
 // inline cue timestamps (`<00:00:01.500>word`) for karaoke rendering.
 const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
-// The merged-mode poster frame (the draft's first-clip thumbnail).
+// The pulse's poster frame (the draft's first-clip thumbnail).
 const DEFAULT_THUMBNAIL_EXTENSIONS: readonly string[] = ['.jpg', '.jpeg', '.png'];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
@@ -76,9 +76,16 @@ export function validateMaxUploadSize(maxUploadSize: number): void {
   }
 }
 
-export function validateUploadUnit(uploadUnit: 'segment' | 'merged' | undefined): void {
-  if (uploadUnit && uploadUnit !== 'segment' && uploadUnit !== 'merged') {
-    throw new TypeError('`uploadUnit` must be "segment" or "merged"');
+/**
+ * Fail at boot on options that no longer exist, instead of silently ignoring
+ * them. Shared by every entry point (Fastify plugin, core) so the message
+ * can't drift between surfaces.
+ */
+export function rejectRemovedOptions(opts: object): void {
+  if ((opts as { uploadUnit?: unknown }).uploadUnit !== undefined) {
+    throw new TypeError(
+      '`uploadUnit` was removed — delete the option. A pulse uploads as one video; beats are timestamps within it (see CHANGELOG).',
+    );
   }
 }
 

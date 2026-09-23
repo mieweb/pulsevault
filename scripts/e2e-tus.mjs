@@ -124,8 +124,8 @@ async function main() {
     assert.equal(typeof caps.protocolVersion, "number");
     assert.ok(caps.minSupportedVersion <= caps.protocolVersion);
     assert.ok(caps.protocolVersion <= caps.maxSupportedVersion);
-    assert.ok(["segment", "merged"].includes(caps.uploadUnit));
-    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, uploadUnit=${caps.uploadUnit}`);
+    assert.equal("uploadUnit" in caps, false, "/capabilities must not return the removed uploadUnit field");
+    console.log(`  ✓ /capabilities reports protocolVersion=${caps.protocolVersion}, no uploadUnit`);
 
     // 2a. Dashboard routes are Better Auth-protected: no session -> 401.
     const unauthed = await fetch(`${BASE}/deeplinks`);
@@ -186,8 +186,11 @@ async function main() {
       },
     });
     assert.equal(create.status, 201, `create should be 201, got ${create.status}`);
-    const location = create.headers.get("location");
-    assert.ok(location, "create response should include a Location header");
+    const rawLocation = create.headers.get("location");
+    assert.ok(rawLocation, "create response should include a Location header");
+    // The server may return a path-only Location (`/pulsevault/upload/…`); resolve it the way a
+    // TUS client does, or fetch() rejects it as an invalid URL.
+    const location = new URL(rawLocation, BASE).href;
     console.log("  ✓ TUS create succeeded");
 
     const half = body.length / 2;
