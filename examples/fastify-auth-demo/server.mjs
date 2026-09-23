@@ -537,10 +537,9 @@ app.get(
 );
 
 /**
- * Reads a finalized artifact's bytes as text. Used for parsing the ordering
- * manifest (`kind=project`) and for serving WebVTT captions
- * (`kind=captions`) — both small text files, so a full read is fine (unlike
- * video bytes, which the checksum validator/sniffer stream instead of
+ * Reads a finalized artifact's bytes as text. Used for serving WebVTT
+ * captions (`kind=captions`) — a small text file, so a full read is fine
+ * (unlike video bytes, which the checksum validator/sniffer stream instead of
  * buffering).
  */
 async function readArtifactText(artifactId) {
@@ -680,36 +679,20 @@ app.get(
       };
     });
 
-    // Pair each video with its subtitles (kind "captions" on the wire) exactly
-    // as ../fastify-demo does: within a pulse (shared `relatedTo ?? artifactId`
-    // anchor), the app names the video's VTT after the video, so matching
-    // filename stems pair them. Fallback: a pulse with exactly one video and one
-    // subtitles file is an unambiguous pair even if the stems drifted. The
+    // Pair each video with its subtitles (kind "captions" on the wire): a pulse's
+    // captions declare `relatedTo` its video, so the pairing is direct. The
     // caption URL carries the same anchor token — /captions authorizes it via
     // the caption's relatedTo.
-    const stem = (filename) => filename.replace(/\.[^.]+$/, "");
-    const byAnchor = new Map();
+    const captionsByVideo = new Map();
     for (const u of items) {
-      const anchorId = u.relatedTo ?? u.artifactId;
-      if (!byAnchor.has(anchorId)) byAnchor.set(anchorId, []);
-      byAnchor.get(anchorId).push(u);
+      if (u.kind === "captions" && u.relatedTo) captionsByVideo.set(u.relatedTo, u);
     }
-    for (const group of byAnchor.values()) {
-      const videos = group.filter((u) => u.kind === "video");
-      const subsPool = group.filter((u) => u.kind === "captions");
-      for (const video of videos) {
-        const idx = subsPool.findIndex((s) => stem(s.filename) === stem(video.filename));
-        const matched =
-          idx >= 0
-            ? subsPool.splice(idx, 1)[0]
-            : videos.length === 1 && subsPool.length === 1
-              ? subsPool.pop()
-              : null;
-        const anchorId = video.relatedTo ?? video.artifactId;
-        video.subtitlesUrl = matched
-          ? `/captions/${matched.artifactId}?token=${tokenFor(anchorId)}`
-          : null;
-      }
+    for (const u of items) {
+      if (u.kind !== "video") continue;
+      const captions = captionsByVideo.get(u.artifactId);
+      u.subtitlesUrl = captions
+        ? `/captions/${captions.artifactId}?token=${tokenFor(u.relatedTo ?? u.artifactId)}`
+        : null;
     }
 
     return reply.send(items.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));

@@ -198,31 +198,16 @@ WebApp.connectHandlers.use("/videos", async (_req, res) => {
 
   const ready = uploads.filter(Boolean);
 
-  // Pair each video with its subtitles (kind "captions" on the wire) the same
-  // way fastify-demo does: within a pulse (shared `relatedTo ?? artifactId`
-  // anchor), the app names the video's VTT after the video, so matching
-  // filename stems pair them. Fallback: a pulse with exactly one video and one
-  // subtitles file is an unambiguous pair even if the stems drifted.
-  const stem = (filename) => filename.replace(/\.[^.]+$/, "");
-  const byAnchor = new Map();
+  // Pair each video with its subtitles (kind "captions" on the wire): a pulse's
+  // captions declare `relatedTo` its video, so the pairing is direct.
+  const captionsByVideo = new Map();
   for (const u of ready) {
-    const anchorId = u.relatedTo ?? u.artifactId;
-    if (!byAnchor.has(anchorId)) byAnchor.set(anchorId, []);
-    byAnchor.get(anchorId).push(u);
+    if (u.kind === "captions" && u.relatedTo) captionsByVideo.set(u.relatedTo, u);
   }
-  for (const group of byAnchor.values()) {
-    const videos = group.filter((u) => u.kind === "video");
-    const subsPool = group.filter((u) => u.kind === "captions");
-    for (const video of videos) {
-      const idx = subsPool.findIndex((s) => stem(s.filename) === stem(video.filename));
-      const matched =
-        idx >= 0
-          ? subsPool.splice(idx, 1)[0]
-          : videos.length === 1 && subsPool.length === 1
-            ? subsPool.pop()
-            : null;
-      video.subtitlesUrl = matched ? `/subtitles/${matched.artifactId}` : null;
-    }
+  for (const u of ready) {
+    if (u.kind !== "video") continue;
+    const captions = captionsByVideo.get(u.artifactId);
+    u.subtitlesUrl = captions ? `/subtitles/${captions.artifactId}` : null;
   }
 
   json(res, 200, ready.sort((a, b) => b.creation_date.localeCompare(a.creation_date)));

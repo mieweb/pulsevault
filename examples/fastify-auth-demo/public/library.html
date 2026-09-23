@@ -56,7 +56,7 @@
       .pair-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.7rem; font-size: 0.75rem; font-weight: 600; background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.18); color: var(--text); border-radius: 999px; text-decoration: none; backdrop-filter: blur(6px); }
       .pair-link:hover { border-color: var(--accent); }
 
-      /* IG-story style progress: one bar per clip. */
+      /* IG-story style progress: one track per beat, sized to the beat's length. */
       .progress-row { position: absolute; top: 0.35rem; left: 0.75rem; right: 0.75rem; z-index: 4; display: flex; gap: 0.25rem; }
       .progress-seg { flex: 1; height: 3px; border-radius: 999px; background: rgba(255, 255, 255, 0.3); overflow: hidden; }
       .progress-fill { height: 100%; background: #fff; border-radius: 999px; }
@@ -156,9 +156,8 @@
         return text.replace(/([?&]token=)[^&"']*/g, "$1");
       }
 
-      // One pulse = every artifact sharing a session anchor: one video plus the captions, beat
-      // manifest and thumbnail whose `relatedTo` points at it. (Uploads from older Pulse builds
-      // can hold several clip videos under one anchor; those play back to back.) Anchoring on
+      // One pulse = every artifact sharing a session anchor: the video, plus the captions, beat
+      // manifest and thumbnail whose `relatedTo` points at it. Anchoring on
       // `relatedTo ?? artifactId` puts each artifact in exactly one group.
       function groupUploads(uploads) {
         const groups = new Map();
@@ -224,14 +223,18 @@
 
       // ── Pure overlay pieces ────────────────────────────────────────────────
 
-      function SegmentProgress({ count, current, progress }) {
+      // One track per beat — a timestamp range inside the video — sized to the beat's length and
+      // filled as playback passes through it. A pulse without a beat manifest gets one track.
+      function BeatProgress({ beats, progress }) {
+        const spans = beats?.length ? beats.map((b) => [b.startMs, b.endMs]) : [[0, 1]];
+        const t = progress * spans[spans.length - 1][1];
         return html`
           <div className="progress-row">
-            ${Array.from({ length: count }, (_, i) => html`
-              <div className="progress-seg" key=${i}>
+            ${spans.map(([start, end], i) => html`
+              <div className="progress-seg" key=${i} style=${{ flex: `${Math.max(end - start, 1)} 1 0` }}>
                 <div
                   className="progress-fill"
-                  style=${{ width: i < current ? "100%" : i === current ? `${progress * 100}%` : "0%" }}
+                  style=${{ width: `${Math.min(1, Math.max(0, (t - start) / Math.max(end - start, 1))) * 100}%` }}
                 ></div>
               </div>`)}
           </div>`;
@@ -252,79 +255,60 @@
           </div>`;
       }
 
-      // ── The smart player: one <video> per pulse that plays its clips back to
-      // back (manifest order), swaps subtitles per clip, and reports progress.
-      // A pulse is one looping video; older multi-clip uploads play clip by clip. ──
+      // ── The smart player: one looping <video> per pulse. The beat manifest splits
+      // the progress bar into beats; the captions are timed against the video. ──
       function SmartPlayer({ pulse, active, near, muted, onToggleMute }) {
         const { anchorId, items } = pulse;
-        const videos = items.filter((u) => u.kind === "video");
+        // A pulse is one video (the anchor) plus its captions, beat manifest and thumbnail.
+        const videoArtifact = items.find((u) => u.kind === "video");
         const manifest = items.find((u) => u.kind === "project");
         const poster = items.find((u) => u.kind === "thumbnail"); // the pulse's poster frame
         const subtitlesCount = items.filter((u) => u.kind === "captions").length; // "captions" is the wire kind
-        // A pulse is a single video (plus a beat manifest + thumbnail); >1 video only happens
-        // for uploads from older Pulse builds that sent each clip separately.
-        const isMultiClip = videos.length > 1;
         const totalSize = items.reduce((sum, u) => sum + u.size, 0);
 
         const videoRef = useRef(null);
-        const [clipIndex, setClipIndex] = useState(0);
         const [progress, setProgress] = useState(0);
         const [halted, setHalted] = useState(false); // user-paused OR autoplay blocked
         const [cues, setCues] = useState(null);
         const [cuePos, setCuePos] = useState(null); // { cueIdx, wordIdx }
 
-        // For older multi-clip uploads, clip order comes from their ordering manifest
-        // (`{ segments: [{ artifactId, order }] }`) — authoritative; upload timestamps are
-        // only the fallback while/if it's missing. (A pulse's `-beats.pulse` lists timestamp
-        // ranges inside its one video, not an ordering — so `m.segments` is absent there and
-        // order stays null, which is fine.)
-        const [order, setOrder] = useState(null);
+        // The beat manifest — `{ type: "beat-manifest", durationMs, beats: [{ segmentId, order,
+        // startMs, endMs }] }` — says where each recorded clip starts and ends inside the video.
+        const [beats, setBeats] = useState(null);
         useEffect(() => {
           if (!manifest) return;
           let cancelled = false;
           fetch(manifest.playbackUrl)
             .then((r) => r.json())
             .then((m) => {
-              if (cancelled || !Array.isArray(m?.segments)) return;
-              setOrder(new Map(m.segments.map((s) => [s.artifactId, s.order])));
+              if (cancelled || m?.type !== "beat-manifest" || !Array.isArray(m.beats)) return;
+              setBeats([...m.beats].sort((a, b) => a.order - b.order));
             })
             .catch(() => {});
           return () => { cancelled = true; };
         }, [manifest?.artifactId]);
 
-        const clips = [...videos].sort((a, b) =>
-          order
-            ? (order.get(a.artifactId) ?? 0) - (order.get(b.artifactId) ?? 0)
-            : a.creation_date.localeCompare(b.creation_date),
-        );
-        const clip = clips[Math.min(clipIndex, clips.length - 1)];
-        const clipCount = clips.length;
-        const clipCountRef = useRef(clipCount);
-        clipCountRef.current = clipCount;
-
         // The <video>'s src is managed imperatively, never as a React prop — the
         // 8s feed poll can re-render this component without touching playback.
-        // (Token rotation is neutralized upstream by stripTokens, so `clip.playbackUrl`
+        // (Token rotation is neutralized upstream by stripTokens, so `videoArtifact.playbackUrl`
         // stays stable between real changes and this effect doesn't re-fire on a poll.)
         useEffect(() => {
           const video = videoRef.current;
-          if (!video || !clip) return;
+          if (!video || !videoArtifact) return;
           if (!near) {
             // Off-screen slides release their network/decoder resources.
             if (video.src) { video.removeAttribute("src"); video.load(); }
             return;
           }
-          const src = new URL(clip.playbackUrl, location.origin).href;
+          const src = new URL(videoArtifact.playbackUrl, location.origin).href;
           if (video.src !== src) {
             video.src = src;
             video.preload = "auto";
-            // A single video loops natively; older multi-clip uploads advance on `ended`.
-            video.loop = clipCount === 1;
             if (active && !halted) video.play().catch(() => setHalted(true));
           }
-        }, [clip?.playbackUrl, near, clipCount]);
+        }, [videoArtifact?.playbackUrl, near]);
 
-        // Play when snapped into view; pause + rewind to clip 1 when scrolled away
+        // Play when snapped into view; pause + rewind when scrolled away
         // (matches Reels: re-entering a slide starts the pulse over).
         useEffect(() => {
           const video = videoRef.current;
@@ -335,7 +319,6 @@
           } else {
             video.pause();
             video.currentTime = 0;
-            setClipIndex(0);
             setProgress(0);
             setCuePos(null);
           }
@@ -345,28 +328,18 @@
           if (videoRef.current) videoRef.current.muted = muted;
         }, [muted]);
 
-        // Sequential clips: when one ends, the next starts (wrap to clip 1).
-        useEffect(() => {
-          const video = videoRef.current;
-          if (!video) return;
-          const onEnded = () => setClipIndex((i) => (i + 1) % clipCountRef.current);
-          video.addEventListener("ended", onEnded);
-          return () => video.removeEventListener("ended", onEnded);
-        }, []);
-
-        // A pulse's video carries its captions starting at 0:00, so the cue set swaps
-        // wholesale when the active clip changes — no timeline offset math needed.
+        // The captions are timed against the video from 0:00 — load them once per pulse.
         useEffect(() => {
           setCues(null);
           setCuePos(null);
-          if (!clip?.subtitlesUrl) return;
+          if (!videoArtifact?.subtitlesUrl) return;
           let cancelled = false;
-          fetch(clip.subtitlesUrl)
+          fetch(videoArtifact.subtitlesUrl)
             .then((r) => r.text())
             .then((text) => { if (!cancelled) setCues(parseVtt(text)); })
             .catch(() => {});
           return () => { cancelled = true; };
-        }, [clip?.subtitlesUrl]);
+        }, [videoArtifact?.subtitlesUrl]);
 
         // One rAF loop while active drives both the progress bar and the karaoke
         // highlight. setState is change-gated so 60fps polling ≠ 60fps renders.
@@ -410,8 +383,8 @@
 
         return html`
           <div style=${{ position: "absolute", inset: 0 }} onClick=${togglePlay}>
-            <video ref=${videoRef} muted playsInline poster=${poster?.playbackUrl ?? undefined}></video>
-            <${SegmentProgress} count=${clipCount} current=${Math.min(clipIndex, clipCount - 1)} progress=${progress} />
+            <video ref=${videoRef} loop muted playsInline poster=${poster?.playbackUrl ?? undefined}></video>
+            <${BeatProgress} beats=${beats} progress=${progress} />
             <${SubtitleOverlay} cue=${activeCue} wordIdx=${cuePos?.wordIdx ?? 0} />
             ${halted && html`<div className="play-glyph">▶</div>`}
             <div className="info-overlay">
@@ -421,7 +394,7 @@
                   <img src=${poster.playbackUrl} alt="Pulse thumbnail" />
                 </div>`}
               <p style=${{ margin: "0 0 0.4rem", display: "flex", gap: "0.35rem", flexWrap: "wrap" }}>
-                <span className="badge">${isMultiClip ? `pulse · ${clipCount} clips` : "pulse"}</span>
+                <span className="badge">${beats?.length ? `pulse · ${beats.length} beat${beats.length === 1 ? "" : "s"}` : "pulse"}</span>
                 <span className="badge token">🔒 capability token</span>
               </p>
               <p className="mono" style=${{ margin: 0 }}>
