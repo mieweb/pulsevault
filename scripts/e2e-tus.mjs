@@ -186,8 +186,11 @@ async function main() {
       },
     });
     assert.equal(create.status, 201, `create should be 201, got ${create.status}`);
-    const location = create.headers.get("location");
-    assert.ok(location, "create response should include a Location header");
+    const rawLocation = create.headers.get("location");
+    assert.ok(rawLocation, "create response should include a Location header");
+    // The server may return a path-only Location (`/pulsevault/upload/…`); resolve it the way a
+    // TUS client does, or fetch() rejects it as an invalid URL.
+    const location = new URL(rawLocation, BASE).href;
     console.log("  ✓ TUS create succeeded");
 
     const half = body.length / 2;
