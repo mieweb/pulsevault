@@ -43,7 +43,8 @@
     "test": "node --test test/*.test.mjs",
     "e2e": "npm run build && node scripts/e2e-tus.mjs",
     "protocol": "npm run build && node scripts/gen-protocol.mjs",
-    "protocol:check": "npm run build && node scripts/gen-protocol.mjs --check"
+    "protocol:check": "npm run build && node scripts/gen-protocol.mjs --check",
+    "protocol:compat": "node scripts/check-protocol.mjs"
   },
   "keywords": [
     "fastify",

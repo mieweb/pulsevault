@@ -1,0 +1,150 @@
+# CI on every PR and push to main:
+# - test:     build + the node:test suite, on each supported Node.
+# - protocol: protocol/ is up to date with the code, and any protocol change follows the
+#             versioning rules in PROTOCOL.md §7.1 (version bump, major for breaking changes).
+# - e2e:      the fastify-auth-demo end to end against a real Postgres.
+# - pulse:    the Pulse app's own contract suite (mieweb/pulse
+#             src/features/upload/pv-integration.test.ts) against THIS build of the server — the
+#             check that catches a server change that breaks the app.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    name: test (node ${{ matrix.node }})
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  protocol:
+    runs-on: ubuntu-latest
+    env:
+      OASDIFF_VERSION: "1.32.1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # the check compares protocol/ against the base commit
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: protocol/ matches the code
+        run: npm run protocol:check
+      - name: Install oasdiff
+        run: |
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" oasdiff
+          echo "OASDIFF=$RUNNER_TEMP/oasdiff" >> "$GITHUB_ENV"
+      - name: Protocol changes follow the versioning rules
+        env:
+          # PRs compare against their base; a push to main against the previous commit.
+          PROTOCOL_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/check-protocol.mjs
+
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: pulsevault
+          POSTGRES_PASSWORD: pulsevault
+          POSTGRES_DB: pulsevault
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pulsevault" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the auth demo
+        working-directory: examples/fastify-auth-demo
+        run: |
+          npm ci
+          npx prisma generate
+      - name: e2e (auth demo, real TUS upload, real Postgres)
+        env:
+          DATABASE_URL: postgres://pulsevault:pulsevault@127.0.0.1:5433/pulsevault
+        run: npm run e2e
+
+  pulse:
+    runs-on: ubuntu-latest
+    name: pulse contract suite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: pulsevault
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Build this pulsevault
+        working-directory: pulsevault
+        run: |
+          npm ci
+          npm run build
+      # Which Pulse to test: main by default. A PR that changes the server and the app together
+      # names the app branch in its description with a line `Pulse-Ref: <branch>`.
+      - name: Pick the Pulse ref
+        id: ref
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          ref=$(printf '%s\n' "$PR_BODY" | sed -nE 's/^[[:space:]]*Pulse-Ref:[[:space:]]*([^[:space:]]+).*/\1/p' | head -n1)
+          echo "ref=${ref:-main}" >> "$GITHUB_OUTPUT"
+          echo "Testing mieweb/pulse at ${ref:-main}"
+      - uses: actions/checkout@v6
+        with:
+          repository: mieweb/pulse
+          ref: ${{ steps.ref.outputs.ref }}
+          path: pulse
+      - name: Does this Pulse have the contract suite?
+        id: suite
+        run: |
+          if [ -f pulse/src/features/upload/pv-integration.test.ts ] && [ -f pulse/scripts/pv-test-server.mjs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::mieweb/pulse@${{ steps.ref.outputs.ref }} has no contract suite yet (it arrives with mieweb/pulse#218); skipping."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v6
+        if: steps.suite.outputs.present == 'true'
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: pulse/package-lock.json
+      - name: Install Pulse
+        if: steps.suite.outputs.present == 'true'
+        working-directory: pulse
+        run: npm ci
+      - name: Pulse's contract suite against this server
+        if: steps.suite.outputs.present == 'true'
+        working-directory: pulse
+        env:
+          PV_CORE: ${{ github.workspace }}/pulsevault/dist/core.js
+          PULSE_INTEGRATION: "1"
+        run: npx jest pv-integration --ci --forceExit
