@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/capabilities.schema.json",
+  "title": "GET /capabilities response",
+  "description": "Unauthenticated discovery (PROTOCOL.md §2). A client reads it before pairing and pairs only if its protocol range overlaps [minSupportedVersion, maxSupportedVersion]. Clients must ignore fields they don't recognize.",
+  "type": "object",
+  "required": [
+    "protocolVersion",
+    "protocolRevision",
+    "minSupportedVersion",
+    "maxSupportedVersion",
+    "kinds",
+    "allowedExtensions",
+    "maxUploadSize",
+    "checksum"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Protocol major this server implements. Also sent as the `Protocol-Version` header on every response."
+    },
+    "protocolRevision": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Spec revision this server implements, `major.minor`. The minor counts additions older clients can ignore."
+    },
+    "minSupportedVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Oldest protocol major this server accepts. Clients whose newest protocol is older get 426 Upgrade Required."
+    },
+    "maxSupportedVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Newest protocol major this server accepts."
+    },
+    "kinds": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["video", "project", "captions", "thumbnail"] },
+      "description": "Artifact kinds this server accepts."
+    },
+    "allowedExtensions": {
+      "type": "object",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } },
+      "description": "Allowed file extensions per kind, lowercase with the leading dot."
+    },
+    "maxUploadSize": {
+      "type": "number",
+      "description": "Largest artifact the server accepts, in bytes."
+    },
+    "checksum": {
+      "type": "object",
+      "required": ["algorithms"],
+      "properties": {
+        "algorithms": { "type": "array", "items": { "type": "string" } }
+      },
+      "description": "Checksum algorithms accepted in `Upload-Metadata.checksum`."
+    }
+  }
+}
