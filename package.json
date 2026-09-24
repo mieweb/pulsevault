@@ -33,14 +33,18 @@
     "CHANGELOG.md",
     "PROTOCOL.md",
     "OPERATIONS.md",
-    "scripts/web-ready-migrate.mjs"
+    "scripts/web-ready-migrate.mjs",
+    "protocol"
   ],
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
-    "e2e": "npm run build && node scripts/e2e-tus.mjs"
+    "e2e": "npm run build && node scripts/e2e-tus.mjs",
+    "protocol": "npm run build && node scripts/gen-protocol.mjs",
+    "protocol:check": "npm run build && node scripts/gen-protocol.mjs --check",
+    "protocol:compat": "node scripts/check-protocol.mjs"
   },
   "keywords": [
     "fastify",
@@ -84,8 +88,11 @@
     "fastify-plugin": "^5.1.0"
   },
   "devDependencies": {
+    "@fastify/swagger": "^9.9.0",
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.6",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "express": "^5.2.1",
     "fastify": "^5.12.1",
     "typescript": "^6.0.3"
@@ -94,5 +101,10 @@
     "@aws-sdk/client-s3": "^3.1131.0",
     "@aws-sdk/s3-request-presigner": "^3.1131.0",
     "@tus/s3-store": "^2.0.6"
+  },
+  "pulseProtocol": {
+    "version": "2.1",
+    "min": 2,
+    "max": 2
   }
 }

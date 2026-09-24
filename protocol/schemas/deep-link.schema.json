@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/deep-link.schema.json",
+  "title": "Pairing link query parameters",
+  "description": "The query parameters of a `pulsecam://?…` pairing link (PROTOCOL.md §3), as built by `buildUploadLink`. Clients must ignore parameters they don't recognize.",
+  "type": "object",
+  "required": ["v", "artifactId", "server"],
+  "properties": {
+    "v": {
+      "type": "string",
+      "const": "1",
+      "description": "Link format version. A client refuses a link whose `v` it doesn't know."
+    },
+    "artifactId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The artifact the pairing is for: the video's id. Related artifacts declare it as `relatedTo`."
+    },
+    "server": {
+      "type": "string",
+      "format": "uri",
+      "description": "Base URL of the server, including its path prefix (e.g. `https://vault.example.org/pulsevault`). The client builds every request as `${server}/<path>`."
+    },
+    "token": {
+      "type": "string",
+      "description": "Optional credential the client sends as `Authorization: Bearer`. Typically a capability token (capability-token.schema.json)."
+    }
+  }
+}

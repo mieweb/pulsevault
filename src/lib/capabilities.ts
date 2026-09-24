@@ -1,13 +1,17 @@
 import { UPLOAD_KINDS, type UploadKind } from '../storage/types.js';
 import type { PulseVaultAllowedExtensions } from './options.js';
+import {
+  MAX_SUPPORTED_PROTOCOL_VERSION,
+  MIN_SUPPORTED_PROTOCOL_VERSION,
+  PROTOCOL_REVISION,
+  PROTOCOL_VERSION,
+} from './protocol.js';
 
-/** Wire protocol version this release implements. See `/capabilities` and `PROTOCOL.md`. */
-export const PROTOCOL_VERSION = 1;
-const MIN_SUPPORTED_PROTOCOL_VERSION = 1;
-const MAX_SUPPORTED_PROTOCOL_VERSION = 1;
+export { PROTOCOL_REVISION, PROTOCOL_VERSION };
 
 export type PulseVaultCapabilities = {
   protocolVersion: number;
+  protocolRevision: string;
   minSupportedVersion: number;
   maxSupportedVersion: number;
   kinds: UploadKind[];
@@ -19,7 +23,8 @@ export type PulseVaultCapabilities = {
 /**
  * The `GET /capabilities` body (PROTOCOL.md §2), built in exactly one place so
  * the core and the Fastify plugin (which delegates to the core) can never
- * advertise different capabilities for the same deployment.
+ * advertise different capabilities for the same deployment. Its shape is
+ * `protocol/schemas/capabilities.schema.json`, checked in the tests.
  */
 export function buildCapabilities(input: {
   allowedExtensions: PulseVaultAllowedExtensions;
@@ -27,6 +32,7 @@ export function buildCapabilities(input: {
 }): PulseVaultCapabilities {
   return {
     protocolVersion: PROTOCOL_VERSION,
+    protocolRevision: PROTOCOL_REVISION,
     minSupportedVersion: MIN_SUPPORTED_PROTOCOL_VERSION,
     maxSupportedVersion: MAX_SUPPORTED_PROTOCOL_VERSION,
     kinds: [...UPLOAD_KINDS],

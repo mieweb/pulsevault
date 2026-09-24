@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/beat-manifest.schema.json",
+  "title": "Beat manifest",
+  "description": "The `kind: project` artifact (e.g. `<draftId>-beats.pulse`) related to a pulse's video (PROTOCOL.md §8). A beat is a timestamp range inside the video: where one recorded clip starts and ends. Beats are contiguous and sum to `durationMs`.",
+  "type": "object",
+  "required": ["version", "type", "durationMs", "beats"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest format version."
+    },
+    "type": {
+      "type": "string",
+      "const": "beat-manifest",
+      "description": "Identifies the document."
+    },
+    "durationMs": {
+      "type": "number",
+      "minimum": 0,
+      "description": "True duration of the video, in milliseconds."
+    },
+    "beats": {
+      "type": "array",
+      "description": "One entry per recorded clip, in play order.",
+      "items": {
+        "type": "object",
+        "required": ["segmentId", "order", "startMs", "endMs"],
+        "properties": {
+          "segmentId": {
+            "type": "string",
+            "description": "The recorded clip's local id on the capturing device."
+          },
+          "order": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0-based position of the clip in the video."
+          },
+          "startMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Where the clip starts in the video, in milliseconds."
+          },
+          "endMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Where the clip ends; equals the next beat's `startMs`."
+          }
+        }
+      }
+    }
+  }
+}

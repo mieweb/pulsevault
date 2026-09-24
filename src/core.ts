@@ -26,6 +26,7 @@ import {
   type PulseVaultAllowedExtensionsInput,
 } from './lib/options.js';
 import { buildCapabilities, PROTOCOL_VERSION } from './lib/capabilities.js';
+import { outdatedClientRejection } from './lib/protocol.js';
 
 export { PROTOCOL_VERSION };
 
@@ -268,6 +269,19 @@ function stampProtocolVersion(res: ServerResponse): void {
   res.setHeader('Protocol-Version', String(PROTOCOL_VERSION));
 }
 
+/**
+ * Refuse a client whose `Pulse-Client` header says its newest protocol is older than this
+ * server's oldest: `426 Upgrade Required` with the supported range, instead of letting it fail
+ * somewhere mid-upload (PROTOCOL.md §7). A client that doesn't send the header is let through.
+ * `/capabilities` never refuses, so an old client can still learn why. Returns true if it answered.
+ */
+function rejectOutdatedClient(req: IncomingMessage, res: ServerResponse): boolean {
+  const rejection = outdatedClientRejection(req);
+  if (!rejection) return false;
+  writeJson(res, 426, rejection);
+  return true;
+}
+
 type PulseVaultRequestContext = { artifactId: string; kind: UploadKind; relatedTo?: string };
 
 /** Same augmentation as `augment.ts`'s `FastifyRequest.pulseVault`, applied to a raw request. */
@@ -400,6 +414,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const handleTus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
     // A client that drops the connection mid-request — a mobile app killed during a PATCH, a
     // network reset, a cancelled upload — makes Node emit an 'error' ('aborted' / ECONNRESET) on
     // the raw request (and sometimes response) stream. Node treats an unhandled 'error' event as
@@ -478,6 +493,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     artifactId: string,
   ): Promise<void> => {
     stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
     try {
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'delete');
       if (!prepared) return;
@@ -506,6 +522,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     token: string | undefined,
   ): Promise<void> => {
     stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
     try {
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
       if (!prepared) return;

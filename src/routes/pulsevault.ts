@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import type {
   FastifyPluginAsync,
   FastifyPluginOptions,
@@ -21,6 +22,19 @@ export type {
   PulseVaultAuthorizeContext,
   PulseVaultAuthorizePhase,
 } from '../lib/authorize.js';
+
+const require = createRequire(import.meta.url);
+
+/**
+ * A schema from `protocol/schemas/` — the protocol's single source (PROTOCOL.md §7) — for use
+ * as a route schema, without the JSON Schema `$schema`/`$id` keys Fastify's compilers don't take.
+ */
+function protocolSchema(name: string): Record<string, unknown> {
+  const { $schema: _schema, $id: _id, ...schema } = require(
+    `../../protocol/schemas/${name}.schema.json`,
+  ) as Record<string, unknown>;
+  return schema;
+}
 
 // Mirrored in the opt-in `./augment.ts` re-export (for consumers who `import
 // "@mieweb/pulsevault/augment"`) and kept here too so this plugin typechecks
@@ -161,31 +175,7 @@ const capabilitiesSchema: OpenApiRouteSchema = {
   summary: "Discover this deployment's protocol version and configuration",
   description:
     'Unauthenticated — the response carries no secrets. Lets a client detect protocol compatibility, allowed artifact kinds/extensions and the upload size cap before pairing.',
-  response: {
-    200: {
-      type: 'object',
-      properties: {
-        protocolVersion: { type: 'number' },
-        minSupportedVersion: { type: 'number' },
-        maxSupportedVersion: { type: 'number' },
-        kinds: { type: 'array', items: { type: 'string' } },
-        allowedExtensions: {
-          type: 'object',
-          properties: {
-            video: { type: 'array', items: { type: 'string' } },
-            project: { type: 'array', items: { type: 'string' } },
-            captions: { type: 'array', items: { type: 'string' } },
-            thumbnail: { type: 'array', items: { type: 'string' } },
-          },
-        },
-        maxUploadSize: { type: 'number' },
-        checksum: {
-          type: 'object',
-          properties: { algorithms: { type: 'array', items: { type: 'string' } } },
-        },
-      },
-    },
-  },
+  response: { 200: protocolSchema('capabilities') },
 };
 
 // Fastify doesn't type route params from the schema alone, so `:artifactId` comes through as `unknown`.

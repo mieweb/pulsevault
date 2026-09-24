@@ -24,6 +24,9 @@ import {
   tusHead,
   uploadFull,
 } from "./helpers.mjs";
+import pkg from "../package.json" with { type: "json" };
+
+const PROTOCOL_MAJOR = Number(pkg.pulseProtocol.version.split(".")[0]);
 
 // Reusable UUIDs. Each test uses its own workspace, so collisions across
 // tests are impossible — these just need to be valid UUIDs.
@@ -85,7 +88,7 @@ test("reserve + full upload flips sidecar to ready and GET streams the bytes", a
 
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 200);
-    assert.equal(get.headers.get("protocol-version"), "1");
+    assert.equal(get.headers.get("protocol-version"), String(PROTOCOL_MAJOR));
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(bytes.length, body.length);
     assert.equal(Buffer.compare(bytes, body), 0);
@@ -658,9 +661,10 @@ test("GET /capabilities is unauthenticated and carries no uploadUnit", async () 
     const res = await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`);
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.equal(body.protocolVersion, 1);
-    assert.equal(body.minSupportedVersion, 1);
-    assert.equal(body.maxSupportedVersion, 1);
+    assert.equal(body.protocolVersion, PROTOCOL_MAJOR);
+    assert.equal(body.protocolRevision, pkg.pulseProtocol.version);
+    assert.equal(body.minSupportedVersion, pkg.pulseProtocol.min);
+    assert.equal(body.maxSupportedVersion, pkg.pulseProtocol.max);
     assert.equal("uploadUnit" in body, false, "uploadUnit was removed from /capabilities");
     assert.deepEqual(body.kinds.sort(), ["captions", "project", "thumbnail", "video"]);
     assert.equal(body.maxUploadSize, 10 * 1024 * 1024);

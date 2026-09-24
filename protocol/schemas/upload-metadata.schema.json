@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/upload-metadata.schema.json",
+  "title": "TUS Upload-Metadata keys",
+  "description": "The decoded `Upload-Metadata` keys a client sends when it creates an upload (PROTOCOL.md §4). Values are strings, base64-encoded on the wire. Servers ignore keys they don't recognize.",
+  "type": "object",
+  "required": ["artifactId", "filename"],
+  "properties": {
+    "artifactId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The artifact's id. For the video it's the pairing link's `artifactId`; related artifacts use a fresh UUID. Legacy aliases `videoid` and `projectid` are still accepted."
+    },
+    "filename": {
+      "type": "string",
+      "description": "Original file name. Its extension must be allowed for `kind` (see `/capabilities`)."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["video", "project", "captions", "thumbnail"],
+      "default": "video",
+      "description": "Artifact kind. Defaults to `video`."
+    },
+    "relatedTo": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The artifact this one belongs to: the video, for its captions, beat manifest and thumbnail. A capability token for the video also authorizes artifacts related to it."
+    },
+    "checksum": {
+      "type": "string",
+      "pattern": "^(sha256|sha1|md5):[0-9a-fA-F]+$",
+      "description": "`<algorithm>:<hex digest>` of the finished file, verified by servers that check checksums."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "Display title (the draft name), sent on the video. Display-only; servers trim and cap it."
+    },
+    "appVersion": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "Since 2.1. Version of the app that uploaded it, e.g. `2.1.0 (45)`. Stored with the artifact. Display-only; servers trim and cap it."
+    }
+  }
+}

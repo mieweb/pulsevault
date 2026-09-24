@@ -42,6 +42,8 @@ type Sidecar = {
   checksum?: string;
   /** Optional human-facing display name. See `ReserveUploadParams.name`. */
   name?: string;
+  /** Optional uploading app version. See `ReserveUploadParams.appVersion`. */
+  appVersion?: string;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -309,6 +311,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
         checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
+        appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
       };
     } catch {
       // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
@@ -334,6 +337,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     relatedTo,
     checksum,
     name,
+    appVersion,
   }: ReserveUploadParams): Promise<string> => {
     const sidecar: Sidecar = {
       version: SIDECAR_VERSION,
@@ -344,6 +348,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       relatedTo,
       checksum,
       name,
+      appVersion,
     };
 
     // Fast-path rejection for the common case. Not atomic by itself (two concurrent

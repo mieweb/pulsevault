@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/capability-token.schema.json",
+  "title": "Capability token claims",
+  "description": "The claims inside a capability token (PROTOCOL.md §5.4). The token is `base64url(JSON claims).signature`, HMAC-signed by the issuing deployment. It authorizes the artifact it names and any artifact whose `relatedTo` is that artifact.",
+  "type": "object",
+  "required": ["artifactId", "iat", "exp", "kid", "issuer"],
+  "properties": {
+    "artifactId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The artifact the token is for (the pulse's video)."
+    },
+    "iat": {
+      "type": "integer",
+      "description": "Issued at, in seconds since the Unix epoch."
+    },
+    "exp": {
+      "type": "integer",
+      "description": "Expires at, in seconds since the Unix epoch."
+    },
+    "kid": {
+      "type": "string",
+      "description": "Id of the signing key, so a deployment can rotate secrets."
+    },
+    "issuer": {
+      "type": "string",
+      "description": "The issuing deployment. A token from another issuer is rejected."
+    }
+  }
+}

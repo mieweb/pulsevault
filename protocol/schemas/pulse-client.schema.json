@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/pulse-client.schema.json",
+  "title": "Pulse-Client request header",
+  "description": "Since 2.1. Optional header a client sends on every request to say what it is and which protocol majors it speaks (PROTOCOL.md §7), e.g. `Pulse/2.1.0 (45; ios); protocol=1-2`. A server answers 426 Upgrade Required on uploads and artifacts when the client's newest protocol is older than its oldest. Without the header, nothing changes.",
+  "type": "string",
+  "pattern": "^[^;]+(;.*)?;\\s*protocol=[0-9]+(-[0-9]+)?\\s*$"
+}

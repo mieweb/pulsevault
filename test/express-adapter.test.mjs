@@ -11,6 +11,9 @@ import path from "node:path";
 import express from "express";
 import { createPulseVaultCore, createLocalStorage } from "../dist/core.js";
 import { makeMp4, tusCreate as tusCreateRaw, tusPatch } from "./helpers.mjs";
+import pkg from "../package.json" with { type: "json" };
+
+const PROTOCOL_MAJOR = Number(pkg.pulseProtocol.version.split(".")[0]);
 
 const ID1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PREFIX = "/pulsevault";
@@ -70,7 +73,7 @@ test("express: full TUS upload + GET round-trips through app.use(prefix, core.ha
 
     const get = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${ID1}`);
     assert.equal(get.status, 200);
-    assert.equal(get.headers.get("protocol-version"), "1");
+    assert.equal(get.headers.get("protocol-version"), String(PROTOCOL_MAJOR));
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(Buffer.compare(bytes, body), 0);
   } finally {
@@ -95,7 +98,8 @@ test("express: GET /capabilities is reachable through the mounted router", async
     const res = await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`);
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.equal(body.protocolVersion, 1);
+    assert.equal(body.protocolVersion, PROTOCOL_MAJOR);
+    assert.equal(body.protocolRevision, pkg.pulseProtocol.version);
   } finally {
     await ctx.teardown();
   }

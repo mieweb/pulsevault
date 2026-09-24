@@ -41,6 +41,8 @@ type Sidecar = {
   checksum?: string;
   /** Optional human-facing display name. See `ReserveUploadParams.name`. */
   name?: string;
+  /** Optional uploading app version. See `ReserveUploadParams.appVersion`. */
+  appVersion?: string;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -239,6 +241,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         relatedTo: typeof parsed.relatedTo === 'string' ? parsed.relatedTo : undefined,
         checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
+        appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
       };
     } catch {
       // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
@@ -275,6 +278,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     relatedTo,
     checksum,
     name,
+    appVersion,
   }: ReserveUploadParams): Promise<string> => {
     await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
@@ -288,6 +292,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       relatedTo,
       checksum,
       name,
+      appVersion,
     };
 
     // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
