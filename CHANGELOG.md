@@ -7,6 +7,38 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+Protocol 2.1 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
+removal below as the breaking change it is; clients built for protocol 1
+can't pair with this release.
+
+### Added
+
+- **The protocol is written down as files, and CI keeps it honest.**
+  `protocol/schemas/*.schema.json` define `/capabilities`, pairing links,
+  `Upload-Metadata`, the beat manifest, capability-token claims and the
+  `Pulse-Client` header; `protocol/openapi.json` is generated from the
+  route schemas (`npm run protocol`), and so are the field tables in
+  `PROTOCOL.md`. `scripts/check-protocol.mjs` fails a change that alters the
+  protocol without the right version bump (oasdiff decides what's breaking
+  for the HTTP routes). The `protocol/` folder is published with the package.
+- **`Pulse-Client` request header and `426 Upgrade Required`** (protocol
+  2.1). A client that says its newest protocol is older than this server's
+  oldest gets 426 with the supported range on uploads and artifact
+  requests; `/capabilities` always answers. No header, no change.
+- **`Upload-Metadata.appVersion`** (protocol 2.1): stored with the artifact
+  by both storage adapters and reported on the `complete`/`reject` events
+  (`PulseVaultArtifactEvent.appVersion`).
+- **`protocolRevision`** in `/capabilities`: the spec revision, `major.minor`.
+- **CI** (`.github/workflows/ci.yml`): tests on Node 22 and 24, the protocol
+  checks, the e2e against Postgres, and the Pulse app's contract suite
+  against each PR's build.
+
+### Changed
+
+- **Breaking: protocol 2.** `/capabilities` reports `protocolVersion: 2` and
+  accepts protocol majors 2–2, read from the new `package.json`
+  `pulseProtocol` field (`{ "version": "2.1", "min": 2, "max": 2 }`).
+
 ### Removed
 
 - **Breaking: `uploadUnit` is gone — a pulse uploads as one video; beats are

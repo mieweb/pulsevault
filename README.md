@@ -429,6 +429,7 @@ type PulseVaultArtifactEvent = {
   kind: "video" | "project" | "captions";
   size?: number;
   reason?: string; // present for "authorize" and "reject"
+  appVersion?: string; // the uploading app's version, on "complete"/"reject" (protocol 2.1)
 };
 
 onArtifactEvent: (event) => {
@@ -458,9 +459,10 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
 
 ```json
 {
-  "protocolVersion": 1,
-  "minSupportedVersion": 1,
-  "maxSupportedVersion": 1,
+  "protocolVersion": 2,
+  "protocolRevision": "2.1",
+  "minSupportedVersion": 2,
+  "maxSupportedVersion": 2,
   "kinds": ["video", "project", "captions", "thumbnail"],
   "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
@@ -470,7 +472,21 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
 
 `checksum.algorithms` always lists what `createChecksumValidator`/`createS3ChecksumValidator` are capable of verifying — it does not detect whether this deployment's `validatePayload` actually calls one of them. A client sending a `checksum` metadata value is only verified if the operator wired in one of these helpers (or an equivalent check of their own).
 
-See `PROTOCOL.md` §2 for the full normative shape.
+See `PROTOCOL.md` §2 for the full normative shape, and [Protocol versioning](#protocol-versioning) for how the numbers are kept.
+
+## Protocol versioning
+
+The protocol this release implements is `pulseProtocol` in `package.json` — the one place it's written down (`PROTOCOL.md` §7):
+
+```json
+"pulseProtocol": { "version": "2.1", "min": 2, "max": 2 }
+```
+
+`version` is the spec revision, `major.minor`: the major changes only for breaking changes and is what pairing compares; the minor counts additions older clients can ignore. `min`/`max` are the protocol majors the server accepts. `/capabilities` and the `Protocol-Version` header come from it, and npm keeps it for every published version (`npm view @mieweb/pulsevault@<version> pulseProtocol`).
+
+- **Clients say what they speak.** A client may send `Pulse-Client: Pulse/2.1.0 (45; ios); protocol=1-2`. If its newest protocol is older than `min`, uploads and artifact requests get `426 Upgrade Required` with the supported range; `/capabilities` always answers. Without the header nothing changes.
+- **The protocol lives in `protocol/`.** `protocol/schemas/*.schema.json` define `/capabilities`, pairing links, `Upload-Metadata`, the beat manifest, capability-token claims and `Pulse-Client`. `protocol/openapi.json` is generated from the plugin's route schemas. The field tables in `PROTOCOL.md` are generated from the same files: edit a schema or a route, then `npm run protocol`.
+- **CI enforces the rules** (`npm run protocol:check`, `scripts/check-protocol.mjs`): anything changed under `protocol/` needs a `pulseProtocol.version` bump, a breaking change needs a major bump ([oasdiff](https://github.com/oasdiff/oasdiff) decides for the HTTP routes), and `PROTOCOL.md` needs a history row for the new version. CI also runs the Pulse app's own contract suite against every PR's build; a PR that changes the server and the app together names the app branch with a `Pulse-Ref: <branch>` line in its description.
 
 ## Capability tokens
 
@@ -518,12 +534,15 @@ The TUS `Upload-Metadata` header is a comma-separated list of `<key> <base64>` p
 | Key | Required | Description |
 |---|---|---|
 | `artifactId` | Yes (or `videoid`/`projectid`) | Server-generated UUID for this upload. |
-| `videoid` / `projectid` | Legacy aliases for `artifactId` | Accepted as synonyms indefinitely (protocol v1). Use `artifactId` for new code. |
+| `videoid` / `projectid` | Legacy aliases for `artifactId` | Accepted as synonyms until a protocol major removes them. Use `artifactId` for new code. |
 | `filename` | Yes | Original filename. The extension is validated against the kind's allowed list. |
 | `kind` | No | `video` (default), `project`, or `captions`. Determines the storage subdir and which hooks fire. |
 | `relatedTo` | No | UUID of another artifact this one belongs to (e.g. a video's captions). Lets one capability token authorize a whole session. |
 | `checksum` | No | `<algorithm>:<hex digest>` of the finished file, verified by `createChecksumValidator`/`createS3ChecksumValidator` if configured. |
 | `name` | No | Free-form UTF-8 display title (e.g. the draft name typed on the capture device). Trimmed + length-capped, persisted to the sidecar, and readable via `storage.getName(artifactId)`. Display-only — never used for storage paths or authorization; escape it for your output context. |
+| `appVersion` | No | Version of the app that uploaded it, e.g. `2.1.0 (45)` (protocol 2.1). Trimmed, capped at 64 characters, persisted to the sidecar and reported on the `complete`/`reject` events. Display-only, like `name`. |
+
+The full list, with types, is `protocol/schemas/upload-metadata.schema.json` (and the generated table in `PROTOCOL.md` §4.1).
 
 > Base64 the **UTF-8 bytes** of each value. `filename`/`kind`/`artifactId` are ASCII, but a free-form `name` can carry accents or emoji — a browser `btoa()` (Latin-1) corrupts those, so encode via `Buffer`/`TextEncoder` (or your platform's UTF-8-safe base64) for the `name` value.
 
@@ -755,10 +774,13 @@ const uploadLink = buildUploadLink({
 ## Tests
 
 ```sh
-npm test
+npm test                # the node:test suite against the built plugin
+npm run protocol:check  # protocol/openapi.json and PROTOCOL.md are up to date
+npm run protocol:compat # protocol changes follow the versioning rules (needs oasdiff on PATH)
+npm run e2e             # the auth demo end to end (needs Postgres; see scripts/e2e-tus.mjs)
 ```
 
-Runs a Node `--test` suite against the built plugin. Coverage includes:
+CI (`.github/workflows/ci.yml`) runs all of these, plus the Pulse app's contract suite against the PR's build. The node:test suite covers:
 
 - TUS create/HEAD/PATCH resume, collision handling, extension rejection, range GETs
 - Ready-gate (`GET` returns 404 while uploading)
@@ -774,7 +796,8 @@ Runs a Node `--test` suite against the built plugin. Coverage includes:
 - `allowedExtensions` object form
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
-- `GET /capabilities`
+- `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata)
+- Protocol versioning: the version read from `package.json`, `Pulse-Client` parsing, `426` for clients that are too old (core and plugin), `appVersion` stored and reported
 - S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, run against an in-process zero-dependency S3 mock (`test/mock-s3.mjs`, no cloud credentials needed)
 - `@mieweb/pulsevault/core` (the framework-agnostic entry point): the same protocol suite re-run against a bare `http.createServer` wrapping `core.handler`, plus an Express-specific smoke test proving `app.use(prefix, handler)` composition
 
