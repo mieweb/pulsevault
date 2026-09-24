@@ -63,7 +63,9 @@ async function buildOpenApi() {
 
 // ---- generated tables in PROTOCOL.md ------------------------------------------------------
 
-const cell = (text) => String(text).replace(/\|/g, "\\|").replace(/\n/g, " ");
+// Markdown table cell: escape backslashes first, then pipes, so a `\` before a `|` can't unescape it.
+const cell = (text) =>
+  String(text).replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
 
 function typeOf(prop) {
   if (prop.const !== undefined) return `\`${JSON.stringify(prop.const)}\``;
