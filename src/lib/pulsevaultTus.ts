@@ -2,6 +2,7 @@ import { Server } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
+import { normalizeAppVersion } from './protocol.js';
 import { statusCodeOf } from './errors.js';
 import type { PulseVaultValidatePayload } from './magic.js';
 import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './request.js';
@@ -44,6 +45,8 @@ export type PulseVaultArtifactEvent = {
   kind: UploadKind;
   size?: number;
   reason?: string;
+  /** The uploading app's version, from `Upload-Metadata.appVersion` (`complete`/`reject` only). */
+  appVersion?: string;
 };
 export type PulseVaultOnArtifactEvent = (event: PulseVaultArtifactEvent) => void | Promise<void>;
 
@@ -117,6 +120,7 @@ type ParsedUploadMetadata = {
   relatedTo?: string;
   checksum?: string;
   name?: string;
+  appVersion?: string;
 };
 
 /**
@@ -151,7 +155,10 @@ function parseUploadMetadata(
       .slice(0, MAX_ARTIFACT_NAME_LENGTH)
       .join('') || undefined;
 
-  return { artifactId, filename, kind, relatedTo, checksum, name };
+  // The uploading app's version (PROTOCOL.md §4), trimmed and capped like `name`.
+  const appVersion = normalizeAppVersion(metadata?.appVersion);
+
+  return { artifactId, filename, kind, relatedTo, checksum, name, appVersion };
 }
 
 export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
@@ -171,7 +178,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     datastore: storage.datastore,
     maxSize,
     namingFunction: async (_req, metadata) => {
-      const { artifactId, filename, kind, relatedTo, checksum, name } =
+      const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =
         parseUploadMetadata(metadata);
 
       if (!isUuid(artifactId)) {
@@ -197,7 +204,16 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         store.checksum = checksum;
       }
 
-      return storage.reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum, name });
+      return storage.reserveUpload({
+        artifactId,
+        filename,
+        ext,
+        kind,
+        relatedTo,
+        checksum,
+        name,
+        appVersion,
+      });
     },
     // Relative Location (RFC 7231 §7.1.2) so the upload URL is correct behind
     // any TLS-terminating proxy without trusting spoofable X-Forwarded-*
@@ -228,6 +244,8 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       }
       const size = upload.size ?? 0;
       const uploadId = upload.id;
+      // Reported on the complete/reject events so an operator can see which app build sent it.
+      const appVersion = normalizeAppVersion(upload.metadata?.appVersion);
 
       // Resolve kind/checksum: prefer the context value (set during the same
       // request's namingFunction for single-request uploads), fall back to a
@@ -262,7 +280,14 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
           } catch (rmErr) {
             logger.error({ err: rmErr, artifactId }, 'pulsevault failed to remove rejected upload');
           }
-          await onArtifactEvent?.({ phase: 'reject', artifactId, kind, size, reason: message });
+          await onArtifactEvent?.({
+            phase: 'reject',
+            artifactId,
+            kind,
+            size,
+            reason: message,
+            ...(appVersion ? { appVersion } : {}),
+          });
           // 4xx rejection reasons are the client's business (e.g. "Checksum
           // mismatch: …"); 5xx means *our* side broke — log the real error and
           // return a generic body so internals (adapter wiring, stack detail)
@@ -304,7 +329,13 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         }
       }
 
-      await onArtifactEvent?.({ phase: 'complete', artifactId, kind, size });
+      await onArtifactEvent?.({
+        phase: 'complete',
+        artifactId,
+        kind,
+        size,
+        ...(appVersion ? { appVersion } : {}),
+      });
 
       return {};
     },

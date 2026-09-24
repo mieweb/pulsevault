@@ -33,7 +33,8 @@
     "CHANGELOG.md",
     "PROTOCOL.md",
     "OPERATIONS.md",
-    "scripts/web-ready-migrate.mjs"
+    "scripts/web-ready-migrate.mjs",
+    "protocol"
   ],
   "scripts": {
     "build": "tsc",
@@ -84,8 +85,10 @@
     "fastify-plugin": "^5.1.0"
   },
   "devDependencies": {
+    "@fastify/swagger": "^9.9.0",
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.6",
+    "ajv": "^8.20.0",
     "express": "^5.2.1",
     "fastify": "^5.12.1",
     "typescript": "^6.0.3"
@@ -94,5 +97,10 @@
     "@aws-sdk/client-s3": "^3.1131.0",
     "@aws-sdk/s3-request-presigner": "^3.1131.0",
     "@tus/s3-store": "^2.0.6"
+  },
+  "pulseProtocol": {
+    "version": "2.1",
+    "min": 2,
+    "max": 2
   }
 }

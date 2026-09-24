@@ -86,6 +86,12 @@ export type ReserveUploadParams = {
    * consumers MUST escape it for their own output context (HTML, shell, etc.).
    */
   name?: string;
+  /**
+   * Optional version of the app that uploaded the artifact, from
+   * `Upload-Metadata.appVersion` (e.g. `2.1.0 (45)`), trimmed and capped upstream. Persisted so
+   * an operator can tell which app build produced a file. Display metadata only, like `name`.
+   */
+  appVersion?: string;
 };
 
 /**

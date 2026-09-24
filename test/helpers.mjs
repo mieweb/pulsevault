@@ -30,7 +30,7 @@ export function makeMp4(size) {
 export async function tusCreate(
   baseUrl,
   prefix,
-  { artifactId, idKey = "artifactId", filename, size, kind, relatedTo, checksum, name, headers = {} },
+  { artifactId, idKey = "artifactId", filename, size, kind, relatedTo, checksum, name, appVersion, headers = {} },
 ) {
   const parts = [`${idKey} ${b64(artifactId)}`, `filename ${b64(filename)}`];
   if (kind) parts.push(`kind ${b64(kind)}`);
@@ -38,6 +38,7 @@ export async function tusCreate(
   if (checksum) parts.push(`checksum ${b64(checksum)}`);
   // `name` may be any UTF-8 title; b64() already encodes via a utf8 Buffer.
   if (name !== undefined) parts.push(`name ${b64(name)}`);
+  if (appVersion !== undefined) parts.push(`appVersion ${b64(appVersion)}`);
   return fetch(`${baseUrl}${prefix}/upload`, {
     method: "POST",
     headers: {
@@ -74,7 +75,7 @@ export async function tusHead(url) {
 export async function uploadFull(
   baseUrl,
   prefix,
-  { artifactId, filename = "clip.mp4", size = 1024, kind, relatedTo, checksum, name, body, headers } = {},
+  { artifactId, filename = "clip.mp4", size = 1024, kind, relatedTo, checksum, name, appVersion, body, headers } = {},
 ) {
   const payload = body ?? makeMp4(size);
   const create = await tusCreate(baseUrl, prefix, {
@@ -85,6 +86,7 @@ export async function uploadFull(
     relatedTo,
     checksum,
     name,
+    appVersion,
     headers,
   });
   assert.equal(create.status, 201, "create");
