@@ -98,6 +98,21 @@ export type ReserveUploadParams = {
  * Storage backend contract. Keep the surface small: one write hook, one read
  * hook, plus optional one-time init. Adapters own their own configuration.
  */
+/** One artifact as `listArtifacts` reports it. */
+export type PulseVaultArtifactRecord = {
+  artifactId: string;
+  kind: UploadKind;
+  /** The artifact this one belongs to, if it declared one (`Upload-Metadata.relatedTo`). */
+  relatedTo?: string;
+  /** `false` while its upload is in flight; `true` once it's finished and served. */
+  ready: boolean;
+  /**
+   * When its metadata last changed, in ms since the epoch: when its upload started while
+   * `ready` is false, when it finished once `ready` is true.
+   */
+  updatedAt: number;
+};
+
 export interface PulseVaultStorage {
   /** TUS datastore used for resumable uploads. */
   readonly datastore: DataStore;
@@ -175,4 +190,11 @@ export interface PulseVaultStorage {
    * sidecar directly.
    */
   getName?(artifactId: string): Promise<string | null>;
+
+  /**
+   * Every artifact the adapter holds, for the retention sweep (`sweepAbandonedUploads`).
+   * Optional — `retention` needs it. An adapter may skip records whose metadata changed at or
+   * after `changedBefore` (ms since epoch): the sweep never removes those.
+   */
+  listArtifacts?(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
 }

@@ -247,6 +247,35 @@ async function main() {
     assert.equal(wrongToken.status, 403, "GET with a token for a different artifact should be 403");
     console.log("  ✓ no token -> 401, wrong-artifact token -> 403");
 
+    // 6. A read-only view link (protocol 2.2): minted with the pairing token, it opens the
+    // video — and can't delete it or mint another link.
+    const viewCaps = await fetch(`${PREFIX}/capabilities`).then((r) => r.json());
+    assert.equal(viewCaps.viewLinks, true, "/capabilities should report viewLinks");
+    const minted = await fetch(`${PREFIX}/artifacts/${artifactId}/view-link`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(minted.status, 200, "view-link should mint with the pairing token");
+    const viewLink = await minted.json();
+    assert.ok(viewLink.token && Number.isInteger(viewLink.expiresAt), "view-link shape");
+    const viewed = await fetch(
+      `${PREFIX}/artifacts/${artifactId}?token=${encodeURIComponent(viewLink.token)}`,
+    );
+    assert.equal(viewed.status, 200, "the view link should open the video");
+    await viewed.arrayBuffer();
+    const asViewer = { Authorization: `Bearer ${viewLink.token}` };
+    const viewerDelete = await fetch(`${PREFIX}/artifacts/${artifactId}`, {
+      method: "DELETE",
+      headers: asViewer,
+    });
+    assert.equal(viewerDelete.status, 403, "a view link must not delete");
+    const viewerMint = await fetch(`${PREFIX}/artifacts/${artifactId}/view-link`, {
+      method: "POST",
+      headers: asViewer,
+    });
+    assert.equal(viewerMint.status, 403, "a view link must not mint another");
+    console.log("  ✓ view link opens the video, and can't delete it or mint another");
+
     console.log("\nAll e2e checks passed.");
   } finally {
     main.done = true;

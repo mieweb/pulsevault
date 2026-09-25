@@ -26,6 +26,13 @@ can't pair with this release.
   verifier that predates them rejects one), and `createCapabilityAuthorize`
   accepts them only for `resolve`. `/capabilities` reports `viewLinks`, and
   `protocol/schemas/view-link.schema.json` defines the response.
+- **Opt-in cleanup of abandoned uploads.** The `retention` option
+  (`{ abandonedAfterSeconds, sweepIntervalSeconds? }`, on the plugin and
+  `createPulseVaultCore`) sweeps on a timer, removing uploads left
+  unfinished past the cutoff and the related artifacts of a video that never
+  finished; finished content is never touched. `sweepAbandonedUploads` runs
+  one sweep for your own scheduler. Storage adapters gain an optional
+  `listArtifacts`, implemented by both built-in adapters.
 
 - **The protocol is written down as files, and CI keeps it honest.**
   `protocol/schemas/*.schema.json` define `/capabilities`, pairing links,

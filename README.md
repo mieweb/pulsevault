@@ -460,6 +460,19 @@ issueViewLink: createViewLinkIssuer({
 
 View tokens are signed with a key derived from the same secret, so they need no new configuration, and a verifier that predates them (an older PulseVault sharing the secret) rejects one instead of treating it as an upload token. Rotating a key out invalidates the view links signed under it — the way to revoke them early, short of deleting the artifact.
 
+### `retention`
+
+Optional cleanup of abandoned uploads — off unless set. A client that dies mid-upload (an app killed, a phone that never comes back) leaves an unfinished upload behind, and the related artifacts it finished before its video — captions, a beat manifest, a thumbnail — belong to a video that will never arrive. Nothing else removes them.
+
+```ts
+retention: {
+  abandonedAfterSeconds: 24 * 60 * 60, // unfinished for a day = abandoned
+  sweepIntervalSeconds: 60 * 60,       // default: sweep hourly
+},
+```
+
+Every `sweepIntervalSeconds` it removes (through `storage.remove`) an upload still unfinished `abandonedAfterSeconds` after it started, and a finished artifact whose `relatedTo` artifact isn't finished — or is gone — that long after it finished. Finished videos, and anything whose video finished, are never touched; this is not a retention *policy* for finished content (see `OPERATIONS.md` "Retention"). Keep `abandonedAfterSeconds` well above how long an upload may take — at least your capability tokens' lifetime, past which no upload can continue anyway. Needs a storage adapter with `listArtifacts` (both built-in adapters have it); invalid settings throw at registration. Several instances may sweep the same storage — a removal that finds nothing is a no-op. To schedule it yourself (a cron job, a queue), call `sweepAbandonedUploads(storage, { abandonedAfterSeconds })` instead; it resolves the removed artifactIds.
+
 ### `validateProjectPayload` / `onProjectUploadComplete` (deprecated)
 
 Same lifecycle as `validatePayload`/`onUploadComplete`, but only fired for `kind=project` uploads. **Deprecated** — use the generic `validatePayload`/`onUploadComplete` with a `ctx.kind === "project"` branch instead. Still honored this release (passing either emits a one-time `DeprecationWarning` at registration); will be removed in a future major version.
@@ -758,9 +771,10 @@ const storage: PulseVaultStorage = {
     await db.updateArtifact(artifactId, { status: "ready" });
   },
   async remove(artifactId) {
-    // Called from DELETE /artifacts/:artifactId and from the plugin's
-    // cleanup path when `validatePayload` rejects an upload. Return false if
-    // the artifactId was already absent.
+    // Called from DELETE /artifacts/:artifactId, for a TUS DELETE of the
+    // artifact's upload, from the plugin's cleanup path when `validatePayload`
+    // rejects an upload, and by the `retention` sweep. Return false if the
+    // artifactId was already absent.
     const result = await db.deleteArtifact(artifactId);
     return result.deleted;
   },
@@ -770,6 +784,13 @@ const storage: PulseVaultStorage = {
   async getRelatedTo(artifactId) { return (await db.findArtifact(artifactId))?.relatedTo ?? null; },
   async getChecksum(artifactId) { return (await db.findArtifact(artifactId))?.checksum ?? null; },
   async getName(artifactId) { return (await db.findArtifact(artifactId))?.name ?? null; },
+  // Optional — needed only by `retention` / `sweepAbandonedUploads`. `updatedAt` is when the
+  // upload started while it's unfinished, and when it finished once ready (ms since epoch).
+  async *listArtifacts({ changedBefore } = {}) {
+    for (const row of await db.listArtifacts({ changedBefore })) {
+      yield { artifactId: row.id, kind: row.kind, relatedTo: row.relatedTo, ready: row.ready, updatedAt: row.updatedAt };
+    }
+  },
 };
 ```
 
@@ -818,6 +839,7 @@ CI (`.github/workflows/ci.yml`) runs all of these, plus the Pulse app's contract
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
 - TUS `DELETE` removing the whole artifact, in flight or finished (local and S3), authorized as `delete`
+- `retention` / `sweepAbandonedUploads` on both adapters: abandoned uploads and the related artifacts of a video that never finished are removed, finished pulses are kept, nothing newer than the cutoff is touched, the option's own timer, and boot-time validation
 - View links: `issueViewToken`/`verifyViewToken`/`createViewLinkIssuer`, a view token opening its artifact and related ones but never uploading, deleting or minting another link, per-link lifetimes, refusal, and only finished artifacts
 - `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata, view links)
 - Protocol versioning: the version read from `package.json`, `Pulse-Client` parsing, `426` for clients that are too old (core and plugin), `appVersion` stored and reported

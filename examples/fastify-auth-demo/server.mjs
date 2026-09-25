@@ -788,6 +788,9 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
+  // Uploads a client abandoned (an app killed mid-upload) — and the captions, manifest or
+  // thumbnail of a video that never finished — are removed after a day.
+  retention: { abandonedAfterSeconds: 24 * 60 * 60 },
   // Read-only, shareable view links (protocol 2.2): the app asks for one once a pulse's video
   // has uploaded, and offers Copy link with it — the pairing token itself is never shared.
   issueViewLink: createViewLinkIssuer({

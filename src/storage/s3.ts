@@ -6,12 +6,14 @@ import type { DataStore } from '@tus/server';
 // install `@aws-sdk/*` or `@tus/s3-store`.
 import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
 import type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
 import { parseUploadKind } from './types.js';
+import { isUuid } from '../lib/uuid.js';
 
 /**
  * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
@@ -185,6 +187,8 @@ export type S3Storage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.listArtifacts` contract. */
+  listArtifacts(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
 };
 
 /**
@@ -221,7 +225,13 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         `(original error: ${err instanceof Error ? err.message : String(err)})`,
     );
   }
-  const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = s3;
+  const {
+    S3Client,
+    GetObjectCommand,
+    PutObjectCommand,
+    DeleteObjectCommand,
+    ListObjectsV2Command,
+  } = s3;
   const { getSignedUrl } = presigner;
   const { S3Store } = s3store;
 
@@ -537,6 +547,44 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta?.name ?? null;
   };
 
+  /**
+   * Walk the sidecar objects. A sidecar is rewritten only when its upload finishes, so its
+   * `LastModified` is when the upload started (still uploading) or when it finished (ready).
+   * Sidecars changed at or after `changedBefore` are skipped without being read.
+   */
+  async function* listArtifacts(
+    opts: { changedBefore?: number } = {},
+  ): AsyncIterable<PulseVaultArtifactRecord> {
+    let continuationToken: string | undefined;
+    do {
+      const page = await client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: `${PULSEVAULT_META_PREFIX}/`,
+          ...(continuationToken ? { ContinuationToken: continuationToken } : {}),
+        }),
+      );
+      for (const object of page.Contents ?? []) {
+        const name = object.Key?.slice(PULSEVAULT_META_PREFIX.length + 1) ?? '';
+        if (!name.endsWith('.json')) continue;
+        const artifactId = name.slice(0, -'.json'.length);
+        if (!isUuid(artifactId)) continue;
+        const updatedAt = object.LastModified?.getTime() ?? 0;
+        if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
+        const sidecar = await readSidecar(artifactId);
+        if (!sidecar) continue;
+        yield {
+          artifactId,
+          kind: sidecar.kind ?? 'video',
+          ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
+          ready: sidecar.status === 'ready',
+          updatedAt,
+        };
+      }
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
   const shutdown = async (): Promise<void> => {
     client.destroy();
   };
@@ -555,6 +603,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     getRelatedTo,
     getChecksum,
     getName,
+    listArtifacts,
     shutdown,
   };
 }

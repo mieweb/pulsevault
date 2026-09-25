@@ -10,6 +10,11 @@ import {
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
 import type { PulseVaultIssueViewLink } from './lib/view-links.js';
+import {
+  type PulseVaultRetentionOptions,
+  startRetentionSweep,
+  validateRetentionOptions,
+} from './lib/retention.js';
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
@@ -77,6 +82,8 @@ export type PulseVaultCoreOptions = {
   onArtifactEvent?: PulseVaultOnArtifactEvent;
   /** Optional read-only view links. See the Fastify plugin's `issueViewLink` option for semantics. */
   issueViewLink?: PulseVaultIssueViewLink;
+  /** Optional cleanup of abandoned uploads. See the Fastify plugin's `retention` option for semantics. */
+  retention?: PulseVaultRetentionOptions;
   /** Logger for internal diagnostics (authorize rejections, tus handler failures). Defaults to `console`. */
   logger?: PulseVaultLogger;
   /** @deprecated Use `validatePayload` instead — see the Fastify plugin's option of the same name. */
@@ -96,7 +103,7 @@ export type PulseVaultCore = {
    * raw `http.createServer((req, res) => core.handler(req, res))` handler.
    */
   handler: (req: IncomingMessage, res: ServerResponse, next?: ConnectNext) => Promise<void>;
-  /** One-time teardown — calls `storage.shutdown?.()`. */
+  /** One-time teardown — stops the `retention` sweep, then calls `storage.shutdown?.()`. */
   shutdown: () => Promise<void>;
   /** Handles a TUS create/patch/head/delete request directly (any method under `/upload`). */
   handleTus: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -322,6 +329,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     options.onProjectUploadComplete,
   );
   const logger = options.logger ?? consoleLogger;
+  validateRetentionOptions(options.retention, storage);
+  const retentionSweep = options.retention
+    ? startRetentionSweep(storage, options.retention, logger)
+    : null;
 
   const tusPath = `${basePath}/upload`;
   const tusServer = createPulsevaultTusServer({
@@ -696,6 +707,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   return {
     handler,
     shutdown: async () => {
+      retentionSweep?.stop();
       await storage.shutdown?.();
     },
     handleTus,
@@ -714,6 +726,7 @@ export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
@@ -750,6 +763,8 @@ export type {
   LookupSecret,
 } from './lib/capability-token.js';
 export { createViewLinkIssuer } from './lib/view-links.js';
+export { sweepAbandonedUploads } from './lib/retention.js';
+export type { PulseVaultRetentionOptions } from './lib/retention.js';
 export type {
   PulseVaultIssueViewLink,
   PulseVaultViewLink,
