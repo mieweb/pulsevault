@@ -157,8 +157,8 @@ The entire state of the local adapter lives under `workspaceDir`:
 (bytes). Back it up as a normal filesystem tree — there's no separate database to keep in
 sync. To restore, copy the tree back and restart; in-progress uploads at
 backup time will resume correctly via the normal TUS `HEAD`-then-resume path
-once the client retries, or will simply sit as abandoned partial uploads
-(see "Retention" below) if the client never retries.
+once the client retries, or will sit as abandoned partial uploads until
+`retention` removes them (see "Retention" below) if the client never retries.
 
 ## Web-ready playback (faststart remux + H.264 transcode)
 
@@ -227,11 +227,16 @@ integrity for artifacts this feature has touched.
 
 ## Retention
 
-`pulsevault` has no built-in retention/expiry feature — this is intentionally
-left to the operator (see `PROTOCOL.md` §1 on lifecycle ownership). A sample
-cron script for the local adapter, deleting artifacts whose sidecar has been
-`"uploading"` for longer than a cutoff (abandoned uploads) or that are older
-than a retention window (compliance-driven deletion):
+**Abandoned uploads** — unfinished uploads a client gave up on, and the
+captions, manifest or thumbnail of a video that never finished — are cleaned
+up by the opt-in `retention` option (or `sweepAbandonedUploads` from your own
+scheduler); see the README's `retention` option. Both adapters support it.
+
+How long to keep **finished** content is a policy decision `pulsevault`
+leaves to the operator (see `PROTOCOL.md` §1 on lifecycle ownership). A
+sample cron script for the local adapter, deleting artifacts older than a
+retention window (compliance-driven deletion), alongside the abandoned-upload
+cutoff it predates:
 
 ```ts
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -263,7 +268,9 @@ for (const file of await readdir(sidecarDir)) {
 
 Run this on whatever schedule your retention policy requires. For S3/R2
 storage, prefer your bucket provider's native lifecycle-policy feature (S3
-Lifecycle Rules, R2 Object Lifecycle) over a custom script where available.
+Lifecycle Rules, R2 Object Lifecycle) over a custom script where available —
+and let `retention` handle abandoned uploads, which a lifecycle rule can't tell
+apart from finished ones (it doesn't read the sidecar's status).
 
 ## Secrets management
 
@@ -286,3 +293,12 @@ async function loadKey(kid: string) {
 Rotate by adding the new `kid` to your lookup table alongside the old one,
 switching issuance to the new `kid`, and removing the old entry only after
 its longest-lived outstanding token has expired.
+
+View links (`issueViewLink` / `createViewLinkIssuer`) are signed with a key
+derived from the same secrets, so they rotate with them — and since they can
+be much longer-lived than an upload token, keep a retired `kid` in the table
+as long as the view links you still want working, or remove it to revoke
+every view link signed under it at once. Deleting a video stops its view
+links opening the video (the `GET` then 404s), but the links keep opening its
+related captions, manifest and thumbnail until those are deleted too — by the
+client, or by `retention` once the video has been gone past its cutoff.

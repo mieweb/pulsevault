@@ -22,6 +22,11 @@ export type CapabilityTokenClaims = {
   kid: string;
   /** Issuing deployment's identity, e.g. `"https://vault.acme-hospital.org"`. */
   issuer: string;
+  /**
+   * `"view"` on a view token (`issueViewToken`): it only opens artifacts. Absent on the
+   * capability token an upload uses.
+   */
+  use?: 'view';
 };
 
 const DEFAULT_EXPIRY_SECONDS = 1800; // 30 minutes — long enough for one upload session.
@@ -33,6 +38,16 @@ function base64urlEncode(input: string): string {
 
 function sign(payload: string, secret: string): string {
   return createHmac('sha256', secret).update(payload).digest('base64url');
+}
+
+/**
+ * The key view tokens are signed with: derived from the deployment's secret, so it needs no new
+ * configuration, but distinct from it — a verifier that predates view tokens checks the
+ * signature against the secret itself and rejects a view token instead of treating it as an
+ * upload capability.
+ */
+function viewKey(secret: string): string {
+  return createHmac('sha256', secret).update('pulsevault view token v1').digest('base64url');
 }
 
 /** Constant-time string comparison, tolerant of mismatched lengths (returns `false` rather than throwing). */
@@ -77,6 +92,43 @@ export function issueCapabilityToken(
   return `${payload}.${sign(payload, secret)}`;
 }
 
+export type IssueViewTokenOptions = {
+  /** Key id this token is signed under (its view key is derived from that key's secret). */
+  keyId: string;
+  /** Issuing deployment's identity. */
+  issuer: string;
+  /** Token lifetime in seconds — the host's choice for this link; there is no default. */
+  expirySeconds: number;
+};
+
+/**
+ * Mint a read-only view token for one artifact: it opens that artifact and the artifacts
+ * `relatedTo` it (`GET {prefix}/artifacts/<id>?token=`), and nothing else — no uploads, no
+ * deletes, no further view links. Signed with a key derived from `secret`, so only a verifier
+ * that knows view tokens (`verifyViewToken`, `createCapabilityAuthorize`) accepts it.
+ */
+export function issueViewToken(
+  artifactId: string,
+  secret: string,
+  opts: IssueViewTokenOptions,
+): string {
+  // At least a second: `exp` is whole seconds, so anything less is a link already expired.
+  if (!Number.isFinite(opts.expirySeconds) || opts.expirySeconds < 1) {
+    throw new TypeError('issueViewToken: `expirySeconds` must be a number of seconds, at least 1');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const claims: CapabilityTokenClaims = {
+    artifactId,
+    iat: now,
+    exp: now + Math.floor(opts.expirySeconds),
+    kid: opts.keyId,
+    issuer: opts.issuer,
+    use: 'view',
+  };
+  const payload = base64urlEncode(JSON.stringify(claims));
+  return `${payload}.${sign(payload, viewKey(secret))}`;
+}
+
 /** Look up the signing secret for a given key id. Return `null`/`undefined` for an unrecognized `kid`. */
 export type LookupSecret = (keyId: string) => string | null | undefined;
 
@@ -87,19 +139,13 @@ export type VerifyCapabilityTokenOptions = {
   clockToleranceSeconds?: number;
 };
 
-/**
- * Verify a token minted by `issueCapabilityToken`. Returns the authorized
- * `artifactId` on success, or `null` for any failure (malformed token,
- * unknown `kid`, bad signature, expired, issued too far in the future, or
- * issuer mismatch) — deliberately collapsed to one failure shape so callers
- * can't accidentally branch on *why* a token failed and leak which part was
- * wrong to an attacker.
- */
-export function verifyCapabilityToken(
+/** Decode and check a token's claims and signature; `null` for any failure. */
+function verifyToken(
   token: string,
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
-): { artifactId: string } | null {
+  use: 'upload' | 'view',
+): { artifactId: string; exp: number } | null {
   const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
@@ -126,10 +172,13 @@ export function verifyCapabilityToken(
   ) {
     return null;
   }
+  // A view token is never an upload capability, and vice versa.
+  if (use === 'view' ? claims.use !== 'view' : claims.use !== undefined) return null;
 
   const secret = lookupSecret(claims.kid);
   if (!secret) return null;
-  if (!timingSafeEqualStrings(signature, sign(payload, secret))) return null;
+  const key = use === 'view' ? viewKey(secret) : secret;
+  if (!timingSafeEqualStrings(signature, sign(payload, key))) return null;
 
   const tolerance = opts.clockToleranceSeconds ?? DEFAULT_CLOCK_TOLERANCE_SECONDS;
   const now = Math.floor(Date.now() / 1000);
@@ -137,7 +186,37 @@ export function verifyCapabilityToken(
   if (claims.exp < now - tolerance) return null;
   if (claims.issuer !== opts.issuer) return null;
 
-  return { artifactId: claims.artifactId };
+  return { artifactId: claims.artifactId, exp: claims.exp };
+}
+
+/**
+ * Verify a token minted by `issueCapabilityToken`. Returns the authorized
+ * `artifactId` on success, or `null` for any failure (malformed token,
+ * unknown `kid`, bad signature, expired, issued too far in the future,
+ * issuer mismatch, or a view token) — deliberately collapsed to one failure
+ * shape so callers can't accidentally branch on *why* a token failed and leak
+ * which part was wrong to an attacker.
+ */
+export function verifyCapabilityToken(
+  token: string,
+  lookupSecret: LookupSecret,
+  opts: VerifyCapabilityTokenOptions,
+): { artifactId: string } | null {
+  const verified = verifyToken(token, lookupSecret, opts, 'upload');
+  return verified && { artifactId: verified.artifactId };
+}
+
+/**
+ * Verify a view token minted by `issueViewToken`. Returns the `artifactId` it opens and its
+ * `exp`, or `null` for any failure — including an upload capability token, which is not a view
+ * token.
+ */
+export function verifyViewToken(
+  token: string,
+  lookupSecret: LookupSecret,
+  opts: VerifyCapabilityTokenOptions,
+): { artifactId: string; exp: number } | null {
+  return verifyToken(token, lookupSecret, opts, 'view');
 }
 
 /** Pull a bearer token from the `Authorization` header, falling back to `ctx.token` (the `resolve`-phase query-string forward). */
@@ -173,6 +252,11 @@ function extractToken(
  * so one token issued for a pulse's video also covers its captions, beat
  * manifest and thumbnail uploaded in the same session, without minting a
  * token per artifact.
+ *
+ * A view token (`issueViewToken`) is accepted only to open an artifact (the
+ * `"resolve"` phase). Every other phase — uploading, deleting, and minting a
+ * view link (`"share"`) — needs the capability token itself, so a shared link
+ * can't be used to change anything or to extend itself.
  */
 export function createCapabilityAuthorize(
   lookupSecret: LookupSecret,
@@ -183,7 +267,9 @@ export function createCapabilityAuthorize(
     if (!token) {
       throw Object.assign(new Error('Missing capability token'), { statusCode: 401 });
     }
-    const verified = verifyCapabilityToken(token, lookupSecret, opts);
+    const verified =
+      verifyCapabilityToken(token, lookupSecret, opts) ??
+      (ctx.phase === 'resolve' ? verifyViewToken(token, lookupSecret, opts) : null);
     if (!verified) {
       throw Object.assign(new Error('Invalid or expired capability token'), { statusCode: 403 });
     }

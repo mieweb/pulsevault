@@ -251,6 +251,7 @@ export async function startMockS3({ buckets = [] } = {}) {
           etag: `"${md5Hex(assembled)}-${partNumbers.length}"`,
           contentType: upload.contentType,
           metadata: upload.metadata,
+          lastModified: new Date(),
         });
         uploads.delete(uploadId);
         const location = `http://mock-s3/${bucket}/${key}`;
@@ -263,10 +264,43 @@ export async function startMockS3({ buckets = [] } = {}) {
       }
 
       if (req.method === 'DELETE' && q.has('uploadId')) {
-        // AbortMultipartUpload — idempotent, like S3.
-        uploads.delete(q.get('uploadId'));
+        // AbortMultipartUpload. Like S3, an upload that's already completed (or aborted) is
+        // gone: NoSuchUpload.
+        if (!uploads.delete(q.get('uploadId'))) {
+          sendError(res, 404, 'NoSuchUpload', 'The specified upload does not exist.');
+          return;
+        }
         res.writeHead(204);
         res.end();
+        return;
+      }
+
+      if (req.method === 'GET' && !key && q.get('list-type') === '2') {
+        // ListObjectsV2 — `prefix`, and `max-keys` / `continuation-token` paging (the token is
+        // the last key of the previous page).
+        const prefix = q.get('prefix') ?? '';
+        const maxKeys = Number(q.get('max-keys') ?? 1000);
+        const after = q.get('continuation-token') ?? '';
+        const keys = [...objects.keys()]
+          .filter((k) => k.startsWith(`${bucket} `))
+          .map((k) => k.slice(bucket.length + 1))
+          .filter((k) => k.startsWith(prefix) && k > after)
+          .sort();
+        const page = keys.slice(0, maxKeys);
+        const truncated = keys.length > page.length;
+        const contents = page
+          .map((k) => {
+            const obj = objects.get(objKey(bucket, k));
+            const modified = (obj.lastModified ?? new Date(0)).toISOString();
+            return `<Contents><Key>${xmlEscape(k)}</Key><LastModified>${modified}</LastModified><Size>${obj.body.length}</Size></Contents>`;
+          })
+          .join('');
+        const next = truncated ? `<NextContinuationToken>${xmlEscape(page.at(-1))}</NextContinuationToken>` : '';
+        sendXml(
+          res,
+          200,
+          `<ListBucketResult><Name>${xmlEscape(bucket)}</Name><Prefix>${xmlEscape(prefix)}</Prefix><KeyCount>${page.length}</KeyCount><MaxKeys>${maxKeys}</MaxKeys><IsTruncated>${truncated}</IsTruncated>${next}${contents}</ListBucketResult>`,
+        );
         return;
       }
 
@@ -317,6 +351,7 @@ export async function startMockS3({ buckets = [] } = {}) {
           etag: `"${md5Hex(body)}"`,
           contentType: req.headers['content-type'] ?? 'application/octet-stream',
           metadata: readAmzMeta(req),
+          lastModified: new Date(),
         });
         res.writeHead(200, { etag: objects.get(objKey(bucket, key)).etag, 'content-length': 0 });
         res.end();
@@ -382,6 +417,9 @@ export async function startMockS3({ buckets = [] } = {}) {
   return {
     endpoint: `http://127.0.0.1:${port}`,
     port,
+    /** Every object key in `bucket`, for asserting what a request left behind. */
+    keys: (bucket) =>
+      [...objects.keys()].filter((k) => k.startsWith(`${bucket} `)).map((k) => k.slice(bucket.length + 1)),
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

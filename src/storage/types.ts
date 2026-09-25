@@ -94,6 +94,21 @@ export type ReserveUploadParams = {
   appVersion?: string;
 };
 
+/** One artifact as `listArtifacts` reports it. */
+export type PulseVaultArtifactRecord = {
+  artifactId: string;
+  kind: UploadKind;
+  /** The artifact this one belongs to, if it declared one (`Upload-Metadata.relatedTo`). */
+  relatedTo?: string;
+  /** `false` while its upload is in flight; `true` once it's finished and served. */
+  ready: boolean;
+  /**
+   * In ms since the epoch: when it finished once `ready` is true; while it isn't, when its upload
+   * last received bytes, or at least when it started (an adapter that can't tell).
+   */
+  updatedAt: number;
+};
+
 /**
  * Storage backend contract. Keep the surface small: one write hook, one read
  * hook, plus optional one-time init. Adapters own their own configuration.
@@ -138,10 +153,11 @@ export interface PulseVaultStorage {
   markReady?(artifactId: string): Promise<void>;
 
   /**
-   * Delete all storage associated with an artifactId. Returns `true` if
-   * something was removed, `false` if the artifactId was already absent.
-   * Called both from the `DELETE /artifacts/:artifactId` route and from the
-   * plugin's cleanup path when `validatePayload` rejects a completed upload.
+   * Delete all storage associated with an artifactId, in flight or finished.
+   * Returns `true` if something was removed, `false` if the artifactId was
+   * already absent. Called from the `DELETE /artifacts/:artifactId` route, for a
+   * TUS `DELETE` of the artifact's upload (under tus's per-upload lock), and from
+   * the plugin's cleanup path when `validatePayload` rejects a completed upload.
    */
   remove?(artifactId: string): Promise<boolean>;
 
@@ -174,4 +190,11 @@ export interface PulseVaultStorage {
    * sidecar directly.
    */
   getName?(artifactId: string): Promise<string | null>;
+
+  /**
+   * Every artifact the adapter holds, for the retention sweep (`sweepAbandonedUploads`).
+   * Optional — `retention` needs it. An adapter may skip records whose metadata changed at or
+   * after `changedBefore` (ms since epoch): the sweep never removes those.
+   */
+  listArtifacts?(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
 }

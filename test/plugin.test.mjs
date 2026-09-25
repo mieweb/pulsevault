@@ -16,12 +16,14 @@ import pulseVault, {
   createChecksumValidator,
   issueCapabilityToken,
   createCapabilityAuthorize,
+  createViewLinkIssuer,
 } from "../dist/app.js";
 import {
   makeMp4,
   tusCreate as tusCreateRaw,
   tusPatch,
   tusHead,
+  tusDelete,
   uploadFull,
 } from "./helpers.mjs";
 import pkg from "../package.json" with { type: "json" };
@@ -44,6 +46,12 @@ const tusCreate = (baseUrl, opts) => tusCreateRaw(baseUrl, PREFIX, opts);
 const uploadFullMp4 = (ctx, artifactId, size = 1024) =>
   uploadFull(ctx.baseUrl, PREFIX, { artifactId, size });
 const artifactUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}`;
+const viewLinkUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}/view-link`;
+const sidecarExists = (ctx, id) =>
+  fs.stat(path.join(ctx.workspaceDir, ".pulsevault", `${id}.json`)).then(
+    () => true,
+    () => false,
+  );
 
 async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
@@ -444,6 +452,149 @@ test("DELETE removes the artifact; second DELETE is 404", async () => {
   }
 });
 
+test("TUS DELETE of an in-flight upload removes the whole artifact, so its id isn't wedged", async () => {
+  const ctx = await startApp();
+  try {
+    const body = makeMp4(4096);
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: body.length,
+    });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 1024))).status, 204);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal(await sidecarExists(ctx, ID1), false, "no sidecar left behind");
+    assert.equal((await tusHead(location)).status, 404);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 404);
+    // Nothing still holds the id: creating it again succeeds instead of a 409.
+    const again = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: body.length,
+    });
+    assert.equal(again.status, 201);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("TUS DELETE of a finished upload removes it: bytes, tus record and sidecar", async () => {
+  const ctx = await startApp();
+  try {
+    const { location } = await uploadFullMp4(ctx, ID1);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 200);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal(await sidecarExists(ctx, ID1), false, "no sidecar left behind");
+    const leftovers = await fs.readdir(path.join(ctx.workspaceDir, "video"));
+    assert.deepEqual(leftovers.filter((f) => f.startsWith(ID1)), []);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 404);
+    assert.equal((await tusDelete(location)).status, 404, "a second DELETE finds nothing");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a TUS DELETE also removes tus's own bytes when the adapter's remove only knows its records", async () => {
+  // Like the README's custom adapter: `remove` drops the adapter's own row, not the tus upload.
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
+  const local = createLocalStorage({ workspaceDir });
+  const removedRecords = [];
+  const storage = {
+    ...local,
+    remove: async (artifactId) => {
+      removedRecords.push(artifactId);
+      return true;
+    },
+  };
+  const app = Fastify({ logger: false });
+  await app.register(pulseVault, { prefix: PREFIX, storage, maxUploadSize: 10 * 1024 * 1024 });
+  const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+  try {
+    const body = makeMp4(4096);
+    const create = await tusCreate(baseUrl, { artifactId: ID1, filename: "clip.mp4", size: body.length });
+    const location = new URL(create.headers.get("location"), baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 1024))).status, 204);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.deepEqual(removedRecords, [ID1]);
+    const leftovers = await fs.readdir(path.join(workspaceDir, "video"));
+    assert.deepEqual(leftovers.filter((f) => f.startsWith(ID1)), [], "tus's bytes and record are gone");
+  } finally {
+    await app.close();
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("both ways of deleting an artifact report it on onArtifactEvent", async () => {
+  const events = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      onArtifactEvent: (event) => {
+        if (event.phase === "remove") events.push(event);
+      },
+    },
+  });
+  try {
+    const { location } = await uploadFullMp4(ctx, ID1);
+    await uploadFullMp4(ctx, ID2);
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal((await fetch(artifactUrl(ctx, ID2), { method: "DELETE" })).status, 204);
+    // A delete that finds nothing reports nothing.
+    assert.equal((await fetch(artifactUrl(ctx, ID2), { method: "DELETE" })).status, 404);
+    assert.deepEqual(events, [
+      { phase: "remove", artifactId: ID1, kind: "video", reason: "deleted" },
+      { phase: "remove", artifactId: ID2, kind: "video", reason: "deleted" },
+    ]);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a TUS DELETE is authorized as a delete of that artifact", async () => {
+  const seen = [];
+  const events = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      onArtifactEvent: (event) => {
+        if (event.phase === "authorize") events.push(event);
+      },
+      authorize: async (_req, { phase, artifactId, kind, relatedTo }) => {
+        seen.push({ phase, artifactId, kind, relatedTo });
+        if (phase === "delete" && artifactId === ID2) {
+          throw Object.assign(new Error("no delete"), { statusCode: 403 });
+        }
+      },
+    },
+  });
+  try {
+    await uploadFullMp4(ctx, ID1);
+    const vtt = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+    const { location } = await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: vtt,
+    });
+
+    seen.length = 0;
+    assert.equal((await tusDelete(location)).status, 403);
+    assert.deepEqual(seen, [
+      { phase: "delete", artifactId: ID2, kind: "captions", relatedTo: ID1 },
+    ]);
+    // Refused, so nothing was removed — and reported like any other rejected delete.
+    assert.equal((await fetch(artifactUrl(ctx, ID2))).status, 200);
+    assert.deepEqual(events, [
+      { phase: "authorize", artifactId: ID2, kind: "captions", reason: "no delete" },
+    ]);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("createMp4Sniffer rejects non-MP4 bytes and removes the artifact", async () => {
   const ctx = await startApp({ withSniffer: true });
   try {
@@ -826,6 +977,122 @@ test("createCapabilityAuthorize: key rotation overlap — old and new kid both v
       headers: { Authorization: `Bearer ${newToken}` },
     });
     assert.equal(r2.status, 201, "new key verifies");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+// ---------- view links (protocol 2.2) ----------
+
+const VIEW_SECRET = "view-link-test-secret";
+const VIEW_ISSUER = "https://vault.example.test";
+const viewLookup = (kid) => (kid === "k1" ? VIEW_SECRET : null);
+const VTT = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+
+test("view links are off unless the host configures them", async () => {
+  const ctx = await startApp();
+  try {
+    const caps = await (await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`)).json();
+    assert.equal(caps.viewLinks, false);
+    await uploadFullMp4(ctx, ID1);
+    const res = await fetch(viewLinkUrl(ctx, ID1), { method: "POST" });
+    assert.equal(res.status, 404);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a view link opens the pulse — video and captions — and nothing else", async () => {
+  const perLink = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: createCapabilityAuthorize(viewLookup, { issuer: VIEW_ISSUER }),
+      issueViewLink: createViewLinkIssuer({
+        keyId: "k1",
+        secret: VIEW_SECRET,
+        issuer: VIEW_ISSUER,
+        // The host decides per link.
+        expirySeconds: (_request, { artifactId, kind }) => {
+          perLink.push({ artifactId, kind });
+          return 7 * 86_400;
+        },
+      }),
+    },
+  });
+  try {
+    const caps = await (await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`)).json();
+    assert.equal(caps.viewLinks, true);
+
+    const upload = issueCapabilityToken(ID1, VIEW_SECRET, { keyId: "k1", issuer: VIEW_ISSUER });
+    const asUploader = { Authorization: `Bearer ${upload}` };
+    const { location } = await uploadFull(ctx.baseUrl, PREFIX, { artifactId: ID1, headers: asUploader });
+    await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: VTT,
+      headers: asUploader,
+    });
+
+    const minted = await fetch(viewLinkUrl(ctx, ID1), { method: "POST", headers: asUploader });
+    assert.equal(minted.status, 200);
+    const link = await minted.json();
+    assert.deepEqual(Object.keys(link).sort(), ["expiresAt", "token"]);
+    assert.ok(Math.abs(link.expiresAt - (Math.floor(Date.now() / 1000) + 7 * 86_400)) <= 1);
+    assert.deepEqual(perLink, [{ artifactId: ID1, kind: "video" }]);
+
+    // Opens the video and its captions, as a watch link.
+    const watch = (id) => fetch(`${artifactUrl(ctx, id)}?token=${encodeURIComponent(link.token)}`);
+    assert.equal((await watch(ID1)).status, 200);
+    assert.equal((await watch(ID2)).status, 200);
+
+    // …and nothing else: no uploading, deleting, or minting a longer link for itself.
+    const asViewer = { Authorization: `Bearer ${link.token}` };
+    const head = await fetch(location, { method: "HEAD", headers: { "Tus-Resumable": "1.0.0", ...asViewer } });
+    assert.equal(head.status, 403);
+    assert.equal((await tusDelete(location, asViewer)).status, 403);
+    assert.equal(
+      (await fetch(artifactUrl(ctx, ID1), { method: "DELETE", headers: asViewer })).status,
+      403,
+    );
+    assert.equal((await fetch(viewLinkUrl(ctx, ID1), { method: "POST", headers: asViewer })).status, 403);
+    const sneak = await tusCreate(ctx.baseUrl, {
+      artifactId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      filename: "x.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      size: VTT.length,
+      headers: asViewer,
+    });
+    assert.equal(sneak.status, 403);
+    assert.equal((await watch(ID1)).status, 200, "still there");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a view link is only for a finished artifact, and the host can refuse one", async () => {
+  const ctx = await startApp({
+    pluginOptions: {
+      // Refuses links to anything but videos.
+      issueViewLink: (_request, { kind }) =>
+        kind === "video" ? { token: "view", expiresAt: 2_000_000_000 } : null,
+    },
+  });
+  try {
+    const create = await tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: 1024 });
+    assert.equal(create.status, 201);
+    assert.equal((await fetch(viewLinkUrl(ctx, ID1), { method: "POST" })).status, 404, "unfinished");
+
+    await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: VTT,
+    });
+    assert.equal((await fetch(viewLinkUrl(ctx, ID2), { method: "POST" })).status, 403, "refused");
   } finally {
     await ctx.teardown();
   }

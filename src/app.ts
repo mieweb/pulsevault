@@ -3,6 +3,12 @@ import fp from 'fastify-plugin';
 import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
 import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
+import type { PulseVaultIssueViewLink } from './lib/view-links.js';
+import {
+  type PulseVaultRetentionOptions,
+  startRetentionSweep,
+  validateRetentionOptions,
+} from './lib/retention.js';
 import type { PulseVaultStorage } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
@@ -135,6 +141,25 @@ export type PulseVaultPluginOptions = {
    */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
   /**
+   * Optional read-only view links (protocol 2.2). When set, `POST {prefix}/artifacts/<id>/view-link`
+   * — authorized as `"share"` — calls this for a finished artifact and returns the link it mints:
+   * a token that opens the artifact (and the artifacts `relatedTo` it) and nothing more, so it's
+   * safe to share, unlike the capability token an upload uses. The host decides each link —
+   * return `null` to refuse one — and `/capabilities` reports `viewLinks: true`. For capability
+   * tokens, use `createViewLinkIssuer`, whose `expirySeconds` can be decided per link.
+   */
+  issueViewLink?: PulseVaultIssueViewLink;
+  /**
+   * Optional cleanup of abandoned uploads, off unless set. Every `sweepIntervalSeconds` (default
+   * an hour) it removes an upload still unfinished `abandonedAfterSeconds` after it started — a
+   * client that died mid-upload — and a finished artifact whose `relatedTo` artifact isn't
+   * finished (or is gone) that long after it finished: the captions, beat manifest or thumbnail
+   * of a video that never arrived. Finished videos are never touched. Needs a storage adapter with
+   * `listArtifacts` (both built-in ones). To schedule it yourself instead, call
+   * `sweepAbandonedUploads` from a cron job.
+   */
+  retention?: PulseVaultRetentionOptions;
+  /**
    * @deprecated Use `validatePayload` instead — it now receives `ctx.kind`
    * and runs for every artifact kind, including `"project"`. Still honored
    * this release (mapped onto `validatePayload` when `kind === "project"`),
@@ -159,15 +184,30 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
   validateBasePath(opts.prefix, 'prefix');
   validateMaxUploadSize(opts.maxUploadSize);
   validateAllowedExtensions(opts.allowedExtensions);
+  validateRetentionOptions(opts.retention, opts.storage);
   warnIfUsingDeprecatedProjectHooks(opts);
 
   // Register the shutdown hook *before* awaiting initialize() so any partial
   // state the adapter allocates mid-init still gets cleaned up if Fastify
   // later tears the plugin down.
+  let retentionSweep: { stop: () => Promise<void> } | null = null;
   fastify.addHook('onClose', async () => {
+    // Waits for a sweep in progress, so it never runs against shut-down storage.
+    await retentionSweep?.stop();
     await opts.storage.shutdown?.();
   });
   await opts.storage.initialize?.();
+  if (opts.retention) {
+    const { onArtifactEvent } = opts;
+    retentionSweep = startRetentionSweep(
+      opts.storage,
+      opts.retention,
+      fastify.log,
+      async ({ artifactId, kind }) => {
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'abandoned' });
+      },
+    );
+  }
 
   const decoratorName = opts.decoratorName ?? DEFAULT_DECORATOR_NAME;
   const allowedExtensions = normalizeAllowedExtensions(opts.allowedExtensions);
@@ -184,6 +224,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     validatePayload: composeValidatePayload(opts.validatePayload, opts.validateProjectPayload),
     onUploadComplete: composeOnUploadComplete(opts.onUploadComplete, opts.onProjectUploadComplete),
     onArtifactEvent: opts.onArtifactEvent,
+    issueViewLink: opts.issueViewLink,
   });
 };
 
@@ -197,6 +238,7 @@ export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
@@ -221,14 +263,26 @@ export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
+  issueViewToken,
+  verifyViewToken,
   createCapabilityAuthorize,
 } from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
+  IssueViewTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
 } from './lib/capability-token.js';
+export { createViewLinkIssuer } from './lib/view-links.js';
+export { sweepAbandonedUploads } from './lib/retention.js';
+export type { PulseVaultRetentionOptions } from './lib/retention.js';
+export type {
+  PulseVaultIssueViewLink,
+  PulseVaultViewLink,
+  PulseVaultViewLinkContext,
+  ViewLinkIssuerOptions,
+} from './lib/view-links.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,

@@ -1,4 +1,4 @@
-import { Server } from '@tus/server';
+import { type DataStore, Server } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
@@ -37,10 +37,13 @@ export type PulseVaultOnUploadComplete = (
 /**
  * Fired at low-frequency, audit-worthy moments — never per chunk — so an
  * operator can wire one hook to get both ops metrics and a compliance audit
- * trail without hand-rolling both from the lower-level hooks.
+ * trail without hand-rolling both from the lower-level hooks. `remove` fires
+ * after PulseVault removed an artifact: a `DELETE /artifacts/:id` or a TUS
+ * `DELETE` (`reason: "deleted"`), or the `retention` sweep (`reason: "abandoned"`)
+ * — so a host keeping its own index of artifacts can drop it.
  */
 export type PulseVaultArtifactEvent = {
-  phase: 'authorize' | 'complete' | 'reject';
+  phase: 'authorize' | 'complete' | 'reject' | 'remove';
   artifactId: string;
   kind: UploadKind;
   size?: number;
@@ -92,6 +95,52 @@ export function tusError(status: number, body: string): Error {
     statusCode: status,
     status_code: status,
     body,
+  });
+}
+
+/**
+ * The datastore tus drives, with termination routed through PulseVault's own removal. A TUS
+ * DELETE (the client cancelling, or discarding what a failed run created) takes tus's per-upload
+ * lock and calls the datastore's `remove` — which on its own drops only tus's bytes and offset
+ * record: PulseVault's sidecar stays, so the artifactId 409s on every later create, and on S3 a
+ * finished upload isn't removed at all (aborting its completed multipart upload fails first).
+ * So both run: the datastore's removal, then `storage.remove`, which deletes the whole artifact,
+ * in flight or finished. It 404s only when neither found anything to remove.
+ */
+function withArtifactRemoval(
+  storage: PulseVaultStorage,
+  onRemoved?: (artifactId: string, kind: UploadKind) => Promise<void>,
+): DataStore {
+  const { datastore } = storage;
+  if (!storage.remove) return datastore;
+  const removeArtifact = storage.remove.bind(storage);
+  return new Proxy(datastore, {
+    get(target, prop) {
+      if (prop === 'remove') {
+        return async (id: string): Promise<void> => {
+          const artifactId = artifactIdFromUploadId(id);
+          const kind = artifactId ? await resolveKind(storage, artifactId) : undefined;
+          // The datastore's own removal first — the upload's bytes and tus's records, which a
+          // custom adapter's `remove` may not know about — then the artifact's.
+          let uploadRemoved = false;
+          let uploadError: unknown;
+          try {
+            await target.remove(id);
+            uploadRemoved = true;
+          } catch (err) {
+            // Not there, or (S3) already completed: `storage.remove` below still removes it.
+            uploadError = err;
+          }
+          const artifactRemoved = artifactId ? await removeArtifact(artifactId) : false;
+          if (artifactId && kind && artifactRemoved) {
+            await onRemoved?.(artifactId, kind);
+          }
+          if (!uploadRemoved && !artifactRemoved) throw uploadError;
+        };
+      }
+      const value: unknown = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
   });
 }
 
@@ -175,7 +224,9 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
 
   const server = new Server({
     path: tusPath,
-    datastore: storage.datastore,
+    datastore: withArtifactRemoval(storage, async (artifactId, kind) => {
+      await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'deleted' });
+    }),
     maxSize,
     namingFunction: async (_req, metadata) => {
       const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =

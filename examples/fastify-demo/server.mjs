@@ -355,6 +355,9 @@ await app.register(pulseVault, {
   // (`Tus-Max-Size`) than the infra accepts means clients get promised sizes
   // that 413 mid-flight. Raise only if the edge limit is raised.
   maxUploadSize: 2 * 1024 * 1024 * 1024, // 2 GiB
+  // Uploads a client abandoned (an app killed mid-upload) — and the captions, manifest or
+  // thumbnail of a video that never finished — are removed after a day.
+  retention: { abandonedAfterSeconds: 24 * 60 * 60 },
   // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
   // captions and a .jpg thumbnail alongside its video; rejecting any of those
   // would make this a broken pairing target.

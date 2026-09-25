@@ -6,12 +6,14 @@ import type { DataStore } from '@tus/server';
 // install `@aws-sdk/*` or `@tus/s3-store`.
 import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
 import type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
   UploadKind,
 } from './types.js';
 import { parseUploadKind } from './types.js';
+import { isUuid } from '../lib/uuid.js';
 
 /**
  * Per-upload metadata sidecar, stored as a small JSON object in the bucket at
@@ -185,6 +187,8 @@ export type S3Storage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.listArtifacts` contract. */
+  listArtifacts(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
 };
 
 /**
@@ -221,7 +225,13 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         `(original error: ${err instanceof Error ? err.message : String(err)})`,
     );
   }
-  const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = s3;
+  const {
+    S3Client,
+    GetObjectCommand,
+    PutObjectCommand,
+    DeleteObjectCommand,
+    ListObjectsV2Command,
+  } = s3;
   const { getSignedUrl } = presigner;
   const { S3Store } = s3store;
 
@@ -456,12 +466,18 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     await Promise.allSettled([
       (datastore as { remove?: (id: string) => Promise<void> }).remove?.(key),
     ]);
-    // Delete the finalized object, the @tus/s3-store `.info` sidecar, and our
-    // metadata sidecar. DeleteObject is idempotent, so this is safe whether or
-    // not the multipart abort above already removed some of them.
+    // @tus/s3-store caches an upload's metadata, and its own removal of a finished upload fails
+    // (NoSuchUpload) before clearing it — a HEAD would then still report the deleted upload as
+    // complete.
+    await (datastore as { clearCache?: (id: string) => Promise<void> }).clearCache?.(key);
+    // Delete the finalized object, the @tus/s3-store `.info` sidecar, the incomplete part it
+    // parks between PATCHes (`.part`, left behind by its own removal), and our metadata
+    // sidecar. DeleteObject is idempotent, so this is safe whether or not the multipart abort
+    // above already removed some of them.
     await Promise.all([
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
+      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.part` })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
     ]);
     return true;
@@ -535,6 +551,44 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta?.name ?? null;
   };
 
+  /**
+   * Walk the sidecar objects. A sidecar is rewritten only when its upload finishes, so its
+   * `LastModified` is when the upload started (still uploading) or when it finished (ready).
+   * Sidecars changed at or after `changedBefore` are skipped without being read.
+   */
+  async function* listArtifacts(
+    opts: { changedBefore?: number } = {},
+  ): AsyncIterable<PulseVaultArtifactRecord> {
+    let continuationToken: string | undefined;
+    do {
+      const page = await client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: `${PULSEVAULT_META_PREFIX}/`,
+          ...(continuationToken ? { ContinuationToken: continuationToken } : {}),
+        }),
+      );
+      for (const object of page.Contents ?? []) {
+        const name = object.Key?.slice(PULSEVAULT_META_PREFIX.length + 1) ?? '';
+        if (!name.endsWith('.json')) continue;
+        const artifactId = name.slice(0, -'.json'.length);
+        if (!isUuid(artifactId)) continue;
+        const updatedAt = object.LastModified?.getTime() ?? 0;
+        if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
+        const sidecar = await readSidecar(artifactId);
+        if (!sidecar) continue;
+        yield {
+          artifactId,
+          kind: sidecar.kind ?? 'video',
+          ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
+          ready: sidecar.status === 'ready',
+          updatedAt,
+        };
+      }
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
   const shutdown = async (): Promise<void> => {
     client.destroy();
   };
@@ -553,6 +607,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     getRelatedTo,
     getChecksum,
     getName,
+    listArtifacts,
     shutdown,
   };
 }
