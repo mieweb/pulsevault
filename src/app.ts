@@ -3,6 +3,7 @@ import fp from 'fastify-plugin';
 import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
 import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
+import type { PulseVaultIssueViewLink } from './lib/view-links.js';
 import type { PulseVaultStorage } from './storage/types.js';
 import {
   normalizeAllowedExtensions,
@@ -135,6 +136,15 @@ export type PulseVaultPluginOptions = {
    */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
   /**
+   * Optional read-only view links (protocol 2.2). When set, `POST {prefix}/artifacts/<id>/view-link`
+   * — authorized as `"share"` — calls this for a finished artifact and returns the link it mints:
+   * a token that opens the artifact (and the artifacts `relatedTo` it) and nothing more, so it's
+   * safe to share, unlike the capability token an upload uses. The host decides each link —
+   * return `null` to refuse one — and `/capabilities` reports `viewLinks: true`. For capability
+   * tokens, use `createViewLinkIssuer`, whose `expirySeconds` can be decided per link.
+   */
+  issueViewLink?: PulseVaultIssueViewLink;
+  /**
    * @deprecated Use `validatePayload` instead — it now receives `ctx.kind`
    * and runs for every artifact kind, including `"project"`. Still honored
    * this release (mapped onto `validatePayload` when `kind === "project"`),
@@ -184,6 +194,7 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     validatePayload: composeValidatePayload(opts.validatePayload, opts.validateProjectPayload),
     onUploadComplete: composeOnUploadComplete(opts.onUploadComplete, opts.onProjectUploadComplete),
     onArtifactEvent: opts.onArtifactEvent,
+    issueViewLink: opts.issueViewLink,
   });
 };
 
@@ -221,14 +232,24 @@ export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
+  issueViewToken,
+  verifyViewToken,
   createCapabilityAuthorize,
 } from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
+  IssueViewTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
 } from './lib/capability-token.js';
+export { createViewLinkIssuer } from './lib/view-links.js';
+export type {
+  PulseVaultIssueViewLink,
+  PulseVaultViewLink,
+  PulseVaultViewLinkContext,
+  ViewLinkIssuerOptions,
+} from './lib/view-links.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,

@@ -34,6 +34,7 @@ import pulseVault, {
   issueCapabilityToken,
   verifyCapabilityToken,
   createCapabilityAuthorize,
+  createViewLinkIssuer,
 } from "@mieweb/pulsevault";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -78,6 +79,9 @@ if (!process.env.DATABASE_URL) {
 const PULSEVAULT_KEY_ID = process.env.PULSEVAULT_KEY_ID || "demo-1";
 const TOKEN_TTL_SECONDS = 30 * 60; // 30 minutes — long enough for one upload session
 const WATCH_TOKEN_TTL_SECONDS = 5 * 60; // short-lived — minted fresh per gallery load, never persisted
+// How long a shareable view link works (the Pulse app asks for one after each upload). This is
+// the host's call per link — PulseVault sets no default — so this demo takes it from the env.
+const VIEW_LINK_TTL_SECONDS = Number(process.env.VIEW_LINK_TTL_SECONDS || 30 * 24 * 60 * 60);
 
 /**
  * A capability token's `issuer` claim is checked for exact string equality
@@ -784,6 +788,14 @@ await app.register(pulseVault, {
   prefix: "/pulsevault",
   storage: pulseStorage,
   maxUploadSize: 5 * 1024 * 1024 * 1024, // 5 GiB
+  // Read-only, shareable view links (protocol 2.2): the app asks for one once a pulse's video
+  // has uploaded, and offers Copy link with it — the pairing token itself is never shared.
+  issueViewLink: createViewLinkIssuer({
+    keyId: PULSEVAULT_KEY_ID,
+    secret: PULSEVAULT_SECRET,
+    issuer: ISSUER,
+    expirySeconds: VIEW_LINK_TTL_SECONDS,
+  }),
   // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
   // captions and a .jpg thumbnail alongside its video; rejecting any of those
   // would make this a broken pairing target. Mirrors ../fastify-demo.

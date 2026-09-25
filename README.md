@@ -230,6 +230,7 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
 | `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, delete the upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
+| `POST` | `/pulsevault/artifacts/:artifactId/view-link` | Mint a read-only view link to a finished artifact (only with [`issueViewLink`](#issueviewlink)) |
 | `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
 
 \* `DELETE /pulsevault/upload/:id` is TUS termination, addressed by the upload URL: it removes the artifact whether the upload is still in flight (a cancel) or finished, exactly as `DELETE /pulsevault/artifacts/:artifactId` does by artifactId.
@@ -319,9 +320,9 @@ Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` i
 
 ### `authorize`
 
-Optional async hook called before TUS create/patch, before GET resolve, and before DELETE. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
+Optional async hook called before TUS create/patch, before GET resolve, before DELETE, and before minting a view link. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
 
-Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal.
+Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal. `"share"` is `POST {prefix}/artifacts/<id>/view-link` — minting a read-only link — and only happens when [`issueViewLink`](#issueviewlink) is set.
 
 ```ts
 type PulseVaultAuthorize = (
@@ -332,7 +333,7 @@ type PulseVaultAuthorize = (
   // `http.IncomingMessage`, etc.) — the same hook works under either.
   request: PulseVaultRequest,
   ctx: {
-    phase: "create" | "patch" | "resolve" | "delete";
+    phase: "create" | "patch" | "resolve" | "delete" | "share";
     artifactId: string;
     kind: "video" | "project" | "captions";  // artifact kind; always present
     token?: string;             // only on "resolve" phase
@@ -438,6 +439,26 @@ onArtifactEvent: (event) => {
 ```
 
 See `OPERATIONS.md` for a Prometheus-counter example and what to alert on.
+
+### `issueViewLink`
+
+Optional — turns on read-only **view links** (protocol 2.2, `PROTOCOL.md` §6.4). The pairing token a client uploads with is a full capability: whoever holds it can upload to the artifact and delete it, so a watch link carrying it isn't safe to share. With this set, `POST {prefix}/artifacts/<id>/view-link` — authorized as `"share"` — calls it for a finished artifact and returns `{ token, expiresAt }`: a token that opens the artifact (and the artifacts `relatedTo` it) as `GET {prefix}/artifacts/<id>?token=…`, and does nothing else. `/capabilities` reports `viewLinks: true`.
+
+You decide every link — how long it works, or whether this artifact gets one at all (return `null` to refuse; the client gets `403`). PulseVault sets no lifetime of its own. With capability tokens, `createViewLinkIssuer` signs view tokens that `createCapabilityAuthorize` accepts for opening artifacts only — never for uploading, deleting, or minting another link — and whose `expirySeconds` can be a number or decided per link:
+
+```ts
+import { createViewLinkIssuer } from "@mieweb/pulsevault";
+
+issueViewLink: createViewLinkIssuer({
+  keyId: "2026-06",
+  secret: keys["2026-06"],
+  issuer,
+  // Per link: e.g. a month for videos, a week for everything else.
+  expirySeconds: (_request, { kind }) => (kind === "video" ? 30 * 86_400 : 7 * 86_400),
+}),
+```
+
+View tokens are signed with a key derived from the same secret, so they need no new configuration, and a verifier that predates them (an older PulseVault sharing the secret) rejects one instead of treating it as an upload token. Rotating a key out invalidates the view links signed under it — the way to revoke them early, short of deleting the artifact.
 
 ### `validateProjectPayload` / `onProjectUploadComplete` (deprecated)
 
@@ -796,7 +817,9 @@ CI (`.github/workflows/ci.yml`) runs all of these, plus the Pulse app's contract
 - `allowedExtensions` object form
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
-- `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata)
+- TUS `DELETE` removing the whole artifact, in flight or finished (local and S3), authorized as `delete`
+- View links: `issueViewToken`/`verifyViewToken`/`createViewLinkIssuer`, a view token opening its artifact and related ones but never uploading, deleting or minting another link, per-link lifetimes, refusal, and only finished artifacts
+- `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata, view links)
 - Protocol versioning: the version read from `package.json`, `Pulse-Client` parsing, `426` for clients that are too old (core and plugin), `appVersion` stored and reported
 - S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, run against an in-process zero-dependency S3 mock (`test/mock-s3.mjs`, no cloud credentials needed)
 - `@mieweb/pulsevault/core` (the framework-agnostic entry point): the same protocol suite re-run against a bare `http.createServer` wrapping `core.handler`, plus an Express-specific smoke test proving `app.use(prefix, handler)` composition

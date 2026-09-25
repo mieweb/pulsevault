@@ -286,3 +286,10 @@ async function loadKey(kid: string) {
 Rotate by adding the new `kid` to your lookup table alongside the old one,
 switching issuance to the new `kid`, and removing the old entry only after
 its longest-lived outstanding token has expired.
+
+View links (`issueViewLink` / `createViewLinkIssuer`) are signed with a key
+derived from the same secrets, so they rotate with them — and since they can
+be much longer-lived than an upload token, keep a retired `kid` in the table
+as long as the view links you still want working, or remove it to revoke
+every view link signed under it at once. Deleting an artifact revokes its
+links too (the `GET` then 404s).

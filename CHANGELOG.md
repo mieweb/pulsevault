@@ -7,11 +7,25 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
-Protocol 2.1 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
+Protocol 2.2 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
 removal below as the breaking change it is; clients built for protocol 1
 can't pair with this release.
 
 ### Added
+
+- **Read-only view links** (protocol 2.2). The pairing token is a full
+  capability, so a watch link carrying it let anyone holding the link
+  upload to the artifact or delete it. The new `issueViewLink` option turns
+  on `POST {prefix}/artifacts/:id/view-link` (authorized as the new
+  `"share"` phase): for a finished artifact it returns `{ token, expiresAt }`,
+  a token that only opens the artifact and the artifacts `relatedTo` it
+  (`GET ?token=`). The host decides each link's lifetime, or refuses one;
+  PulseVault sets none. `createViewLinkIssuer` / `issueViewToken` /
+  `verifyViewToken` implement it for capability tokens: view tokens carry
+  `use: "view"`, are signed with a key derived from the same secret (so a
+  verifier that predates them rejects one), and `createCapabilityAuthorize`
+  accepts them only for `resolve`. `/capabilities` reports `viewLinks`, and
+  `protocol/schemas/view-link.schema.json` defines the response.
 
 - **The protocol is written down as files, and CI keeps it honest.**
   `protocol/schemas/*.schema.json` define `/capabilities`, pairing links,

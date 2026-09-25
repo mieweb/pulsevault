@@ -14,6 +14,7 @@ import type {
 } from '../lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import { type PulseVaultAuthorize } from '../lib/authorize.js';
+import type { PulseVaultIssueViewLink } from '../lib/view-links.js';
 import type { PulseVaultAllowedExtensions } from '../lib/options.js';
 import type { PulseVaultStorage, UploadKind } from '../storage/types.js';
 
@@ -54,6 +55,7 @@ export type PulseVaultRoutesOptions = {
   validatePayload?: PulseVaultValidatePayload;
   onUploadComplete?: PulseVaultOnUploadComplete;
   onArtifactEvent?: PulseVaultOnArtifactEvent;
+  issueViewLink?: PulseVaultIssueViewLink;
 } & FastifyPluginOptions;
 
 // Adds the OpenAPI-flavored fields without pulling `@fastify/swagger` into this
@@ -87,7 +89,7 @@ const tusRouteSchema: OpenApiRouteSchema = {
     '  - `checksum` — optional `<algorithm>:<hex digest>` of the finished file, verified post-upload if a checksum validator is configured.\n' +
     '- `PATCH` appends a chunk at the offset given by `Upload-Offset`, with `Content-Type: application/offset+octet-stream`.\n' +
     '- `HEAD` returns the current offset for a resumable upload.\n' +
-    '- `DELETE` cancels an in-flight upload.\n\n' +
+    '- `DELETE` removes the upload and its artifact, whether in flight (a cancel) or finished. Authorized as `delete`.\n\n' +
     'See https://tus.io/protocols/resumable-upload for the full protocol.',
   response: {
     400: { description: 'Invalid request.', ...pulseVaultErrorResponse },
@@ -170,6 +172,39 @@ const artifactGetSchema: OpenApiRouteSchema = {
   },
 };
 
+const viewLinkSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: 'Mint a read-only view link for a finished artifact',
+  description:
+    'Returns a token that opens the artifact (and the artifacts `relatedTo` it) as `GET /artifacts/:artifactId?token=`, and nothing more — no uploads, deletes or further links. Runs the `authorize` hook with `phase: "share"`; the host\'s `issueViewLink` decides how long the link works. 404 unless the server enables view links (`/capabilities` `viewLinks`) and the artifact is finished; 403 when the host refuses a link for it.',
+  params: {
+    type: 'object',
+    properties: {
+      artifactId: {
+        type: 'string',
+        format: 'uuid',
+        description: 'UUID of the finished artifact to link to.',
+      },
+    },
+    required: ['artifactId'],
+  },
+  response: {
+    200: protocolSchema('view-link'),
+    400: {
+      description: '`artifactId` is not a valid UUID.',
+      ...pulseVaultErrorResponse,
+    },
+    403: {
+      description: 'Authorize hook rejected the request, or the host refused a link for this artifact.',
+      ...pulseVaultErrorResponse,
+    },
+    404: {
+      description: 'View links are not enabled, or the artifact is not found or not finished.',
+      ...pulseVaultErrorResponse,
+    },
+  },
+};
+
 const capabilitiesSchema: OpenApiRouteSchema = {
   tags: ['pulsevault'],
   summary: "Discover this deployment's protocol version and configuration",
@@ -196,6 +231,7 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     validatePayload,
     onUploadComplete,
     onArtifactEvent,
+    issueViewLink,
   } = opts;
 
   // All hook orchestration, tus glue, and artifact GET/DELETE logic lives in
@@ -213,6 +249,7 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     validatePayload,
     onUploadComplete,
     onArtifactEvent,
+    issueViewLink,
     logger: fastify.log,
   });
 
@@ -253,6 +290,16 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
       const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
       reply.hijack();
       await core.handleArtifactDelete(request.raw, reply.raw, artifactId);
+    },
+  );
+
+  fastify.post(
+    '/artifacts/:artifactId/view-link',
+    { schema: viewLinkSchema },
+    async (request, reply) => {
+      const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
+      reply.hijack();
+      await core.handleViewLink(request.raw, reply.raw, artifactId);
     },
   );
 

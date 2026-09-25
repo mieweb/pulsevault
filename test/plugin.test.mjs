@@ -16,6 +16,7 @@ import pulseVault, {
   createChecksumValidator,
   issueCapabilityToken,
   createCapabilityAuthorize,
+  createViewLinkIssuer,
 } from "../dist/app.js";
 import {
   makeMp4,
@@ -45,6 +46,7 @@ const tusCreate = (baseUrl, opts) => tusCreateRaw(baseUrl, PREFIX, opts);
 const uploadFullMp4 = (ctx, artifactId, size = 1024) =>
   uploadFull(ctx.baseUrl, PREFIX, { artifactId, size });
 const artifactUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}`;
+const viewLinkUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}/view-link`;
 const sidecarExists = (ctx, id) =>
   fs.stat(path.join(ctx.workspaceDir, ".pulsevault", `${id}.json`)).then(
     () => true,
@@ -919,6 +921,122 @@ test("createCapabilityAuthorize: key rotation overlap — old and new kid both v
       headers: { Authorization: `Bearer ${newToken}` },
     });
     assert.equal(r2.status, 201, "new key verifies");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+// ---------- view links (protocol 2.2) ----------
+
+const VIEW_SECRET = "view-link-test-secret";
+const VIEW_ISSUER = "https://vault.example.test";
+const viewLookup = (kid) => (kid === "k1" ? VIEW_SECRET : null);
+const VTT = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+
+test("view links are off unless the host configures them", async () => {
+  const ctx = await startApp();
+  try {
+    const caps = await (await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`)).json();
+    assert.equal(caps.viewLinks, false);
+    await uploadFullMp4(ctx, ID1);
+    const res = await fetch(viewLinkUrl(ctx, ID1), { method: "POST" });
+    assert.equal(res.status, 404);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a view link opens the pulse — video and captions — and nothing else", async () => {
+  const perLink = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      authorize: createCapabilityAuthorize(viewLookup, { issuer: VIEW_ISSUER }),
+      issueViewLink: createViewLinkIssuer({
+        keyId: "k1",
+        secret: VIEW_SECRET,
+        issuer: VIEW_ISSUER,
+        // The host decides per link.
+        expirySeconds: (_request, { artifactId, kind }) => {
+          perLink.push({ artifactId, kind });
+          return 7 * 86_400;
+        },
+      }),
+    },
+  });
+  try {
+    const caps = await (await fetch(`${ctx.baseUrl}${PREFIX}/capabilities`)).json();
+    assert.equal(caps.viewLinks, true);
+
+    const upload = issueCapabilityToken(ID1, VIEW_SECRET, { keyId: "k1", issuer: VIEW_ISSUER });
+    const asUploader = { Authorization: `Bearer ${upload}` };
+    const { location } = await uploadFull(ctx.baseUrl, PREFIX, { artifactId: ID1, headers: asUploader });
+    await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: VTT,
+      headers: asUploader,
+    });
+
+    const minted = await fetch(viewLinkUrl(ctx, ID1), { method: "POST", headers: asUploader });
+    assert.equal(minted.status, 200);
+    const link = await minted.json();
+    assert.deepEqual(Object.keys(link).sort(), ["expiresAt", "token"]);
+    assert.ok(Math.abs(link.expiresAt - (Math.floor(Date.now() / 1000) + 7 * 86_400)) <= 1);
+    assert.deepEqual(perLink, [{ artifactId: ID1, kind: "video" }]);
+
+    // Opens the video and its captions, as a watch link.
+    const watch = (id) => fetch(`${artifactUrl(ctx, id)}?token=${encodeURIComponent(link.token)}`);
+    assert.equal((await watch(ID1)).status, 200);
+    assert.equal((await watch(ID2)).status, 200);
+
+    // …and nothing else: no uploading, deleting, or minting a longer link for itself.
+    const asViewer = { Authorization: `Bearer ${link.token}` };
+    const head = await fetch(location, { method: "HEAD", headers: { "Tus-Resumable": "1.0.0", ...asViewer } });
+    assert.equal(head.status, 403);
+    assert.equal((await tusDelete(location, asViewer)).status, 403);
+    assert.equal(
+      (await fetch(artifactUrl(ctx, ID1), { method: "DELETE", headers: asViewer })).status,
+      403,
+    );
+    assert.equal((await fetch(viewLinkUrl(ctx, ID1), { method: "POST", headers: asViewer })).status, 403);
+    const sneak = await tusCreate(ctx.baseUrl, {
+      artifactId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      filename: "x.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      size: VTT.length,
+      headers: asViewer,
+    });
+    assert.equal(sneak.status, 403);
+    assert.equal((await watch(ID1)).status, 200, "still there");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a view link is only for a finished artifact, and the host can refuse one", async () => {
+  const ctx = await startApp({
+    pluginOptions: {
+      // Refuses links to anything but videos.
+      issueViewLink: (_request, { kind }) =>
+        kind === "video" ? { token: "view", expiresAt: 2_000_000_000 } : null,
+    },
+  });
+  try {
+    const create = await tusCreate(ctx.baseUrl, { artifactId: ID1, filename: "clip.mp4", size: 1024 });
+    assert.equal(create.status, 201);
+    assert.equal((await fetch(viewLinkUrl(ctx, ID1), { method: "POST" })).status, 404, "unfinished");
+
+    await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: VTT,
+    });
+    assert.equal((await fetch(viewLinkUrl(ctx, ID2), { method: "POST" })).status, 403, "refused");
   } finally {
     await ctx.teardown();
   }

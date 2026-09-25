@@ -9,6 +9,7 @@ import {
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
+import type { PulseVaultIssueViewLink } from './lib/view-links.js';
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
@@ -74,6 +75,8 @@ export type PulseVaultCoreOptions = {
   onUploadComplete?: PulseVaultOnUploadComplete;
   /** Optional low-frequency event hook. See the Fastify plugin's `onArtifactEvent` option for semantics. */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
+  /** Optional read-only view links. See the Fastify plugin's `issueViewLink` option for semantics. */
+  issueViewLink?: PulseVaultIssueViewLink;
   /** Logger for internal diagnostics (authorize rejections, tus handler failures). Defaults to `console`. */
   logger?: PulseVaultLogger;
   /** @deprecated Use `validatePayload` instead — see the Fastify plugin's option of the same name. */
@@ -106,6 +109,8 @@ export type PulseVaultCore = {
     artifactId: string,
     token: string | undefined,
   ) => Promise<void>;
+  /** Handles `POST /artifacts/:artifactId/view-link` (404 unless `issueViewLink` is configured). */
+  handleViewLink: (req: IncomingMessage, res: ServerResponse, artifactId: string) => Promise<void>;
   /** Handles `DELETE /artifacts/:artifactId`. */
   handleArtifactDelete: (
     req: IncomingMessage,
@@ -304,7 +309,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   validateAllowedExtensions(options.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(options);
 
-  const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
+  const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent, issueViewLink } =
+    options;
   const stripBasePath = options.stripBasePath ?? true;
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   const validatePayload = composeValidatePayload(
@@ -449,7 +455,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     try {
-      writeJson(res, 200, buildCapabilities({ allowedExtensions, maxUploadSize }));
+      writeJson(
+        res,
+        200,
+        buildCapabilities({ allowedExtensions, maxUploadSize, viewLinks: !!issueViewLink }),
+      );
     } catch (err) {
       failClosed(res, err, 'capabilities');
     }
@@ -465,7 +475,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     req: IncomingMessage,
     res: ServerResponse,
     artifactId: string,
-    phase: 'resolve' | 'delete',
+    phase: 'resolve' | 'delete' | 'share',
     token?: string,
   ): Promise<{ kind: UploadKind; relatedTo: string | undefined } | undefined> => {
     if (!isUuid(artifactId)) {
@@ -517,6 +527,43 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       res.end();
     } catch (err) {
       failClosed(res, err, 'artifact delete');
+    }
+  };
+
+  /**
+   * `POST /artifacts/:artifactId/view-link` (PROTOCOL.md §6.4): a read-only link to a finished
+   * artifact, minted by the host's `issueViewLink` once `authorize` allowed the request as
+   * `"share"`. 404 when the host didn't configure view links, or the artifact isn't finished;
+   * 403 when the host refuses a link for it.
+   */
+  const handleViewLink = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
+    try {
+      if (!issueViewLink) {
+        writeJson(res, 404, pulseVaultError('View links are not enabled on this server'));
+        return;
+      }
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'share');
+      if (!prepared) return;
+
+      // Only a finished artifact gets a link: one still uploading might never finish.
+      if (!(await storage.resolve(artifactId))) {
+        writeJson(res, 404, pulseVaultError('Artifact not found'));
+        return;
+      }
+      const link = await issueViewLink(req, { artifactId, ...prepared });
+      if (!link) {
+        writeJson(res, 403, pulseVaultError('No view link for this artifact'));
+        return;
+      }
+      writeJson(res, 200, { token: link.token, expiresAt: link.expiresAt });
+    } catch (err) {
+      failClosed(res, err, 'view link');
     }
   };
 
@@ -626,6 +673,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await handleCapabilities(req, res);
       return;
     }
+    const viewLinkMatch = pathname.match(/^\/artifacts\/([^/]+)\/view-link$/);
+    if (viewLinkMatch?.[1] && req.method === 'POST') {
+      await handleViewLink(req, res, viewLinkMatch[1]);
+      return;
+    }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
@@ -649,6 +701,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     handleTus,
     handleCapabilities,
     handleArtifactGet,
+    handleViewLink,
     handleArtifactDelete,
   };
 }
@@ -685,14 +738,24 @@ export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
+  issueViewToken,
+  verifyViewToken,
   createCapabilityAuthorize,
 } from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
+  IssueViewTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
 } from './lib/capability-token.js';
+export { createViewLinkIssuer } from './lib/view-links.js';
+export type {
+  PulseVaultIssueViewLink,
+  PulseVaultViewLink,
+  PulseVaultViewLinkContext,
+  ViewLinkIssuerOptions,
+} from './lib/view-links.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,
