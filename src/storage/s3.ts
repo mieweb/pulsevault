@@ -456,12 +456,14 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     await Promise.allSettled([
       (datastore as { remove?: (id: string) => Promise<void> }).remove?.(key),
     ]);
-    // Delete the finalized object, the @tus/s3-store `.info` sidecar, and our
-    // metadata sidecar. DeleteObject is idempotent, so this is safe whether or
-    // not the multipart abort above already removed some of them.
+    // Delete the finalized object, the @tus/s3-store `.info` sidecar, the incomplete part it
+    // parks between PATCHes (`.part`, left behind by its own removal), and our metadata
+    // sidecar. DeleteObject is idempotent, so this is safe whether or not the multipart abort
+    // above already removed some of them.
     await Promise.all([
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
+      client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.part` })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
     ]);
     return true;

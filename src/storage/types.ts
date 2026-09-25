@@ -138,10 +138,11 @@ export interface PulseVaultStorage {
   markReady?(artifactId: string): Promise<void>;
 
   /**
-   * Delete all storage associated with an artifactId. Returns `true` if
-   * something was removed, `false` if the artifactId was already absent.
-   * Called both from the `DELETE /artifacts/:artifactId` route and from the
-   * plugin's cleanup path when `validatePayload` rejects a completed upload.
+   * Delete all storage associated with an artifactId, in flight or finished.
+   * Returns `true` if something was removed, `false` if the artifactId was
+   * already absent. Called from the `DELETE /artifacts/:artifactId` route, for a
+   * TUS `DELETE` of the artifact's upload (under tus's per-upload lock), and from
+   * the plugin's cleanup path when `validatePayload` rejects a completed upload.
    */
   remove?(artifactId: string): Promise<boolean>;
 

@@ -113,7 +113,7 @@ core protocol (creation + core resumable upload). A server MUST mount:
 | `POST` | `{prefix}/upload` | Create a resumable upload |
 | `PATCH` | `{prefix}/upload/<id>` | Append a chunk at `Upload-Offset` |
 | `HEAD` | `{prefix}/upload/<id>` | Query the current offset |
-| `DELETE` | `{prefix}/upload/<id>` | Cancel an in-flight upload |
+| `DELETE` | `{prefix}/upload/<id>` | Delete the upload and its artifact, in flight or finished |
 
 `PATCH` bodies MUST be the raw bytes for that offset
 (`Content-Type: application/offset+octet-stream`) — never base64-encoded or

@@ -35,6 +35,12 @@ can't pair with this release.
 
 ### Changed
 
+- **A TUS `DELETE` is authorized as `"delete"`, not `"patch"`.** It now
+  removes the artifact (below), the same as `DELETE /artifacts/:id`, so an
+  `authorize` hook sees one phase for every removal — and a rejected one is
+  reported on `onArtifactEvent` like any other rejected delete. If your hook
+  allows `"patch"` but refuses `"delete"`, clients can no longer cancel an
+  upload through TUS; allow `"delete"` for the artifact's own token.
 - **Breaking: protocol 2.** `/capabilities` reports `protocolVersion: 2` and
   accepts protocol majors 2–2, read from the new `package.json`
   `pulseProtocol` field (`{ "version": "2.1", "min": 2, "max": 2 }`).
@@ -56,6 +62,18 @@ can't pair with this release.
   - `GET /capabilities` no longer returns an `uploadUnit` field.
   - Ship this together with the Pulse app update for mieweb/pulse#213 —
     older Pulse builds require `uploadUnit` in `/capabilities`.
+
+### Fixed
+
+- **A TUS `DELETE` removes the whole artifact.** It used to reach only the
+  tus datastore, so PulseVault's sidecar stayed behind: the artifactId
+  answered every later create with `409`, a finished upload deleted on the
+  local adapter kept a `ready` sidecar pointing at nothing, and on S3 a
+  finished upload wasn't deleted at all (aborting its completed multipart
+  upload fails with `NoSuchUpload` before anything is removed). Termination
+  now runs `storage.remove` under tus's per-upload lock — bytes, tus record
+  and sidecar, in flight or finished. The S3 adapter's `remove` also deletes
+  the incomplete `.part` object @tus/s3-store parks between PATCHes.
 
 ## [0.3.0] - 2026-09-16
 

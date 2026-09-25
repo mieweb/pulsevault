@@ -12,7 +12,7 @@ import pulseVault, {
   createS3Mp4Sniffer,
   createS3ChecksumValidator,
 } from "../dist/app.js";
-import { makeMp4, tusCreate, tusPatch, tusHead, uploadFull } from "./helpers.mjs";
+import { makeMp4, tusCreate, tusPatch, tusHead, tusDelete, uploadFull } from "./helpers.mjs";
 import { startMockS3 } from "./mock-s3.mjs";
 
 const PREFIX = "/pulsevault";
@@ -295,6 +295,54 @@ test("DELETE removes the object; second DELETE is 404", async () => {
 
     const del2 = await fetch(artifactUrl(ctx, id), { method: "DELETE" });
     assert.equal(del2.status, 404);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+const keysFor = (id) => mockS3.keys(BUCKET).filter((k) => k.includes(id));
+
+test("TUS DELETE of a finished upload deletes the object, its .info and the sidecar", async () => {
+  const ctx = await startApp();
+  const id = randomUUID();
+  try {
+    const { location } = await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, size: 2048 });
+    assert.ok(keysFor(id).length > 0);
+
+    // S3 answers NoSuchUpload to aborting a completed multipart upload, which used to stop
+    // @tus/s3-store's own removal before it deleted anything.
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.deepEqual(keysFor(id), [], "nothing left in the bucket");
+    assert.equal((await fetch(artifactUrl(ctx, id), { redirect: "manual" })).status, 404);
+    const again = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: id,
+      filename: "clip.mp4",
+      size: 1024,
+    });
+    assert.equal(again.status, 201, "the id isn't wedged");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("TUS DELETE of an in-flight upload leaves nothing behind, including its incomplete part", async () => {
+  const ctx = await startApp();
+  const id = randomUUID();
+  try {
+    const body = makeMp4(4096);
+    const create = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: id,
+      filename: "clip.mp4",
+      size: body.length,
+    });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    // Smaller than a multipart part, so @tus/s3-store parks it as `<key>.part`.
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 1000))).status, 204);
+    assert.ok(keysFor(id).some((k) => k.endsWith(".part")), "incomplete part stored");
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.deepEqual(keysFor(id), [], "nothing left in the bucket");
+    assert.equal((await tusHead(location)).status, 404);
   } finally {
     await ctx.teardown();
   }

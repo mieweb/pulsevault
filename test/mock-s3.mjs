@@ -263,8 +263,12 @@ export async function startMockS3({ buckets = [] } = {}) {
       }
 
       if (req.method === 'DELETE' && q.has('uploadId')) {
-        // AbortMultipartUpload — idempotent, like S3.
-        uploads.delete(q.get('uploadId'));
+        // AbortMultipartUpload. Like S3, an upload that's already completed (or aborted) is
+        // gone: NoSuchUpload.
+        if (!uploads.delete(q.get('uploadId'))) {
+          sendError(res, 404, 'NoSuchUpload', 'The specified upload does not exist.');
+          return;
+        }
         res.writeHead(204);
         res.end();
         return;
@@ -382,6 +386,9 @@ export async function startMockS3({ buckets = [] } = {}) {
   return {
     endpoint: `http://127.0.0.1:${port}`,
     port,
+    /** Every object key in `bucket`, for asserting what a request left behind. */
+    keys: (bucket) =>
+      [...objects.keys()].filter((k) => k.startsWith(`${bucket} `)).map((k) => k.slice(bucket.length + 1)),
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

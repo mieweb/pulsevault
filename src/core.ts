@@ -337,7 +337,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const runAuthorize = async (
     req: IncomingMessage,
     res: ServerResponse,
-    phase: 'create' | 'patch',
+    phase: 'create' | 'patch' | 'delete',
   ): Promise<
     | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
     | { ok: false }
@@ -366,7 +366,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       return { ok: true, artifactId, kind, relatedTo };
     }
 
-    if (!artifactId && phase === 'patch') {
+    if (!artifactId && phase !== 'create') {
       // PROTOCOL.md §5.2: failing to resolve the artifactId for an in-flight
       // upload request is an authorization failure — reject, don't fall
       // through to "no artifactId to check, so allow".
@@ -386,7 +386,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       const statusCode = statusCodeOf(err, 403);
       const message = extractAuthzMessage(err);
       logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      if (phase === 'create') {
+      // Like the artifact routes: every rejected create or delete is reported, never a per-chunk
+      // `patch`.
+      if (phase !== 'patch') {
         await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
       }
       writeJson(res, statusCode, pulseVaultError(message));
@@ -425,7 +427,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     // the client resumes from the last persisted byte on its next PATCH.
     req.on('error', () => {});
     res.on('error', () => {});
-    const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
+    // A TUS DELETE removes the whole artifact, in flight or finished (see `withArtifactRemoval`),
+    // exactly as `DELETE /artifacts/:id` does — so it's authorized as the same `delete`.
+    const phase: 'create' | 'patch' | 'delete' =
+      req.method === 'POST' ? 'create' : req.method === 'DELETE' ? 'delete' : 'patch';
     try {
       // Inside the try: runAuthorize does storage I/O (kind/relatedTo resolution)
       // and header writes of its own — an adapter fault or a consumer error with

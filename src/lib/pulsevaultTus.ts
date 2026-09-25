@@ -1,4 +1,4 @@
-import { Server } from '@tus/server';
+import { type DataStore, Server } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
@@ -96,6 +96,34 @@ export function tusError(status: number, body: string): Error {
 }
 
 /** Parse the artifactId UUID from a tus upload id of the form `<kind>/<artifactId><ext>`. */
+/**
+ * The datastore tus drives, with termination routed through PulseVault's own removal. A TUS
+ * DELETE (the client cancelling, or discarding what a failed run created) takes tus's per-upload
+ * lock and calls the datastore's `remove` — which on its own drops only tus's bytes and offset
+ * record: PulseVault's sidecar stays, so the artifactId 409s on every later create, and on S3 a
+ * finished upload isn't removed at all (aborting its completed multipart upload fails first).
+ * `storage.remove` deletes the whole artifact, in flight or finished. An upload with no sidecar
+ * falls back to the datastore's own removal, which 404s when there's nothing to remove.
+ */
+function withArtifactRemoval(storage: PulseVaultStorage): DataStore {
+  const { datastore } = storage;
+  if (!storage.remove) return datastore;
+  const removeArtifact = storage.remove.bind(storage);
+  return new Proxy(datastore, {
+    get(target, prop) {
+      if (prop === 'remove') {
+        return async (id: string): Promise<void> => {
+          const artifactId = artifactIdFromUploadId(id);
+          if (artifactId && (await removeArtifact(artifactId))) return;
+          await target.remove(id);
+        };
+      }
+      const value: unknown = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 export function artifactIdFromUploadId(id: string): string | undefined {
   const [, nameWithExt] = id.split('/');
   if (!nameWithExt) return undefined;
@@ -175,7 +203,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
 
   const server = new Server({
     path: tusPath,
-    datastore: storage.datastore,
+    datastore: withArtifactRemoval(storage),
     maxSize,
     namingFunction: async (_req, metadata) => {
       const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =

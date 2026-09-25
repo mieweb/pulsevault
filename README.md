@@ -228,11 +228,11 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 | --- | --- | --- |
 | `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, artifact kinds, allowed extensions, limits |
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
-| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
+| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, delete the upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
 | `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
 
-\* `DELETE /pulsevault/upload/:id` is TUS's own "cancel in-flight upload" — distinct from `DELETE /pulsevault/artifacts/:artifactId`, which removes a finalized artifact.
+\* `DELETE /pulsevault/upload/:id` is TUS termination, addressed by the upload URL: it removes the artifact whether the upload is still in flight (a cancel) or finished, exactly as `DELETE /pulsevault/artifacts/:artifactId` does by artifactId.
 
 > `POST /reserve` is **not** part of the plugin. Your server implements it so you control auth, ownership, and any business logic tied to artifact creation.
 
@@ -321,7 +321,7 @@ Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` i
 
 Optional async hook called before TUS create/patch, before GET resolve, and before DELETE. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
 
-Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers **every other request on the upload routes** — `PATCH` chunks, `HEAD` offset queries, **and the in-flight cancel `DELETE {prefix}/upload/<id>`**; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` fires **only** for the finalized-artifact route `DELETE {prefix}/artifacts/<id>`. If you gate deletion on `phase === "delete"` alone, you are not gating upload cancellation — that arrives as `"patch"`.
+Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal.
 
 ```ts
 type PulseVaultAuthorize = (

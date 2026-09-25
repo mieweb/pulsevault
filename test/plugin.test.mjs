@@ -22,6 +22,7 @@ import {
   tusCreate as tusCreateRaw,
   tusPatch,
   tusHead,
+  tusDelete,
   uploadFull,
 } from "./helpers.mjs";
 import pkg from "../package.json" with { type: "json" };
@@ -44,6 +45,11 @@ const tusCreate = (baseUrl, opts) => tusCreateRaw(baseUrl, PREFIX, opts);
 const uploadFullMp4 = (ctx, artifactId, size = 1024) =>
   uploadFull(ctx.baseUrl, PREFIX, { artifactId, size });
 const artifactUrl = (ctx, id) => `${ctx.baseUrl}${PREFIX}/artifacts/${id}`;
+const sidecarExists = (ctx, id) =>
+  fs.stat(path.join(ctx.workspaceDir, ".pulsevault", `${id}.json`)).then(
+    () => true,
+    () => false,
+  );
 
 async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
@@ -439,6 +445,93 @@ test("DELETE removes the artifact; second DELETE is 404", async () => {
 
     const del2 = await fetch(artifactUrl(ctx, ID1), { method: "DELETE" });
     assert.equal(del2.status, 404);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("TUS DELETE of an in-flight upload removes the whole artifact, so its id isn't wedged", async () => {
+  const ctx = await startApp();
+  try {
+    const body = makeMp4(4096);
+    const create = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: body.length,
+    });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 1024))).status, 204);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal(await sidecarExists(ctx, ID1), false, "no sidecar left behind");
+    assert.equal((await tusHead(location)).status, 404);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 404);
+    // Nothing still holds the id: creating it again succeeds instead of a 409.
+    const again = await tusCreate(ctx.baseUrl, {
+      artifactId: ID1,
+      filename: "clip.mp4",
+      size: body.length,
+    });
+    assert.equal(again.status, 201);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("TUS DELETE of a finished upload removes it: bytes, tus record and sidecar", async () => {
+  const ctx = await startApp();
+  try {
+    const { location } = await uploadFullMp4(ctx, ID1);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 200);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal(await sidecarExists(ctx, ID1), false, "no sidecar left behind");
+    const leftovers = await fs.readdir(path.join(ctx.workspaceDir, "video"));
+    assert.deepEqual(leftovers.filter((f) => f.startsWith(ID1)), []);
+    assert.equal((await fetch(artifactUrl(ctx, ID1))).status, 404);
+    assert.equal((await tusDelete(location)).status, 404, "a second DELETE finds nothing");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a TUS DELETE is authorized as a delete of that artifact", async () => {
+  const seen = [];
+  const events = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      onArtifactEvent: (event) => {
+        if (event.phase === "authorize") events.push(event);
+      },
+      authorize: async (_req, { phase, artifactId, kind, relatedTo }) => {
+        seen.push({ phase, artifactId, kind, relatedTo });
+        if (phase === "delete" && artifactId === ID2) {
+          throw Object.assign(new Error("no delete"), { statusCode: 403 });
+        }
+      },
+    },
+  });
+  try {
+    await uploadFullMp4(ctx, ID1);
+    const vtt = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n");
+    const { location } = await uploadFull(ctx.baseUrl, PREFIX, {
+      artifactId: ID2,
+      filename: "clip.vtt",
+      kind: "captions",
+      relatedTo: ID1,
+      body: vtt,
+    });
+
+    seen.length = 0;
+    assert.equal((await tusDelete(location)).status, 403);
+    assert.deepEqual(seen, [
+      { phase: "delete", artifactId: ID2, kind: "captions", relatedTo: ID1 },
+    ]);
+    // Refused, so nothing was removed — and reported like any other rejected delete.
+    assert.equal((await fetch(artifactUrl(ctx, ID2))).status, 200);
+    assert.deepEqual(events, [
+      { phase: "authorize", artifactId: ID2, kind: "captions", reason: "no delete" },
+    ]);
   } finally {
     await ctx.teardown();
   }
