@@ -276,6 +276,34 @@ async function main() {
     assert.equal(viewerMint.status, 403, "a view link must not mint another");
     console.log("  ✓ view link opens the video, and can't delete it or mint another");
 
+    // 7. The dashboard gallery hands the browser read-only view tokens, not upload capabilities.
+    const gallery = await fetch(`${BASE}/videos`, { headers: { cookie } }).then((r) => r.json());
+    const listed = gallery.find((item) => item.artifactId === artifactId);
+    assert.ok(listed, "/videos should list the uploaded video");
+    const galleryPlay = await fetch(`${BASE}${listed.playbackUrl}`);
+    assert.equal(galleryPlay.status, 200, "the gallery's playbackUrl should play");
+    await galleryPlay.arrayBuffer();
+    const galleryToken = new URL(listed.playbackUrl, BASE).searchParams.get("token");
+    const galleryDelete = await fetch(`${PREFIX}/artifacts/${artifactId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${galleryToken}` },
+    });
+    assert.equal(galleryDelete.status, 403, "the gallery's token must not delete");
+    console.log("  ✓ /videos playback URLs carry read-only view tokens");
+
+    // 8. A TUS DELETE removes the finished upload, and the demo's index drops it (the
+    // `remove` event), so /videos stops listing a video that's gone.
+    const terminate = await fetch(location, {
+      method: "DELETE",
+      headers: { "Tus-Resumable": "1.0.0", Authorization: `Bearer ${token}` },
+    });
+    assert.equal(terminate.status, 204, `TUS DELETE should be 204, got ${terminate.status}`);
+    const gone = await fetch(`${PREFIX}/artifacts/${artifactId}?token=${token}`);
+    assert.equal(gone.status, 404, "the deleted video should 404");
+    const after = await fetch(`${BASE}/videos`, { headers: { cookie } }).then((r) => r.json());
+    assert.ok(!after.some((item) => item.artifactId === artifactId), "/videos should drop it");
+    console.log("  ✓ TUS DELETE removes the finished video, and /videos drops it");
+
     console.log("\nAll e2e checks passed.");
   } finally {
     main.done = true;

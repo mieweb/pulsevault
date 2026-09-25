@@ -497,6 +497,62 @@ test("TUS DELETE of a finished upload removes it: bytes, tus record and sidecar"
   }
 });
 
+test("a TUS DELETE also removes tus's own bytes when the adapter's remove only knows its records", async () => {
+  // Like the README's custom adapter: `remove` drops the adapter's own row, not the tus upload.
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-test-"));
+  const local = createLocalStorage({ workspaceDir });
+  const removedRecords = [];
+  const storage = {
+    ...local,
+    remove: async (artifactId) => {
+      removedRecords.push(artifactId);
+      return true;
+    },
+  };
+  const app = Fastify({ logger: false });
+  await app.register(pulseVault, { prefix: PREFIX, storage, maxUploadSize: 10 * 1024 * 1024 });
+  const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+  try {
+    const body = makeMp4(4096);
+    const create = await tusCreate(baseUrl, { artifactId: ID1, filename: "clip.mp4", size: body.length });
+    const location = new URL(create.headers.get("location"), baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 1024))).status, 204);
+
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.deepEqual(removedRecords, [ID1]);
+    const leftovers = await fs.readdir(path.join(workspaceDir, "video"));
+    assert.deepEqual(leftovers.filter((f) => f.startsWith(ID1)), [], "tus's bytes and record are gone");
+  } finally {
+    await app.close();
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("both ways of deleting an artifact report it on onArtifactEvent", async () => {
+  const events = [];
+  const ctx = await startApp({
+    pluginOptions: {
+      onArtifactEvent: (event) => {
+        if (event.phase === "remove") events.push(event);
+      },
+    },
+  });
+  try {
+    const { location } = await uploadFullMp4(ctx, ID1);
+    await uploadFullMp4(ctx, ID2);
+    assert.equal((await tusDelete(location)).status, 204);
+    assert.equal((await fetch(artifactUrl(ctx, ID2), { method: "DELETE" })).status, 204);
+    // A delete that finds nothing reports nothing.
+    assert.equal((await fetch(artifactUrl(ctx, ID2), { method: "DELETE" })).status, 404);
+    assert.deepEqual(events, [
+      { phase: "remove", artifactId: ID1, kind: "video", reason: "deleted" },
+      { phase: "remove", artifactId: ID2, kind: "video", reason: "deleted" },
+    ]);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("a TUS DELETE is authorized as a delete of that artifact", async () => {
   const seen = [];
   const events = [];

@@ -32,7 +32,8 @@ import pulseVault, {
   createChecksumValidator,
   buildUploadLink,
   issueCapabilityToken,
-  verifyCapabilityToken,
+  issueViewToken,
+  verifyViewToken,
   createCapabilityAuthorize,
   createViewLinkIssuer,
 } from "@mieweb/pulsevault";
@@ -524,7 +525,7 @@ app.get(
           items: {
             type: "object",
             properties: {
-              phase: { type: "string", enum: ["authorize", "complete", "reject"] },
+              phase: { type: "string", enum: ["authorize", "complete", "reject", "remove"] },
               artifactId: { type: "string", format: "uuid" },
               kind: { type: "string", enum: ["video", "project", "captions", "thumbnail"] },
               size: { type: "number" },
@@ -578,7 +579,7 @@ app.get(
       },
       querystring: {
         type: "object",
-        properties: { token: { type: "string", description: "Capability token for this artifact or its relatedTo anchor." } },
+        properties: { token: { type: "string", description: "View token for this artifact or its relatedTo anchor." } },
       },
     },
     // On top of the global per-IP limit: this route verifies a token and reads
@@ -588,7 +589,12 @@ app.get(
   async (req, reply) => {
     const { artifactId } = req.params;
     const token = req.query?.token ?? "";
-    const verified = token ? verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }) : null;
+    // Read-only access, like the plugin's resolve phase: a view token (the gallery's, or one the
+    // Pulse app shared) or the upload capability itself.
+    const verified = token
+      ? (verifyViewToken(token, lookupSecret, { issuer: ISSUER }) ??
+        verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }))
+      : null;
     const relatedTo = (await pulseStorage.getRelatedTo?.(artifactId)) ?? null;
     const authorized = verified && (verified.artifactId === artifactId || verified.artifactId === relatedTo);
     if (!authorized) return reply.code(403).send();
@@ -653,13 +659,14 @@ app.get(
     const artifacts = await artifactIndex.all();
 
     // One watch token per pulse (session anchor = `relatedTo ?? artifactId`),
-    // reused for every artifact in that pulse. createCapabilityAuthorize accepts
-    // an anchor-scoped token for any child via relatedTo (PROTOCOL.md §5.4).
+    // reused for every artifact in that pulse. A read-only view token: it opens
+    // the pulse and can't upload to it or delete it, so it's safe in a browser.
+    // createCapabilityAuthorize accepts it for any child via relatedTo (PROTOCOL.md §5.5).
     const tokenByAnchor = new Map();
     const tokenFor = (anchorId) => {
       let token = tokenByAnchor.get(anchorId);
       if (!token) {
-        token = issueCapabilityToken(anchorId, PULSEVAULT_SECRET, {
+        token = issueViewToken(anchorId, PULSEVAULT_SECRET, {
           keyId: PULSEVAULT_KEY_ID,
           issuer: ISSUER,
           expirySeconds: WATCH_TOKEN_TTL_SECONDS,
@@ -824,9 +831,11 @@ await app.register(pulseVault, {
   // One hook covers both ops metrics and a compliance audit trail (see
   // OPERATIONS.md "Monitoring and audit logging") — fed straight into the
   // in-memory feed `/events` exposes to the pairing page.
-  onArtifactEvent: (event) => {
+  onArtifactEvent: async (event) => {
     app.log.info(event, "pulsevault artifact event");
     recordEvent(event);
+    // Deleted (by its uploader) or swept as abandoned (`retention`): drop it from the index.
+    if (event.phase === "remove") await artifactIndex.remove(event.artifactId);
   },
   // `createCapabilityAuthorize` — the library's secure-by-default auth
   // option (see README "Capability tokens" / PROTOCOL.md §5.4): a
@@ -834,17 +843,9 @@ await app.register(pulseVault, {
   // family, via `relatedTo`). No server-side session table, so secrets can
   // rotate and TTLs can change entirely on this server's own schedule.
   //
-  // Wrapped to prune the artifact index when a delete is authorized — the
-  // plugin has no post-delete hook (onArtifactEvent phases are
-  // authorize/complete/reject), and the boot-time reconcile corrects any
-  // drift a failed delete could leave behind.
-  authorize: (() => {
-    const capabilityAuthorize = createCapabilityAuthorize(lookupSecret, { issuer: ISSUER });
-    return async (request, ctx) => {
-      await capabilityAuthorize(request, ctx);
-      if (ctx.phase === "delete") await artifactIndex.remove(ctx.artifactId);
-    };
-  })(),
+  // The artifact index is pruned on `onArtifactEvent`'s `remove` (above), and
+  // the boot-time reconcile corrects any drift.
+  authorize: createCapabilityAuthorize(lookupSecret, { issuer: ISSUER }),
 });
 
 // Bring the index in line with what's actually on disk before serving:

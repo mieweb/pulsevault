@@ -29,10 +29,15 @@ can't pair with this release.
 - **Opt-in cleanup of abandoned uploads.** The `retention` option
   (`{ abandonedAfterSeconds, sweepIntervalSeconds? }`, on the plugin and
   `createPulseVaultCore`) sweeps on a timer, removing uploads left
-  unfinished past the cutoff and the related artifacts of a video that never
-  finished; finished content is never touched. `sweepAbandonedUploads` runs
-  one sweep for your own scheduler. Storage adapters gain an optional
-  `listArtifacts`, implemented by both built-in adapters.
+  unfinished past the cutoff and the related artifacts (never videos) of a
+  video that never finished; finished videos are never touched.
+  `sweepAbandonedUploads` runs one sweep for your own scheduler. Storage
+  adapters gain an optional `listArtifacts`, implemented by both built-in
+  adapters.
+- **`onArtifactEvent` reports removals:** `phase: "remove"`, with `reason:
+  "deleted"` (`DELETE /artifacts/:id` or a TUS `DELETE`) or `"abandoned"` (the
+  `retention` sweep), so a host keeping its own index of artifacts can drop
+  one. A consumer that switches exhaustively on `phase` sees a new value.
 
 - **The protocol is written down as files, and CI keeps it honest.**
   `protocol/schemas/*.schema.json` define `/capabilities`, pairing links,

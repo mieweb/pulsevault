@@ -175,8 +175,8 @@ test("a token claiming `use: view` but signed with the secret itself is neither 
   assert.equal(verifyViewToken(forged, lookupSecret, { issuer: ISSUER }), null);
 });
 
-test("issueViewToken needs a positive lifetime — PulseVault sets none of its own", () => {
-  for (const expirySeconds of [0, -1, Number.NaN, Infinity, undefined]) {
+test("issueViewToken needs a lifetime of at least a second — PulseVault sets none of its own", () => {
+  for (const expirySeconds of [0, 0.5, -1, Number.NaN, Infinity, undefined]) {
     assert.throws(
       () => issueViewToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, expirySeconds }),
       TypeError,
@@ -240,4 +240,16 @@ test("createViewLinkIssuer: the host decides each link's lifetime, or refuses th
   const fixed = createViewLinkIssuer({ keyId: "k1", secret: SECRET, issuer: ISSUER, expirySeconds: 90 });
   const fixedLink = await fixed({ headers: {} }, { artifactId: ARTIFACT_ID, kind: "video" });
   assert.ok(Math.abs(fixedLink.expiresAt - (nowSeconds() + 90)) <= 1);
+});
+
+test("createViewLinkIssuer refuses a fixed lifetime that can't work, when it's set up", () => {
+  for (const expirySeconds of [Number.NaN, 0, 0.5, -60, Infinity, "3600", undefined]) {
+    assert.throws(
+      () => createViewLinkIssuer({ keyId: "k1", secret: SECRET, issuer: ISSUER, expirySeconds }),
+      TypeError,
+    );
+  }
+  assert.doesNotThrow(() =>
+    createViewLinkIssuer({ keyId: "k1", secret: SECRET, issuer: ISSUER, expirySeconds: () => 60 }),
+  );
 });

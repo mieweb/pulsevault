@@ -331,7 +331,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const logger = options.logger ?? consoleLogger;
   validateRetentionOptions(options.retention, storage);
   const retentionSweep = options.retention
-    ? startRetentionSweep(storage, options.retention, logger)
+    ? startRetentionSweep(storage, options.retention, logger, async ({ artifactId, kind }) => {
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'abandoned' });
+      })
     : null;
 
   const tusPath = `${basePath}/upload`;
@@ -534,6 +536,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('Artifact not found'));
         return;
       }
+      await onArtifactEvent?.({
+        phase: 'remove',
+        artifactId,
+        kind: prepared.kind,
+        reason: 'deleted',
+      });
       res.writeHead(204);
       res.end();
     } catch (err) {
@@ -707,7 +715,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   return {
     handler,
     shutdown: async () => {
-      retentionSweep?.stop();
+      await retentionSweep?.stop();
       await storage.shutdown?.();
     },
     handleTus,

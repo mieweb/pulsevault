@@ -190,14 +190,23 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
   // Register the shutdown hook *before* awaiting initialize() so any partial
   // state the adapter allocates mid-init still gets cleaned up if Fastify
   // later tears the plugin down.
-  let retentionSweep: { stop: () => void } | null = null;
+  let retentionSweep: { stop: () => Promise<void> } | null = null;
   fastify.addHook('onClose', async () => {
-    retentionSweep?.stop();
+    // Waits for a sweep in progress, so it never runs against shut-down storage.
+    await retentionSweep?.stop();
     await opts.storage.shutdown?.();
   });
   await opts.storage.initialize?.();
   if (opts.retention) {
-    retentionSweep = startRetentionSweep(opts.storage, opts.retention, fastify.log);
+    const { onArtifactEvent } = opts;
+    retentionSweep = startRetentionSweep(
+      opts.storage,
+      opts.retention,
+      fastify.log,
+      async ({ artifactId, kind }) => {
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'abandoned' });
+      },
+    );
   }
 
   const decoratorName = opts.decoratorName ?? DEFAULT_DECORATOR_NAME;

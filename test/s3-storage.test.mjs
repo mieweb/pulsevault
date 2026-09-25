@@ -314,6 +314,8 @@ test("TUS DELETE of a finished upload deletes the object, its .info and the side
     assert.equal((await tusDelete(location)).status, 204);
     assert.deepEqual(keysFor(id), [], "nothing left in the bucket");
     assert.equal((await fetch(artifactUrl(ctx, id), { redirect: "manual" })).status, 404);
+    // @tus/s3-store's cached metadata is gone too: HEAD doesn't report a deleted upload complete.
+    assert.equal((await tusHead(location)).status, 404);
     const again = await tusCreate(ctx.baseUrl, PREFIX, {
       artifactId: id,
       filename: "clip.mp4",

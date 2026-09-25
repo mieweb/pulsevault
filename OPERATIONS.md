@@ -298,5 +298,7 @@ View links (`issueViewLink` / `createViewLinkIssuer`) are signed with a key
 derived from the same secrets, so they rotate with them — and since they can
 be much longer-lived than an upload token, keep a retired `kid` in the table
 as long as the view links you still want working, or remove it to revoke
-every view link signed under it at once. Deleting an artifact revokes its
-links too (the `GET` then 404s).
+every view link signed under it at once. Deleting a video stops its view
+links opening the video (the `GET` then 404s), but the links keep opening its
+related captions, manifest and thumbnail until those are deleted too — by the
+client, or by `retention` once the video has been gone past its cutoff.

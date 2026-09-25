@@ -94,10 +94,6 @@ export type ReserveUploadParams = {
   appVersion?: string;
 };
 
-/**
- * Storage backend contract. Keep the surface small: one write hook, one read
- * hook, plus optional one-time init. Adapters own their own configuration.
- */
 /** One artifact as `listArtifacts` reports it. */
 export type PulseVaultArtifactRecord = {
   artifactId: string;
@@ -107,12 +103,16 @@ export type PulseVaultArtifactRecord = {
   /** `false` while its upload is in flight; `true` once it's finished and served. */
   ready: boolean;
   /**
-   * When its metadata last changed, in ms since the epoch: when its upload started while
-   * `ready` is false, when it finished once `ready` is true.
+   * In ms since the epoch: when it finished once `ready` is true; while it isn't, when its upload
+   * last received bytes, or at least when it started (an adapter that can't tell).
    */
   updatedAt: number;
 };
 
+/**
+ * Storage backend contract. Keep the surface small: one write hook, one read
+ * hook, plus optional one-time init. Adapters own their own configuration.
+ */
 export interface PulseVaultStorage {
   /** TUS datastore used for resumable uploads. */
   readonly datastore: DataStore;

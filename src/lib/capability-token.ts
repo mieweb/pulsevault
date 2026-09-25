@@ -112,8 +112,9 @@ export function issueViewToken(
   secret: string,
   opts: IssueViewTokenOptions,
 ): string {
-  if (!Number.isFinite(opts.expirySeconds) || opts.expirySeconds <= 0) {
-    throw new TypeError('issueViewToken: `expirySeconds` must be a positive number');
+  // At least a second: `exp` is whole seconds, so anything less is a link already expired.
+  if (!Number.isFinite(opts.expirySeconds) || opts.expirySeconds < 1) {
+    throw new TypeError('issueViewToken: `expirySeconds` must be a number of seconds, at least 1');
   }
   const now = Math.floor(Date.now() / 1000);
   const claims: CapabilityTokenClaims = {

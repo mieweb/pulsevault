@@ -15,6 +15,7 @@ import pulseVault, {
   sweepAbandonedUploads,
 } from "../dist/app.js";
 import { makeMp4, tusCreate, tusPatch, tusHead, uploadFull } from "./helpers.mjs";
+import { startRetentionSweep } from "../dist/lib/retention.js";
 import { startMockS3 } from "./mock-s3.mjs";
 
 const PREFIX = "/pulsevault";
@@ -180,6 +181,8 @@ test("retention refuses settings that can't work, at boot", async () => {
       { abandonedAfterSeconds: -1 },
       { abandonedAfterSeconds: Number.NaN },
       { abandonedAfterSeconds: HOUR, sweepIntervalSeconds: 0 },
+      // Past what a Node timer can wait: it would fire every millisecond instead.
+      { abandonedAfterSeconds: HOUR, sweepIntervalSeconds: 30 * 24 * HOUR },
     ]) {
       await assert.rejects(() => startApp(storage, { retention }), TypeError);
     }
@@ -219,4 +222,154 @@ test("the sweep keeps anything newer than the cutoff, even from an adapter that 
     [records[0].artifactId],
   );
   assert.deepEqual(removed, [records[0].artifactId]);
+});
+
+/** A storage that lists `records` and removes whatever it's asked to, recording the ids. */
+function listedStorage(records, { finished = () => false, failRemove = () => false } = {}) {
+  const removed = [];
+  return {
+    removed,
+    storage: {
+      async *listArtifacts() {
+        yield* records;
+      },
+      resolve: async (artifactId) => (finished(artifactId) ? { kind: "stream" } : null),
+      remove: async (artifactId) => {
+        if (failRemove(artifactId)) throw new Error("EACCES");
+        removed.push(artifactId);
+        return true;
+      },
+    },
+  };
+}
+const quiet = { info() {}, error() {} };
+
+test("a cutoff that isn't a positive number is refused, not taken as \"everything is old\"", async () => {
+  const { storage, removed } = listedStorage([
+    { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: Date.now() },
+  ]);
+  for (const abandonedAfterSeconds of [Number.NaN, undefined, 0, -1, "3600"]) {
+    await assert.rejects(() => sweepAbandonedUploads(storage, { abandonedAfterSeconds }), TypeError);
+  }
+  assert.deepEqual(removed, []);
+});
+
+test("a record without a usable timestamp is kept", async () => {
+  const { storage, removed } = listedStorage([
+    { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: "2026-01-01T00:00:00Z" },
+    { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: Number.NaN },
+    { artifactId: randomUUID(), kind: "video", ready: false },
+  ]);
+  assert.deepEqual(await sweepAbandonedUploads(storage, { abandonedAfterSeconds: HOUR }), []);
+  assert.deepEqual(removed, []);
+});
+
+test("a finished video is never removed, even when what it's relatedTo is gone", async () => {
+  const old = Date.now() - 2 * HOUR * 1000;
+  const reply = { artifactId: randomUUID(), kind: "video", relatedTo: randomUUID(), ready: true, updatedAt: old };
+  const captions = { artifactId: randomUUID(), kind: "captions", relatedTo: randomUUID(), ready: true, updatedAt: old };
+  const { storage, removed } = listedStorage([reply, captions]);
+  assert.deepEqual(
+    await sweepAbandonedUploads(storage, { abandonedAfterSeconds: HOUR }),
+    [captions.artifactId],
+  );
+  assert.deepEqual(removed, [captions.artifactId]);
+});
+
+test("one artifact that can't be removed doesn't stop the sweep; each removal is reported", async () => {
+  const old = Date.now() - 2 * HOUR * 1000;
+  const stuck = { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: old };
+  const next = { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: old };
+  const { storage } = listedStorage([stuck, next], {
+    failRemove: (id) => id === stuck.artifactId,
+  });
+  const errors = [];
+  const reported = [];
+  const removed = await sweepAbandonedUploads(storage, {
+    abandonedAfterSeconds: HOUR,
+    logger: { info() {}, error: (obj) => errors.push(obj.artifactId) },
+    onRemoved: (record) => reported.push(record.artifactId),
+  });
+  assert.deepEqual(removed, [next.artifactId]);
+  assert.deepEqual(errors, [stuck.artifactId]);
+  assert.deepEqual(reported, [next.artifactId]);
+});
+
+test("stopping the timer waits for a sweep in progress, which stops early", async () => {
+  const old = Date.now() - 2 * HOUR * 1000;
+  let listed = 0;
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const removed = [];
+  const storage = {
+    async *listArtifacts() {
+      for (let i = 0; i < 3; i++) {
+        listed++;
+        if (i === 1) await gate;
+        yield { artifactId: randomUUID(), kind: "video", ready: false, updatedAt: old };
+      }
+    },
+    resolve: async () => null,
+    remove: async (id) => {
+      removed.push(id);
+      return true;
+    },
+  };
+  const sweep = startRetentionSweep(storage, { abandonedAfterSeconds: HOUR, sweepIntervalSeconds: 0.01 }, quiet);
+  while (listed < 2) await new Promise((resolve) => setTimeout(resolve, 5));
+  let stopped = false;
+  const stopping = sweep.stop().then(() => (stopped = true));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(stopped, false, "stop waits for the sweep in progress");
+  release();
+  await stopping;
+  // It stopped at the next artifact instead of finishing the listing.
+  assert.equal(removed.length, 1);
+});
+
+test("local: an upload still receiving bytes isn't abandoned, however long ago it started", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-retention-"));
+  const storage = createLocalStorage({ workspaceDir });
+  const { app, baseUrl } = await startApp(storage);
+  try {
+    const id = randomUUID();
+    await abandonUpload(baseUrl, id);
+    const twoHoursAgo = new Date(Date.now() - 2 * HOUR * 1000);
+    // Started two hours ago (the sidecar), but bytes arrived just now.
+    await fs.utimes(path.join(workspaceDir, ".pulsevault", `${id}.json`), twoHoursAgo, twoHoursAgo);
+    assert.deepEqual(await sweepAbandonedUploads(storage, { abandonedAfterSeconds: HOUR }), []);
+
+    // Nothing written for two hours either: now it's abandoned.
+    await fs.utimes(path.join(workspaceDir, "video", `${id}.mp4`), twoHoursAgo, twoHoursAgo);
+    assert.deepEqual(await sweepAbandonedUploads(storage, { abandonedAfterSeconds: HOUR }), [id]);
+  } finally {
+    await app.close();
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("the retention option reports each removal on onArtifactEvent", async () => {
+  const { storage, cleanup } = await localStorage();
+  const events = [];
+  const { app, baseUrl } = await startApp(storage, {
+    retention: { abandonedAfterSeconds: 0.05, sweepIntervalSeconds: 0.05 },
+    onArtifactEvent: (event) => {
+      if (event.phase === "remove") events.push(event);
+    },
+  });
+  try {
+    const abandoned = randomUUID();
+    await abandonUpload(baseUrl, abandoned);
+    const deadline = Date.now() + 3000;
+    while (events.length === 0) {
+      if (Date.now() > deadline) assert.fail("no remove event");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(events, [
+      { phase: "remove", artifactId: abandoned, kind: "video", reason: "abandoned" },
+    ]);
+  } finally {
+    await app.close();
+    await cleanup();
+  }
 });

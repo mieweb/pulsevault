@@ -421,15 +421,17 @@ type PulseVaultOnUploadComplete = (
 
 ### `onArtifactEvent`
 
-Optional low-frequency hook — fired on authorize rejection (`create`/`delete`/`resolve` phases only, never per-chunk `patch`), upload completion, and payload-validation rejection. One hook covers both ops metrics and a compliance audit trail instead of hand-wiring both from the lower-level hooks above:
+Optional low-frequency hook — fired on authorize rejection (every phase but per-chunk `patch`), upload completion, payload-validation rejection, and removal. One hook covers both ops metrics and a compliance audit trail instead of hand-wiring both from the lower-level hooks above, and `remove` is where a host keeping its own index of artifacts drops one:
 
 ```ts
 type PulseVaultArtifactEvent = {
-  phase: "authorize" | "complete" | "reject";
+  phase: "authorize" | "complete" | "reject" | "remove";
   artifactId: string;
-  kind: "video" | "project" | "captions";
+  kind: "video" | "project" | "captions" | "thumbnail";
   size?: number;
-  reason?: string; // present for "authorize" and "reject"
+  // present for "authorize" and "reject"; on "remove", "deleted" (DELETE /artifacts/:id or a
+  // TUS DELETE) or "abandoned" (the `retention` sweep)
+  reason?: string;
   appVersion?: string; // the uploading app's version, on "complete"/"reject" (protocol 2.1)
 };
 
@@ -471,7 +473,14 @@ retention: {
 },
 ```
 
-Every `sweepIntervalSeconds` it removes (through `storage.remove`) an upload still unfinished `abandonedAfterSeconds` after it started, and a finished artifact whose `relatedTo` artifact isn't finished — or is gone — that long after it finished. Finished videos, and anything whose video finished, are never touched; this is not a retention *policy* for finished content (see `OPERATIONS.md` "Retention"). Keep `abandonedAfterSeconds` well above how long an upload may take — at least your capability tokens' lifetime, past which no upload can continue anyway. Needs a storage adapter with `listArtifacts` (both built-in adapters have it); invalid settings throw at registration. Several instances may sweep the same storage — a removal that finds nothing is a no-op. To schedule it yourself (a cron job, a queue), call `sweepAbandonedUploads(storage, { abandonedAfterSeconds })` instead; it resolves the removed artifactIds.
+Every `sweepIntervalSeconds` (at most 24 days) it removes, through `storage.remove`:
+
+- an upload still unfinished `abandonedAfterSeconds` after its last write (the local adapter) or after it started (S3, which can't tell when bytes last arrived);
+- a finished captions, beat manifest, project or thumbnail whose `relatedTo` artifact isn't finished — or is gone — that long after it finished.
+
+Finished videos, and anything whose video finished, are never touched; this is not a retention *policy* for finished content (see `OPERATIONS.md` "Retention"). Keep `abandonedAfterSeconds` well above how long an upload may take — at least your capability tokens' lifetime, past which no upload can continue anyway (on S3 especially, where a long upload is judged by when it started). Each removal fires `onArtifactEvent` with `phase: "remove"`, `reason: "abandoned"`. An artifact that can't be checked or removed is logged and skipped. Needs a storage adapter with `listArtifacts` (both built-in adapters have it); invalid settings throw at registration.
+
+A sweep reads the metadata of every artifact older than the cutoff — one `GetObject` each on S3 — so on a large bucket sweep daily (or off-peak from a cron job) rather than hourly. Several instances may sweep the same storage (a removal that finds nothing is a no-op), but each instance caches metadata: on S3, an id another instance removed can still answer `409` on this one until the entry is evicted — the same as for `DELETE /artifacts/:id`. To schedule it yourself (a cron job, a queue), call `sweepAbandonedUploads(storage, { abandonedAfterSeconds, onRemoved? })` instead; it resolves the removed artifactIds.
 
 ### `validateProjectPayload` / `onProjectUploadComplete` (deprecated)
 

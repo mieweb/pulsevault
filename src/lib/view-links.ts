@@ -61,6 +61,15 @@ export type ViewLinkIssuerOptions = {
  */
 export function createViewLinkIssuer(opts: ViewLinkIssuerOptions): PulseVaultIssueViewLink {
   const { keyId, secret, issuer, expirySeconds } = opts;
+  // A fixed lifetime that can't work fails here, at boot — not as a 500 on every link.
+  if (
+    typeof expirySeconds !== 'function' &&
+    !(typeof expirySeconds === 'number' && Number.isFinite(expirySeconds) && expirySeconds >= 1)
+  ) {
+    throw new TypeError(
+      'createViewLinkIssuer: `expirySeconds` must be a number of seconds (at least 1) or a function',
+    );
+  }
   return async (request, ctx) => {
     const seconds =
       typeof expirySeconds === 'function' ? await expirySeconds(request, ctx) : expirySeconds;

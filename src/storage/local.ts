@@ -409,7 +409,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   /**
    * Walk the sidecars. A sidecar is rewritten only when its upload finishes, so its mtime is
-   * when the upload started (still uploading) or when it finished (ready).
+   * when the upload started (still uploading) or when it finished (ready). An upload in flight
+   * counts from its last write instead — the bytes file's mtime — so a long upload that's still
+   * moving is never taken for an abandoned one.
    */
   async function* listArtifacts(
     opts: { changedBefore?: number } = {},
@@ -434,9 +436,19 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
       const sidecar = await readSidecar(artifactId);
       if (!sidecar) continue;
+      const kind = sidecar.kind ?? 'video';
+      if (sidecar.status === 'uploading') {
+        const bytes = path.join(workspaceRoot, kind, `${artifactId}${sidecar.ext}`);
+        const written = await fs.stat(bytes).then(
+          (stats) => stats.mtimeMs,
+          () => 0,
+        );
+        updatedAt = Math.max(updatedAt, written);
+        if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
+      }
       yield {
         artifactId,
-        kind: sidecar.kind ?? 'video',
+        kind,
         ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
         ready: sidecar.status === 'ready',
         updatedAt,
