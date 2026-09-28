@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/view-link.schema.json",
+  "title": "POST /artifacts/<id>/view-link response",
+  "description": "A read-only view link to a finished artifact (PROTOCOL.md §6.4, protocol 2.2). The token opens the artifact, and the artifacts `relatedTo` it, as `GET {prefix}/artifacts/<id>?token=<token>` — nothing more, so it is safe to share. The server decides how long it works.",
+  "type": "object",
+  "required": [
+    "token",
+    "expiresAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "token": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The view token. Opaque to clients."
+    },
+    "expiresAt": {
+      "type": "integer",
+      "description": "When the link stops working, in seconds since the Unix epoch."
+    }
+  }
+}

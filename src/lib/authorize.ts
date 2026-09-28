@@ -1,7 +1,13 @@
 import type { PulseVaultRequest } from './request.js';
 import type { UploadKind } from '../storage/types.js';
 
-export type PulseVaultAuthorizePhase = 'create' | 'patch' | 'resolve' | 'delete';
+/**
+ * What the request does: `create` / `patch` upload (the TUS `POST`, and its `PATCH`/`HEAD`),
+ * `resolve` opens an artifact (`GET /artifacts/<id>`), `delete` removes one (`DELETE
+ * /artifacts/<id>` or a TUS `DELETE`), and `share` mints a read-only view link for one
+ * (`POST /artifacts/<id>/view-link`, only when the host configured `issueViewLink`).
+ */
+export type PulseVaultAuthorizePhase = 'create' | 'patch' | 'resolve' | 'delete' | 'share';
 
 export type PulseVaultAuthorizeContext = {
   phase: PulseVaultAuthorizePhase;

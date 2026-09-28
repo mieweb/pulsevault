@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.1` |
+| Spec revision | `2.2` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -49,6 +49,7 @@ Its JSON body is defined by
 | `allowedExtensions` | object | Yes | Allowed file extensions per kind, lowercase with the leading dot. |
 | `maxUploadSize` | number | Yes | Largest artifact the server accepts, in bytes. |
 | `checksum` | object | Yes | Checksum algorithms accepted in `Upload-Metadata.checksum`. |
+| `viewLinks` | boolean | No | Whether `POST {prefix}/artifacts/<id>/view-link` mints read-only view links (§6.4). Absent before protocol 2.2, which a client treats as false. |
 <!-- END GENERATED: capabilities -->
 
 A client pairs only if its protocol range overlaps
@@ -113,7 +114,7 @@ core protocol (creation + core resumable upload). A server MUST mount:
 | `POST` | `{prefix}/upload` | Create a resumable upload |
 | `PATCH` | `{prefix}/upload/<id>` | Append a chunk at `Upload-Offset` |
 | `HEAD` | `{prefix}/upload/<id>` | Query the current offset |
-| `DELETE` | `{prefix}/upload/<id>` | Cancel an in-flight upload |
+| `DELETE` | `{prefix}/upload/<id>` | Delete the upload and its artifact, in flight or finished |
 
 `PATCH` bodies MUST be the raw bytes for that offset
 (`Content-Type: application/offset+octet-stream`) — never base64-encoded or
@@ -249,6 +250,20 @@ This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
 is free to use its own scheme entirely — only §5.1–§5.3 are normative.
 
+### 5.5 View tokens (non-normative)
+
+The pairing token is a full capability: whoever holds it can upload to the
+artifact, delete it, and create artifacts related to it. A watch link that
+carries it is unsafe to share. A server that offers view links (§6.4) mints a
+separate **view token** that only opens an artifact and the artifacts
+`relatedTo` it. `@mieweb/pulsevault`'s view token has the §5.4 claims plus
+`"use": "view"`, and is signed with a key derived from the deployment's
+secret, so a verifier that predates view tokens rejects one outright instead of
+treating it as an upload capability. `createCapabilityAuthorize` accepts it
+only for `GET {prefix}/artifacts/<id>` (the `resolve` phase); minting a view
+link (`share`) needs the pairing token itself, so a view link can't extend
+itself.
+
 ## 6. Storage and validation
 
 ### 6.1 Readiness
@@ -264,6 +279,8 @@ A server MUST expose `GET {prefix}/artifacts/<artifactId>` returning either
 the bytes directly or a redirect to a URL serving them (e.g. a presigned
 object-storage URL). The kind is resolved server-side; it is not encoded in
 this URL. A server MUST also expose `DELETE {prefix}/artifacts/<artifactId>`.
+A TUS `DELETE {prefix}/upload/<id>` removes the artifact the same way,
+whether its upload is in flight or finished.
 
 ### 6.3 Checksum (optional)
 
@@ -274,6 +291,26 @@ with `422` and remove the rejected bytes. This is at-rest integrity
 verification on the finished artifact — it does not substitute for
 in-transit (TLS) integrity, and does not verify individual chunks as they
 arrive.
+
+### 6.4 View links (optional, protocol 2.2)
+
+A server that reports `viewLinks: true` in `/capabilities` (§2) MUST expose
+`POST {prefix}/artifacts/<artifactId>/view-link`. Authorized with the pairing
+token (§5.1), it returns a read-only link to a **finished** artifact:
+
+```json
+{ "token": "<view token>", "expiresAt": 1790000000 }
+```
+
+The token opens the artifact, and the artifacts `relatedTo` it, as
+`GET {prefix}/artifacts/<artifactId>?token=<token>` until `expiresAt` (seconds
+since the Unix epoch) — and does nothing else, so it is safe to share (§5.5).
+The server decides how long each link works. It returns `404` for an artifact
+that isn't finished (or when view links aren't enabled), and `403` when it
+won't link to that artifact. A client that wants a shareable link asks for one
+right after the upload finishes, while its pairing token is still valid; a
+server without `viewLinks` offers no shareable link, and the client MUST NOT
+share the pairing token in its place.
 
 ## 7. Versioning
 
@@ -340,6 +377,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | [`deep-link.schema.json`](protocol/schemas/deep-link.schema.json) | Pairing link query parameters |
 | [`pulse-client.schema.json`](protocol/schemas/pulse-client.schema.json) | Pulse-Client request header |
 | [`upload-metadata.schema.json`](protocol/schemas/upload-metadata.schema.json) | TUS Upload-Metadata keys |
+| [`view-link.schema.json`](protocol/schemas/view-link.schema.json) | POST /artifacts/<id>/view-link response |
 <!-- END GENERATED: schemas -->
 
 ### 7.4 History
@@ -349,6 +387,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 1.0 | First version. `/capabilities` and pairing links carried `uploadUnit` (`segment` or `merged`). |
 | 2.0 | **Breaking:** `uploadUnit` removed from `/capabilities` and pairing links — a pulse always uploads as one video (§8). Clients built for 1.0 required it. |
 | 2.1 | Added `protocolRevision` to `/capabilities`, the `Pulse-Client` header with `426 Upgrade Required` (§7.2), and `Upload-Metadata.appVersion` (§4.1). |
+| 2.2 | Added read-only view links: `viewLinks` in `/capabilities`, `POST {prefix}/artifacts/<id>/view-link` (§6.4), and the view token's `use` claim (§5.5). |
 
 ## 8. Artifact relationships (`relatedTo`)
 

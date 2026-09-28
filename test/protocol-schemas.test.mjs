@@ -13,7 +13,8 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 import { createLocalStorage, createPulseVaultCore } from "../dist/core.js";
-import { issueCapabilityToken } from "../dist/lib/capability-token.js";
+import { issueCapabilityToken, issueViewToken } from "../dist/lib/capability-token.js";
+import { createViewLinkIssuer } from "../dist/lib/view-links.js";
 import { buildUploadLink } from "../dist/lib/deeplinks.js";
 import { parsePulseClient } from "../dist/lib/protocol.js";
 
@@ -80,6 +81,71 @@ test("issued capability tokens carry claims matching capability-token.schema.jso
   const token = issueCapabilityToken(randomUUID(), "secret", { keyId: "k1", issuer: "vault" });
   const claims = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
   assertValid("capability-token", claims);
+});
+
+test("view tokens carry claims matching capability-token.schema.json", () => {
+  const token = issueViewToken(randomUUID(), "secret", {
+    keyId: "k1",
+    issuer: "vault",
+    expirySeconds: 60,
+  });
+  const claims = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
+  assertValid("capability-token", claims);
+  assert.equal(claims.use, "view");
+});
+
+test("a minted view link matches view-link.schema.json, and /capabilities reports viewLinks", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-schema-test-"));
+  const core = createPulseVaultCore({
+    basePath: "/pulsevault",
+    storage: createLocalStorage({ workspaceDir }),
+    maxUploadSize: 1 << 20,
+    issueViewLink: createViewLinkIssuer({
+      keyId: "k1",
+      secret: "secret",
+      issuer: "vault",
+      expirySeconds: 60,
+    }),
+  });
+  const server = http.createServer((req, res) => void core.handler(req, res));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}/pulsevault`;
+  try {
+    const caps = await (await fetch(`${base}/capabilities`)).json();
+    assertValid("capabilities", caps);
+    assert.equal(caps.viewLinks, true);
+
+    // A finished artifact: create + one PATCH of a minimal MP4.
+    const artifactId = randomUUID();
+    const body = Buffer.alloc(64);
+    Buffer.from([0, 0, 0, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]).copy(body);
+    const create = await fetch(`${base}/upload`, {
+      method: "POST",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Length": String(body.length),
+        "Upload-Metadata": `artifactId ${Buffer.from(artifactId).toString("base64")},filename ${Buffer.from("a.mp4").toString("base64")}`,
+      },
+    });
+    const location = new URL(create.headers.get("location"), base).href;
+    const patch = await fetch(location, {
+      method: "PATCH",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Offset": "0",
+        "Content-Type": "application/offset+octet-stream",
+      },
+      body,
+    });
+    assert.equal(patch.status, 204);
+
+    const res = await fetch(`${base}/artifacts/${artifactId}/view-link`, { method: "POST" });
+    assert.equal(res.status, 200);
+    assertValid("view-link", await res.json());
+  } finally {
+    server.close();
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
 });
 
 test("the metadata a Pulse upload sends matches upload-metadata.schema.json", () => {

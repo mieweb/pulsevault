@@ -9,6 +9,12 @@ import {
 } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultAuthorize } from './lib/authorize.js';
+import type { PulseVaultIssueViewLink } from './lib/view-links.js';
+import {
+  type PulseVaultRetentionOptions,
+  startRetentionSweep,
+  validateRetentionOptions,
+} from './lib/retention.js';
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
@@ -74,6 +80,10 @@ export type PulseVaultCoreOptions = {
   onUploadComplete?: PulseVaultOnUploadComplete;
   /** Optional low-frequency event hook. See the Fastify plugin's `onArtifactEvent` option for semantics. */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
+  /** Optional read-only view links. See the Fastify plugin's `issueViewLink` option for semantics. */
+  issueViewLink?: PulseVaultIssueViewLink;
+  /** Optional cleanup of abandoned uploads. See the Fastify plugin's `retention` option for semantics. */
+  retention?: PulseVaultRetentionOptions;
   /** Logger for internal diagnostics (authorize rejections, tus handler failures). Defaults to `console`. */
   logger?: PulseVaultLogger;
   /** @deprecated Use `validatePayload` instead — see the Fastify plugin's option of the same name. */
@@ -93,7 +103,7 @@ export type PulseVaultCore = {
    * raw `http.createServer((req, res) => core.handler(req, res))` handler.
    */
   handler: (req: IncomingMessage, res: ServerResponse, next?: ConnectNext) => Promise<void>;
-  /** One-time teardown — calls `storage.shutdown?.()`. */
+  /** One-time teardown — stops the `retention` sweep, then calls `storage.shutdown?.()`. */
   shutdown: () => Promise<void>;
   /** Handles a TUS create/patch/head/delete request directly (any method under `/upload`). */
   handleTus: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -106,6 +116,8 @@ export type PulseVaultCore = {
     artifactId: string,
     token: string | undefined,
   ) => Promise<void>;
+  /** Handles `POST /artifacts/:artifactId/view-link` (404 unless `issueViewLink` is configured). */
+  handleViewLink: (req: IncomingMessage, res: ServerResponse, artifactId: string) => Promise<void>;
   /** Handles `DELETE /artifacts/:artifactId`. */
   handleArtifactDelete: (
     req: IncomingMessage,
@@ -304,7 +316,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   validateAllowedExtensions(options.allowedExtensions);
   warnIfUsingDeprecatedProjectHooks(options);
 
-  const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent } = options;
+  const { storage, basePath, maxUploadSize, cache, authorize, onArtifactEvent, issueViewLink } =
+    options;
   const stripBasePath = options.stripBasePath ?? true;
   const allowedExtensions = normalizeAllowedExtensions(options.allowedExtensions);
   const validatePayload = composeValidatePayload(
@@ -316,6 +329,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     options.onProjectUploadComplete,
   );
   const logger = options.logger ?? consoleLogger;
+  validateRetentionOptions(options.retention, storage);
+  const retentionSweep = options.retention
+    ? startRetentionSweep(storage, options.retention, logger, async ({ artifactId, kind }) => {
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'abandoned' });
+      })
+    : null;
 
   const tusPath = `${basePath}/upload`;
   const tusServer = createPulsevaultTusServer({
@@ -337,7 +356,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const runAuthorize = async (
     req: IncomingMessage,
     res: ServerResponse,
-    phase: 'create' | 'patch',
+    phase: 'create' | 'patch' | 'delete',
   ): Promise<
     | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
     | { ok: false }
@@ -366,7 +385,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       return { ok: true, artifactId, kind, relatedTo };
     }
 
-    if (!artifactId && phase === 'patch') {
+    if (!artifactId && phase !== 'create') {
       // PROTOCOL.md §5.2: failing to resolve the artifactId for an in-flight
       // upload request is an authorization failure — reject, don't fall
       // through to "no artifactId to check, so allow".
@@ -386,7 +405,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       const statusCode = statusCodeOf(err, 403);
       const message = extractAuthzMessage(err);
       logger.info({ err, artifactId, phase, statusCode }, 'pulsevault authorize rejected');
-      if (phase === 'create') {
+      // Like the artifact routes: every rejected create or delete is reported, never a per-chunk
+      // `patch`.
+      if (phase !== 'patch') {
         await onArtifactEvent?.({ phase: 'authorize', artifactId, kind, reason: message });
       }
       writeJson(res, statusCode, pulseVaultError(message));
@@ -425,7 +446,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     // the client resumes from the last persisted byte on its next PATCH.
     req.on('error', () => {});
     res.on('error', () => {});
-    const phase: 'create' | 'patch' = req.method === 'POST' ? 'create' : 'patch';
+    // A TUS DELETE removes the whole artifact, in flight or finished (see `withArtifactRemoval`),
+    // exactly as `DELETE /artifacts/:id` does — so it's authorized as the same `delete`.
+    const phase: 'create' | 'patch' | 'delete' =
+      req.method === 'POST' ? 'create' : req.method === 'DELETE' ? 'delete' : 'patch';
     try {
       // Inside the try: runAuthorize does storage I/O (kind/relatedTo resolution)
       // and header writes of its own — an adapter fault or a consumer error with
@@ -444,7 +468,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const handleCapabilities = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stampProtocolVersion(res);
     try {
-      writeJson(res, 200, buildCapabilities({ allowedExtensions, maxUploadSize }));
+      writeJson(
+        res,
+        200,
+        buildCapabilities({ allowedExtensions, maxUploadSize, viewLinks: !!issueViewLink }),
+      );
     } catch (err) {
       failClosed(res, err, 'capabilities');
     }
@@ -460,7 +488,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     req: IncomingMessage,
     res: ServerResponse,
     artifactId: string,
-    phase: 'resolve' | 'delete',
+    phase: 'resolve' | 'delete' | 'share',
     token?: string,
   ): Promise<{ kind: UploadKind; relatedTo: string | undefined } | undefined> => {
     if (!isUuid(artifactId)) {
@@ -508,10 +536,53 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('Artifact not found'));
         return;
       }
+      await onArtifactEvent?.({
+        phase: 'remove',
+        artifactId,
+        kind: prepared.kind,
+        reason: 'deleted',
+      });
       res.writeHead(204);
       res.end();
     } catch (err) {
       failClosed(res, err, 'artifact delete');
+    }
+  };
+
+  /**
+   * `POST /artifacts/:artifactId/view-link` (PROTOCOL.md §6.4): a read-only link to a finished
+   * artifact, minted by the host's `issueViewLink` once `authorize` allowed the request as
+   * `"share"`. 404 when the host didn't configure view links, or the artifact isn't finished;
+   * 403 when the host refuses a link for it.
+   */
+  const handleViewLink = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
+    try {
+      if (!issueViewLink) {
+        writeJson(res, 404, pulseVaultError('View links are not enabled on this server'));
+        return;
+      }
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'share');
+      if (!prepared) return;
+
+      // Only a finished artifact gets a link: one still uploading might never finish.
+      if (!(await storage.resolve(artifactId))) {
+        writeJson(res, 404, pulseVaultError('Artifact not found'));
+        return;
+      }
+      const link = await issueViewLink(req, { artifactId, ...prepared });
+      if (!link) {
+        writeJson(res, 403, pulseVaultError('No view link for this artifact'));
+        return;
+      }
+      writeJson(res, 200, { token: link.token, expiresAt: link.expiresAt });
+    } catch (err) {
+      failClosed(res, err, 'view link');
     }
   };
 
@@ -621,6 +692,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await handleCapabilities(req, res);
       return;
     }
+    const viewLinkMatch = pathname.match(/^\/artifacts\/([^/]+)\/view-link$/);
+    if (viewLinkMatch?.[1] && req.method === 'POST') {
+      await handleViewLink(req, res, viewLinkMatch[1]);
+      return;
+    }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
@@ -639,11 +715,13 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   return {
     handler,
     shutdown: async () => {
+      await retentionSweep?.stop();
       await storage.shutdown?.();
     },
     handleTus,
     handleCapabilities,
     handleArtifactGet,
+    handleViewLink,
     handleArtifactDelete,
   };
 }
@@ -656,6 +734,7 @@ export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
@@ -680,14 +759,26 @@ export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,
   verifyCapabilityToken,
+  issueViewToken,
+  verifyViewToken,
   createCapabilityAuthorize,
 } from './lib/capability-token.js';
 export type {
   CapabilityTokenClaims,
   IssueCapabilityTokenOptions,
+  IssueViewTokenOptions,
   VerifyCapabilityTokenOptions,
   LookupSecret,
 } from './lib/capability-token.js';
+export { createViewLinkIssuer } from './lib/view-links.js';
+export { sweepAbandonedUploads } from './lib/retention.js';
+export type { PulseVaultRetentionOptions } from './lib/retention.js';
+export type {
+  PulseVaultIssueViewLink,
+  PulseVaultViewLink,
+  PulseVaultViewLinkContext,
+  ViewLinkIssuerOptions,
+} from './lib/view-links.js';
 export {
   createChecksumValidator,
   createS3ChecksumValidator,

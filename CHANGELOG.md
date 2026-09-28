@@ -7,11 +7,37 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
-Protocol 2.1 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
+Protocol 2.2 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
 removal below as the breaking change it is; clients built for protocol 1
 can't pair with this release.
 
 ### Added
+
+- **Read-only view links** (protocol 2.2). The pairing token is a full
+  capability, so a watch link carrying it let anyone holding the link
+  upload to the artifact or delete it. The new `issueViewLink` option turns
+  on `POST {prefix}/artifacts/:id/view-link` (authorized as the new
+  `"share"` phase): for a finished artifact it returns `{ token, expiresAt }`,
+  a token that only opens the artifact and the artifacts `relatedTo` it
+  (`GET ?token=`). The host decides each link's lifetime, or refuses one;
+  PulseVault sets none. `createViewLinkIssuer` / `issueViewToken` /
+  `verifyViewToken` implement it for capability tokens: view tokens carry
+  `use: "view"`, are signed with a key derived from the same secret (so a
+  verifier that predates them rejects one), and `createCapabilityAuthorize`
+  accepts them only for `resolve`. `/capabilities` reports `viewLinks`, and
+  `protocol/schemas/view-link.schema.json` defines the response.
+- **Opt-in cleanup of abandoned uploads.** The `retention` option
+  (`{ abandonedAfterSeconds, sweepIntervalSeconds? }`, on the plugin and
+  `createPulseVaultCore`) sweeps on a timer, removing uploads left
+  unfinished past the cutoff and the related artifacts (never videos) of a
+  video that never finished; finished videos are never touched.
+  `sweepAbandonedUploads` runs one sweep for your own scheduler. Storage
+  adapters gain an optional `listArtifacts`, implemented by both built-in
+  adapters.
+- **`onArtifactEvent` reports removals:** `phase: "remove"`, with `reason:
+  "deleted"` (`DELETE /artifacts/:id` or a TUS `DELETE`) or `"abandoned"` (the
+  `retention` sweep), so a host keeping its own index of artifacts can drop
+  one. A consumer that switches exhaustively on `phase` sees a new value.
 
 - **The protocol is written down as files, and CI keeps it honest.**
   `protocol/schemas/*.schema.json` define `/capabilities`, pairing links,
@@ -35,6 +61,12 @@ can't pair with this release.
 
 ### Changed
 
+- **A TUS `DELETE` is authorized as `"delete"`, not `"patch"`.** It now
+  removes the artifact (below), the same as `DELETE /artifacts/:id`, so an
+  `authorize` hook sees one phase for every removal — and a rejected one is
+  reported on `onArtifactEvent` like any other rejected delete. If your hook
+  allows `"patch"` but refuses `"delete"`, clients can no longer cancel an
+  upload through TUS; allow `"delete"` for the artifact's own token.
 - **Breaking: protocol 2.** `/capabilities` reports `protocolVersion: 2` and
   accepts protocol majors 2–2, read from the new `package.json`
   `pulseProtocol` field (`{ "version": "2.1", "min": 2, "max": 2 }`).
@@ -56,6 +88,18 @@ can't pair with this release.
   - `GET /capabilities` no longer returns an `uploadUnit` field.
   - Ship this together with the Pulse app update for mieweb/pulse#213 —
     older Pulse builds require `uploadUnit` in `/capabilities`.
+
+### Fixed
+
+- **A TUS `DELETE` removes the whole artifact.** It used to reach only the
+  tus datastore, so PulseVault's sidecar stayed behind: the artifactId
+  answered every later create with `409`, a finished upload deleted on the
+  local adapter kept a `ready` sidecar pointing at nothing, and on S3 a
+  finished upload wasn't deleted at all (aborting its completed multipart
+  upload fails with `NoSuchUpload` before anything is removed). Termination
+  now runs `storage.remove` under tus's per-upload lock — bytes, tus record
+  and sidecar, in flight or finished. The S3 adapter's `remove` also deletes
+  the incomplete `.part` object @tus/s3-store parks between PATCHes.
 
 ## [0.3.0] - 2026-09-16
 

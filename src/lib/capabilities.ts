@@ -18,6 +18,8 @@ export type PulseVaultCapabilities = {
   allowedExtensions: PulseVaultAllowedExtensions;
   maxUploadSize: number;
   checksum: { algorithms: string[] };
+  /** Whether `POST /artifacts/<id>/view-link` mints read-only view links (protocol 2.2). */
+  viewLinks: boolean;
 };
 
 /**
@@ -29,6 +31,7 @@ export type PulseVaultCapabilities = {
 export function buildCapabilities(input: {
   allowedExtensions: PulseVaultAllowedExtensions;
   maxUploadSize: number;
+  viewLinks: boolean;
 }): PulseVaultCapabilities {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -39,5 +42,6 @@ export function buildCapabilities(input: {
     allowedExtensions: input.allowedExtensions,
     maxUploadSize: input.maxUploadSize,
     checksum: { algorithms: ['sha256', 'sha1', 'md5'] },
+    viewLinks: input.viewLinks,
   };
 }

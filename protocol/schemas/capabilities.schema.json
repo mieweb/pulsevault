@@ -56,6 +56,10 @@
         "algorithms": { "type": "array", "items": { "type": "string" } }
       },
       "description": "Checksum algorithms accepted in `Upload-Metadata.checksum`."
+    },
+    "viewLinks": {
+      "type": "boolean",
+      "description": "Whether `POST {prefix}/artifacts/<id>/view-link` mints read-only view links (§6.4). Absent before protocol 2.2, which a client treats as false."
     }
   }
 }

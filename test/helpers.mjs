@@ -63,6 +63,13 @@ export async function tusPatch(url, offset, body, headers = {}) {
   });
 }
 
+export async function tusDelete(url, headers = {}) {
+  return fetch(url, {
+    method: "DELETE",
+    headers: { "Tus-Resumable": "1.0.0", ...headers },
+  });
+}
+
 export async function tusHead(url) {
   return fetch(url, {
     method: "HEAD",

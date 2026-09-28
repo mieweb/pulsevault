@@ -26,6 +26,11 @@
     "issuer": {
       "type": "string",
       "description": "The issuing deployment. A token from another issuer is rejected."
+    },
+    "use": {
+      "type": "string",
+      "enum": ["view"],
+      "description": "`view` on a read-only view token (§5.5), which only opens artifacts and is signed with a key derived from the secret. Absent on the capability token an upload uses."
     }
   }
 }

@@ -228,11 +228,12 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 | --- | --- | --- |
 | `GET` | `/pulsevault/capabilities` | Unauthenticated discovery: protocol version, artifact kinds, allowed extensions, limits |
 | `POST` | `/pulsevault/upload` | Create a TUS upload session |
-| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, cancel upload (TUS) |
+| `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, delete the upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
+| `POST` | `/pulsevault/artifacts/:artifactId/view-link` | Mint a read-only view link to a finished artifact (only with [`issueViewLink`](#issueviewlink)) |
 | `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
 
-\* `DELETE /pulsevault/upload/:id` is TUS's own "cancel in-flight upload" — distinct from `DELETE /pulsevault/artifacts/:artifactId`, which removes a finalized artifact.
+\* `DELETE /pulsevault/upload/:id` is TUS termination, addressed by the upload URL: it removes the artifact whether the upload is still in flight (a cancel) or finished, exactly as `DELETE /pulsevault/artifacts/:artifactId` does by artifactId.
 
 > `POST /reserve` is **not** part of the plugin. Your server implements it so you control auth, ownership, and any business logic tied to artifact creation.
 
@@ -319,9 +320,9 @@ Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` i
 
 ### `authorize`
 
-Optional async hook called before TUS create/patch, before GET resolve, and before DELETE. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
+Optional async hook called before TUS create/patch, before GET resolve, before DELETE, and before minting a view link. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
 
-Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers **every other request on the upload routes** — `PATCH` chunks, `HEAD` offset queries, **and the in-flight cancel `DELETE {prefix}/upload/<id>`**; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` fires **only** for the finalized-artifact route `DELETE {prefix}/artifacts/<id>`. If you gate deletion on `phase === "delete"` alone, you are not gating upload cancellation — that arrives as `"patch"`.
+Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal. `"share"` is `POST {prefix}/artifacts/<id>/view-link` — minting a read-only link — and only happens when [`issueViewLink`](#issueviewlink) is set.
 
 ```ts
 type PulseVaultAuthorize = (
@@ -332,7 +333,7 @@ type PulseVaultAuthorize = (
   // `http.IncomingMessage`, etc.) — the same hook works under either.
   request: PulseVaultRequest,
   ctx: {
-    phase: "create" | "patch" | "resolve" | "delete";
+    phase: "create" | "patch" | "resolve" | "delete" | "share";
     artifactId: string;
     kind: "video" | "project" | "captions";  // artifact kind; always present
     token?: string;             // only on "resolve" phase
@@ -420,15 +421,17 @@ type PulseVaultOnUploadComplete = (
 
 ### `onArtifactEvent`
 
-Optional low-frequency hook — fired on authorize rejection (`create`/`delete`/`resolve` phases only, never per-chunk `patch`), upload completion, and payload-validation rejection. One hook covers both ops metrics and a compliance audit trail instead of hand-wiring both from the lower-level hooks above:
+Optional low-frequency hook — fired on authorize rejection (every phase but per-chunk `patch`), upload completion, payload-validation rejection, and removal. One hook covers both ops metrics and a compliance audit trail instead of hand-wiring both from the lower-level hooks above, and `remove` is where a host keeping its own index of artifacts drops one:
 
 ```ts
 type PulseVaultArtifactEvent = {
-  phase: "authorize" | "complete" | "reject";
+  phase: "authorize" | "complete" | "reject" | "remove";
   artifactId: string;
-  kind: "video" | "project" | "captions";
+  kind: "video" | "project" | "captions" | "thumbnail";
   size?: number;
-  reason?: string; // present for "authorize" and "reject"
+  // present for "authorize" and "reject"; on "remove", "deleted" (DELETE /artifacts/:id or a
+  // TUS DELETE) or "abandoned" (the `retention` sweep)
+  reason?: string;
   appVersion?: string; // the uploading app's version, on "complete"/"reject" (protocol 2.1)
 };
 
@@ -438,6 +441,46 @@ onArtifactEvent: (event) => {
 ```
 
 See `OPERATIONS.md` for a Prometheus-counter example and what to alert on.
+
+### `issueViewLink`
+
+Optional — turns on read-only **view links** (protocol 2.2, `PROTOCOL.md` §6.4). The pairing token a client uploads with is a full capability: whoever holds it can upload to the artifact and delete it, so a watch link carrying it isn't safe to share. With this set, `POST {prefix}/artifacts/<id>/view-link` — authorized as `"share"` — calls it for a finished artifact and returns `{ token, expiresAt }`: a token that opens the artifact (and the artifacts `relatedTo` it) as `GET {prefix}/artifacts/<id>?token=…`, and does nothing else. `/capabilities` reports `viewLinks: true`.
+
+You decide every link — how long it works, or whether this artifact gets one at all (return `null` to refuse; the client gets `403`). PulseVault sets no lifetime of its own. With capability tokens, `createViewLinkIssuer` signs view tokens that `createCapabilityAuthorize` accepts for opening artifacts only — never for uploading, deleting, or minting another link — and whose `expirySeconds` can be a number or decided per link:
+
+```ts
+import { createViewLinkIssuer } from "@mieweb/pulsevault";
+
+issueViewLink: createViewLinkIssuer({
+  keyId: "2026-06",
+  secret: keys["2026-06"],
+  issuer,
+  // Per link: e.g. a month for videos, a week for everything else.
+  expirySeconds: (_request, { kind }) => (kind === "video" ? 30 * 86_400 : 7 * 86_400),
+}),
+```
+
+View tokens are signed with a key derived from the same secret, so they need no new configuration, and a verifier that predates them (an older PulseVault sharing the secret) rejects one instead of treating it as an upload token. Rotating a key out invalidates the view links signed under it — the way to revoke them early, short of deleting the artifact.
+
+### `retention`
+
+Optional cleanup of abandoned uploads — off unless set. A client that dies mid-upload (an app killed, a phone that never comes back) leaves an unfinished upload behind, and the related artifacts it finished before its video — captions, a beat manifest, a thumbnail — belong to a video that will never arrive. Nothing else removes them.
+
+```ts
+retention: {
+  abandonedAfterSeconds: 24 * 60 * 60, // unfinished for a day = abandoned
+  sweepIntervalSeconds: 60 * 60,       // default: sweep hourly
+},
+```
+
+Every `sweepIntervalSeconds` (at most 24 days) it removes, through `storage.remove`:
+
+- an upload still unfinished `abandonedAfterSeconds` after its last write (the local adapter) or after it started (S3, which can't tell when bytes last arrived);
+- a finished captions, beat manifest, project or thumbnail whose `relatedTo` artifact isn't finished — or is gone — that long after it finished.
+
+Finished videos, and anything whose video finished, are never touched; this is not a retention *policy* for finished content (see `OPERATIONS.md` "Retention"). Keep `abandonedAfterSeconds` well above how long an upload may take — at least your capability tokens' lifetime, past which no upload can continue anyway (on S3 especially, where a long upload is judged by when it started). Each removal fires `onArtifactEvent` with `phase: "remove"`, `reason: "abandoned"`. An artifact that can't be checked or removed is logged and skipped. Needs a storage adapter with `listArtifacts` (both built-in adapters have it); invalid settings throw at registration.
+
+A sweep reads the metadata of every artifact older than the cutoff — one `GetObject` each on S3 — so on a large bucket sweep daily (or off-peak from a cron job) rather than hourly. Several instances may sweep the same storage (a removal that finds nothing is a no-op), but each instance caches metadata: on S3, an id another instance removed can still answer `409` on this one until the entry is evicted — the same as for `DELETE /artifacts/:id`. To schedule it yourself (a cron job, a queue), call `sweepAbandonedUploads(storage, { abandonedAfterSeconds, onRemoved? })` instead; it resolves the removed artifactIds.
 
 ### `validateProjectPayload` / `onProjectUploadComplete` (deprecated)
 
@@ -737,9 +780,10 @@ const storage: PulseVaultStorage = {
     await db.updateArtifact(artifactId, { status: "ready" });
   },
   async remove(artifactId) {
-    // Called from DELETE /artifacts/:artifactId and from the plugin's
-    // cleanup path when `validatePayload` rejects an upload. Return false if
-    // the artifactId was already absent.
+    // Called from DELETE /artifacts/:artifactId, for a TUS DELETE of the
+    // artifact's upload, from the plugin's cleanup path when `validatePayload`
+    // rejects an upload, and by the `retention` sweep. Return false if the
+    // artifactId was already absent.
     const result = await db.deleteArtifact(artifactId);
     return result.deleted;
   },
@@ -749,6 +793,13 @@ const storage: PulseVaultStorage = {
   async getRelatedTo(artifactId) { return (await db.findArtifact(artifactId))?.relatedTo ?? null; },
   async getChecksum(artifactId) { return (await db.findArtifact(artifactId))?.checksum ?? null; },
   async getName(artifactId) { return (await db.findArtifact(artifactId))?.name ?? null; },
+  // Optional — needed only by `retention` / `sweepAbandonedUploads`. `updatedAt` is when the
+  // upload started while it's unfinished, and when it finished once ready (ms since epoch).
+  async *listArtifacts({ changedBefore } = {}) {
+    for (const row of await db.listArtifacts({ changedBefore })) {
+      yield { artifactId: row.id, kind: row.kind, relatedTo: row.relatedTo, ready: row.ready, updatedAt: row.updatedAt };
+    }
+  },
 };
 ```
 
@@ -796,7 +847,10 @@ CI (`.github/workflows/ci.yml`) runs all of these, plus the Pulse app's contract
 - `allowedExtensions` object form
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
-- `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata)
+- TUS `DELETE` removing the whole artifact, in flight or finished (local and S3), authorized as `delete`
+- `retention` / `sweepAbandonedUploads` on both adapters: abandoned uploads and the related artifacts of a video that never finished are removed, finished pulses are kept, nothing newer than the cutoff is touched, the option's own timer, and boot-time validation
+- View links: `issueViewToken`/`verifyViewToken`/`createViewLinkIssuer`, a view token opening its artifact and related ones but never uploading, deleting or minting another link, per-link lifetimes, refusal, and only finished artifacts
+- `GET /capabilities`, and every protocol schema checked against what the code actually produces (`/capabilities`, pairing links, token claims, upload metadata, view links)
 - Protocol versioning: the version read from `package.json`, `Pulse-Client` parsing, `426` for clients that are too old (core and plugin), `appVersion` stored and reported
 - S3/R2 backend (`createS3Storage`): full resumable upload → presigned-redirect playback, `createS3Mp4Sniffer`, `createS3ChecksumValidator`, `DELETE`, `kind=project`/`captions`, run against an in-process zero-dependency S3 mock (`test/mock-s3.mjs`, no cloud credentials needed)
 - `@mieweb/pulsevault/core` (the framework-agnostic entry point): the same protocol suite re-run against a bare `http.createServer` wrapping `core.handler`, plus an Express-specific smoke test proving `app.use(prefix, handler)` composition

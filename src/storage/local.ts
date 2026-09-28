@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isUuid } from '../lib/uuid.js';
 import type {
+  PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
@@ -145,6 +146,8 @@ export type LocalStorage = PulseVaultStorage & {
   getChecksum(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.getName` contract. */
   getName(artifactId: string): Promise<string | null>;
+  /** Satisfies the optional `PulseVaultStorage.listArtifacts` contract. */
+  listArtifacts(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
@@ -404,6 +407,55 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return meta?.name ?? null;
   };
 
+  /**
+   * Walk the sidecars. A sidecar is rewritten only when its upload finishes, so its mtime is
+   * when the upload started (still uploading) or when it finished (ready). An upload in flight
+   * counts from its last write instead — the bytes file's mtime — so a long upload that's still
+   * moving is never taken for an abandoned one.
+   */
+  async function* listArtifacts(
+    opts: { changedBefore?: number } = {},
+  ): AsyncIterable<PulseVaultArtifactRecord> {
+    let names: string[];
+    try {
+      names = await fs.readdir(sidecarDir());
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+      throw err;
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const artifactId = name.slice(0, -'.json'.length);
+      if (!isUuid(artifactId)) continue;
+      let updatedAt: number;
+      try {
+        updatedAt = (await fs.stat(sidecarPath(artifactId))).mtimeMs;
+      } catch {
+        continue; // Removed since the readdir.
+      }
+      if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
+      const sidecar = await readSidecar(artifactId);
+      if (!sidecar) continue;
+      const kind = sidecar.kind ?? 'video';
+      if (sidecar.status === 'uploading') {
+        const bytes = path.join(workspaceRoot, kind, `${artifactId}${sidecar.ext}`);
+        const written = await fs.stat(bytes).then(
+          (stats) => stats.mtimeMs,
+          () => 0,
+        );
+        updatedAt = Math.max(updatedAt, written);
+        if (opts.changedBefore !== undefined && updatedAt >= opts.changedBefore) continue;
+      }
+      yield {
+        artifactId,
+        kind,
+        ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
+        ready: sidecar.status === 'ready',
+        updatedAt,
+      };
+    }
+  }
+
   return {
     datastore,
     workspaceRoot,
@@ -417,5 +469,6 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     getRelatedTo,
     getChecksum,
     getName,
+    listArtifacts,
   };
 }
