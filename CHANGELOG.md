@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
 Protocol 2.2 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`
 removal below as the breaking change it is; clients built for protocol 1
 can't pair with this release.
@@ -86,7 +88,7 @@ can't pair with this release.
     Links minted by older releases stay valid: clients ignore unknown params
     (`PROTOCOL.md` §3).
   - `GET /capabilities` no longer returns an `uploadUnit` field.
-  - Ship this together with the Pulse app update for mieweb/pulse#213 —
+  - Needs Pulse 2.1.0 or later (mieweb/pulse#213) —
     older Pulse builds require `uploadUnit` in `/capabilities`.
 
 ### Fixed
@@ -384,6 +386,7 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mieweb/pulsevault/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mieweb/pulsevault/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mieweb/pulsevault/compare/v0.0.1...v0.2.0
