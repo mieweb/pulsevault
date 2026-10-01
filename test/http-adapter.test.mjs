@@ -451,23 +451,21 @@ test("GET /capabilities is unauthenticated and carries no uploadUnit", async () 
   }
 });
 
-test("passing the removed uploadUnit option throws at boot", async () => {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-http-test-"));
-  try {
-    for (const uploadUnit of ["segment", "merged"]) {
-      assert.throws(
-        () =>
-          createPulseVaultCore({
-            basePath: PREFIX,
-            storage: createLocalStorage({ workspaceDir }),
-            maxUploadSize: 10 * 1024 * 1024,
-            uploadUnit,
-          }),
-        { name: "TypeError", message: /`uploadUnit` was removed — delete the option/ },
-      );
-    }
-  } finally {
-    await fs.rm(workspaceDir, { recursive: true, force: true });
+test("passing the removed uploadUnit option throws at boot", () => {
+  // The option is rejected before storage is touched, so no real storage: a
+  // local adapter starts creating its directories on construction, and that
+  // could still be running after the test removed them.
+  for (const uploadUnit of ["segment", "merged"]) {
+    assert.throws(
+      () =>
+        createPulseVaultCore({
+          basePath: PREFIX,
+          storage: {},
+          maxUploadSize: 10 * 1024 * 1024,
+          uploadUnit,
+        }),
+      { name: "TypeError", message: /`uploadUnit` was removed — delete the option/ },
+    );
   }
 });
 
