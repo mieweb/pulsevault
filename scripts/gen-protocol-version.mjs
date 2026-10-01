@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Writes src/lib/protocol-version.gen.ts from package.json `pulseProtocol` — the one place the
 // protocol version is written down (PROTOCOL.md §7). Runs before `tsc` in `npm run build`.
+// `--check` writes nothing and fails if the committed file is stale; `protocol:check` runs it
+// before building, since a build would quietly fix the file.
 //
 // The version is baked in at build time rather than read from package.json at runtime:
 // `createRequire(import.meta.url)` is valid ESM for Node, but bundlers that compile npm
@@ -31,4 +33,12 @@ export const PULSE_PROTOCOL: { version: string; min: number; max: number } = {
 
 const target = path.join(root, "src", "lib", "protocol-version.gen.ts");
 const current = await fs.readFile(target, "utf8").catch(() => null);
-if (current !== out) await fs.writeFile(target, out);
+if (process.argv.includes("--check")) {
+  if (current !== out) {
+    console.error("✗ src/lib/protocol-version.gen.ts is stale — run `npm run build` and commit it");
+    process.exit(1);
+  }
+  console.log("✓ src/lib/protocol-version.gen.ts matches package.json pulseProtocol");
+} else if (current !== out) {
+  await fs.writeFile(target, out);
+}
