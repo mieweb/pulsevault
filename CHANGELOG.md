@@ -7,6 +7,18 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`@mieweb/pulsevault/core` loads under Meteor again.** 0.4.0 read the
+  protocol version from `package.json` at runtime with
+  `createRequire(import.meta.url)`. That's valid ESM for Node, but Meteor
+  compiles npm packages into its own module wrapper, which already declares
+  `require` and can't compile `import.meta`, so a Meteor app crashed at boot
+  (`SyntaxError: Identifier 'require' has already been declared`). `npm run
+  build` now writes the version into `src/lib/protocol-version.gen.ts`
+  (`scripts/gen-protocol-version.mjs`); `package.json` `pulseProtocol` is still
+  the one place it's set, and a missing or malformed value now fails the build.
+
 ## [0.4.0] - 2026-09-30
 
 Protocol 2.2 (`PROTOCOL.md` §7.4). Protocol 2 records the `uploadUnit`

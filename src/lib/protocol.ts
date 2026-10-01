@@ -1,19 +1,18 @@
-import { createRequire } from 'node:module';
 import type { IncomingMessage } from 'node:http';
 
-/**
- * The protocol this release implements, read from `package.json` `pulseProtocol` — the one
- * place it's written down (PROTOCOL.md §7). npm keeps the field for every published version,
- * so which release spoke which protocol can always be looked up.
+import { PULSE_PROTOCOL as pulseProtocol } from './protocol-version.gen.js';
+
+/*
+ * The protocol this release implements, from `package.json` `pulseProtocol` — the one place
+ * it's written down (PROTOCOL.md §7). npm keeps the field for every published version, so
+ * which release spoke which protocol can always be looked up. `npm run build` bakes it into
+ * `protocol-version.gen.ts` rather than reading package.json at runtime, which bundlers that
+ * wrap npm packages in their own module function (Meteor) can't compile.
  *
  * - `version` is the spec revision, `major.minor`. The major changes only for breaking changes
  *   and is what pairing compares; the minor counts additions older clients can ignore.
  * - `min`/`max` are the protocol majors this release accepts from clients.
  */
-type PulseProtocol = { version: string; min: number; max: number };
-
-const require = createRequire(import.meta.url);
-const { pulseProtocol } = require('../../package.json') as { pulseProtocol: PulseProtocol };
 
 /** Spec revision this release implements, e.g. `"2.1"`. */
 export const PROTOCOL_REVISION = pulseProtocol.version;

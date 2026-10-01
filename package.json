@@ -37,13 +37,13 @@
     "protocol"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/gen-protocol-version.mjs && tsc",
     "prepublishOnly": "npm run build",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
     "e2e": "npm run build && node scripts/e2e-tus.mjs",
     "protocol": "npm run build && node scripts/gen-protocol.mjs",
-    "protocol:check": "npm run build && node scripts/gen-protocol.mjs --check",
+    "protocol:check": "node scripts/gen-protocol-version.mjs --check && npm run build && node scripts/gen-protocol.mjs --check",
     "protocol:compat": "node scripts/check-protocol.mjs"
   },
   "keywords": [
