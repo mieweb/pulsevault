@@ -9,10 +9,12 @@ breaking changes, called out explicitly below.
 
 ### Added
 
-- **The Pulse logo ships with the package**, in full colour and one colour
-  (`assets/pulse-logo.svg`, `assets/pulse-logo-mono.svg`, exported as
-  `@mieweb/pulsevault/assets/*`), so an app can put it on the button that
-  opens Pulse. See `assets/README.md`.
+- **The Pulse logo and the store badges ship with the package**: the logo in
+  full colour and one colour (`assets/pulse-logo.svg`,
+  `assets/pulse-logo-mono.svg`), and the App Store and Google Play badges
+  (`assets/badge-app-store.svg`, `assets/badge-google-play.png`), exported as
+  `@mieweb/pulsevault/assets/*`. An app can put the logo on the button that
+  opens Pulse and link the badges to Pulse's listings. See `assets/README.md`.
 
 ## [0.4.1] - 2026-09-30
 
