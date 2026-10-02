@@ -7,6 +7,13 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+
+- **The Pulse logo ships with the package**, in full colour and one colour
+  (`assets/pulse-logo.svg`, `assets/pulse-logo-mono.svg`, exported as
+  `@mieweb/pulsevault/assets/*`), so an app can put it on the button that
+  opens Pulse. See `assets/README.md`.
+
 ## [0.4.1] - 2026-09-30
 
 ### Fixed

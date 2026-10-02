@@ -822,6 +822,12 @@ const uploadLink = buildUploadLink({
 // pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
 
+## Pulse logo
+
+The package ships the Pulse logo for the button that opens Pulse:
+`@mieweb/pulsevault/assets/pulse-logo.svg` (full colour) and
+`pulse-logo-mono.svg` (one colour). See [assets/README.md](assets/README.md).
+
 ## Tests
 
 ```sh
