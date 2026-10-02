@@ -20,7 +20,8 @@
       "types": "./dist/core.d.ts",
       "import": "./dist/core.js",
       "default": "./dist/core.js"
-    }
+    },
+    "./assets/*": "./assets/*"
   },
   "files": [
     "dist",
@@ -34,7 +35,8 @@
     "PROTOCOL.md",
     "OPERATIONS.md",
     "scripts/web-ready-migrate.mjs",
-    "protocol"
+    "protocol",
+    "assets"
   ],
   "scripts": {
     "build": "node scripts/gen-protocol-version.mjs && tsc",

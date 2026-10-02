@@ -822,6 +822,13 @@ const uploadLink = buildUploadLink({
 // pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
 
+## Pulse logo and store badges
+
+The package ships the Pulse logo for the button that opens Pulse
+(`@mieweb/pulsevault/assets/pulse-logo.svg` in full colour,
+`pulse-logo-mono.svg` in one colour), and the App Store and Google Play badges
+to link to Pulse's listings. See [assets/README.md](assets/README.md).
+
 ## Tests
 
 ```sh
