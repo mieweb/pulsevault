@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-02
+
 ### Added
 
 - **The Pulse logo and the store badges ship with the package**: the logo in
@@ -409,7 +411,8 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/mieweb/pulsevault/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mieweb/pulsevault/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mieweb/pulsevault/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mieweb/pulsevault/compare/v0.2.0...v0.3.0
