@@ -256,7 +256,7 @@ type PulseVaultPluginOptions = {
   allowedExtensions?:
     | string[]                                                                              // legacy — treated as video-only
     | { video?: string[]; project?: string[]; captions?: string[]; thumbnail?: string[] };  // per-kind (recommended)
-  // defaults: { video: [".mp4", ".mov", ".m4v"], project: [".pulse", ".zip"], captions: [".vtt", ".srt"], thumbnail: [".jpg", ".jpeg", ".png"] }
+  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] } — what Pulse sends
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;          // runs for every kind; branch on ctx.kind

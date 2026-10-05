@@ -44,10 +44,10 @@ types phones send. Two defaults change; both have an escape hatch.
   second time.
 - **`authorize` gains the `status` phase** (`GET /artifacts/:id/status`).
   An exhaustive `switch` on the phase needs a case for it.
-- **Default `allowedExtensions`** now accept `.mov` and `.m4v` videos and
-  `.srt` captions, and `.mov`, `.m4v`, `.srt` and `.pulse` are served with
-  their own content types (`video/quicktime`, `video/x-m4v`,
-  `application/x-subrip`, `application/json`) instead of
+- **Content types**: the `.pulse` beat manifest is served as
+  `application/json`, and `.mov`, `.m4v` and `.srt` — when a host allows them
+  in `allowedExtensions`; the defaults stay what the Pulse app sends — as
+  `video/quicktime`, `video/x-m4v` and `application/x-subrip`, instead of
   `application/octet-stream`, which `<video>` downloads instead of playing.
 
 ### Added

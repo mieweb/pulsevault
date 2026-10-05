@@ -767,12 +767,16 @@ for (const [name, start] of [["local", startLocal], ["S3", startS3]]) {
 
 // ---------- §9 content types ----------
 
-test("content types: .mov and .m4v videos, .srt captions and the .pulse manifest are accepted and served", async () => {
-  const ctx = await startLocal();
+test("content types: the .pulse manifest is JSON; .mov/.m4v/.srt are served right when a host allows them", async () => {
+  const ctx = await startLocal({
+    pluginOptions: {
+      allowedExtensions: { video: [".mp4", ".mov", ".m4v"], captions: [".vtt", ".srt"] },
+    },
+  });
   try {
     const caps = await (await fetch(ctx.url("/capabilities"))).json();
     assert.deepEqual(caps.allowedExtensions.video, [".mp4", ".mov", ".m4v"]);
-    assert.deepEqual(caps.allowedExtensions.captions, [".vtt", ".srt"]);
+    assert.deepEqual(caps.allowedExtensions.project, [".pulse", ".zip"], "the defaults are what Pulse sends");
 
     const videoId = randomUUID();
     await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "IMG_0001.mov", kind: "video" });
