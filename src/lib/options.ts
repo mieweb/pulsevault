@@ -18,11 +18,12 @@ export type PulseVaultAllowedExtensions = {
   thumbnail: readonly string[];
 };
 
-const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
+// What phones send: MP4, and the QuickTime containers an iPhone records to.
+const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4', '.mov', '.m4v'];
 const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
-// WebVTT only — it's what the Pulse app uploads, and it carries word-level
-// inline cue timestamps (`<00:00:01.500>word`) for karaoke rendering.
-const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
+// WebVTT is what the Pulse app uploads, with word-level inline cue timestamps
+// (`<00:00:01.500>word`) for karaoke rendering; SubRip for other clients.
+const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt', '.srt'];
 // The pulse's poster frame (the draft's first-clip thumbnail).
 const DEFAULT_THUMBNAIL_EXTENSIONS: readonly string[] = ['.jpg', '.jpeg', '.png'];
 const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;

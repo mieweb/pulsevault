@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/artifact-status.schema.json",
+  "title": "GET /artifacts/<id>/status response",
+  "description": "Where an upload is (PROTOCOL.md §6.5, protocol 2.3): for a page waiting on it, so the host needs no table of its own. Authorized like opening the artifact. Never cached.",
+  "type": "object",
+  "required": ["artifactId", "state"],
+  "properties": {
+    "artifactId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The artifact asked about."
+    },
+    "state": {
+      "type": "string",
+      "enum": ["unknown", "uploading", "processing", "ready"],
+      "description": "`unknown` for an id the server has never seen; `uploading` until the final byte; `processing` while the server converts the bytes for the web; `ready` once the artifact is served."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["video", "project", "captions", "thumbnail"],
+      "description": "Artifact kind. Absent when `state` is `unknown`."
+    },
+    "relatedTo": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The video this artifact belongs to, if it declared one."
+    },
+    "name": {
+      "type": "string",
+      "description": "The display name the client sent (`Upload-Metadata.name`), if any."
+    },
+    "bytesReceived": {
+      "type": "number",
+      "description": "Bytes received so far while `uploading`, or stored once finished, when the server knows."
+    },
+    "size": {
+      "type": "number",
+      "description": "The upload's declared length, when the server knows."
+    },
+    "acknowledged": {
+      "type": "boolean",
+      "description": "Whether the host has finished handling the completed upload (its `onUploadComplete` returned)."
+    },
+    "outcome": {
+      "description": "What the host recorded about where the upload went, or why it didn't. Any JSON; absent until the host records one."
+    }
+  }
+}

@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.2` |
+| Spec revision | `2.3` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -246,6 +246,18 @@ the token's `artifactId` as its `relatedTo` (§8) — this lets one token cover
 an entire upload session (a pulse's video plus its captions, beat manifest and
 thumbnail) rather than requiring one token per artifact.
 
+A token MAY also carry an opaque `ctx` claim (protocol 2.3): host data signed
+with the rest — who the upload is for, where it goes — that the server stores
+with the artifact the token creates and hands back to its own hooks, so the
+host needs no table keyed by artifactId. A client never reads it.
+
+When a token names a pulse's video, a server SHOULD hold the token to the
+shape of a pulse (§8): the video only under the token's own `artifactId`, with
+no `relatedTo`, and a thumbnail, beat manifest or captions only under another
+id, `relatedTo` the token's. Otherwise one token can create any number of
+artifacts under ids of the client's choosing, or take the video's own id with a
+thumbnail so the video itself can never land.
+
 This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
 is free to use its own scheme entirely — only §5.1–§5.3 are normative.
@@ -312,6 +324,29 @@ right after the upload finishes, while its pairing token is still valid; a
 server without `viewLinks` offers no shareable link, and the client MUST NOT
 share the pairing token in its place.
 
+### 6.5 Status and poster (optional, protocol 2.3)
+
+A server MAY expose `GET {prefix}/artifacts/<artifactId>/status`, authorized
+like opening the artifact (§5.1; a view token, §5.5, is enough), reporting
+where an upload is so a page waiting on it needs nothing from the host. Its
+body is defined by
+[`protocol/schemas/artifact-status.schema.json`](protocol/schemas/artifact-status.schema.json):
+`state` is `unknown`, `uploading`, `processing` (the server is converting the
+bytes for the web) or `ready`, with the bytes received against the declared
+length while uploading, and whatever outcome the host recorded once finished.
+The response MUST NOT be cached.
+
+A server MAY also expose `GET {prefix}/artifacts/<videoId>/poster`: the finished
+thumbnail `relatedTo` the video (§8), served exactly as §6.2 serves an artifact
+and authorized as opening the video, so whoever may watch it may see its poster.
+It returns `404` until the thumbnail has landed.
+
+An unfinished upload whose client died (an app killed mid-upload sends no
+TUS `DELETE`) would otherwise answer `409` to every later create of the same
+`artifactId`. A server SHOULD let a create authorized by the same token take
+over such an upload once it has been idle for a while, instead of refusing it
+until cleanup runs.
+
 ## 7. Versioning
 
 The protocol has a version `major.minor`, written once in `@mieweb/pulsevault`'s
@@ -371,6 +406,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | File | Defines |
 |---|---|
 | [`openapi.json`](protocol/openapi.json) | Every HTTP route, generated from the plugin |
+| [`artifact-status.schema.json`](protocol/schemas/artifact-status.schema.json) | GET /artifacts/<id>/status response |
 | [`beat-manifest.schema.json`](protocol/schemas/beat-manifest.schema.json) | Beat manifest |
 | [`capabilities.schema.json`](protocol/schemas/capabilities.schema.json) | GET /capabilities response |
 | [`capability-token.schema.json`](protocol/schemas/capability-token.schema.json) | Capability token claims |
@@ -388,6 +424,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.0 | **Breaking:** `uploadUnit` removed from `/capabilities` and pairing links — a pulse always uploads as one video (§8). Clients built for 1.0 required it. |
 | 2.1 | Added `protocolRevision` to `/capabilities`, the `Pulse-Client` header with `426 Upgrade Required` (§7.2), and `Upload-Metadata.appVersion` (§4.1). |
 | 2.2 | Added read-only view links: `viewLinks` in `/capabilities`, `POST {prefix}/artifacts/<id>/view-link` (§6.4), and the view token's `use` claim (§5.5). |
+| 2.3 | Added `GET {prefix}/artifacts/<id>/status` and `GET {prefix}/artifacts/<id>/poster` (§6.5), the capability token's `ctx` claim (§5.4), and the pulse-shape rule for creates (§5.4). |
 
 ## 8. Artifact relationships (`relatedTo`)
 

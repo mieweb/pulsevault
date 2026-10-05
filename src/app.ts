@@ -1,9 +1,10 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import pulseVaultRoutes, { type PulseVaultAuthorize } from './routes/pulsevault.js';
+import pulseVaultRoutes, { type PulseVaultAuthorize, type PulseVaultCore } from './routes/pulsevault.js';
 import type { PulseVaultOnUploadComplete, PulseVaultOnArtifactEvent } from './lib/pulsevaultTus.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
 import type { PulseVaultIssueViewLink } from './lib/view-links.js';
+import type { PulseVaultReplayOptions, PulseVaultWebReadyOptions } from './lib/completion.js';
 import {
   type PulseVaultRetentionOptions,
   startRetentionSweep,
@@ -159,6 +160,21 @@ export type PulseVaultPluginOptions = {
    * `sweepAbandonedUploads` from a cron job.
    */
   retention?: PulseVaultRetentionOptions;
+  /** See the core's option of the same name: hold every create to the shape of a pulse. Defaults to `true`. */
+  pulseShape?: boolean;
+  /** See the core's option of the same name: a create takes over an idle unfinished upload of the same id. Defaults to `{ idleSeconds: 300 }`. */
+  reclaim?: { idleSeconds?: number } | false;
+  /** See the core's option of the same name: a finished artifact can't be deleted through the routes. */
+  lockWhenReady?: boolean;
+  /** See the core's option of the same name: background web-ready conversion of finished videos. */
+  webReady?: PulseVaultWebReadyOptions | boolean;
+  /** See the core's option of the same name: re-fire `onUploadComplete` for completions the host never finished. */
+  replayCompletions?: PulseVaultReplayOptions | false;
+  /**
+   * Name of the decorator that exposes the core (`fastify.<name>.getStatus`, `.getPulse`,
+   * `.recordOutcome`, `.replayCompletions`). Defaults to `"pulseVaultCore"`.
+   */
+  coreDecoratorName?: string;
   /**
    * @deprecated Use `validatePayload` instead — it now receives `ctx.kind`
    * and runs for every artifact kind, including `"project"`. Still honored
@@ -178,6 +194,7 @@ export type PulseVaultPluginOptions = {
 };
 
 const DEFAULT_DECORATOR_NAME = 'pulseVault';
+const DEFAULT_CORE_DECORATOR_NAME = 'pulseVaultCore';
 
 const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) => {
   rejectRemovedOptions(opts);
@@ -191,10 +208,13 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
   // state the adapter allocates mid-init still gets cleaned up if Fastify
   // later tears the plugin down.
   let retentionSweep: { stop: () => Promise<void> } | null = null;
+  let core: PulseVaultCore | null = null;
   fastify.addHook('onClose', async () => {
-    // Waits for a sweep in progress, so it never runs against shut-down storage.
+    // Waits for a sweep in progress, so it never runs against shut-down storage. The core's
+    // shutdown stops its completion queue and replay timer (and shuts storage down itself).
     await retentionSweep?.stop();
-    await opts.storage.shutdown?.();
+    if (core) await core.shutdown();
+    else await opts.storage.shutdown?.();
   });
   await opts.storage.initialize?.();
   if (opts.retention) {
@@ -225,7 +245,17 @@ const app: FastifyPluginAsync<PulseVaultPluginOptions> = async (fastify, opts) =
     onUploadComplete: composeOnUploadComplete(opts.onUploadComplete, opts.onProjectUploadComplete),
     onArtifactEvent: opts.onArtifactEvent,
     issueViewLink: opts.issueViewLink,
+    pulseShape: opts.pulseShape,
+    reclaim: opts.reclaim,
+    lockWhenReady: opts.lockWhenReady,
+    webReady: opts.webReady,
+    replayCompletions: opts.replayCompletions,
+    onCore: (built) => {
+      core = built;
+    },
   });
+  if (!core) throw new Error('pulsevault: the routes plugin did not hand back its core');
+  fastify.decorate(opts.coreDecoratorName ?? DEFAULT_CORE_DECORATOR_NAME, core);
 };
 
 export default fp(app, {
@@ -290,3 +320,16 @@ export {
 } from './lib/checksum.js';
 export type { ChecksumAlgorithm, ParsedChecksum } from './lib/checksum.js';
 export type { PulseVaultRequest, PulseVaultLogger } from './lib/request.js';
+export type {
+  PulseVaultCore,
+  PulseVaultArtifactStatus,
+  PulseVaultPulse,
+} from './core.js';
+export type {
+  PulseVaultArtifactMeta,
+  PulseVaultArtifactPatch,
+} from './storage/types.js';
+export type { PulseVaultAuthorizeResult } from './lib/authorize.js';
+export type { PulseVaultUploadCompleteContext } from './lib/pulsevaultTus.js';
+export type { PulseVaultWebReadyOptions, PulseVaultReplayOptions } from './lib/completion.js';
+export { MAX_CONTEXT_BYTES } from './lib/capability-token.js';

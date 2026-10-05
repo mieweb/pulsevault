@@ -50,6 +50,8 @@ async function startApp({ pluginOptions = {}, withSniffer = false } = {}) {
     prefix: PREFIX,
     storage,
     maxUploadSize: 10 * 1024 * 1024,
+    // These tests upload each kind on its own, not as a pulse's related files.
+    pulseShape: false,
     ...(withSniffer ? { validatePayload: createS3Mp4Sniffer(storage) } : {}),
     ...pluginOptions,
   });

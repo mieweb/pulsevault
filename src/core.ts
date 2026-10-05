@@ -4,11 +4,22 @@ import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
   artifactIdFromUploadId,
+  normalizeArtifactName,
   type PulseVaultOnUploadComplete,
   type PulseVaultOnArtifactEvent,
 } from './lib/pulsevaultTus.js';
+import {
+  createCompletionRunner,
+  validateCompletionOptions,
+  type PulseVaultReplayOptions,
+  type PulseVaultWebReadyOptions,
+} from './lib/completion.js';
 import type { PulseVaultValidatePayload } from './lib/magic.js';
-import type { PulseVaultAuthorize } from './lib/authorize.js';
+import type {
+  PulseVaultAuthorize,
+  PulseVaultAuthorizeContext,
+  PulseVaultAuthorizePhase,
+} from './lib/authorize.js';
 import type { PulseVaultIssueViewLink } from './lib/view-links.js';
 import {
   type PulseVaultRetentionOptions,
@@ -18,8 +29,14 @@ import {
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
-import type { PulseVaultStorage, UploadKind } from './storage/types.js';
+import type {
+  PulseVaultArtifactMeta,
+  PulseVaultResolution,
+  PulseVaultStorage,
+  UploadKind,
+} from './storage/types.js';
 import { parseUploadKind } from './storage/types.js';
+import { normalizeAppVersion } from './lib/protocol.js';
 import {
   normalizeAllowedExtensions,
   validateBasePath,
@@ -84,6 +101,42 @@ export type PulseVaultCoreOptions = {
   issueViewLink?: PulseVaultIssueViewLink;
   /** Optional cleanup of abandoned uploads. See the Fastify plugin's `retention` option for semantics. */
   retention?: PulseVaultRetentionOptions;
+  /**
+   * Hold every create to the shape of a pulse (PROTOCOL.md §8): a video is created with no
+   * `relatedTo`, and a thumbnail, beat manifest or captions under its own id, `relatedTo` the
+   * video. With `createCapabilityAuthorize` the ids are also tied to the token: the video only
+   * under the token's own artifactId, the rest only `relatedTo` it. Defaults to `true`; set
+   * `false` for uploads that aren't pulses.
+   */
+  pulseShape?: boolean;
+  /**
+   * Let a create take over an unfinished upload of the same artifactId once it has been idle
+   * this long, instead of answering `409` until `retention` removes it. Only an upload of the
+   * same kind and `relatedTo`, so the token that authorized the new create authorized the old
+   * one. Defaults to `{ idleSeconds: 300 }`; `false` turns it off.
+   */
+  reclaim?: { idleSeconds?: number } | false;
+  /**
+   * Once an artifact is finished, refuse to delete it — or anything `relatedTo` a finished
+   * video — through the routes (`DELETE /artifacts/:id` and the TUS `DELETE`): a pulse that
+   * landed stays. Removal then goes through `storage.remove` on the host's own terms. Off by
+   * default.
+   */
+  lockWhenReady?: boolean;
+  /**
+   * Convert every finished video for the web in the background (faststart remux, or an H.264
+   * transcode for a codec browsers can't play), after the final `PATCH` is answered. `true`
+   * for the defaults, or `ensureWebReady`'s options plus `concurrency` and `completeAfter`.
+   * Needs the local storage adapter. Off by default.
+   */
+  webReady?: PulseVaultWebReadyOptions | boolean;
+  /**
+   * How often a finished artifact whose `onUploadComplete` never finished is fired again, and a
+   * conversion a restart interrupted is resumed. On by default, every 300 seconds, with the
+   * first pass shortly after start; `false` turns it off. Needs `listArtifacts` and
+   * `describeArtifact` (both built-in adapters).
+   */
+  replayCompletions?: PulseVaultReplayOptions | false;
   /** Logger for internal diagnostics (authorize rejections, tus handler failures). Defaults to `console`. */
   logger?: PulseVaultLogger;
   /** @deprecated Use `validatePayload` instead — see the Fastify plugin's option of the same name. */
@@ -124,6 +177,61 @@ export type PulseVaultCore = {
     res: ServerResponse,
     artifactId: string,
   ) => Promise<void>;
+  /** Handles `GET /artifacts/:artifactId/status` (authorized as `status`). */
+  handleStatus: (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+    token: string | undefined,
+  ) => Promise<void>;
+  /** Handles `GET /artifacts/:artifactId/poster`: the video's thumbnail (authorized as `resolve` on the video). */
+  handlePoster: (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+    token: string | undefined,
+  ) => Promise<void>;
+  /** The state of one artifact, as the status route reports it — for a host that polls server-side. */
+  getStatus: (artifactId: string) => Promise<PulseVaultArtifactStatus>;
+  /** A video and the finished artifacts `relatedTo` it, by kind. `video` is `null` for an unknown id. */
+  getPulse: (artifactId: string) => Promise<PulseVaultPulse>;
+  /**
+   * Record where an upload went, or why it didn't (any JSON; `null` clears it). Reported by the
+   * status route as `outcome`, so a page waiting on an upload learns it from PulseVault alone.
+   * Resolves `false` for an unknown artifactId.
+   */
+  recordOutcome: (artifactId: string, outcome: unknown) => Promise<boolean>;
+  /** Run one completion-replay pass now (see `replayCompletions`). Resolves the replayed artifactIds. */
+  replayCompletions: () => Promise<string[]>;
+};
+
+/** What `GET /artifacts/:id/status` and `getStatus` report. */
+export type PulseVaultArtifactStatus = {
+  artifactId: string;
+  /**
+   * `unknown` for an id storage has never seen; `uploading` until the final byte; `processing`
+   * while a web-ready conversion rewrites the bytes; `ready` once the artifact is served.
+   */
+  state: 'unknown' | 'uploading' | 'processing' | 'ready';
+  kind?: UploadKind;
+  relatedTo?: string;
+  name?: string;
+  /** Bytes received so far (while `uploading`), or stored (once finished), when known. */
+  bytesReceived?: number;
+  /** The upload's declared length, when known. */
+  size?: number;
+  /** Whether the host's `onUploadComplete` has finished for this artifact. */
+  acknowledged?: boolean;
+  /** What the host recorded with `recordOutcome`, if anything. */
+  outcome?: unknown;
+};
+
+/** A pulse: its video and the finished artifacts `relatedTo` it, one per kind (the newest wins). */
+export type PulseVaultPulse = {
+  video: PulseVaultArtifactMeta | null;
+  thumbnail?: PulseVaultArtifactMeta;
+  captions?: PulseVaultArtifactMeta;
+  manifest?: PulseVaultArtifactMeta;
 };
 
 /**
@@ -143,12 +251,18 @@ function parseUploadMetadata(header: string): {
   artifactId: string | undefined;
   kind: UploadKind;
   relatedTo: string | undefined;
+  filename: string | undefined;
+  name: string | undefined;
+  appVersion: string | undefined;
 } {
   let artifactIdRaw: string | undefined;
   let videoidRaw: string | undefined;
   let projectidRaw: string | undefined;
   let kind: UploadKind = 'video';
   let relatedTo: string | undefined;
+  let filename: string | undefined;
+  let name: string | undefined;
+  let appVersion: string | undefined;
   for (const pair of header.split(',')) {
     const trimmed = pair.trim();
     if (!trimmed) continue;
@@ -169,6 +283,12 @@ function parseUploadMetadata(header: string): {
         kind = parseUploadKind(decoded);
       } else if (key === 'relatedTo' && !relatedTo) {
         relatedTo = isUuid(decoded) ? decoded : undefined;
+      } else if (key === 'filename') {
+        filename ??= decoded.trim() || undefined;
+      } else if (key === 'name') {
+        name ??= normalizeArtifactName(decoded);
+      } else if (key === 'appVersion') {
+        appVersion ??= normalizeAppVersion(decoded);
       }
     } catch {
       // ignore malformed base64
@@ -176,7 +296,28 @@ function parseUploadMetadata(header: string): {
   }
   const candidate = (artifactIdRaw ?? videoidRaw ?? projectidRaw ?? '').trim();
   const artifactId = isUuid(candidate) ? candidate : undefined;
-  return { artifactId, kind, relatedTo };
+  return { artifactId, kind, relatedTo, filename, name, appVersion };
+}
+
+/** Lowercase extension of a filename, with the leading dot; `undefined` when it has none. */
+function extensionOf(filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const dot = filename.lastIndexOf('.');
+  return dot > 0 ? filename.slice(dot).toLowerCase() : undefined;
+}
+
+/** The hook-context fields that come from stored metadata, for every phase after `create`. */
+function describedFields(
+  meta: PulseVaultArtifactMeta | null,
+): Pick<PulseVaultAuthorizeContext, 'name' | 'appVersion' | 'filename' | 'ext' | 'context'> {
+  if (!meta) return {};
+  return {
+    ...(meta.name ? { name: meta.name } : {}),
+    ...(meta.appVersion ? { appVersion: meta.appVersion } : {}),
+    filename: meta.filename,
+    ext: meta.ext,
+    ...(meta.context !== undefined ? { context: meta.context } : {}),
+  };
 }
 
 /**
@@ -336,6 +477,28 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       })
     : null;
 
+  const pulseShape = options.pulseShape ?? true;
+  const lockWhenReady = options.lockWhenReady === true;
+  if (options.reclaim !== undefined && options.reclaim !== false) {
+    const { idleSeconds } = options.reclaim;
+    if (idleSeconds !== undefined && !(idleSeconds >= 0 && Number.isFinite(idleSeconds))) {
+      throw new TypeError('`reclaim.idleSeconds` must be a number of seconds, at least 0');
+    }
+  }
+  const reclaim =
+    options.reclaim === false ? false : { idleSeconds: options.reclaim?.idleSeconds ?? 300 };
+  const replay = options.replayCompletions === false ? false : (options.replayCompletions ?? {});
+  validateCompletionOptions({ storage, webReady: options.webReady, replay });
+  const completion = createCompletionRunner({
+    storage,
+    onUploadComplete,
+    onArtifactEvent,
+    webReady: options.webReady,
+    replay,
+    logger,
+  });
+  completion.start();
+
   const tusPath = `${basePath}/upload`;
   const tusServer = createPulsevaultTusServer({
     storage,
@@ -343,10 +506,29 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     maxSize: maxUploadSize,
     allowedExtensions,
     validatePayload,
-    onUploadComplete,
+    completion,
     onArtifactEvent,
+    pulseShape,
+    reclaim,
     logger,
   });
+
+  const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
+    typeof storage.describeArtifact === 'function'
+      ? storage.describeArtifact(artifactId)
+      : Promise.resolve(null);
+
+  /**
+   * With `lockWhenReady`, whether a delete must be refused: the artifact is finished, or it
+   * belongs to a finished video. The check reads storage just before the removal; the TUS
+   * `DELETE` additionally runs under tus's per-upload lock, so it can't interleave with the
+   * final chunk of the same upload.
+   */
+  const isLocked = async (artifactId: string, relatedTo: string | undefined): Promise<boolean> => {
+    if (!lockWhenReady) return false;
+    if (await storage.resolve(artifactId)) return true;
+    return relatedTo !== undefined && (await storage.resolve(relatedTo)) !== null;
+  };
 
   /**
    * Run the consumer's `authorize` hook (if any) for a TUS request. Returns
@@ -358,22 +540,40 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     res: ServerResponse,
     phase: 'create' | 'patch' | 'delete',
   ): Promise<
-    | { ok: true; artifactId: string | undefined; kind: UploadKind; relatedTo?: string }
+    | {
+        ok: true;
+        artifactId: string | undefined;
+        kind: UploadKind;
+        relatedTo?: string;
+        /** What `authorize` returned on `create`: the context to store with the artifact. */
+        context?: unknown;
+      }
     | { ok: false }
   > => {
     let artifactId: string | undefined;
     let kind: UploadKind = 'video';
     let relatedTo: string | undefined;
+    let fields: Pick<PulseVaultAuthorizeContext, 'name' | 'appVersion' | 'filename' | 'ext' | 'context'> =
+      {};
     if (phase === 'create') {
       const meta = req.headers['upload-metadata'];
       if (typeof meta === 'string') {
-        ({ artifactId, kind, relatedTo } = parseUploadMetadata(meta));
+        const parsed = parseUploadMetadata(meta);
+        ({ artifactId, kind, relatedTo } = parsed);
+        fields = {
+          ...(parsed.name ? { name: parsed.name } : {}),
+          ...(parsed.appVersion ? { appVersion: parsed.appVersion } : {}),
+          ...(parsed.filename ? { filename: parsed.filename } : {}),
+          ...(extensionOf(parsed.filename) ? { ext: extensionOf(parsed.filename) } : {}),
+        };
       }
     } else {
       artifactId = artifactIdFromTusUrl(req.url ?? '');
       if (artifactId) {
-        kind = await resolveStorageKind(storage, artifactId);
-        relatedTo = await resolveStorageRelatedTo(storage, artifactId);
+        const described = await describe(artifactId);
+        kind = described?.kind ?? (await resolveStorageKind(storage, artifactId));
+        relatedTo = described?.relatedTo ?? (await resolveStorageRelatedTo(storage, artifactId));
+        fields = describedFields(described);
       }
     }
 
@@ -399,8 +599,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     }
 
     try {
-      await authorize(req, { phase, artifactId, kind, relatedTo });
-      return { ok: true, artifactId, kind, relatedTo };
+      const result = await authorize(req, { phase, artifactId, kind, relatedTo, ...fields });
+      const context = phase === 'create' && result ? result.context : undefined;
+      return { ok: true, artifactId, kind, relatedTo, ...(context !== undefined ? { context } : {}) };
     } catch (err) {
       const statusCode = statusCodeOf(err, 403);
       const message = extractAuthzMessage(err);
@@ -456,9 +657,18 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       // a bogus statusCode there must fail closed too, not hang the hijacked socket.
       const authz = await runAuthorize(req, res, phase);
       if (!authz.ok) return;
+      if (phase === 'delete' && authz.artifactId && (await isLocked(authz.artifactId, authz.relatedTo))) {
+        writeJson(res, 403, pulseVaultError('A finished artifact is locked'));
+        return;
+      }
 
-      await pulseVaultTusContext.run({ request: req, artifactId: authz.artifactId }, () =>
-        tusServer.handle(req, res),
+      await pulseVaultTusContext.run(
+        {
+          request: req,
+          artifactId: authz.artifactId,
+          ...(authz.context !== undefined ? { context: authz.context } : {}),
+        },
+        () => tusServer.handle(req, res),
       );
     } catch (err) {
       failClosed(res, err, 'tus handler');
@@ -488,7 +698,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     req: IncomingMessage,
     res: ServerResponse,
     artifactId: string,
-    phase: 'resolve' | 'delete' | 'share',
+    phase: Exclude<PulseVaultAuthorizePhase, 'create' | 'patch'>,
     token?: string,
   ): Promise<{ kind: UploadKind; relatedTo: string | undefined } | undefined> => {
     if (!isUuid(artifactId)) {
@@ -496,14 +706,22 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       return undefined;
     }
 
-    const kind = await resolveStorageKind(storage, artifactId);
-    const relatedTo = await resolveStorageRelatedTo(storage, artifactId);
+    const described = await describe(artifactId);
+    const kind = described?.kind ?? (await resolveStorageKind(storage, artifactId));
+    const relatedTo = described?.relatedTo ?? (await resolveStorageRelatedTo(storage, artifactId));
     stashPulseVaultContext(req, { artifactId, kind, relatedTo });
 
     if (!authorize) return { kind, relatedTo };
 
     try {
-      await authorize(req, { phase, artifactId, kind, relatedTo, token });
+      await authorize(req, {
+        phase,
+        artifactId,
+        kind,
+        relatedTo,
+        token,
+        ...describedFields(described),
+      });
       return { kind, relatedTo };
     } catch (err) {
       const statusCode = statusCodeOf(err, 403);
@@ -528,6 +746,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
       if (typeof storage.remove !== 'function') {
         writeJson(res, 501, pulseVaultError('Storage adapter does not support delete'));
+        return;
+      }
+      if (await isLocked(artifactId, prepared.relatedTo)) {
+        writeJson(res, 403, pulseVaultError('A finished artifact is locked'));
         return;
       }
 
@@ -603,42 +825,164 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('Artifact not found'));
         return;
       }
-
-      if (resolved.kind === 'redirect') {
-        res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
-        res.end();
-        return;
-      }
-
-      const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
-
-      if (result.type === 'error') {
-        writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
-        return;
-      }
-
-      const headers = { ...result.headers };
-      // If the storage adapter provided an explicit content type (e.g. for
-      // non-standard extensions like `.pulse`), override what @fastify/send
-      // would otherwise infer from the filename.
-      if (resolved.contentType) {
-        headers['content-type'] = resolved.contentType;
-      }
-      res.writeHead(result.statusCode, headers);
-      // Headers are on the wire now, so a mid-stream read error (file removed
-      // after stat, disk error) can't become a 500 — destroy the socket instead
-      // of letting an unhandled 'error' crash the process. Destroy the source on
-      // client disconnect so the file descriptor is never leaked.
-      result.stream.on('error', (err) => failClosed(res, err, 'artifact stream'));
-      // A client that aborts mid-download makes the *response* stream emit its own
-      // 'error' (ECONNRESET / EPIPE). `.pipe` doesn't forward that, and an unhandled
-      // 'error' on `res` is fatal to the process — so swallow it (the 'close' handler
-      // above already tears down the source and reclaims the fd).
-      res.on('error', () => {});
-      res.on('close', () => result.stream.destroy());
-      result.stream.pipe(res);
+      await serveResolution(req, res, resolved);
     } catch (err) {
       failClosed(res, err, 'artifact get');
+    }
+  };
+
+  /** Stream or redirect to a resolved artifact — the tail of the GET route, shared with the poster route. */
+  const serveResolution = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    resolved: PulseVaultResolution,
+  ): Promise<void> => {
+    if (resolved.kind === 'redirect') {
+      res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
+      res.end();
+      return;
+    }
+
+    const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
+
+    if (result.type === 'error') {
+      writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
+      return;
+    }
+
+    const headers = { ...result.headers };
+    // If the storage adapter provided an explicit content type (e.g. for
+    // non-standard extensions like `.pulse`), override what @fastify/send
+    // would otherwise infer from the filename.
+    if (resolved.contentType) {
+      headers['content-type'] = resolved.contentType;
+    }
+    res.writeHead(result.statusCode, headers);
+    // Headers are on the wire now, so a mid-stream read error (file removed
+    // after stat, disk error) can't become a 500 — destroy the socket instead
+    // of letting an unhandled 'error' crash the process. Destroy the source on
+    // client disconnect so the file descriptor is never leaked.
+    result.stream.on('error', (err) => failClosed(res, err, 'artifact stream'));
+    // A client that aborts mid-download makes the *response* stream emit its own
+    // 'error' (ECONNRESET / EPIPE). `.pipe` doesn't forward that, and an unhandled
+    // 'error' on `res` is fatal to the process — so swallow it (the 'close' handler
+    // above already tears down the source and reclaims the fd).
+    res.on('error', () => {});
+    res.on('close', () => result.stream.destroy());
+    result.stream.pipe(res);
+  };
+
+  /** The declared length and bytes received of an upload, from tus's own record. */
+  const uploadProgress = async (
+    meta: PulseVaultArtifactMeta,
+  ): Promise<{ size?: number; bytesReceived?: number }> => {
+    try {
+      const upload = await storage.datastore.getUpload(`${meta.kind}/${meta.artifactId}${meta.ext}`);
+      return {
+        ...(typeof upload.size === 'number' ? { size: upload.size } : {}),
+        ...(typeof upload.offset === 'number' ? { bytesReceived: upload.offset } : {}),
+      };
+    } catch {
+      return {};
+    }
+  };
+
+  const getStatus = async (artifactId: string): Promise<PulseVaultArtifactStatus> => {
+    const meta = isUuid(artifactId) ? await describe(artifactId) : null;
+    if (!meta) return { artifactId, state: 'unknown' };
+    const state = !meta.ready ? 'uploading' : meta.processing ? 'processing' : 'ready';
+    return {
+      artifactId,
+      state,
+      kind: meta.kind,
+      ...(meta.relatedTo ? { relatedTo: meta.relatedTo } : {}),
+      ...(meta.name ? { name: meta.name } : {}),
+      ...(await uploadProgress(meta)),
+      acknowledged: meta.acknowledged,
+      ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),
+    };
+  };
+
+  const getPulse = async (artifactId: string): Promise<PulseVaultPulse> => {
+    const video = isUuid(artifactId) ? await describe(artifactId) : null;
+    const pulse: PulseVaultPulse = { video };
+    if (!video || typeof storage.listRelated !== 'function') return pulse;
+    for await (const record of storage.listRelated(artifactId)) {
+      if (!record.ready) continue;
+      const slot =
+        record.kind === 'thumbnail'
+          ? 'thumbnail'
+          : record.kind === 'captions'
+            ? 'captions'
+            : record.kind === 'project'
+              ? 'manifest'
+              : null;
+      if (!slot) continue;
+      // One per kind: a pulse uploads each once, and a retry that re-sent one is the newer.
+      const current = pulse[slot];
+      if (current && current.updatedAt >= record.updatedAt) continue;
+      const meta = await describe(record.artifactId);
+      if (meta) pulse[slot] = meta;
+    }
+    return pulse;
+  };
+
+  const recordOutcome = async (artifactId: string, outcome: unknown): Promise<boolean> => {
+    if (typeof storage.patchArtifact !== 'function') {
+      throw new TypeError('recordOutcome needs a storage adapter with `patchArtifact`');
+    }
+    if (!isUuid(artifactId)) return false;
+    return storage.patchArtifact(artifactId, { outcome: outcome === undefined ? null : outcome });
+  };
+
+  /**
+   * `GET /artifacts/:artifactId/status`: where an upload is, for a page waiting on it. Authorized
+   * as `status`, which `createCapabilityAuthorize` grants to the pairing token and to a view token.
+   */
+  const handleStatus = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+    token: string | undefined,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
+    try {
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'status', token);
+      if (!prepared) return;
+      res.setHeader('cache-control', 'no-store');
+      writeJson(res, 200, await getStatus(artifactId));
+    } catch (err) {
+      failClosed(res, err, 'artifact status');
+    }
+  };
+
+  /**
+   * `GET /artifacts/:artifactId/poster`: the finished thumbnail `relatedTo` the video, served as
+   * the artifact route would serve it. Authorized as `resolve` on the video, so whoever may watch
+   * it may see its poster. 404 until the poster has landed.
+   */
+  const handlePoster = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    artifactId: string,
+    token: string | undefined,
+  ): Promise<void> => {
+    stampProtocolVersion(res);
+    if (rejectOutdatedClient(req, res)) return;
+    try {
+      const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
+      if (!prepared) return;
+      const { thumbnail } = await getPulse(artifactId);
+      const resolved = thumbnail ? await storage.resolve(thumbnail.artifactId) : null;
+      if (!resolved) {
+        res.setHeader('cache-control', 'no-store');
+        writeJson(res, 404, pulseVaultError('No poster for this artifact'));
+        return;
+      }
+      await serveResolution(req, res, resolved);
+    } catch (err) {
+      failClosed(res, err, 'artifact poster');
     }
   };
 
@@ -697,6 +1041,16 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       await handleViewLink(req, res, viewLinkMatch[1]);
       return;
     }
+    const statusMatch = pathname.match(/^\/artifacts\/([^/]+)\/status$/);
+    if (statusMatch?.[1] && req.method === 'GET') {
+      await handleStatus(req, res, statusMatch[1], url.searchParams.get('token') ?? undefined);
+      return;
+    }
+    const posterMatch = pathname.match(/^\/artifacts\/([^/]+)\/poster$/);
+    if (posterMatch?.[1] && req.method === 'GET') {
+      await handlePoster(req, res, posterMatch[1], url.searchParams.get('token') ?? undefined);
+      return;
+    }
     const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)$/);
     if (artifactMatch?.[1]) {
       const artifactId = artifactMatch[1];
@@ -716,6 +1070,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     handler,
     shutdown: async () => {
       await retentionSweep?.stop();
+      await completion.stop();
       await storage.shutdown?.();
     },
     handleTus,
@@ -723,6 +1078,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     handleArtifactGet,
     handleViewLink,
     handleArtifactDelete,
+    handleStatus,
+    handlePoster,
+    getStatus,
+    getPulse,
+    recordOutcome,
+    replayCompletions: () => completion.replay(),
   };
 }
 
@@ -734,6 +1095,8 @@ export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
 export type {
+  PulseVaultArtifactMeta,
+  PulseVaultArtifactPatch,
   PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
@@ -744,12 +1107,15 @@ export type {
   PulseVaultAuthorize,
   PulseVaultAuthorizeContext,
   PulseVaultAuthorizePhase,
+  PulseVaultAuthorizeResult,
 } from './lib/authorize.js';
 export type {
   PulseVaultOnUploadComplete,
+  PulseVaultUploadCompleteContext,
   PulseVaultOnArtifactEvent,
   PulseVaultArtifactEvent,
 } from './lib/pulsevaultTus.js';
+export type { PulseVaultWebReadyOptions, PulseVaultReplayOptions } from './lib/completion.js';
 export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';

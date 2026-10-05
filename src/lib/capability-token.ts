@@ -27,10 +27,41 @@ export type CapabilityTokenClaims = {
    * capability token an upload uses.
    */
   use?: 'view';
+  /**
+   * Opaque host data (`issueCapabilityToken`'s `context`): who the upload is for, where it goes.
+   * Signed with the rest, so it can't be changed by whoever holds the token; stored with the
+   * artifact at create and handed back to every hook. JSON, at most `MAX_CONTEXT_BYTES` encoded.
+   */
+  ctx?: unknown;
 };
 
 const DEFAULT_EXPIRY_SECONDS = 1800; // 30 minutes — long enough for one upload session.
 const DEFAULT_CLOCK_TOLERANCE_SECONDS = 30;
+/**
+ * Cap on the encoded `context` claim. The token travels in a QR code and in every request's
+ * `Authorization` header, so a context is an owner and a destination, not a record.
+ */
+export const MAX_CONTEXT_BYTES = 1024;
+
+/** `JSON.stringify` a context, refusing anything that isn't plain JSON or is too large. */
+function encodeContext(context: unknown): string {
+  if (context === undefined) {
+    throw new TypeError('`context` must be JSON (an object, array, string, number, boolean or null)');
+  }
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(context);
+  } catch {
+    throw new TypeError('`context` must be JSON-serializable');
+  }
+  if (encoded === undefined) {
+    throw new TypeError('`context` must be JSON (an object, array, string, number, boolean or null)');
+  }
+  if (Buffer.byteLength(encoded, 'utf8') > MAX_CONTEXT_BYTES) {
+    throw new TypeError(`\`context\` must encode to at most ${MAX_CONTEXT_BYTES} bytes of JSON`);
+  }
+  return encoded;
+}
 
 function base64urlEncode(input: string): string {
   return Buffer.from(input, 'utf8').toString('base64url');
@@ -65,6 +96,13 @@ export type IssueCapabilityTokenOptions = {
   issuer: string;
   /** Token lifetime in seconds. Defaults to 1800 (30 minutes). */
   expirySeconds?: number;
+  /**
+   * Opaque host data signed into the token (`ctx` claim): the owner, the destination — whatever
+   * the host would otherwise keep in a table keyed by artifactId. PulseVault stores it with the
+   * artifact at create and hands it to `authorize`, `onUploadComplete`, `getStatus` and
+   * `getPulse`, so most hosts need no lookup table of their own. JSON, at most 1 KiB encoded.
+   */
+  context?: unknown;
 };
 
 /**
@@ -87,6 +125,8 @@ export function issueCapabilityToken(
     exp: now + (opts.expirySeconds ?? DEFAULT_EXPIRY_SECONDS),
     kid: opts.keyId,
     issuer: opts.issuer,
+    // Round-tripped through JSON so the claim is exactly what a verifier will read back.
+    ...(opts.context !== undefined ? { ctx: JSON.parse(encodeContext(opts.context)) } : {}),
   };
   const payload = base64urlEncode(JSON.stringify(claims));
   return `${payload}.${sign(payload, secret)}`;
@@ -137,6 +177,13 @@ export type VerifyCapabilityTokenOptions = {
   issuer: string;
   /** Clock-skew tolerance in seconds applied to both `iat` and `exp` checks. Defaults to 30. */
   clockToleranceSeconds?: number;
+  /**
+   * Whether `createCapabilityAuthorize` holds a create to the shape of a pulse: a video only
+   * under the token's own `artifactId` (with no `relatedTo`), and a thumbnail, beat manifest or
+   * captions only under another id, `relatedTo` the token's. Defaults to `true`, matching the
+   * core's `pulseShape` option; set `false` there and here for non-Pulse uploads.
+   */
+  pulseShape?: boolean;
 };
 
 /** Decode and check a token's claims and signature; `null` for any failure. */
@@ -145,7 +192,7 @@ function verifyToken(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
   use: 'upload' | 'view',
-): { artifactId: string; exp: number } | null {
+): { artifactId: string; exp: number; context?: unknown } | null {
   const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
@@ -185,8 +232,21 @@ function verifyToken(
   if (claims.iat > now + tolerance) return null;
   if (claims.exp < now - tolerance) return null;
   if (claims.issuer !== opts.issuer) return null;
+  // The signature already covers `ctx`; the size cap is enforced on the way in, and checked
+  // again here so a token minted elsewhere with the same secret can't carry a huge context.
+  if (claims.ctx !== undefined) {
+    try {
+      encodeContext(claims.ctx);
+    } catch {
+      return null;
+    }
+  }
 
-  return { artifactId: claims.artifactId, exp: claims.exp };
+  return {
+    artifactId: claims.artifactId,
+    exp: claims.exp,
+    ...(claims.ctx !== undefined ? { context: claims.ctx } : {}),
+  };
 }
 
 /**
@@ -201,9 +261,13 @@ export function verifyCapabilityToken(
   token: string,
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
-): { artifactId: string } | null {
+): { artifactId: string; context?: unknown } | null {
   const verified = verifyToken(token, lookupSecret, opts, 'upload');
-  return verified && { artifactId: verified.artifactId };
+  if (!verified) return null;
+  return {
+    artifactId: verified.artifactId,
+    ...(verified.context !== undefined ? { context: verified.context } : {}),
+  };
 }
 
 /**
@@ -262,19 +326,46 @@ export function createCapabilityAuthorize(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
 ): PulseVaultAuthorize {
+  const pulseShape = opts.pulseShape ?? true;
   return async (request, ctx) => {
     const token = extractToken(request, ctx);
     if (!token) {
       throw Object.assign(new Error('Missing capability token'), { statusCode: 401 });
     }
+    const readOnly = ctx.phase === 'resolve' || ctx.phase === 'status';
+    const capability = verifyCapabilityToken(token, lookupSecret, opts);
     const verified =
-      verifyCapabilityToken(token, lookupSecret, opts) ??
-      (ctx.phase === 'resolve' ? verifyViewToken(token, lookupSecret, opts) : null);
+      capability ?? (readOnly ? verifyViewToken(token, lookupSecret, opts) : null);
     if (!verified) {
       throw Object.assign(new Error('Invalid or expired capability token'), { statusCode: 403 });
     }
-    if (ctx.artifactId !== verified.artifactId && ctx.relatedTo !== verified.artifactId) {
+    if (pulseShape && ctx.phase === 'create') {
+      // The shape of a pulse: the token names the video, and only the video is created under
+      // that id. Everything else is created under its own id, `relatedTo` the token's. Without
+      // this, a token could create any number of videos under ids of the client's choosing, or
+      // take the video's own id with a thumbnail so the real video can never land.
+      const ok =
+        ctx.kind === 'video'
+          ? ctx.artifactId === verified.artifactId && ctx.relatedTo === undefined
+          : ctx.relatedTo === verified.artifactId && ctx.artifactId !== verified.artifactId;
+      if (!ok) {
+        throw Object.assign(
+          new Error(
+            ctx.kind === 'video'
+              ? 'A video is uploaded under the token’s own artifactId, with no relatedTo'
+              : `A ${ctx.kind} is uploaded under its own artifactId, relatedTo the token’s`,
+          ),
+          { statusCode: 403 },
+        );
+      }
+    } else if (ctx.artifactId !== verified.artifactId && ctx.relatedTo !== verified.artifactId) {
       throw Object.assign(new Error('Token does not authorize this artifact'), { statusCode: 403 });
     }
+    // The token's context is stored with the artifact it creates, so every later hook, status
+    // read and replay gets it without a host lookup.
+    if (ctx.phase === 'create' && capability?.context !== undefined) {
+      return { context: capability.context };
+    }
+    return undefined;
   };
 }

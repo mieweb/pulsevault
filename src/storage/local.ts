@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isUuid } from '../lib/uuid.js';
 import type {
+  PulseVaultArtifactMeta,
+  PulseVaultArtifactPatch,
   PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
@@ -44,11 +46,28 @@ type Sidecar = {
   name?: string;
   /** Optional uploading app version. See `ReserveUploadParams.appVersion`. */
   appVersion?: string;
+  /** Optional host data from the capability token. See `ReserveUploadParams.context`. */
+  context?: unknown;
+  /**
+   * `false` from reserve until the core records that `onUploadComplete` finished. Absent on
+   * sidecars written before the flag existed, read as `true` (nothing to replay).
+   */
+  acknowledged?: boolean;
+  /** `true` while a background web-ready conversion is rewriting the bytes. */
+  processing?: boolean;
+  /** Whatever the host recorded with `recordOutcome`. */
+  outcome?: unknown;
 };
 
 const SIDECAR_VERSION = 1 as const;
 /** Hidden directory inside workspaceRoot that holds per-upload sidecar files. */
 const PULSEVAULT_META_DIR = '.pulsevault';
+/**
+ * Relation index under the metadata directory: `related/<anchorId>/<artifactId>` is an empty
+ * marker for every artifact that declared `relatedTo` the anchor, so a pulse's files are one
+ * `readdir` away instead of a scan of every sidecar.
+ */
+const RELATED_DIR = 'related';
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
 const DEFAULT_META_CACHE_LIMIT = 10_000;
 
@@ -70,6 +89,15 @@ function extToContentType(ext: string): string {
       return 'application/zip';
     case '.vtt':
       return 'text/vtt';
+    case '.mov':
+      return 'video/quicktime';
+    case '.m4v':
+      return 'video/x-m4v';
+    case '.srt':
+      return 'application/x-subrip';
+    case '.pulse':
+      // The beat manifest (PROTOCOL.md §8) is JSON.
+      return 'application/json';
     case '.jpg':
     case '.jpeg':
       return 'image/jpeg';
@@ -148,6 +176,12 @@ export type LocalStorage = PulseVaultStorage & {
   getName(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.listArtifacts` contract. */
   listArtifacts(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
+  /** Satisfies the optional `PulseVaultStorage.describeArtifact` contract. */
+  describeArtifact(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
+  /** Satisfies the optional `PulseVaultStorage.patchArtifact` contract. */
+  patchArtifact(artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean>;
+  /** Satisfies the optional `PulseVaultStorage.listRelated` contract. */
+  listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
@@ -245,6 +279,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
+        ...(parsed.context !== undefined ? { context: parsed.context } : {}),
+        // A sidecar from before the flag existed has nothing to replay.
+        acknowledged: parsed.acknowledged !== false,
+        processing: parsed.processing === true,
+        ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
       };
     } catch {
       // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
@@ -252,6 +291,57 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return null;
     }
   };
+
+  /** Directory of relation markers for one anchor artifact. */
+  const relatedDir = (anchorId: string): string => {
+    const base = path.resolve(sidecarDir(), RELATED_DIR);
+    const resolved = path.resolve(base, anchorId);
+    if (!resolved.startsWith(`${base}${path.sep}`)) {
+      throw new Error('artifactId escapes the metadata directory');
+    }
+    return resolved;
+  };
+
+  /** When the upload last moved: the sidecar's mtime, or the bytes file's while still uploading. */
+  const lastActivity = async (artifactId: string, sidecar: Sidecar): Promise<number> => {
+    let updatedAt: number;
+    try {
+      updatedAt = (await fs.stat(sidecarPath(artifactId))).mtimeMs;
+    } catch {
+      return 0;
+    }
+    if (sidecar.status === 'uploading') {
+      const kind = sidecar.kind ?? 'video';
+      const bytes = path.join(workspaceRoot, kind, `${artifactId}${sidecar.ext}`);
+      const written = await fs.stat(bytes).then(
+        (stats) => stats.mtimeMs,
+        () => 0,
+      );
+      updatedAt = Math.max(updatedAt, written);
+    }
+    return updatedAt;
+  };
+
+  const sidecarToMeta = (
+    artifactId: string,
+    sidecar: Sidecar,
+    updatedAt: number,
+  ): PulseVaultArtifactMeta => ({
+    artifactId,
+    kind: sidecar.kind ?? 'video',
+    ext: sidecar.ext,
+    filename: sidecar.filename,
+    ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
+    ...(sidecar.checksum ? { checksum: sidecar.checksum } : {}),
+    ...(sidecar.name ? { name: sidecar.name } : {}),
+    ...(sidecar.appVersion ? { appVersion: sidecar.appVersion } : {}),
+    ...(sidecar.context !== undefined ? { context: sidecar.context } : {}),
+    ready: sidecar.status === 'ready',
+    acknowledged: sidecar.acknowledged !== false,
+    processing: sidecar.processing === true,
+    ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
+    updatedAt,
+  });
 
   const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
     const cached = metaCache.get(artifactId);
@@ -282,6 +372,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     checksum,
     name,
     appVersion,
+    context,
   }: ReserveUploadParams): Promise<string> => {
     await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
@@ -296,6 +387,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       checksum,
       name,
       appVersion,
+      ...(context !== undefined ? { context } : {}),
+      acknowledged: false,
     };
 
     // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
@@ -319,6 +412,15 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         });
       }
       await writeSidecar(artifactId, sidecar);
+    }
+
+    if (relatedTo) {
+      // The relation index entry. Written after the sidecar so a crash between the two leaves
+      // an artifact without an index entry (it still works, it's just not listed under its
+      // anchor), never an index entry without an artifact.
+      const dir = relatedDir(relatedTo);
+      await fs.mkdir(dir, { recursive: true, mode: 0o750 });
+      await fs.writeFile(path.join(dir, artifactId), '', { flag: 'w' });
     }
 
     cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum, name });
@@ -377,6 +479,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       fs.rm(artifactPath, { force: true }),
       fs.rm(`${artifactPath}.json`, { force: true }),
       fs.rm(sidecarPath(artifactId), { force: true }),
+      ...(meta.relatedTo
+        ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
+        : []),
     ]);
     return true;
   };
@@ -406,6 +511,56 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     const meta = await loadMeta(artifactId);
     return meta?.name ?? null;
   };
+
+  /** Straight from the sidecar, never the cache: its flags change after the cache was filled. */
+  const describeArtifact = async (artifactId: string): Promise<PulseVaultArtifactMeta | null> => {
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) return null;
+    return sidecarToMeta(artifactId, sidecar, await lastActivity(artifactId, sidecar));
+  };
+
+  const patchArtifact = async (
+    artifactId: string,
+    patch: PulseVaultArtifactPatch,
+  ): Promise<boolean> => {
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) return false;
+    const next: Sidecar = { ...sidecar };
+    if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
+    if (patch.processing !== undefined) next.processing = patch.processing;
+    if (patch.outcome !== undefined) {
+      if (patch.outcome === null) delete next.outcome;
+      else next.outcome = patch.outcome;
+    }
+    await writeSidecar(artifactId, next);
+    // The cache holds nothing a patch changes, but a `ready` flip elsewhere must not be undone
+    // by a stale entry either — keep it consistent with what was just written.
+    cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+    return true;
+  };
+
+  async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {
+    if (!isUuid(artifactId)) return;
+    let names: string[];
+    try {
+      names = await fs.readdir(relatedDir(artifactId));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+      throw err;
+    }
+    for (const relatedId of names) {
+      if (!isUuid(relatedId)) continue;
+      const sidecar = await readSidecar(relatedId);
+      if (!sidecar || sidecar.relatedTo !== artifactId) continue; // A marker whose artifact is gone.
+      yield {
+        artifactId: relatedId,
+        kind: sidecar.kind ?? 'video',
+        relatedTo: artifactId,
+        ready: sidecar.status === 'ready',
+        updatedAt: await lastActivity(relatedId, sidecar),
+      };
+    }
+  }
 
   /**
    * Walk the sidecars. A sidecar is rewritten only when its upload finishes, so its mtime is
@@ -470,5 +625,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     getChecksum,
     getName,
     listArtifacts,
+    describeArtifact,
+    patchArtifact,
+    listRelated,
   };
 }

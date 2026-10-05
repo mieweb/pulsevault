@@ -1,4 +1,5 @@
 import type { PulseVaultStorage, UploadKind } from './storage/types.js';
+import type { PulseVaultCore } from './core.js';
 
 /**
  * Opt-in TypeScript augmentation for the default `pulseVault` decorator and
@@ -33,6 +34,8 @@ import type { PulseVaultStorage, UploadKind } from './storage/types.js';
 declare module 'fastify' {
   interface FastifyInstance {
     pulseVault: PulseVaultStorage;
+    /** The core behind the routes: `getStatus`, `getPulse`, `recordOutcome`, `replayCompletions`. */
+    pulseVaultCore: PulseVaultCore;
   }
   interface FastifyRequest {
     /**

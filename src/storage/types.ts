@@ -92,6 +92,52 @@ export type ReserveUploadParams = {
    * an operator can tell which app build produced a file. Display metadata only, like `name`.
    */
   appVersion?: string;
+  /**
+   * Opaque host data the capability token carried (`issueCapabilityToken`'s `context`: an owner,
+   * a destination), as the `authorize` hook returned it for this create. Persisted verbatim so
+   * every later hook, status read and completion replay gets it back without a host lookup.
+   * JSON only; never interpreted by PulseVault.
+   */
+  context?: unknown;
+};
+
+/** Everything an adapter knows about one artifact, from `describeArtifact`. */
+export type PulseVaultArtifactMeta = {
+  artifactId: string;
+  kind: UploadKind;
+  /** Lowercase extension including the leading dot. */
+  ext: string;
+  /** Original filename from `Upload-Metadata.filename`. */
+  filename: string;
+  relatedTo?: string;
+  checksum?: string;
+  name?: string;
+  appVersion?: string;
+  /** See `ReserveUploadParams.context`. */
+  context?: unknown;
+  /** `true` once the upload finished and is served. */
+  ready: boolean;
+  /**
+   * `true` while the host's `onUploadComplete` has not finished for this artifact: set `false` at
+   * reserve, `true` by the core once the hook returned. A completion the host never recorded
+   * (a throw, a restart) is replayed from this flag. Sidecars written before the flag existed
+   * read as `true`, so an upgrade replays nothing.
+   */
+  acknowledged: boolean;
+  /** `true` while a background web-ready conversion is rewriting the bytes. */
+  processing: boolean;
+  /** Whatever the host recorded with `recordOutcome` (where the upload went, why it was kept). */
+  outcome?: unknown;
+  /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */
+  updatedAt: number;
+};
+
+/** The fields `patchArtifact` may change. Each is optional; absent means unchanged. */
+export type PulseVaultArtifactPatch = {
+  acknowledged?: boolean;
+  processing?: boolean;
+  /** `null` clears a recorded outcome. */
+  outcome?: unknown;
 };
 
 /** One artifact as `listArtifacts` reports it. */
@@ -197,4 +243,25 @@ export interface PulseVaultStorage {
    * after `changedBefore` (ms since epoch): the sweep never removes those.
    */
   listArtifacts?(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
+
+  /**
+   * Everything stored about one artifact, or `null` if the artifactId is unknown. Optional —
+   * the richer hook context, `getStatus`, `getPulse`, reclaiming idle uploads and replaying
+   * completions all need it (both built-in adapters have it).
+   */
+  describeArtifact?(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
+
+  /**
+   * Change the bookkeeping flags of one artifact (`acknowledged`, `processing`, `outcome`).
+   * Resolves `false` if the artifactId is unknown. Optional — completion replay, background
+   * web-ready and `recordOutcome` need it.
+   */
+  patchArtifact?(artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean>;
+
+  /**
+   * The artifacts that declared `relatedTo` this one (a pulse's captions, beat manifest and
+   * thumbnail), in flight or finished. Optional — `getPulse` and the poster route need it. Built
+   * from an index the adapter keeps at reserve time, so it never scans every artifact.
+   */
+  listRelated?(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
 }

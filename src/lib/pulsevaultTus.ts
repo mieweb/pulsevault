@@ -9,6 +9,14 @@ import { type PulseVaultRequest, type PulseVaultLogger, consoleLogger } from './
 import type { PulseVaultStorage } from '../storage/types.js';
 import type { UploadKind } from '../storage/types.js';
 import { parseUploadKind } from '../storage/types.js';
+import type { CompletionRunner, PulseVaultOnArtifactEvent } from './completion.js';
+
+export type {
+  PulseVaultOnUploadComplete,
+  PulseVaultUploadCompleteContext,
+  PulseVaultArtifactEvent,
+  PulseVaultOnArtifactEvent,
+} from './completion.js';
 
 /**
  * Context the plugin stashes on each incoming request for the lifetime of a
@@ -25,33 +33,11 @@ export type PulseVaultTusContext = {
   relatedTo?: string;
   /** Raw `checksum` metadata value (`<algorithm>:<hex>`), if the client sent one. */
   checksum?: string;
+  /** The host data `authorize` returned for this create (the capability token's `context`), stored with the artifact. */
+  context?: unknown;
 };
 
 export const pulseVaultTusContext = new AsyncLocalStorage<PulseVaultTusContext>();
-
-export type PulseVaultOnUploadComplete = (
-  request: PulseVaultRequest,
-  ctx: { artifactId: string; kind: UploadKind; size: number; uploadId: string },
-) => void | Promise<void>;
-
-/**
- * Fired at low-frequency, audit-worthy moments — never per chunk — so an
- * operator can wire one hook to get both ops metrics and a compliance audit
- * trail without hand-rolling both from the lower-level hooks. `remove` fires
- * after PulseVault removed an artifact: a `DELETE /artifacts/:id` or a TUS
- * `DELETE` (`reason: "deleted"`), or the `retention` sweep (`reason: "abandoned"`)
- * — so a host keeping its own index of artifacts can drop it.
- */
-export type PulseVaultArtifactEvent = {
-  phase: 'authorize' | 'complete' | 'reject' | 'remove';
-  artifactId: string;
-  kind: UploadKind;
-  size?: number;
-  reason?: string;
-  /** The uploading app's version, from `Upload-Metadata.appVersion` (`complete`/`reject` only). */
-  appVersion?: string;
-};
-export type PulseVaultOnArtifactEvent = (event: PulseVaultArtifactEvent) => void | Promise<void>;
 
 export type PulsevaultTusOptions = {
   storage: PulseVaultStorage;
@@ -76,10 +62,21 @@ export type PulsevaultTusOptions = {
    * `storage.remove?.(artifactId)` and a 4xx (default 422).
    */
   validatePayload?: PulseVaultValidatePayload;
-  /** Fired once the final byte has been written and any `validatePayload` has passed, for every kind. */
-  onUploadComplete?: PulseVaultOnUploadComplete;
+  /** Runs the host's `onUploadComplete` (and the web-ready queue) once the final byte has been written and any `validatePayload` has passed. */
+  completion: CompletionRunner;
   /** See `PulseVaultOnArtifactEvent`. */
   onArtifactEvent?: PulseVaultOnArtifactEvent;
+  /**
+   * Hold every create to the shape of a pulse: a video with no `relatedTo`; a thumbnail, beat
+   * manifest or captions under its own id, `relatedTo` another. See the core's `pulseShape`.
+   */
+  pulseShape: boolean;
+  /**
+   * Let a create take over an unfinished upload of the same artifactId, kind and `relatedTo`
+   * once it has been idle this long (so the same token authorizes both), instead of a `409`
+   * until `retention` runs. See the core's `reclaim`.
+   */
+  reclaim: { idleSeconds: number } | false;
   /** Logger for internal diagnostics (cleanup failures, etc). Defaults to `console`. */
   logger?: PulseVaultLogger;
 };
@@ -162,6 +159,20 @@ export function artifactIdFromUploadId(id: string): string | undefined {
  */
 const MAX_ARTIFACT_NAME_LENGTH = 512;
 
+/**
+ * Trim a display name and hard-cap its length so a hostile or buggy client can't bloat the
+ * sidecar; an all-whitespace/empty value is dropped. Capped by code point (Array.from iterates
+ * code points) rather than by `.slice()`'s UTF-16 units, so a title truncated at the boundary
+ * can't be left with a split surrogate pair (a half-emoji / lone surrogate).
+ */
+export function normalizeArtifactName(value: string | null | undefined): string | undefined {
+  return (
+    Array.from((value ?? '').trim())
+      .slice(0, MAX_ARTIFACT_NAME_LENGTH)
+      .join('') || undefined
+  );
+}
+
 type ParsedUploadMetadata = {
   artifactId: string;
   filename: string;
@@ -194,15 +205,8 @@ function parseUploadMetadata(
   const rawRelatedTo = (metadata?.relatedTo ?? '').trim();
   const relatedTo = isUuid(rawRelatedTo) ? rawRelatedTo : undefined;
   const checksum = (metadata?.checksum ?? '').trim() || undefined;
-  // Free-form display title. Trim, then hard-cap length so a hostile or buggy
-  // client can't bloat the sidecar; an all-whitespace/empty value is dropped.
-  // Cap by code point (Array.from iterates code points) rather than by
-  // `.slice()`'s UTF-16 units, so a title truncated at the boundary can't be
-  // left with a split surrogate pair (a half-emoji / lone surrogate).
-  const name =
-    Array.from((metadata?.name ?? '').trim())
-      .slice(0, MAX_ARTIFACT_NAME_LENGTH)
-      .join('') || undefined;
+  // Free-form display title, trimmed and capped (see `normalizeArtifactName`).
+  const name = normalizeArtifactName(metadata?.name);
 
   // The uploading app's version (PROTOCOL.md §4), trimmed and capped like `name`.
   const appVersion = normalizeAppVersion(metadata?.appVersion);
@@ -217,8 +221,10 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     maxSize,
     allowedExtensions,
     validatePayload,
-    onUploadComplete,
+    completion,
     onArtifactEvent,
+    pulseShape,
+    reclaim,
     logger = consoleLogger,
   } = options;
 
@@ -255,7 +261,23 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         store.checksum = checksum;
       }
 
-      return storage.reserveUpload({
+      // The shape of a pulse (PROTOCOL.md §8): the video is the anchor, created under the id the
+      // pairing link named, with no `relatedTo`; its thumbnail, beat manifest and captions are
+      // created under ids of their own, `relatedTo` the video. `createCapabilityAuthorize` also
+      // ties the ids to the token; this structural check holds for any `authorize`.
+      if (pulseShape) {
+        if (kind === 'video' && relatedTo !== undefined) {
+          throw tusError(403, 'A video is uploaded under its own artifactId, with no `relatedTo`.\n');
+        }
+        if (kind !== 'video' && (relatedTo === undefined || relatedTo === artifactId)) {
+          throw tusError(
+            403,
+            `A ${kind} is uploaded under its own artifactId, \`relatedTo\` the video it belongs to.\n`,
+          );
+        }
+      }
+
+      const params = {
         artifactId,
         filename,
         ext,
@@ -264,7 +286,33 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         checksum,
         name,
         appVersion,
-      });
+        ...(store?.context !== undefined ? { context: store.context } : {}),
+      };
+      try {
+        return await storage.reserveUpload(params);
+      } catch (err) {
+        if (statusCodeOf(err, 500) !== 409 || !reclaim) throw err;
+        // The id is taken. If it's an unfinished upload of the same kind and `relatedTo` — so
+        // the token that authorized this create authorized that one — that has been idle long
+        // enough to be abandoned (an app killed mid-upload sends no TUS DELETE; the person
+        // scanned the same link again), take it over instead of answering 409 until `retention`.
+        const existing = await storage.describeArtifact?.(artifactId);
+        // An adapter that can't say when the upload last moved (`updatedAt` 0) never reclaims.
+        const idleMs = existing && existing.updatedAt > 0 ? Date.now() - existing.updatedAt : -1;
+        if (
+          !existing ||
+          existing.ready ||
+          existing.kind !== kind ||
+          existing.relatedTo !== relatedTo ||
+          !(idleMs >= reclaim.idleSeconds * 1000)
+        ) {
+          throw err;
+        }
+        if (!(await storage.remove?.(artifactId))) throw err;
+        logger.info({ artifactId, kind, idleMs }, 'pulsevault reclaimed an idle unfinished upload');
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'reclaimed' });
+        return storage.reserveUpload(params);
+      }
     },
     // Relative Location (RFC 7231 §7.1.2) so the upload URL is correct behind
     // any TLS-terminating proxy without trusting spoofable X-Forwarded-*
@@ -363,21 +411,21 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         throw tusError(500, 'Upload finalization failed\n');
       }
 
-      // 3. Consumer hook — business logic (DB writes, queue jobs).
-      if (onUploadComplete) {
-        try {
-          await onUploadComplete(store.request, { artifactId, kind, size, uploadId });
-        } catch (err) {
-          // Propagate as a tus error so the client sees a non-2xx and can
-          // distinguish "bytes stored but completion hook failed" from
-          // success. The artifact is marked ready at this point — consumers
-          // who want "all-or-nothing" should `storage.remove` before
-          // throwing.
-          // The real error (often a consumer DB failure whose message can leak
-          // schema/infra detail) stays in the server log, not the client body.
-          logger.error({ err, artifactId, kind }, 'pulsevault onUploadComplete failed');
-          throw tusError(500, 'Upload completion hook failed\n');
-        }
+      // 3. Consumer hook — business logic (DB writes, queue jobs) — through the completion
+      //    runner, which records that the hook finished (so one that didn't is replayed) and
+      //    runs the background web-ready conversion.
+      try {
+        await completion.complete(store.request, { artifactId, kind, size, uploadId });
+      } catch (err) {
+        // Propagate as a tus error so the client sees a non-2xx and can
+        // distinguish "bytes stored but completion hook failed" from
+        // success. The artifact is marked ready at this point, and the
+        // completion is replayed later — consumers who want "all-or-nothing"
+        // should `storage.remove` before throwing.
+        // The real error (often a consumer DB failure whose message can leak
+        // schema/infra detail) stays in the server log, not the client body.
+        logger.error({ err, artifactId, kind }, 'pulsevault onUploadComplete failed');
+        throw tusError(500, 'Upload completion hook failed\n');
       }
 
       await onArtifactEvent?.({

@@ -31,6 +31,9 @@
       "type": "string",
       "enum": ["view"],
       "description": "`view` on a read-only view token (§5.5), which only opens artifacts and is signed with a key derived from the secret. Absent on the capability token an upload uses."
+    },
+    "ctx": {
+      "description": "Opaque host data signed into the token (protocol 2.3): who the upload is for, where it goes. The server stores it with the artifact the token creates and hands it back to its own hooks; a client never reads it. Any JSON, at most 1 KiB encoded."
     }
   }
 }
