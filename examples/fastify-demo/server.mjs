@@ -21,7 +21,7 @@ import fastifyCompress from "@fastify/compress";
 import fastifyEtag from "@fastify/etag";
 import underPressure from "@fastify/under-pressure";
 import QRCode from "qrcode";
-import pulseVault, { createLocalStorage, buildUploadLink, ensureWebReady } from "@mieweb/pulsevault";
+import pulseVault, { createLocalStorage, buildUploadLink } from "@mieweb/pulsevault";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // The route schema says `format: "uuid"` but Fastify's default Ajv doesn't
@@ -369,19 +369,17 @@ await app.register(pulseVault, {
   },
   // Web-playability backstop: mobile capture pipelines routinely upload MP4s
   // with the moov atom at the end (seconds of browser stall before frame one)
-  // or HEVC video (undecodable in Firefox and most Chrome). Fix each video
-  // once, right after its final byte lands: a lossless sub-second faststart
-  // remux, or a one-time H.264 transcode when the codec is hostile. Fail-open:
-  // without ffmpeg on PATH this logs one warning and serves the original
-  // bytes, exactly as before. For artifacts uploaded before this hook existed,
-  // run `node scripts/web-ready-migrate.mjs <dataDir>` (see OPERATIONS.md).
-  onUploadComplete: async (_request, { artifactId, kind }) => {
-    if (kind !== "video") return;
-    const localPath = await storage.getLocalPath(artifactId);
-    if (!localPath) return;
-    const result = await ensureWebReady(localPath, { logger: app.log });
-    if (result.action !== "none") {
-      app.log.info({ artifactId, ...result }, "web-ready");
+  // or HEVC video (undecodable in Firefox and most Chrome). The core fixes
+  // each video once, in the background after the final PATCH is answered: a
+  // lossless sub-second faststart remux, or a one-time H.264 transcode when
+  // the codec is hostile. Fail-open: without ffmpeg on PATH it logs one
+  // warning and serves the original bytes. For artifacts uploaded before
+  // this existed, run `node scripts/web-ready-migrate.mjs <dataDir>` (see
+  // OPERATIONS.md).
+  webReady: true,
+  onArtifactEvent: (event) => {
+    if (event.phase === "processed" && event.webReady?.action !== "none") {
+      app.log.info({ artifactId: event.artifactId, ...event.webReady }, "web-ready");
     }
   },
 });
