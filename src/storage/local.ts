@@ -1,6 +1,7 @@
 import { FileStore } from '@tus/file-store';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { isUuid } from '../lib/uuid.js';
 import type {
   PulseVaultArtifactMeta,
@@ -57,6 +58,8 @@ type Sidecar = {
   processing?: boolean;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
+  /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
+  readyAt?: number;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -232,12 +235,37 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     // Atomic tmp + rename so a crash mid-write can never leave a truncated
-    // JSON blob that `loadMeta` would then treat as corrupt.
+    // JSON blob that `loadMeta` would then treat as corrupt. The tmp name is
+    // unique, so two writers (two instances on a shared filesystem) never
+    // write into, or rename away, each other's tmp file.
     const finalPath = sidecarPath(artifactId);
-    const tmpPath = `${finalPath}.tmp`;
+    const tmpPath = `${finalPath}.${randomUUID()}.tmp`;
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
-    await fs.writeFile(tmpPath, JSON.stringify(sidecar), 'utf8');
-    await fs.rename(tmpPath, finalPath);
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(sidecar), 'utf8');
+      await fs.rename(tmpPath, finalPath);
+    } catch (err) {
+      await fs.rm(tmpPath, { force: true });
+      throw err;
+    }
+  };
+
+  /**
+   * Read-modify-write of a sidecar's flags runs one at a time per artifact in this process, so
+   * an acknowledgement and a conversion finishing at the same moment can't lose each other's
+   * write. (Across instances on a shared filesystem the last rename wins; the replay recovers a
+   * lost acknowledgement, and `processing` is only ever written by the instance converting.)
+   */
+  const sidecarWrites = new Map<string, Promise<unknown>>();
+  const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
+    const previous = sidecarWrites.get(artifactId) ?? Promise.resolve();
+    const run = previous.catch(() => {}).then(work);
+    sidecarWrites.set(artifactId, run);
+    try {
+      return await run;
+    } finally {
+      if (sidecarWrites.get(artifactId) === run) sidecarWrites.delete(artifactId);
+    }
   };
 
   const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
@@ -284,6 +312,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         acknowledged: parsed.acknowledged !== false,
         processing: parsed.processing === true,
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
+        ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
     } catch {
       // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
@@ -341,6 +370,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     processing: sidecar.processing === true,
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
+    ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
   });
 
   const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
@@ -450,23 +480,24 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     };
   };
 
-  const markReady = async (artifactId: string): Promise<void> => {
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) {
-      // No sidecar means no `reserveUpload` happened for this artifactId —
-      // this is a contract violation by the caller, not a recoverable state.
-      throw new Error(
-        `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
-      );
-    }
-    if (sidecar.status === 'ready') {
-      // Idempotent: already ready is fine, keep the cache consistent.
+  const markReady = (artifactId: string): Promise<void> =>
+    withSidecarLock(artifactId, async () => {
+      const sidecar = await readSidecar(artifactId);
+      if (!sidecar) {
+        // No sidecar means no `reserveUpload` happened for this artifactId —
+        // this is a contract violation by the caller, not a recoverable state.
+        throw new Error(
+          `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
+        );
+      }
+      if (sidecar.status === 'ready') {
+        // Idempotent: already ready is fine, keep the cache consistent.
+        cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+        return;
+      }
+      await writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() });
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
-      return;
-    }
-    await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
-  };
+    });
 
   const remove = async (artifactId: string): Promise<boolean> => {
     const meta = await loadMeta(artifactId);
@@ -519,25 +550,23 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return sidecarToMeta(artifactId, sidecar, await lastActivity(artifactId, sidecar));
   };
 
-  const patchArtifact = async (
-    artifactId: string,
-    patch: PulseVaultArtifactPatch,
-  ): Promise<boolean> => {
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) return false;
-    const next: Sidecar = { ...sidecar };
-    if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
-    if (patch.processing !== undefined) next.processing = patch.processing;
-    if (patch.outcome !== undefined) {
-      if (patch.outcome === null) delete next.outcome;
-      else next.outcome = patch.outcome;
-    }
-    await writeSidecar(artifactId, next);
-    // The cache holds nothing a patch changes, but a `ready` flip elsewhere must not be undone
-    // by a stale entry either — keep it consistent with what was just written.
-    cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
-    return true;
-  };
+  const patchArtifact = (artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean> =>
+    withSidecarLock(artifactId, async () => {
+      const sidecar = await readSidecar(artifactId);
+      if (!sidecar) return false;
+      const next: Sidecar = { ...sidecar };
+      if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
+      if (patch.processing !== undefined) next.processing = patch.processing;
+      if (patch.outcome !== undefined) {
+        if (patch.outcome === null) delete next.outcome;
+        else next.outcome = patch.outcome;
+      }
+      await writeSidecar(artifactId, next);
+      // The cache holds nothing a patch changes, but a `ready` flip elsewhere must not be undone
+      // by a stale entry either — keep it consistent with what was just written.
+      cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+      return true;
+    });
 
   async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {
     if (!isUuid(artifactId)) return;

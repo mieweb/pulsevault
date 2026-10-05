@@ -528,11 +528,11 @@ The Pulse app has always uploaded in this shape. For uploads that aren't pulses,
 
 ### `reclaim`
 
-`{ idleSeconds: 300 }` by default; `false` turns it off. An app killed mid-upload sends no TUS `DELETE`, so its unfinished upload keeps its artifactId and every later create of that id — the person scanning the same link again — answers `409` until `retention` removes it. With `reclaim`, a create takes over an unfinished upload of the same artifactId once it has been idle for `idleSeconds` (no bytes written, on the local adapter; since it started, on S3): the old upload is removed (`onArtifactEvent` `remove` with `reason: "reclaimed"`) and the new one starts from byte 0. Only an upload of the same kind and `relatedTo` is taken over, so the token that authorized the new create authorized the old one; and only one whose last activity the adapter knows.
+`{ idleSeconds: 300 }` by default; `false` turns it off. An app killed mid-upload sends no TUS `DELETE`, so its unfinished upload keeps its artifactId and every later create of that id — the person scanning the same link again — answers `409` until `retention` removes it. With `reclaim`, a create takes over an unfinished upload of the same artifactId once it has been idle for `idleSeconds` — no bytes received: the bytes file's mtime on the local adapter, the newest multipart part (or the incomplete part parked between `PATCH`es) on S3: the old upload is removed (`onArtifactEvent` `remove` with `reason: "reclaimed"`) and the new one starts from byte 0. Only an upload of the same kind and `relatedTo` is taken over, so the token that authorized the new create authorized the old one; only one whose last activity the adapter knows; and creates for one artifactId run one at a time per instance, so two rescans can't both take it over.
 
 ### `lockWhenReady`
 
-Off by default. Once an artifact is finished, `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE` answer `403` for it, and for anything `relatedTo` a finished video: a pulse that landed stays, whatever token is presented. Removal then goes through `storage.remove` on the host's own terms (an admin action, a retention policy). The check reads storage just before the removal; the TUS `DELETE` also runs under tus's per-upload lock, so it can't interleave with the final chunk of the same upload.
+Off by default. Once an artifact is finished, `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE` answer `403` for it, and for anything `relatedTo` a finished video: a pulse that landed stays, whatever token is presented. Removal then goes through `storage.remove` on the host's own terms (an admin action, a retention policy). The check reads storage (not the per-instance cache) just before the removal. For the TUS `DELETE` it runs inside tus's per-upload lock, so a cancel racing the final chunk of the same upload waits for it and then finds the artifact finished. `DELETE {prefix}/artifacts/<id>` takes no such lock — the Pulse app never uses it while uploading — so a delete and a final chunk arriving in the same instant can both succeed there.
 
 ### `webReady`
 
@@ -560,13 +560,15 @@ The core behind the routes is `fastify.pulseVaultCore` (rename it with `coreDeco
 // Where an upload is — what GET /artifacts/:id/status reports — for a host that polls server-side.
 await app.pulseVaultCore.getStatus(videoId);
 // → { artifactId, state: "unknown" | "uploading" | "processing" | "ready", kind, relatedTo?, name?,
-//     bytesReceived?, size?, acknowledged, outcome? }
+//     bytesReceived?, size?, acknowledged, outcome?, context? }
+// `context` (the token's) is for the host — an owner check is a comparison on it; the route leaves it out.
 
 // Where it went, or why it didn't: any JSON, reported as `outcome` by the status route. `null` clears it.
 await app.pulseVaultCore.recordOutcome(videoId, { state: "done", note: "Posted to Huddle" });
 
 // A video and the finished files relatedTo it, by kind — from the adapters' relation index, never a scan.
 const { video, thumbnail, captions, manifest } = await app.pulseVaultCore.getPulse(videoId);
+// One per kind; when a file was re-sent, the one that finished last (`readyAt`) wins.
 ```
 
 A page waiting on an upload polls `GET {prefix}/artifacts/<id>/status` (never cached) with the pairing token or a view token, and reads `outcome` once the host recorded one — no table, SSE route or polling method of the host's own. `GET {prefix}/artifacts/<videoId>/poster` serves the video's thumbnail the way the artifact route serves it, authorized as `resolve` on the video, and `404`s until the poster has landed, so a card asks by the video's id and nothing is copied onto the host's records.

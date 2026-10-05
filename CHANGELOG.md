@@ -7,8 +7,6 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-10-05
-
 Protocol 2.3 (`PROTOCOL.md` §7.4). What every host rebuilt around PulseVault
 (#80), in the core: the shape of a pulse, a completion that survives a throw
 or a restart, a lock on finished pulses, the token's own context, a status

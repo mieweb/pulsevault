@@ -223,8 +223,15 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
   const replayEvery =
     opts.replay === false ? null : (opts.replay?.intervalSeconds ?? DEFAULT_REPLAY_INTERVAL_SECONDS) * 1000;
 
-  /** Artifacts this process is completing or converting right now; the replay leaves them alone. */
-  const inFlight = new Set<string>();
+  /**
+   * Artifacts this process is working on, which the replay leaves alone: `completing` while the
+   * host's hook runs, `converting` from the moment a conversion is queued (not only once it has
+   * a slot — a video waiting behind a long transcode must not be queued twice) until it ends.
+   */
+  const completing = new Set<string>();
+  const converting = new Set<string>();
+  const inFlight = (artifactId: string): boolean =>
+    completing.has(artifactId) || converting.has(artifactId);
 
   const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
     storage.describeArtifact ? storage.describeArtifact(artifactId) : Promise.resolve(null);
@@ -262,9 +269,10 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     request: PulseVaultRequest,
     ctx: PulseVaultUploadCompleteContext,
     runHookAfter: boolean,
-  ): Promise<void> =>
-    queue.run(async () => {
-      inFlight.add(ctx.artifactId);
+  ): Promise<void> => {
+    if (converting.has(ctx.artifactId)) return Promise.resolve(); // already queued or running
+    converting.add(ctx.artifactId);
+    return queue.run(async () => {
       try {
         const localPath = await localPathFor(ctx.artifactId);
         const result: WebReadyResult = localPath
@@ -293,15 +301,18 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
         logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault web-ready conversion failed');
         await storage.patchArtifact?.(ctx.artifactId, { processing: false }).catch(() => {});
       } finally {
-        inFlight.delete(ctx.artifactId);
+        converting.delete(ctx.artifactId);
       }
     });
+  };
 
   const complete = async (request: PulseVaultRequest, upload: FinishedUpload): Promise<void> => {
     const meta = await describe(upload.artifactId);
-    // A final PATCH the client retried after losing the 204 finishes the upload a second time:
-    // the hook already ran and was recorded, so don't run it again.
-    if (meta?.acknowledged && !meta.processing) return;
+    // A final PATCH the client retried after losing the 204 finishes the upload a second time.
+    // The hook already ran and was recorded: don't run it again (a conversion still going on is
+    // the queue's business). And a conversion already queued — with `completeAfter`, the hook
+    // follows it — must not be queued twice.
+    if (meta?.acknowledged || meta?.processing || inFlight(upload.artifactId)) return;
     const ctx = contextFor(meta, upload, false);
     const converts = webReady !== undefined && upload.kind === 'video';
     if (converts) {
@@ -309,11 +320,11 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       void convert(request, ctx, completeAfter);
       if (completeAfter) return;
     }
-    inFlight.add(upload.artifactId);
+    completing.add(upload.artifactId);
     try {
       await runHook(request, ctx);
     } finally {
-      inFlight.delete(upload.artifactId);
+      completing.delete(upload.artifactId);
     }
   };
 
@@ -336,7 +347,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
         return replayed;
       }
       for await (const record of storage.listArtifacts()) {
-        if (!record.ready || inFlight.has(record.artifactId)) continue;
+        if (!record.ready || inFlight(record.artifactId)) continue;
         let meta: PulseVaultArtifactMeta | null;
         try {
           meta = await storage.describeArtifact(record.artifactId);
@@ -344,7 +355,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           logger.error({ err, artifactId: record.artifactId }, 'pulsevault replay could not read an artifact');
           continue;
         }
-        if (!meta || inFlight.has(meta.artifactId)) continue;
+        if (!meta || inFlight(meta.artifactId)) continue;
         if (meta.acknowledged && !meta.processing) continue;
         const uploadId = `${meta.kind}/${meta.artifactId}${meta.ext}`;
         const upload: FinishedUpload = {
@@ -354,10 +365,11 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           uploadId,
         };
         const ctx = contextFor(meta, upload, true);
+        const convertible = webReady !== undefined && meta.kind === 'video';
         if (meta.processing) {
           // A conversion a restart interrupted. `ensureWebReady` is idempotent, so a rewrite
           // that did finish before the flag was cleared is a no-op here.
-          if (webReady !== undefined && meta.kind === 'video') {
+          if (convertible) {
             void convert(REPLAY_REQUEST, ctx, !meta.acknowledged && completeAfter);
             if (meta.acknowledged || completeAfter) {
               replayed.push(meta.artifactId);
@@ -367,8 +379,16 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             await storage.patchArtifact?.(meta.artifactId, { processing: false }).catch(() => {});
           }
           if (meta.acknowledged) continue;
+        } else if (convertible && completeAfter) {
+          // Unacknowledged with `completeAfter`: the hook may only run after the conversion, and
+          // the process may have stopped between `markReady` and recording that one was due.
+          // Converting first costs nothing when the bytes are already web-ready.
+          await storage.patchArtifact?.(meta.artifactId, { processing: true }).catch(() => {});
+          void convert(REPLAY_REQUEST, ctx, true);
+          replayed.push(meta.artifactId);
+          continue;
         }
-        inFlight.add(meta.artifactId);
+        completing.add(meta.artifactId);
         try {
           await runHook(REPLAY_REQUEST, ctx);
           replayed.push(meta.artifactId);
@@ -378,7 +398,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             'pulsevault onUploadComplete failed on replay; it will be tried again',
           );
         } finally {
-          inFlight.delete(meta.artifactId);
+          completing.delete(meta.artifactId);
         }
       }
       return replayed;

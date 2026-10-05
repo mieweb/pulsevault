@@ -58,6 +58,7 @@
          fixed, height follows the poster, so vertical clips keep their shape. */
       .card { position: relative; width: 100%; max-width: 20rem; border-radius: 10px; overflow: hidden; background: #000; }
       .card button.play { all: unset; display: block; width: 100%; cursor: pointer; }
+      .card button.play:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
       .card img { display: block; width: 100%; }
       .card .fallback { display: block; width: 100%; aspect-ratio: 9 / 16; max-height: 22rem; background: #111; }
       .card .glyph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }

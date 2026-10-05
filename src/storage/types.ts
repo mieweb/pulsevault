@@ -130,6 +130,12 @@ export type PulseVaultArtifactMeta = {
   outcome?: unknown;
   /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */
   updatedAt: number;
+  /**
+   * When the upload finished (ms since the epoch), recorded by `markReady` and never changed
+   * after — a stable order for "the newest related file", which `updatedAt` isn't (a later
+   * acknowledgement or outcome moves it). Absent on sidecars written before it was recorded.
+   */
+  readyAt?: number;
 };
 
 /** The fields `patchArtifact` may change. Each is optional; absent means unchanged. */

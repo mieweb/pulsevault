@@ -224,6 +224,8 @@ export type PulseVaultArtifactStatus = {
   acknowledged?: boolean;
   /** What the host recorded with `recordOutcome`, if anything. */
   outcome?: unknown;
+  /** The capability token's context (`getStatus` only; the status route leaves it out). */
+  context?: unknown;
 };
 
 /** A pulse: its video and the finished artifacts `relatedTo` it, one per kind (the newest wins). */
@@ -479,6 +481,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   const pulseShape = options.pulseShape ?? true;
   const lockWhenReady = options.lockWhenReady === true;
+  const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
+    typeof storage.describeArtifact === 'function'
+      ? storage.describeArtifact(artifactId)
+      : Promise.resolve(null);
   if (options.reclaim !== undefined && options.reclaim !== false) {
     const { idleSeconds } = options.reclaim;
     if (idleSeconds !== undefined && !(idleSeconds >= 0 && Number.isFinite(idleSeconds))) {
@@ -510,13 +516,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     onArtifactEvent,
     pulseShape,
     reclaim,
+    ...(lockWhenReady ? { isLocked: (artifactId: string) => isLocked(artifactId) } : {}),
     logger,
   });
-
-  const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
-    typeof storage.describeArtifact === 'function'
-      ? storage.describeArtifact(artifactId)
-      : Promise.resolve(null);
 
   /**
    * With `lockWhenReady`, whether a delete must be refused: the artifact is finished, or it
@@ -524,10 +526,20 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
    * `DELETE` additionally runs under tus's per-upload lock, so it can't interleave with the
    * final chunk of the same upload.
    */
-  const isLocked = async (artifactId: string, relatedTo: string | undefined): Promise<boolean> => {
+  const isFinished = async (artifactId: string): Promise<boolean> => {
+    // `describeArtifact` reads storage itself; `resolve` may answer from a per-instance cache
+    // that hasn't seen another instance finish the upload.
+    if (typeof storage.describeArtifact === 'function') {
+      return (await storage.describeArtifact(artifactId))?.ready ?? false;
+    }
+    return (await storage.resolve(artifactId)) !== null;
+  };
+  const isLocked = async (artifactId: string, relatedTo?: string): Promise<boolean> => {
     if (!lockWhenReady) return false;
-    if (await storage.resolve(artifactId)) return true;
-    return relatedTo !== undefined && (await storage.resolve(relatedTo)) !== null;
+    const meta = await describe(artifactId);
+    if (meta ? meta.ready : await isFinished(artifactId)) return true;
+    const parent = relatedTo ?? meta?.relatedTo;
+    return parent !== undefined && (await isFinished(parent));
   };
 
   /**
@@ -657,10 +669,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       // a bogus statusCode there must fail closed too, not hang the hijacked socket.
       const authz = await runAuthorize(req, res, phase);
       if (!authz.ok) return;
-      if (phase === 'delete' && authz.artifactId && (await isLocked(authz.artifactId, authz.relatedTo))) {
-        writeJson(res, 403, pulseVaultError('A finished artifact is locked'));
-        return;
-      }
+      // `lockWhenReady` for a TUS DELETE is checked inside the datastore's removal, under tus's
+      // per-upload lock (see `withArtifactRemoval`).
 
       await pulseVaultTusContext.run(
         {
@@ -900,6 +910,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       ...(await uploadProgress(meta)),
       acknowledged: meta.acknowledged,
       ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),
+      ...(meta.context !== undefined ? { context: meta.context } : {}),
     };
   };
 
@@ -918,11 +929,13 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
               ? 'manifest'
               : null;
       if (!slot) continue;
-      // One per kind: a pulse uploads each once, and a retry that re-sent one is the newer.
-      const current = pulse[slot];
-      if (current && current.updatedAt >= record.updatedAt) continue;
+      // One per kind: a pulse uploads each once, and a retry that re-sent one is the newer —
+      // by when it finished (`readyAt`), which later bookkeeping never moves.
       const meta = await describe(record.artifactId);
-      if (meta) pulse[slot] = meta;
+      if (!meta) continue;
+      const current = pulse[slot];
+      if (current && (current.readyAt ?? current.updatedAt) >= (meta.readyAt ?? meta.updatedAt)) continue;
+      pulse[slot] = meta;
     }
     return pulse;
   };
@@ -951,7 +964,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'status', token);
       if (!prepared) return;
       res.setHeader('cache-control', 'no-store');
-      writeJson(res, 200, await getStatus(artifactId));
+      // The token's context is the host's data about the upload, not the viewer's business.
+      const { context: _context, ...status } = await getStatus(artifactId);
+      writeJson(res, 200, status);
     } catch (err) {
       failClosed(res, err, 'artifact status');
     }

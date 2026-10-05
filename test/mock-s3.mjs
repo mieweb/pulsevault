@@ -196,7 +196,7 @@ export async function startMockS3({ buckets = [] } = {}) {
         }
         const body = await readBody(req);
         const etag = `"${md5Hex(body)}"`;
-        upload.parts.set(Number(q.get('partNumber')), { body, etag });
+        upload.parts.set(Number(q.get('partNumber')), { body, etag, lastModified: new Date() });
         res.writeHead(200, { etag, 'content-length': 0 });
         res.end();
         return;
@@ -213,7 +213,7 @@ export async function startMockS3({ buckets = [] } = {}) {
           .sort(([a], [b]) => a - b)
           .map(
             ([n, p]) =>
-              `<Part><PartNumber>${n}</PartNumber><ETag>${p.etag}</ETag><Size>${p.body.length}</Size></Part>`,
+              `<Part><PartNumber>${n}</PartNumber><LastModified>${(p.lastModified ?? new Date(0)).toISOString()}</LastModified><ETag>${p.etag}</ETag><Size>${p.body.length}</Size></Part>`,
           )
           .join('');
         sendXml(
@@ -345,6 +345,13 @@ export async function startMockS3({ buckets = [] } = {}) {
           sendError(res, 412, 'PreconditionFailed', 'Object already exists');
           return;
         }
+        // `If-Match` (a conditional rewrite): 412 unless the stored version has that ETag.
+        const ifMatch = req.headers['if-match'];
+        if (ifMatch && objects.get(objKey(bucket, key))?.etag !== ifMatch) {
+          await readBody(req);
+          sendError(res, 412, 'PreconditionFailed', 'At least one of the pre-conditions you specified did not hold');
+          return;
+        }
         const body = await readBody(req);
         objects.set(objKey(bucket, key), {
           body,
@@ -381,6 +388,7 @@ export async function startMockS3({ buckets = [] } = {}) {
           'content-type': q.get('response-content-type') ?? obj.contentType,
           'content-length': slice.length,
           etag: obj.etag,
+          'last-modified': (obj.lastModified ?? new Date(0)).toUTCString(),
           'accept-ranges': 'bytes',
         };
         // Echo object metadata back as x-amz-meta-* — the SDK surfaces these as

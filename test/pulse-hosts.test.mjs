@@ -14,11 +14,13 @@ import Fastify from "fastify";
 import pulseVault, {
   createLocalStorage,
   createS3Storage,
+  createChecksumValidator,
   issueCapabilityToken,
   issueViewToken,
   createCapabilityAuthorize,
   MAX_CONTEXT_BYTES,
 } from "../dist/app.js";
+import { createHash } from "node:crypto";
 import { makeMp4, tusCreate, tusPatch, tusDelete, uploadFull } from "./helpers.mjs";
 import { startMockS3 } from "./mock-s3.mjs";
 
@@ -346,20 +348,26 @@ test("reclaim: a fresh unfinished upload still 409s, and reclaim: false keeps th
   }
 });
 
-test("reclaim on S3: the mock reports when the sidecar was written, so an idle upload is taken over", async () => {
-  const ctx = await startS3({ pluginOptions: { authorize: authorize(), reclaim: { idleSeconds: 0 } } });
+test("reclaim on S3: idleness counts from the last part received, not from the reservation", async () => {
+  const ctx = await startS3({ pluginOptions: { authorize: authorize(), reclaim: { idleSeconds: 2 } } });
   try {
     const videoId = randomUUID();
     const headers = bearer(mint(videoId));
-    const create = { artifactId: videoId, filename: "draft.mp4", size: 1024, kind: "video", headers };
-    assert.equal((await tusCreate(ctx.baseUrl, PREFIX, create)).status, 201);
-    const meta = await ctx.storage.describeArtifact(videoId);
-    if (!(meta.updatedAt > 0)) {
-      // An adapter that can't tell when the upload last moved never reclaims.
-      assert.equal((await tusCreate(ctx.baseUrl, PREFIX, create)).status, 409);
-      return;
-    }
-    assert.equal((await tusCreate(ctx.baseUrl, PREFIX, create)).status, 201);
+    const body = makeMp4(6 * 1024 * 1024);
+    const create = { artifactId: videoId, filename: "draft.mp4", size: body.length, kind: "video", headers };
+    const first = await tusCreate(ctx.baseUrl, PREFIX, create);
+    assert.equal(first.status, 201);
+    const reservedAt = (await ctx.storage.describeArtifact(videoId)).updatedAt;
+    assert.ok(reservedAt > 0, "the mock reports when the sidecar was written");
+    await new Promise((r) => setTimeout(r, 2100));
+    // A part lands after the reservation went idle: the upload is active again.
+    const location = new URL(first.headers.get("location"), ctx.baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body.subarray(0, 5 * 1024 * 1024), headers)).status, 204);
+    const active = await ctx.storage.describeArtifact(videoId);
+    assert.ok(active.updatedAt > reservedAt, "last activity moved with the part");
+    assert.equal((await tusCreate(ctx.baseUrl, PREFIX, create)).status, 409, "not idle: not reclaimed");
+    await new Promise((r) => setTimeout(r, 2100));
+    assert.equal((await tusCreate(ctx.baseUrl, PREFIX, create)).status, 201, "idle again: reclaimed");
   } finally {
     await ctx.teardown();
   }
@@ -426,6 +434,118 @@ test("durable completion: an acknowledged completion is not fired again by a ret
     await ctx.teardown();
   }
 });
+
+test("a retried final PATCH after a web-ready rewrite skips payload validation, so a checksum validator can't remove a delivered video", { skip: !FFMPEG }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-retry-"));
+  const recorded = path.join(dir, "recorded.mp4");
+  execFileSync("ffmpeg", [
+    "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", recorded,
+  ], { stdio: "ignore" });
+  const body = await fs.readFile(recorded);
+  let fired = 0;
+  let ctx;
+  try {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-hosts-"));
+    const storage = createLocalStorage({ workspaceDir });
+    ctx = await startApp(
+      storage,
+      {
+        validatePayload: createChecksumValidator(),
+        webReady: true,
+        onUploadComplete: async () => { fired++; },
+      },
+      () => fs.rm(workspaceDir, { recursive: true, force: true }),
+    );
+    const videoId = randomUUID();
+    const checksum = `sha256:${createHash("sha256").update(body).digest("hex")}`;
+    const create = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: videoId, filename: "draft.mp4", size: body.length, kind: "video", checksum,
+    });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body)).status, 204);
+    assert.equal(fired, 1);
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && (await ctx.core.getStatus(videoId)).state !== "ready") {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.notDeepEqual(await fs.readFile(await storage.getLocalPath(videoId)), body, "the bytes were remuxed");
+    // The client lost the 204 and sends the (empty) tail again: the checksum of the rewritten
+    // bytes no longer matches, but the finished upload isn't validated — or removed — again.
+    const retry = await tusPatch(location, body.length, Buffer.alloc(0));
+    assert.equal(retry.status, 204);
+    assert.equal(fired, 1);
+    assert.equal((await ctx.core.getStatus(videoId)).state, "ready");
+    assert.equal((await fetch(ctx.url(`/artifacts/${videoId}`))).status, 200);
+  } finally {
+    await ctx?.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("replay with completeAfter converts before the hook, even when the process stopped before the conversion was recorded", { skip: !FFMPEG }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-replay-"));
+  const recorded = path.join(dir, "recorded.mp4");
+  execFileSync("ffmpeg", [
+    "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", recorded,
+  ], { stdio: "ignore" });
+  const body = await fs.readFile(recorded);
+  const completions = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      onUploadComplete: async (_req, c) => { completions.push(c); },
+    },
+  });
+  try {
+    // The state a crash between markReady and the queue leaves behind: ready, unacknowledged,
+    // not processing — written straight into storage.
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "draft.mp4", kind: "video", body });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !(await ctx.core.getStatus(videoId)).acknowledged) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(completions.length, 1);
+    await fs.writeFile(await ctx.storage.getLocalPath(videoId), body); // the original bytes again
+    await ctx.storage.patchArtifact(videoId, { acknowledged: false, processing: false });
+
+    assert.deepEqual(await ctx.core.replayCompletions(), [videoId]);
+    const done = Date.now() + 20_000;
+    while (Date.now() < done && completions.length < 2) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(completions.length, 2);
+    assert.equal(completions[1].replay, true);
+    assert.equal(completions[1].webReady?.action, "remuxed", "converted before the hook ran");
+    assert.equal((await ctx.core.getStatus(videoId)).acknowledged, true);
+  } finally {
+    await ctx.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [name, start] of [["local", startLocal], ["S3", startS3]]) {
+  test(`patchArtifact (${name}): concurrent flag writes don't lose each other`, async () => {
+    const ctx = await start();
+    try {
+      const videoId = randomUUID();
+      await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "draft.mp4", kind: "video" });
+      await ctx.storage.patchArtifact(videoId, { acknowledged: false, processing: true });
+      await Promise.all([
+        ctx.storage.patchArtifact(videoId, { acknowledged: true }),
+        ctx.storage.patchArtifact(videoId, { processing: false }),
+        ctx.storage.patchArtifact(videoId, { outcome: { state: "done" } }),
+      ]);
+      const meta = await ctx.storage.describeArtifact(videoId);
+      assert.equal(meta.acknowledged, true);
+      assert.equal(meta.processing, false);
+      assert.deepEqual(meta.outcome, { state: "done" });
+      assert.ok(meta.readyAt > 0, "readyAt is recorded at markReady");
+    } finally {
+      await ctx.teardown();
+    }
+  });
+}
 
 test("sidecars from before the acknowledged flag read as acknowledged, so an upgrade replays nothing", async () => {
   const ctx = await startLocal({ pluginOptions: { onUploadComplete: async () => {} } });
@@ -528,6 +648,14 @@ test("status route: unknown, uploading with progress, ready with the host's outc
     assert.equal(await ctx.core.recordOutcome(videoId, null), true);
     assert.equal((await ctx.core.getStatus(videoId)).outcome, undefined);
     assert.equal(await ctx.core.recordOutcome(randomUUID(), "x"), false);
+
+    // The token's context reaches the host's server-side read, never the route.
+    const owned = randomUUID();
+    const ownedToken = mint(owned, { context: { userId: "u1" } });
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: owned, filename: "o.mp4", kind: "video", headers: bearer(ownedToken) });
+    assert.deepEqual((await ctx.core.getStatus(owned)).context, { userId: "u1" });
+    const routed = await (await fetch(ctx.url(`/artifacts/${owned}/status`), { headers: bearer(ownedToken) })).json();
+    assert.equal(routed.context, undefined);
   } finally {
     await ctx.teardown();
   }

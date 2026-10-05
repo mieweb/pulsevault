@@ -82,11 +82,31 @@ let appLoaded = (async () => {
     await saveApp();
   }
 })();
-async function saveApp() {
-  await mkdir(path.dirname(appFile), { recursive: true });
-  const tmp = `${appFile}.tmp`;
-  await writeFile(tmp, JSON.stringify(app, null, 2));
-  await rename(tmp, appFile);
+// Saves run one at a time (a ticket being added while a video is delivered), each snapshot
+// written to its own temp file and renamed into place, so the file is never half-written and
+// an older snapshot never lands after a newer one.
+let saving = Promise.resolve();
+function saveApp() {
+  const run = saving.catch(() => {}).then(async () => {
+    await mkdir(path.dirname(appFile), { recursive: true });
+    const tmp = `${appFile}.${randomUUID()}.tmp`;
+    await writeFile(tmp, JSON.stringify(app, null, 2));
+    await rename(tmp, appFile);
+  });
+  saving = run;
+  return run;
+}
+/** Apply a change to the app's records only once it's on disk, so a failed save leaves nothing behind in memory. */
+async function commit(change) {
+  const before = app;
+  app = structuredClone(app);
+  try {
+    change(app);
+    await saveApp();
+  } catch (err) {
+    app = before;
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -102,16 +122,16 @@ const DESTINATIONS = {
       return {};
     },
     async deliver(userId, _destination, video) {
-      if (!app.posts.some((p) => p.videoId === video.artifactId)) {
-        app.posts.unshift({
+      await commit((next) => {
+        if (next.posts.some((p) => p.videoId === video.artifactId)) return; // a replay
+        next.posts.unshift({
           id: randomUUID(),
           author: userId,
           text: video.name || "A Pulse video",
           videoId: video.artifactId,
           createdAt: new Date().toISOString(),
         });
-        await saveApp();
-      }
+      });
       return "Posted to the feed";
     },
   },
@@ -123,17 +143,17 @@ const DESTINATIONS = {
       return { id };
     },
     async deliver(userId, { id }, video) {
-      const ticket = app.tickets.find((t) => t.id === id);
-      if (!ticket) throw httpError(404, `Ticket ${id} was deleted while the video was uploading`);
-      if (!ticket.attachments.some((a) => a.videoId === video.artifactId)) {
+      await commit((next) => {
+        const ticket = next.tickets.find((t) => t.id === id);
+        if (!ticket) throw httpError(404, `Ticket ${id} was deleted while the video was uploading`);
+        if (ticket.attachments.some((a) => a.videoId === video.artifactId)) return; // a replay
         ticket.attachments.push({
           videoId: video.artifactId,
           name: video.name || "A Pulse video",
           by: userId,
           createdAt: new Date().toISOString(),
         });
-        await saveApp();
-      }
+      });
       return `Attached to ticket ${id}`;
     },
   },
@@ -191,7 +211,10 @@ const core = createPulseVaultCore({
       await core.recordOutcome(ctx.artifactId, { state: "done", note });
       console.log(`[demo] ${ctx.replay ? "replayed: " : ""}${note} (${ctx.artifactId}, ${ctx.webReady?.action ?? "no conversion"})`);
     } catch (err) {
-      // The destination went away: the video stays in storage, and the page says why.
+      // Only a destination that's gone for good settles the upload as kept (the video stays in
+      // storage, and the page says why). Anything else — the records file couldn't be written,
+      // a bug — is thrown, so PulseVault replays the completion instead of recording it done.
+      if (err.statusCode !== 404) throw err;
       await core.recordOutcome(ctx.artifactId, { state: "kept", reason: err.message });
       console.warn(`[demo] kept ${ctx.artifactId}: ${err.message}`);
     }
@@ -315,8 +338,7 @@ const api = {
     const clean = String(title ?? "").trim().slice(0, 80);
     if (!clean) throw httpError(400, "A title is required");
     const ticket = { id: `T-${100 + app.tickets.length + 1}`, title: clean, attachments: [], createdAt: new Date().toISOString() };
-    app.tickets.push(ticket);
-    await saveApp();
+    await commit((next) => next.tickets.push(ticket));
     return ticket;
   },
 };

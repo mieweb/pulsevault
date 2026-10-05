@@ -77,6 +77,8 @@ export type PulsevaultTusOptions = {
    * until `retention` runs. See the core's `reclaim`.
    */
   reclaim: { idleSeconds: number } | false;
+  /** With the core's `lockWhenReady`: whether a TUS `DELETE` of this artifact must be refused. */
+  isLocked?: (artifactId: string) => Promise<boolean>;
   /** Logger for internal diagnostics (cleanup failures, etc). Defaults to `console`. */
   logger?: PulseVaultLogger;
 };
@@ -107,6 +109,7 @@ export function tusError(status: number, body: string): Error {
 function withArtifactRemoval(
   storage: PulseVaultStorage,
   onRemoved?: (artifactId: string, kind: UploadKind) => Promise<void>,
+  isLocked?: (artifactId: string) => Promise<boolean>,
 ): DataStore {
   const { datastore } = storage;
   if (!storage.remove) return datastore;
@@ -116,6 +119,12 @@ function withArtifactRemoval(
       if (prop === 'remove') {
         return async (id: string): Promise<void> => {
           const artifactId = artifactIdFromUploadId(id);
+          // `lockWhenReady`, checked here because tus's DELETE handler holds the per-upload lock
+          // around this call: a DELETE racing the final PATCH of the same upload waits for it
+          // and then sees the artifact finished.
+          if (artifactId && isLocked && (await isLocked(artifactId))) {
+            throw tusError(403, 'A finished artifact is locked\n');
+          }
           const kind = artifactId ? await resolveKind(storage, artifactId) : undefined;
           // The datastore's own removal first — the upload's bytes and tus's records, which a
           // custom adapter's `remove` may not know about — then the artifact's.
@@ -225,14 +234,34 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
     onArtifactEvent,
     pulseShape,
     reclaim,
+    isLocked,
     logger = consoleLogger,
   } = options;
 
+  // Creates for one artifactId run one at a time in this process, so two creates that both
+  // find the same idle upload can't both remove it and the second clobber the first's
+  // replacement. (Across instances the local adapter's exclusive sidecar write still decides.)
+  const creating = new Map<string, Promise<unknown>>();
+  const serializeCreate = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
+    const previous = creating.get(artifactId) ?? Promise.resolve();
+    const run = previous.catch(() => {}).then(work);
+    creating.set(artifactId, run);
+    try {
+      return await run;
+    } finally {
+      if (creating.get(artifactId) === run) creating.delete(artifactId);
+    }
+  };
+
   const server = new Server({
     path: tusPath,
-    datastore: withArtifactRemoval(storage, async (artifactId, kind) => {
-      await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'deleted' });
-    }),
+    datastore: withArtifactRemoval(
+      storage,
+      async (artifactId, kind) => {
+        await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'deleted' });
+      },
+      isLocked,
+    ),
     maxSize,
     namingFunction: async (_req, metadata) => {
       const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =
@@ -288,6 +317,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         appVersion,
         ...(store?.context !== undefined ? { context: store.context } : {}),
       };
+      return serializeCreate(artifactId, async () => {
       try {
         return await storage.reserveUpload(params);
       } catch (err) {
@@ -313,6 +343,7 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
         await onArtifactEvent?.({ phase: 'remove', artifactId, kind, reason: 'reclaimed' });
         return storage.reserveUpload(params);
       }
+      });
     },
     // Relative Location (RFC 7231 §7.1.2) so the upload URL is correct behind
     // any TLS-terminating proxy without trusting spoofable X-Forwarded-*
@@ -345,6 +376,21 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       const uploadId = upload.id;
       // Reported on the complete/reject events so an operator can see which app build sent it.
       const appVersion = normalizeAppVersion(upload.metadata?.appVersion);
+
+      // A final PATCH the client retried after losing the 204 finishes an upload that already
+      // finished. Its bytes were validated then, and may since have been rewritten for the web
+      // (so a checksum check would fail and remove a delivered video): only the completion
+      // bookkeeping runs again, which itself skips a hook that was recorded.
+      const finished = (await storage.describeArtifact?.(artifactId))?.ready ?? false;
+      if (finished) {
+        try {
+          await completion.complete(store.request, { artifactId, kind: await resolveKind(storage, artifactId), size, uploadId });
+        } catch (err) {
+          logger.error({ err, artifactId }, 'pulsevault onUploadComplete failed');
+          throw tusError(500, 'Upload completion hook failed\n');
+        }
+        return {};
+      }
 
       // Resolve kind/checksum: prefer the context value (set during the same
       // request's namingFunction for single-request uploads), fall back to a

@@ -56,6 +56,8 @@ type Sidecar = {
   processing?: boolean;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
+  /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
+  readyAt?: number;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -262,6 +264,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     DeleteObjectCommand,
     HeadObjectCommand,
     ListObjectsV2Command,
+    ListPartsCommand,
   } = s3;
   const { getSignedUrl } = presigner;
   const { S3Store } = s3store;
@@ -315,28 +318,47 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
 
-  const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
+  const writeSidecar = async (
+    artifactId: string,
+    sidecar: Sidecar,
+    /** Only replace the version with this ETag (a read-modify-write that must not lose a concurrent one). */
+    ifMatch?: string,
+  ): Promise<void> => {
     await client.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: sidecarKey(artifactId),
         Body: JSON.stringify(sidecar),
         ContentType: 'application/json',
+        ...(ifMatch ? { IfMatch: ifMatch } : {}),
       }),
     );
   };
 
-  const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
+  /** The sidecar and the ETag of the version read, for a conditional rewrite. */
+  const readSidecarVersioned = async (
+    artifactId: string,
+  ): Promise<{ sidecar: Sidecar; etag?: string } | null> => {
     let raw: string;
+    let etag: string | undefined;
     try {
       const res = await client.send(
         new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
       );
       raw = (await bodyToBuffer(res.Body)).toString('utf8');
+      etag = res.ETag;
     } catch (err) {
       if (isNotFound(err)) return null;
       throw err;
     }
+    const sidecar = parseSidecar(raw);
+    return sidecar ? { sidecar, ...(etag ? { etag } : {}) } : null;
+  };
+
+  const readSidecar = async (artifactId: string): Promise<Sidecar | null> =>
+    (await readSidecarVersioned(artifactId))?.sidecar ?? null;
+
+  const parseSidecar = (raw: string): Sidecar | null => {
     try {
       const parsed = JSON.parse(raw) as Partial<Sidecar>;
       if (typeof parsed.ext !== 'string') return null;
@@ -358,11 +380,49 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         acknowledged: parsed.acknowledged !== false,
         processing: parsed.processing === true,
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
+        ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
     } catch {
       // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
       return null;
     }
+  };
+
+  /** `LastModified` of one object, 0 when absent or unknown. */
+  const objectModifiedAt = async (key: string): Promise<number> => {
+    try {
+      const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      return head.LastModified?.getTime() ?? 0;
+    } catch (err) {
+      if (isNotFound(err)) return 0;
+      throw err;
+    }
+  };
+
+  /**
+   * When an unfinished upload last received bytes, as far as the bucket can tell: the newest of
+   * its multipart parts (listed through the upload id @tus/s3-store keeps on its `.info` object)
+   * and the incomplete part it parks between PATCHes. 0 when nothing has arrived yet. A PATCH
+   * leaves a trace here as soon as it lands, unlike the sidecar, which is written at reserve.
+   */
+  const lastUploadActivity = async (key: string): Promise<number> => {
+    let latest = await objectModifiedAt(`${key}.part`);
+    try {
+      const info = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: `${key}.info` }));
+      latest = Math.max(latest, info.LastModified?.getTime() ?? 0);
+      const uploadId = info.Metadata?.['upload-id'];
+      if (uploadId) {
+        const parts = await client.send(
+          new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+        );
+        for (const part of parts.Parts ?? []) {
+          latest = Math.max(latest, part.LastModified?.getTime() ?? 0);
+        }
+      }
+    } catch {
+      // No `.info` yet, the multipart upload is gone, or ListParts isn't supported: what we have.
+    }
+    return latest;
   };
 
   /** Relation index key for one related artifact under its anchor. */
@@ -401,6 +461,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     processing: sidecar.processing === true,
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
+    ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
   });
 
   const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
@@ -536,7 +597,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       cacheSet(artifactId, next);
       return;
     }
-    await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
+    await writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() });
     cacheSet(artifactId, next);
   };
 
@@ -648,26 +709,51 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     if (!isUuid(artifactId)) return null;
     const sidecar = await readSidecar(artifactId);
     if (!sidecar) return null;
-    return sidecarToMeta(artifactId, sidecar, await sidecarModifiedAt(artifactId));
+    let updatedAt = await sidecarModifiedAt(artifactId);
+    if (sidecar.status === 'uploading') {
+      // An upload in flight counts from its last byte, not from when it was reserved — so a
+      // long upload that's still moving is never taken for an idle one.
+      const key = artifactKey(artifactId, sidecar.kind ?? 'video', sidecar.ext);
+      updatedAt = Math.max(updatedAt, await lastUploadActivity(key));
+    }
+    return sidecarToMeta(artifactId, sidecar, updatedAt);
   };
 
+  /**
+   * A read-modify-write that must not lose a concurrent one (an instance acknowledging a
+   * completion while another records its outcome): the rewrite is conditional on the ETag that
+   * was read, and retried from a fresh read when the object changed meanwhile. On a backend that
+   * doesn't support `IfMatch`, the write is unconditional — the same degraded mode as reserve.
+   */
   const patchArtifact = async (
     artifactId: string,
     patch: PulseVaultArtifactPatch,
   ): Promise<boolean> => {
     if (!isUuid(artifactId)) return false;
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) return false;
-    const next: Sidecar = { ...sidecar };
-    if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
-    if (patch.processing !== undefined) next.processing = patch.processing;
-    if (patch.outcome !== undefined) {
-      if (patch.outcome === null) delete next.outcome;
-      else next.outcome = patch.outcome;
+    for (let attempt = 0; ; attempt++) {
+      const current = await readSidecarVersioned(artifactId);
+      if (!current) return false;
+      const next: Sidecar = { ...current.sidecar };
+      if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
+      if (patch.processing !== undefined) next.processing = patch.processing;
+      if (patch.outcome !== undefined) {
+        if (patch.outcome === null) delete next.outcome;
+        else next.outcome = patch.outcome;
+      }
+      try {
+        await writeSidecar(artifactId, next, current.etag);
+      } catch (err) {
+        if (isPreconditionFailed(err) && attempt < 5) continue; // changed under us: re-read, retry
+        if (isConditionalWriteUnsupported(err)) {
+          warnAboutConditionalWriteFallbackOnce();
+          await writeSidecar(artifactId, next);
+        } else {
+          throw err;
+        }
+      }
+      cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+      return true;
     }
-    await writeSidecar(artifactId, next);
-    cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
-    return true;
   };
 
   async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {
