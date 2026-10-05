@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/png" href="/favicon.png" />
-    <title>PulseVault — Minimal Meteor Demo</title>
+    <title>Huddle — PulseVault Meteor demo</title>
     <style>
       :root {
         --bg: #0a0e16;
@@ -14,84 +14,97 @@
         --text: #e7eaf0;
         --text-2: #9aa4b8;
         --text-3: #626d82;
-        --accent: #10b981;
+        --accent: #ff383c;
+        --ok: #34d399;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
         background: var(--bg);
         color: var(--text);
       }
       * { box-sizing: border-box; min-width: 0; }
-      html { overflow-x: hidden; }
-      body { max-width: 46rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; line-height: 1.5; overflow-x: hidden; }
-
-      .eyebrow { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); margin: 0 0 0.6rem; }
-      h1 { font-size: 1.05rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
-      h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
-
-      .brand-row { display: flex; align-items: center; gap: 0.6rem; }
-      .brand-mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #047857); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; flex: none; }
-      .brand-sub { font-size: 0.75rem; color: var(--text-3); margin: 0.1rem 0 0; }
-      .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
-
-      .docs-link { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.4rem 0.75rem; font-size: 0.75rem; font-weight: 600; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); border-radius: 6px; text-decoration: none; }
-      .docs-link:hover { border-color: var(--accent); color: var(--text); }
-
-      .status-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
-      .chip { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.7rem; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--text-2); }
-      .chip b { color: var(--text); font-weight: 600; }
-      .dot { width: 0.45rem; height: 0.45rem; border-radius: 999px; background: #34d399; box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.14); flex: none; }
-
-      /* Diagrams routinely render wider than a phone screen — scroll them
-         horizontally rather than letting them force the whole page to scroll. */
-      .diagram-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 0 0.75rem; }
-      .diagram-wrap .mermaid { min-width: 460px; }
-      .diagram-caption { font-size: 0.72rem; font-weight: 600; color: var(--text-3); margin: 0 0 0.4rem; }
-
-      section { margin-top: 1.75rem; }
-      .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
-
-      details summary { cursor: pointer; list-style: none; }
-      details summary::-webkit-details-marker { display: none; }
-      details.panel summary { font-weight: 600; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
-      details.panel summary::before { content: "▸"; color: var(--text-3); font-size: 0.7rem; }
-      details.panel[open] summary::before { content: "▾"; }
-      details.panel[open] summary { margin-bottom: 0.9rem; }
-
-      .feature-list { margin: 0; padding: 0; list-style: none; font-size: 0.8rem; color: var(--text-2); }
-      .feature-list li { position: relative; padding: 0.4rem 0 0.4rem 1.1rem; border-top: 1px solid var(--border); }
-      .feature-list li:first-child { border-top: none; }
-      .feature-list li::before { content: "→"; color: var(--accent); position: absolute; left: 0; top: 0.4rem; }
+      body { max-width: 64rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; line-height: 1.5; }
+      h1 { font-size: 1.05rem; font-weight: 700; margin: 0; }
+      h2 { font-size: 0.8rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); margin: 0 0 0.75rem; }
+      p { margin: 0; }
+      a { color: var(--text-2); }
       code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; font-size: 0.85em; }
 
-      .btn { display: block; width: 100%; padding: 0.55rem 1rem; font-size: 0.85rem; font-weight: 600; border-radius: 7px; text-align: center; text-decoration: none; cursor: pointer; border: 1px solid transparent; }
-      .btn-primary { color: #fff; background: var(--accent); margin-top: 1rem; }
-      .btn-primary:hover { background: #059669; }
-      .btn-ghost { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
-      .btn-ghost:hover { color: var(--text); border-color: var(--accent); }
-      .btn-sm { width: auto; padding: 0.3rem 0.65rem; font-size: 0.72rem; }
+      .top { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+      .brand { display: flex; align-items: center; gap: 0.6rem; }
+      .mark { width: 1.9rem; height: 1.9rem; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #b91c1c); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 0.85rem; }
+      .sub { font-size: 0.75rem; color: var(--text-3); }
+      .me { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-2); }
 
-      .qr { display: block; margin: 1rem auto 0; border-radius: 8px; background: #fff; padding: 10px; }
-      .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; word-break: break-all; color: var(--text-3); }
-      label { display: block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); margin: 0.7rem 0 0.2rem; }
-      label:first-of-type { margin-top: 0; }
+      .cols { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 1.25rem; }
+      @media (max-width: 760px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+      .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.1rem; }
+      .stack > * + * { margin-top: 0.9rem; }
 
-      footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.35rem; }
-      footer a { color: var(--text-3); word-break: break-all; }
+      .btn { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.45rem 0.85rem; font-size: 0.8rem; font-weight: 600; border-radius: 7px; cursor: pointer; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-family: inherit; }
+      .btn:hover { border-color: var(--text-3); }
+      .btn-pulse { background: var(--accent); border-color: transparent; color: #fff; }
+      .btn-pulse:hover { background: #e3262b; }
+      .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.72rem; }
+      .btn-link { background: none; border: none; color: var(--text-3); padding: 0; font-size: 0.75rem; cursor: pointer; text-decoration: underline; font-family: inherit; }
+      input { font: inherit; font-size: 0.85rem; padding: 0.45rem 0.6rem; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+      .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+      .post { border-top: 1px solid var(--border); padding-top: 0.9rem; }
+      .post:first-child { border-top: none; padding-top: 0; }
+      .byline { font-size: 0.75rem; color: var(--text-3); margin-bottom: 0.35rem; }
+      .byline b { color: var(--text-2); }
+      .empty { font-size: 0.8rem; color: var(--text-3); }
+
+      /* The video card: the poster with a play button, the player mounted on tap. Width is
+         fixed, height follows the poster, so vertical clips keep their shape. */
+      .card { position: relative; width: 100%; max-width: 20rem; border-radius: 10px; overflow: hidden; background: #000; }
+      .card button.play { all: unset; display: block; width: 100%; cursor: pointer; }
+      .card button.play:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
+      .card img { display: block; width: 100%; }
+      .card .fallback { display: block; width: 100%; aspect-ratio: 9 / 16; max-height: 22rem; background: #111; }
+      .card .glyph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+      .card .glyph span { width: 3rem; height: 3rem; border-radius: 999px; background: rgba(0,0,0,0.55); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 1.1rem; padding-left: 0.2rem; }
+      .card video { display: block; width: 100%; max-height: 32rem; background: #000; }
+      .card .state { position: absolute; left: 0.5rem; bottom: 0.5rem; font-size: 0.65rem; background: rgba(0,0,0,0.6); color: #fff; padding: 0.15rem 0.45rem; border-radius: 999px; }
+      .title { font-size: 0.85rem; margin-top: 0.4rem; }
+
+      .ticket { border-top: 1px solid var(--border); padding: 0.75rem 0; }
+      .ticket:first-of-type { border-top: none; padding-top: 0; }
+      .ticket-head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+      .ticket-id { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; color: var(--text-3); }
+      .attachments { display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.6rem; }
+
+      /* The pairing popup */
+      .scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 10; }
+      .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; width: 100%; max-width: 22rem; text-align: center; }
+      .modal h3 { margin: 0 0 0.25rem; font-size: 0.95rem; }
+      .modal .where { font-size: 0.78rem; color: var(--text-2); margin-bottom: 0.9rem; }
+      .qr { display: block; margin: 0 auto; border-radius: 8px; background: #fff; padding: 8px; width: 240px; max-width: 100%; }
+      .status { margin-top: 0.9rem; font-size: 0.82rem; min-height: 1.5rem; }
+      .status.ok { color: var(--ok); }
+      .status.warn { color: #fbbf24; }
+      .bar { height: 0.35rem; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin-top: 0.4rem; }
+      .bar i { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+      .modal .actions { display: flex; gap: 0.5rem; justify-content: center; margin-top: 0.9rem; flex-wrap: wrap; }
+      .hint { font-size: 0.72rem; color: var(--text-3); margin-top: 0.75rem; }
+
+      details.how { margin-top: 1.5rem; font-size: 0.8rem; color: var(--text-2); }
+      details.how summary { cursor: pointer; font-weight: 600; color: var(--text-2); }
+      details.how ol { padding-left: 1.2rem; margin: 0.5rem 0 0; }
+      details.how li { margin: 0.25rem 0; }
+      footer { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--text-3); }
     </style>
   </head>
   <body>
     <div id="root"></div>
 
-    <!-- Real React, no build step: pinned ESM builds served from a CDN, with
-         `htm` providing JSX-like templating in plain JS. Keeps this example a
-         single `meteor run` with no bundler while the page itself is a normal
-         React component tree (state, effects, polling). -->
+    <!-- Real React, no build step: pinned ESM builds from a CDN, with `htm` for JSX-like
+         templating. Keeps the example a single `meteor run`. -->
     <script type="importmap">
       {
         "imports": {
           "react": "https://esm.sh/react@19.1.0",
           "react-dom/client": "https://esm.sh/react-dom@19.1.0/client",
-          "htm/react": "https://esm.sh/htm@3.1.1/react?deps=react@19.1.0",
-          "mermaid": "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+          "htm/react": "https://esm.sh/htm@3.1.1/react?deps=react@19.1.0"
         }
       }
     </script>
@@ -99,241 +112,220 @@
       import { useState, useEffect, useCallback, useRef } from "react";
       import { createRoot } from "react-dom/client";
       import { html } from "htm/react";
-      import mermaid from "mermaid";
 
-      mermaid.initialize({ startOnLoad: false, theme: "dark" });
-
-      // ----------------------------------------------------------------- //
-      // Static content                                                    //
-      // ----------------------------------------------------------------- //
-
-      const SETUP_DIAGRAM = `
-graph TB
-    subgraph demo ["examples/meteor-demo — the code this demo owns"]
-        R["this React page (GET /)"]
-        D1["POST /reserve — mint artifactId"]
-        D2["GET /deeplinks — pairing link + QR"]
-        D3["GET /videos — list finished uploads"]
-    end
-    subgraph plugin ["@mieweb/pulsevault/core — mounted at /pulsevault via WebApp.connectHandlers"]
-        P1["GET /capabilities — protocol discovery"]
-        P2["TUS /upload — resumable uploads<br/>(POST create, PATCH chunks, HEAD resume)"]
-        P3["GET + DELETE /artifacts/:id — serve + delete bytes"]
-    end
-    S[("os.tmpdir()<br/>local storage: bytes + sidecars")]
-    App["Pulse app"] -->|scans QR from| D2
-    App -->|uploads via| P2
-    P2 --> S
-    P3 --> S
-    D3 -->|reads sidecars| S`;
-
-      const FLOW_DIAGRAM = `
-sequenceDiagram
-    participant User
-    participant Demo as This demo server
-    participant Vault as pulsevault core
-    participant Pulse as Pulse app
-
-    User->>Demo: open this page
-    Demo->>User: QR + pulsecam:// deep link (artifactId minted server-side)
-    User->>Pulse: scan / open link
-    Pulse->>Vault: GET /capabilities (protocol version, limits)
-    Pulse->>Vault: POST /upload -> 201 + Location
-    Pulse->>Vault: PATCH chunks, HEAD before resume
-    Vault->>Vault: finished upload marked ready on disk
-    Demo->>Vault: page lists /videos, plays /artifacts/:id`;
-
-      const S3_DIAGRAM = `
-graph LR
-    V["pulsevault core —<br/>N instances, no sticky sessions"] -->|multipart TUS| B[("S3 / Cloudflare R2<br/>bucket")]
-    B -.->|"playback: 302 presigned URL,<br/>bytes never proxy through Node"| P["viewer"]`;
-
-      const DB_DIAGRAM = `
-graph LR
-    H["onUploadComplete +<br/>onArtifactEvent hooks"] -->|index once,<br/>on completion| DB[("artifacts · sessions ·<br/>signing keys (kid) · audit log")]
-    DB -->|one indexed query| L["GET /pulses"]
-    C["retention cron /<br/>key rotation"] --> DB`;
+      const api = async (method, path, body) => {
+        const res = await fetch(`/api${path}`, {
+          method,
+          headers: body ? { "content-type": "application/json" } : {},
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `${method} ${path} failed (${res.status})`);
+        return data;
+      };
 
       // ----------------------------------------------------------------- //
-      // Shared helpers                                                    //
+      // Who's using it: a name, kept in a cookie. No passwords in a demo.  //
       // ----------------------------------------------------------------- //
+      function NamePrompt({ onDone }) {
+        const [name, setName] = useState("");
+        const submit = async (e) => {
+          e.preventDefault();
+          if (!name.trim()) return;
+          await api("POST", "/me", { name });
+          onDone(name.trim());
+        };
+        return html`<div class="scrim"><form class="modal" onSubmit=${submit}>
+          <h3>Who are you?</h3>
+          <p class="where">A name is all this demo needs. It travels inside each upload's token, so the server knows whose video landed without a table.</p>
+          <div class="row" style=${{ justifyContent: "center" }}>
+            <input autoFocus placeholder="Your name" value=${name} onInput=${(e) => setName(e.target.value)} />
+            <button class="btn btn-pulse" type="submit">Continue</button>
+          </div>
+        </form></div>`;
+      }
 
-      let mermaidSeq = 0;
-      function MermaidDiagram({ chart }) {
+      // ----------------------------------------------------------------- //
+      // The pairing popup: QR + status, polled from the server's status    //
+      // proxy (PulseVault's getStatus behind an owner check).              //
+      // ----------------------------------------------------------------- //
+      function PulsePopup({ destination, onClose, onLanded }) {
+        const [link, setLink] = useState(null);
+        const [error, setError] = useState(null);
+        const [status, setStatus] = useState({ state: "unknown" });
+        const landed = useRef(false);
+
+        useEffect(() => {
+          api("POST", "/reserve", { destination }).then(setLink, (e) => setError(e.message));
+        }, []);
+
+        useEffect(() => {
+          if (!link) return;
+          let stop = false;
+          const tick = async () => {
+            if (stop || document.hidden) return;
+            try {
+              const s = await api("GET", `/uploads/${link.artifactId}/status`);
+              if (stop) return;
+              setStatus(s);
+              if (s.outcome && !landed.current) {
+                landed.current = true;
+                onLanded();
+              }
+            } catch (e) {
+              if (!stop) setError(e.message);
+            }
+          };
+          tick();
+          const id = setInterval(tick, 2000);
+          return () => { stop = true; clearInterval(id); };
+        }, [link]);
+
+        const pct = status.state === "uploading" && status.size ? Math.round((100 * (status.bytesReceived ?? 0)) / status.size) : null;
+        const line = error
+          ? ["warn", error]
+          : status.outcome?.state === "done"
+            ? ["ok", `${status.outcome.note} ✓`]
+            : status.outcome?.state === "kept"
+              ? ["warn", `Kept in storage: ${status.outcome.reason}`]
+              : status.state === "ready"
+                ? ["", "Uploaded. Delivering…"]
+                : status.state === "processing"
+                  ? ["", "Uploaded. Making it web-playable…"]
+                  : status.state === "uploading"
+                    ? ["", `Uploading${pct !== null ? ` ${pct}%` : "…"}`]
+                    : ["", "Waiting for Pulse…"];
+
+        return html`<div class="scrim" onClick=${(e) => { if (e.target === e.currentTarget) onClose(); }}>
+          <div class="modal">
+            <h3>Record a Pulse</h3>
+            <p class="where">It will go to <b>${link?.destination ?? "…"}</b></p>
+            ${link ? html`<img class="qr" src=${link.qr} alt="Scan with Pulse" />` : html`<div class="qr" style=${{ height: "240px" }}></div>`}
+            <div class=${`status ${line[0]}`}>${line[1]}</div>
+            ${pct !== null && html`<div class="bar"><i style=${{ width: `${pct}%` }}></i></div>`}
+            <div class="actions">
+              ${link && html`<a class="btn btn-pulse" href=${link.link}>Open in Pulse</a>`}
+              <button class="btn" onClick=${onClose}>${status.outcome ? "Done" : "Cancel"}</button>
+            </div>
+            <p class="hint">Scan on a phone with Pulse installed, or open the link on this device. The link works for ${Math.round((link?.expiresInSeconds ?? 1800) / 60)} minutes.</p>
+          </div>
+        </div>`;
+      }
+
+      // ----------------------------------------------------------------- //
+      // A video card: poster by the video's id, player mounted on tap.     //
+      // ----------------------------------------------------------------- //
+      let playing = null; // starting one video pauses any other
+      function VideoCard({ pulse, title }) {
+        const [open, setOpen] = useState(false);
+        const [noPoster, setNoPoster] = useState(false);
         const ref = useRef(null);
         useEffect(() => {
-          let cancelled = false;
-          mermaid
-            .render(`mmd-${++mermaidSeq}`, chart)
-            .then(({ svg }) => {
-              if (!cancelled && ref.current) ref.current.innerHTML = svg;
-            })
-            .catch(() => {});
-          return () => { cancelled = true; };
-        }, [chart]);
-        return html`
-          <div className="diagram-wrap">
-            <div className="mermaid" ref=${ref}></div>
-          </div>`;
-      }
-
-      // ----------------------------------------------------------------- //
-      // Components                                                        //
-      // ----------------------------------------------------------------- //
-
-      function StatusBar({ caps }) {
-        if (!caps) return html`<div className="status-bar"></div>`;
-        return html`
-          <div className="status-bar">
-            <span className="chip"><span className="dot"></span>Protocol <b>v${caps.protocolVersion}</b></span>
-            <span className="chip">Auth <b>open (no auth)</b></span>
-          </div>`;
-      }
-
-      function HowItWorks() {
-        return html`
-          <section>
-            <details className="panel">
-              <summary>How this works</summary>
-              <p className="diagram-caption">Setup — what this demo owns vs what pulsevault gives you for free</p>
-              <${MermaidDiagram} chart=${SETUP_DIAGRAM} />
-              <p className="diagram-caption">Pairing + upload flow — what happens once you scan the QR below</p>
-              <${MermaidDiagram} chart=${FLOW_DIAGRAM} />
-              <ul className="feature-list">
-                <li>
-                  <b>pulsevault gives:</b> the whole wire protocol — resumable TUS uploads that survive
-                  signal drops (<code>POST/PATCH/HEAD /upload</code>), protocol discovery
-                  (<code>/capabilities</code>), artifact serving + deletion (<code>/artifacts/:id</code>),
-                  and pluggable storage (local disk here).
-                </li>
-                <li>
-                  <b>this demo adds:</b> artifactId minting (<code>/reserve</code>), the pairing
-                  deep link + QR (<code>/deeplinks</code> via <code>buildUploadLink</code>), the uploads
-                  listing (<code>/videos</code>), and this page — mounted with
-                  <code>WebApp.connectHandlers</code>, that's the entire integration surface.
-                </li>
-                <li>
-                  <b>deliberately not here:</b> authentication, a database, or payload validation — see
-                  <code>../fastify-auth-demo</code> for the production-shaped reference with capability
-                  tokens and a Postgres index.
-                </li>
-              </ul>
-            </details>
-          </section>`;
-      }
-
-      function ScalingPanel() {
-        return html`
-          <section>
-            <details className="panel">
-              <summary>Scaling this up — database & S3</summary>
-              <p className="diagram-caption">Storage — this demo writes to local disk; production swaps one call for S3/R2</p>
-              <${MermaidDiagram} chart=${S3_DIAGRAM} />
-              <p className="diagram-caption">Metadata — this demo scans sidecar files per request; the auth demo indexes uploads into Postgres via the hooks</p>
-              <${MermaidDiagram} chart=${DB_DIAGRAM} />
-              <ul className="feature-list">
-                <li>
-                  <b>S3 / R2:</b> swap <code>createLocalStorage</code> for <code>createS3Storage</code> and
-                  nothing else changes — uploads stream to the bucket via multipart TUS, playback becomes a
-                  <code>302</code> presigned redirect, and any number of server instances can share one
-                  bucket with no sticky sessions (see <code>OPERATIONS.md</code>).
-                </li>
-                <li>
-                  <b>Database:</b> this demo's <code>/videos</code> re-reads every sidecar file on every
-                  request — fine at this size. The step up is implemented in
-                  <code>../fastify-auth-demo</code>: one Prisma + Postgres schema holding auth sessions and
-                  an artifact index written once per upload by <code>onUploadComplete</code>, plus Better
-                  Auth, captions, session grouping, and a Docker Compose stack.
-                </li>
-                <li>
-                  <b>Same core everywhere:</b> this page runs <code>@mieweb/pulsevault/core</code> under
-                  Meteor's <code>WebApp.connectHandlers</code>; the Express and Fastify demos in
-                  <code>../</code> mount the exact same protocol a different way. Pick the host you already run.
-                </li>
-              </ul>
-            </details>
-          </section>`;
-      }
-
-      function PairPanel() {
-        const [link, setLink] = useState(null);
-        const refresh = useCallback(() => {
-          fetch("/deeplinks").then((r) => r.json()).then(setLink);
-        }, []);
-        useEffect(() => { refresh(); }, [refresh]);
-
-        return html`
-          <section>
-            <p className="eyebrow">Pair a device</p>
-            <div className="panel">
-              <label>Deep link</label>
-              <p className="mono">${link ? link.upload : "Loading…"}</p>
-              <label>Artifact ID</label>
-              <p className="mono">${link ? link.artifactId : ""}</p>
-              <button className="btn btn-ghost" onClick=${refresh}>↻ Generate new pairing link</button>
-
-              ${link && html`<img className="qr" width="200" height="200" src=${link.qrUpload} alt="Pairing QR code" />`}
-              <a className="btn btn-primary" href=${link ? link.upload : "#"}>Open in Pulse app</a>
-            </div>
-          </section>`;
-      }
-
-      // Live count only — the uploads themselves (playback) moved to their own
-      // page at /library, keeping this one focused on pairing. Rendered as a
-      // header link rather than its own section.
-      function UploadsLink() {
-        const [count, setCount] = useState(null);
-        useEffect(() => {
-          // Count PULSES (feed items), not raw artifacts — a pulse is one video plus
-          // its captions, beat manifest and thumbnail on the wire, but one feed item.
-          // Same grouping as the feed page: one pulse per session anchor
-          // (`relatedTo ?? artifactId`), counted only if it actually has video.
-          const refresh = () =>
-            fetch("/videos")
-              .then((r) => r.json())
-              .then((uploads) => {
-                const anchors = new Set();
-                for (const u of uploads) {
-                  if (u.kind === "video") anchors.add(u.relatedTo ?? u.artifactId);
-                }
-                setCount(anchors.size);
-              })
-              .catch(() => {});
-          refresh();
-          const id = setInterval(refresh, 8000);
-          return () => clearInterval(id);
-        }, []);
-
-        return html`<a href="/library" className="docs-link">View feed${count ? ` (${count})` : ""} ↗</a>`;
-      }
-
-      function App() {
-        const [caps, setCaps] = useState(null);
-        useEffect(() => {
-          fetch("/pulsevault/capabilities").then((r) => r.json()).then(setCaps).catch(() => {});
-        }, []);
-
-        return html`
-          <div className="top-row">
-            <div className="brand-row">
-              <div className="brand-mark">PV</div>
-              <div>
-                <h1>PulseVault</h1>
-                <p className="brand-sub">Minimal demo · Meteor · no auth</p>
-              </div>
-            </div>
-            <div style=${{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-              <${UploadsLink} />
-            </div>
+          if (!open || !ref.current) return;
+          if (playing && playing !== ref.current) playing.pause();
+          playing = ref.current;
+          ref.current.play().catch(() => {});
+        }, [open]);
+        return html`<div>
+          <div class="card">
+            ${open
+              ? html`<video ref=${ref} controls playsInline src=${pulse.src} poster=${noPoster ? undefined : pulse.poster}>
+                  ${pulse.captions && html`<track kind="subtitles" srclang="en" label="Captions" src=${pulse.captions} default />`}
+                </video>`
+              : html`<button class="play" aria-label=${`Play ${title}`} onClick=${() => setOpen(true)}>
+                  ${noPoster
+                    ? html`<span class="fallback"></span>`
+                    : html`<img src=${pulse.poster} alt="" onError=${() => setNoPoster(true)} />`}
+                  <span class="glyph"><span>▶</span></span>
+                  ${!pulse.ready && html`<span class="state">still uploading</span>`}
+                </button>`}
           </div>
-          <${StatusBar} caps=${caps} />
-          <${HowItWorks} />
-          <${ScalingPanel} />
-          <${PairPanel} />
-          <footer>
-            <span>@mieweb/pulsevault</span>
-            <a href="https://github.com/mieweb/pulsevault" target="_blank" rel="noreferrer">github.com/mieweb/pulsevault</a>
-          </footer>`;
+          <p class="title">${title}</p>
+        </div>`;
+      }
+
+      // ----------------------------------------------------------------- //
+      // The app                                                            //
+      // ----------------------------------------------------------------- //
+      function App() {
+        const [me, setMe] = useState(undefined);
+        const [feed, setFeed] = useState({ posts: [], tickets: [] });
+        const [popup, setPopup] = useState(null); // a destination
+        const [newTicket, setNewTicket] = useState("");
+
+        const refresh = useCallback(() => api("GET", "/feed").then(setFeed).catch(() => {}), []);
+        useEffect(() => { api("GET", "/me").then((r) => setMe(r.name)); }, []);
+        useEffect(() => { if (me) refresh(); }, [me, refresh]);
+        // A video that is still converting shows "still uploading" until the next refresh.
+        useEffect(() => {
+          if (!me) return;
+          const id = setInterval(() => { if (!document.hidden) refresh(); }, 10000);
+          return () => clearInterval(id);
+        }, [me, refresh]);
+
+        const addTicket = async (e) => {
+          e.preventDefault();
+          if (!newTicket.trim()) return;
+          await api("POST", "/tickets", { title: newTicket });
+          setNewTicket("");
+          refresh();
+        };
+        const signOut = () => { document.cookie = "pv_user=; Path=/; Max-Age=0"; setMe(null); };
+
+        if (me === undefined) return null;
+        return html`
+          <div class="top">
+            <div class="brand">
+              <div class="mark">P</div>
+              <div><h1>Huddle</h1><div class="sub">PulseVault Meteor demo — the reference host integration</div></div>
+            </div>
+            ${me && html`<div class="me">You are <b>${me}</b> <button class="btn-link" onClick=${signOut}>change</button></div>`}
+          </div>
+          ${!me && html`<${NamePrompt} onDone=${setMe} />`}
+          ${popup && html`<${PulsePopup} destination=${popup} onClose=${() => { setPopup(null); refresh(); }} onLanded=${refresh} />`}
+
+          <div class="cols">
+            <section class="panel stack">
+              <div class="row" style=${{ justifyContent: "space-between" }}>
+                <h2 style=${{ margin: 0 }}>Team feed</h2>
+                <button class="btn btn-pulse" onClick=${() => setPopup({ kind: "feed" })}>● Post a Pulse</button>
+              </div>
+              ${feed.posts.length === 0 && html`<p class="empty">Nothing yet. Post a Pulse: the video lands here by itself when the upload finishes.</p>`}
+              ${feed.posts.map((p) => html`<div class="post" key=${p.id}>
+                <div class="byline"><b>${p.author}</b> · ${new Date(p.createdAt).toLocaleString()}</div>
+                <${VideoCard} pulse=${p.pulse} title=${p.text} />
+              </div>`)}
+            </section>
+
+            <section class="panel">
+              <h2>Tickets</h2>
+              ${feed.tickets.map((t) => html`<div class="ticket" key=${t.id}>
+                <div class="ticket-head">
+                  <div><span class="ticket-id">${t.id}</span> ${t.title}</div>
+                  <button class="btn btn-sm" onClick=${() => setPopup({ kind: "ticket", id: t.id })}>● Pulse</button>
+                </div>
+                ${t.attachments.length > 0 && html`<div class="attachments">
+                  ${t.attachments.map((a) => html`<${VideoCard} key=${a.videoId} pulse=${a.pulse} title=${`${a.name} — ${a.by}`} />`)}
+                </div>`}
+              </div>`)}
+              <form class="row" style=${{ marginTop: "0.9rem" }} onSubmit=${addTicket}>
+                <input placeholder="New ticket title" value=${newTicket} onInput=${(e) => setNewTicket(e.target.value)} />
+                <button class="btn btn-sm" type="submit">Add</button>
+              </form>
+            </section>
+          </div>
+
+          <details class="how">
+            <summary>How this works</summary>
+            <ol>
+              <li><b>Post a Pulse</b> asks <code>POST /api/reserve</code>. The server checks the destination and mints a capability token whose <code>context</code> is <code>{ userId, destination }</code>. Nothing is written.</li>
+              <li>Pulse uploads the captions, beat manifest and thumbnail, then the video. PulseVault holds every create to that shape and stores the token's context with each file.</li>
+              <li>PulseVault makes the video web-playable in the background, then fires <code>onUploadComplete</code> with the context. The server posts or attaches it, and records the outcome. If that throws or the server restarts, PulseVault fires it again.</li>
+              <li>This popup polls <code>GET /api/uploads/:id/status</code>: PulseVault's status behind an owner check that is a comparison on the context — no table.</li>
+              <li>Each card asks <code>GET /pulsevault/artifacts/:id/poster</code> for its frame and plays <code>GET /pulsevault/artifacts/:id</code>, with the pulse's captions as a track.</li>
+            </ol>
+          </details>
+          <footer>No table of uploads, no shape check, no stale-upload cleanup, no SSE route and no content-type fix-up live in this app. See <code>server/main.js</code>.</footer>`;
       }
 
       createRoot(document.getElementById("root")).render(html`<${App} />`);

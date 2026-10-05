@@ -7,6 +7,93 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+Protocol 2.3 (`PROTOCOL.md` §7.4). What every host rebuilt around PulseVault
+(#80), in the core: the shape of a pulse, a completion that survives a throw
+or a restart, a lock on finished pulses, the token's own context, a status
+route, background web-ready, a poster route and `getPulse`, and the content
+types phones send. Two defaults change; both have an escape hatch.
+
+### Changed (breaking)
+
+- **A create must have the shape of a pulse** (`pulseShape`, on by default):
+  a video with no `relatedTo`; a thumbnail, beat manifest or captions under
+  its own id, `relatedTo` the video. With `createCapabilityAuthorize` the ids
+  are also tied to the token: the video only under the token's own
+  `artifactId`, the rest only `relatedTo` it. Before, one token could create
+  any number of artifacts under ids the client picked, or take the video's
+  own id with a thumbnail so the real video answered `409` for good. The
+  Pulse app has always uploaded in this shape. For uploads that aren't
+  pulses, pass `pulseShape: false` to the plugin or core *and* to
+  `createCapabilityAuthorize`.
+- **A create reclaims an idle unfinished upload of the same artifactId**
+  (`reclaim`, `{ idleSeconds: 300 }` by default): an app killed mid-upload
+  sends no TUS `DELETE`, so re-scanning the same link answered `409` until
+  `retention` ran. Only an upload of the same kind and `relatedTo` is taken
+  over (the same token authorized both), and only once the local adapter has
+  seen no bytes for `idleSeconds`. `reclaim: false` keeps the old `409`.
+- **`onUploadComplete` is at-least-once.** PulseVault records that the hook
+  returned (`acknowledged` in the sidecar) and fires it again, with
+  `ctx.replay: true`, for a finished artifact it never recorded: the hook
+  threw, or the process stopped first. Every 300 seconds, with the first pass
+  shortly after start (`replayCompletions`; `false` turns it off, and
+  `core.replayCompletions()` / `fastify.pulseVaultCore.replayCompletions()`
+  runs a pass on demand). Hosts must check their own record before writing
+  it again. Finished sidecars written before this release read as acknowledged, so an
+  upgrade replays nothing; one still uploading at the upgrade completes
+  normally. A retried final `PATCH` no longer fires the hook a
+  second time.
+- **`authorize` gains the `status` phase** (`GET /artifacts/:id/status`).
+  An exhaustive `switch` on the phase needs a case for it.
+- **Content types**: the `.pulse` beat manifest is served as
+  `application/json`, and `.mov`, `.m4v` and `.srt` — when a host allows them
+  in `allowedExtensions`; the defaults stay what the Pulse app sends — as
+  `video/quicktime`, `video/x-m4v` and `application/x-subrip`, instead of
+  `application/octet-stream`, which `<video>` downloads instead of playing.
+
+### Added
+
+- **Hook context**: `authorize` and `onUploadComplete` receive `relatedTo`,
+  `name`, `appVersion`, `filename`, `ext` and the token's `context`, so a
+  host maps a finished file to its own record without reading storage back.
+- **`context` in the capability token** (`issueCapabilityToken(id, secret,
+  { context })`, the `ctx` claim, at most 1 KiB of JSON): an owner, a
+  destination — signed, stored with the artifact at create (`authorize` may
+  return `{ context }`), and handed to every hook, `getStatus` and `getPulse`.
+  Most hosts need no table keyed by artifactId any more.
+- **`GET /artifacts/:id/status`** and `core.getStatus(id)`: `unknown`,
+  `uploading` (with `bytesReceived` against `size`), `processing` or
+  `ready`, plus `acknowledged` and whatever the host recorded with
+  `recordOutcome(id, outcome)`. Authorized as `status`;
+  `createCapabilityAuthorize` grants it to the pairing token and a view token.
+- **`webReady`**: the conversion `ensureWebReady` does, run by the core in
+  the background after the final `PATCH` is answered, `concurrency` at a
+  time, with a `processing` status meanwhile, a `processed` event when done,
+  and `completeAfter: true` to hold `onUploadComplete` until the conversion
+  has finished (`ctx.webReady` says what it did). Whether it finished is
+  recorded on the sidecar (`converted`), so a conversion a restart
+  interrupted is redone by the replay. Local storage only.
+- **`lockWhenReady`**: a finished artifact, and anything `relatedTo` a
+  finished video, can't be deleted through the routes (`403`); the host
+  removes through `storage.remove` on its own terms.
+- **`core.getPulse(videoId)`** → `{ video, thumbnail, captions, manifest }`
+  and **`GET /artifacts/:videoId/poster`**, both from a relation index the
+  adapters keep at reserve time (`storage.listRelated`), so neither scans
+  storage and nothing is backfilled.
+- **Storage adapter contract**: optional `describeArtifact`, `patchArtifact`
+  and `listRelated`, and `context` in `reserveUpload` (both built-in
+  adapters implement them). The local adapter's relation index lives at
+  `.pulsevault/related/<videoId>/<artifactId>`; the S3 adapter's under the
+  same key prefix.
+- **`onArtifactEvent`**: `phase: "processed"` (with `webReady`), and
+  `reason: "reclaimed"` on `remove`.
+- **Fastify**: `fastify.pulseVaultCore` (`coreDecoratorName`) exposes
+  `getStatus`, `getPulse`, `recordOutcome` and `replayCompletions`.
+- **`examples/meteor-demo`** is now the reference host integration, shaped
+  like a team app: people, destinations, a reserve that signs the owner and
+  destination into the token, delivery from `onUploadComplete`, status
+  polling, and video cards with posters — with no table of uploads, no shape
+  check, no stale-upload cleanup and no content-type fix-up of its own.
+
 ## [0.4.2] - 2026-10-02
 
 ### Added

@@ -7,11 +7,12 @@ import type {
   FastifySchema,
 } from 'fastify';
 import type { PulseVaultCacheOptions } from '../app.js';
-import { createPulseVaultCore, PROTOCOL_VERSION } from '../core.js';
+import { createPulseVaultCore, PROTOCOL_VERSION, type PulseVaultCore } from '../core.js';
 import type {
   PulseVaultOnUploadComplete,
   PulseVaultOnArtifactEvent,
 } from '../lib/pulsevaultTus.js';
+import type { PulseVaultReplayOptions, PulseVaultWebReadyOptions } from '../lib/completion.js';
 import type { PulseVaultValidatePayload } from '../lib/magic.js';
 import { type PulseVaultAuthorize } from '../lib/authorize.js';
 import type { PulseVaultIssueViewLink } from '../lib/view-links.js';
@@ -56,6 +57,13 @@ export type PulseVaultRoutesOptions = {
   onUploadComplete?: PulseVaultOnUploadComplete;
   onArtifactEvent?: PulseVaultOnArtifactEvent;
   issueViewLink?: PulseVaultIssueViewLink;
+  pulseShape?: boolean;
+  reclaim?: { idleSeconds?: number } | false;
+  lockWhenReady?: boolean;
+  webReady?: PulseVaultWebReadyOptions | boolean;
+  replayCompletions?: PulseVaultReplayOptions | false;
+  /** Receives the core this plugin built, so the (encapsulating) host plugin can expose it. */
+  onCore?: (core: PulseVaultCore) => void;
 } & FastifyPluginOptions;
 
 // Adds the OpenAPI-flavored fields without pulling `@fastify/swagger` into this
@@ -214,6 +222,84 @@ const capabilitiesSchema: OpenApiRouteSchema = {
 };
 
 // Fastify doesn't type route params from the schema alone, so `:artifactId` comes through as `unknown`.
+const artifactStatusSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: "Where an upload is: uploading, processing or ready",
+  description:
+    "Reports the artifact's state (`unknown`, `uploading`, `processing` while a web-ready conversion rewrites it, `ready`), its kind and `relatedTo`, the bytes received against its declared length, whether the host's `onUploadComplete` has finished (`acknowledged`), and what the host recorded with `recordOutcome` (`outcome`). Runs the `authorize` hook with `phase: \"status\"`; `createCapabilityAuthorize` grants it to the pairing token and to a view token. Never cached.",
+  params: {
+    type: 'object',
+    properties: {
+      artifactId: {
+        type: 'string',
+        format: 'uuid',
+        description: 'UUID of the upload to report on.',
+      },
+    },
+    required: ['artifactId'],
+  },
+  querystring: {
+    type: 'object',
+    properties: {
+      token: {
+        type: 'string',
+        description:
+          'Optional bearer token (the pairing token or a view token), forwarded to the `authorize` hook as `ctx.token` for browsers that can’t set a header.',
+      },
+    },
+  },
+  response: {
+    200: protocolSchema('artifact-status'),
+    400: {
+      description: '`artifactId` is not a valid UUID.',
+      ...pulseVaultErrorResponse,
+    },
+    403: {
+      description: 'Authorize hook rejected the request.',
+      ...pulseVaultErrorResponse,
+    },
+  },
+};
+
+const artifactPosterSchema: OpenApiRouteSchema = {
+  tags: ['pulsevault'],
+  summary: "Serve a video's poster frame",
+  description:
+    "Streams or redirects to the finished thumbnail `relatedTo` the video, exactly as `GET /artifacts/:artifactId` would serve it. Runs the `authorize` hook with `phase: \"resolve\"` on the video, so whoever may watch it may see its poster. 404 until the poster has landed.",
+  params: {
+    type: 'object',
+    properties: {
+      artifactId: {
+        type: 'string',
+        format: 'uuid',
+        description: "UUID of the video (the pulse's anchor artifact).",
+      },
+    },
+    required: ['artifactId'],
+  },
+  querystring: {
+    type: 'object',
+    properties: {
+      token: {
+        type: 'string',
+        description:
+          'Optional bearer token for pre-authenticated watch links, forwarded to the `authorize` hook as `ctx.token`.',
+      },
+    },
+  },
+  response: {
+    400: {
+      description: '`artifactId` is not a valid UUID.',
+      ...pulseVaultErrorResponse,
+    },
+    403: {
+      description: 'Authorize hook rejected the request.',
+      ...pulseVaultErrorResponse,
+    },
+    404: { description: 'The video has no finished poster frame.', ...pulseVaultErrorResponse },
+  },
+};
+
 type ArtifactIdParams = { artifactId?: unknown };
 
 /** Coerce the raw route param to a string; an invalid UUID is rejected by the core's own check either way. */
@@ -232,6 +318,12 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     onUploadComplete,
     onArtifactEvent,
     issueViewLink,
+    pulseShape,
+    reclaim,
+    lockWhenReady,
+    webReady,
+    replayCompletions,
+    onCore,
   } = opts;
 
   // All hook orchestration, tus glue, and artifact GET/DELETE logic lives in
@@ -250,8 +342,14 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     onUploadComplete,
     onArtifactEvent,
     issueViewLink,
+    pulseShape,
+    reclaim,
+    lockWhenReady,
+    webReady,
+    replayCompletions,
     logger: fastify.log,
   });
+  onCore?.(core);
 
   fastify.addContentTypeParser('application/offset+octet-stream', (_request, _payload, done) => {
     done(null);
@@ -309,7 +407,31 @@ const pulseVaultRoutes: FastifyPluginAsync<PulseVaultRoutesOptions> = async (fas
     reply.hijack();
     await core.handleArtifactGet(request.raw, reply.raw, artifactId, token);
   });
+
+  fastify.get(
+    '/artifacts/:artifactId/status',
+    { schema: artifactStatusSchema },
+    async (request, reply) => {
+      const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
+      const token = (request.query as { token?: string })?.token;
+      reply.hijack();
+      await core.handleStatus(request.raw, reply.raw, artifactId, token);
+    },
+  );
+
+  fastify.get(
+    '/artifacts/:artifactId/poster',
+    { schema: artifactPosterSchema },
+    async (request, reply) => {
+      const artifactId = paramToString((request.params as ArtifactIdParams)?.artifactId);
+      const token = (request.query as { token?: string })?.token;
+      reply.hijack();
+      await core.handlePoster(request.raw, reply.raw, artifactId, token);
+    },
+  );
 };
+
+export type { PulseVaultCore };
 
 export default pulseVaultRoutes;
 export { PROTOCOL_VERSION };

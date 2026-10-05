@@ -39,6 +39,8 @@ async function startApp(pluginOptions = {}) {
     prefix: PREFIX,
     storage,
     maxUploadSize: 10 * 1024 * 1024,
+    // These tests upload each kind on its own, not as a pulse's related files.
+    pulseShape: false,
     ...pluginOptions,
   });
   const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
@@ -124,7 +126,8 @@ test("kind=project .pulse happy path: file under project/ subdir, correct Conten
     const get = await fetch(artifactUrl(ctx, ID1));
     assert.equal(get.status, 200);
     const ct = get.headers.get("content-type");
-    assert.ok(ct?.includes("application/octet-stream"), `content-type was: ${ct}`);
+    // The beat manifest is JSON (PROTOCOL.md §8), served as such since 0.5.
+    assert.ok(ct?.includes("application/json"), `content-type was: ${ct}`);
     const bytes = Buffer.from(await get.arrayBuffer());
     assert.equal(Buffer.compare(bytes, payload), 0);
   } finally {

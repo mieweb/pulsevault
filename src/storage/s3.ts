@@ -6,6 +6,8 @@ import type { DataStore } from '@tus/server';
 // install `@aws-sdk/*` or `@tus/s3-store`.
 import type { S3Client, S3ClientConfig } from '@aws-sdk/client-s3';
 import type {
+  PulseVaultArtifactMeta,
+  PulseVaultArtifactPatch,
   PulseVaultArtifactRecord,
   PulseVaultResolution,
   PulseVaultStorage,
@@ -46,11 +48,26 @@ type Sidecar = {
   name?: string;
   /** Optional uploading app version. See `ReserveUploadParams.appVersion`. */
   appVersion?: string;
+  /** Optional host data from the capability token. See `ReserveUploadParams.context`. */
+  context?: unknown;
+  /** `false` from reserve until the core records that `onUploadComplete` finished; absent reads as `true` once finished. */
+  acknowledged?: boolean;
+  /** `false` from reserve until the core records that the web-ready conversion finished; absent reads as `true` once finished. */
+  converted?: boolean;
+  /** Whatever the host recorded with `recordOutcome`. */
+  outcome?: unknown;
+  /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
+  readyAt?: number;
 };
 
 const SIDECAR_VERSION = 1 as const;
 /** Key prefix inside the bucket that holds the per-upload sidecar objects. */
 const PULSEVAULT_META_PREFIX = '.pulsevault';
+/**
+ * Relation index: `.pulsevault/related/<anchorId>/<artifactId>` is an empty object for every
+ * artifact that declared `relatedTo` the anchor, so a pulse's files are one prefix listing away.
+ */
+const RELATED_PREFIX = `${PULSEVAULT_META_PREFIX}/related`;
 /** Default presigned playback URL lifetime (15 minutes). */
 const DEFAULT_PRESIGN_TTL_SECONDS = 900;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
@@ -74,6 +91,15 @@ function extToContentType(ext: string): string {
       return 'application/zip';
     case '.vtt':
       return 'text/vtt';
+    case '.mov':
+      return 'video/quicktime';
+    case '.m4v':
+      return 'video/x-m4v';
+    case '.srt':
+      return 'application/x-subrip';
+    case '.pulse':
+      // The beat manifest (PROTOCOL.md §8) is JSON.
+      return 'application/json';
     case '.jpg':
     case '.jpeg':
       return 'image/jpeg';
@@ -189,6 +215,12 @@ export type S3Storage = PulseVaultStorage & {
   getName(artifactId: string): Promise<string | null>;
   /** Satisfies the optional `PulseVaultStorage.listArtifacts` contract. */
   listArtifacts(opts?: { changedBefore?: number }): AsyncIterable<PulseVaultArtifactRecord>;
+  /** Satisfies the optional `PulseVaultStorage.describeArtifact` contract. */
+  describeArtifact(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
+  /** Satisfies the optional `PulseVaultStorage.patchArtifact` contract. */
+  patchArtifact(artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean>;
+  /** Satisfies the optional `PulseVaultStorage.listRelated` contract. */
+  listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
 };
 
 /**
@@ -230,7 +262,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     GetObjectCommand,
     PutObjectCommand,
     DeleteObjectCommand,
+    HeadObjectCommand,
     ListObjectsV2Command,
+    ListPartsCommand,
   } = s3;
   const { getSignedUrl } = presigner;
   const { S3Store } = s3store;
@@ -284,28 +318,47 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   const artifactKey = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
 
-  const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
+  const writeSidecar = async (
+    artifactId: string,
+    sidecar: Sidecar,
+    /** Only replace the version with this ETag (a read-modify-write that must not lose a concurrent one). */
+    ifMatch?: string,
+  ): Promise<void> => {
     await client.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: sidecarKey(artifactId),
         Body: JSON.stringify(sidecar),
         ContentType: 'application/json',
+        ...(ifMatch ? { IfMatch: ifMatch } : {}),
       }),
     );
   };
 
-  const readSidecar = async (artifactId: string): Promise<Sidecar | null> => {
+  /** The sidecar and the ETag of the version read, for a conditional rewrite. */
+  const readSidecarVersioned = async (
+    artifactId: string,
+  ): Promise<{ sidecar: Sidecar; etag?: string } | null> => {
     let raw: string;
+    let etag: string | undefined;
     try {
       const res = await client.send(
         new GetObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
       );
       raw = (await bodyToBuffer(res.Body)).toString('utf8');
+      etag = res.ETag;
     } catch (err) {
       if (isNotFound(err)) return null;
       throw err;
     }
+    const sidecar = parseSidecar(raw);
+    return sidecar ? { sidecar, ...(etag ? { etag } : {}) } : null;
+  };
+
+  const readSidecar = async (artifactId: string): Promise<Sidecar | null> =>
+    (await readSidecarVersioned(artifactId))?.sidecar ?? null;
+
+  const parseSidecar = (raw: string): Sidecar | null => {
     try {
       const parsed = JSON.parse(raw) as Partial<Sidecar>;
       if (typeof parsed.ext !== 'string') return null;
@@ -322,12 +375,107 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         checksum: typeof parsed.checksum === 'string' ? parsed.checksum : undefined,
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
+        ...(parsed.context !== undefined ? { context: parsed.context } : {}),
+        // A sidecar from before the flag existed: finished means nothing to replay; still
+        // uploading means its completion hasn't happened yet.
+        acknowledged: parsed.acknowledged ?? status === 'ready',
+        converted: parsed.converted ?? status === 'ready',
+        ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
+        ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
     } catch {
       // Malformed sidecar — treat as absent; `reserveUpload` rewrites it.
       return null;
     }
   };
+
+  /** `LastModified` of one object, 0 when absent or unknown. */
+  const objectModifiedAt = async (key: string): Promise<number> => {
+    try {
+      const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      return head.LastModified?.getTime() ?? 0;
+    } catch (err) {
+      if (isNotFound(err)) return 0;
+      throw err;
+    }
+  };
+
+  /**
+   * When an unfinished upload last received bytes, as far as the bucket can tell: the newest of
+   * its multipart parts (listed through the upload id @tus/s3-store keeps on its `.info` object)
+   * and the incomplete part it parks between PATCHes. 0 when nothing has arrived yet. A PATCH
+   * leaves a trace here as soon as it lands, unlike the sidecar, which is written at reserve.
+   */
+  const lastUploadActivity = async (key: string): Promise<number> => {
+    let latest = await objectModifiedAt(`${key}.part`);
+    try {
+      const info = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: `${key}.info` }));
+      latest = Math.max(latest, info.LastModified?.getTime() ?? 0);
+      const uploadId = info.Metadata?.['upload-id'];
+      if (uploadId) {
+        // Pages of at most 1,000 parts: a long upload's newest parts are on the last page.
+        let marker: string | undefined;
+        do {
+          const page = await client.send(
+            new ListPartsCommand({
+              Bucket: bucket,
+              Key: key,
+              UploadId: uploadId,
+              ...(marker ? { PartNumberMarker: marker } : {}),
+            }),
+          );
+          for (const part of page.Parts ?? []) {
+            latest = Math.max(latest, part.LastModified?.getTime() ?? 0);
+          }
+          marker = page.IsTruncated ? page.NextPartNumberMarker : undefined;
+        } while (marker);
+      }
+    } catch (err) {
+      // No `.info` yet, or the multipart upload is gone: nothing more to learn. Anything else
+      // (permissions, a transient failure) must not read as "idle".
+      if (!isNotFound(err) && !isNoSuchUpload(err)) throw err;
+    }
+    return latest;
+  };
+
+  /** Relation index key for one related artifact under its anchor. */
+  const relatedKey = (anchorId: string, artifactId: string): string =>
+    `${RELATED_PREFIX}/${anchorId}/${artifactId}`;
+
+  /** When the sidecar was last written — when the upload started, or when it finished. */
+  const sidecarModifiedAt = async (artifactId: string): Promise<number> => {
+    try {
+      const head = await client.send(
+        new HeadObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) }),
+      );
+      return head.LastModified?.getTime() ?? 0;
+    } catch (err) {
+      if (isNotFound(err)) return 0;
+      throw err;
+    }
+  };
+
+  const sidecarToMeta = (
+    artifactId: string,
+    sidecar: Sidecar,
+    updatedAt: number,
+  ): PulseVaultArtifactMeta => ({
+    artifactId,
+    kind: sidecar.kind ?? 'video',
+    ext: sidecar.ext,
+    filename: sidecar.filename,
+    ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
+    ...(sidecar.checksum ? { checksum: sidecar.checksum } : {}),
+    ...(sidecar.name ? { name: sidecar.name } : {}),
+    ...(sidecar.appVersion ? { appVersion: sidecar.appVersion } : {}),
+    ...(sidecar.context !== undefined ? { context: sidecar.context } : {}),
+    ready: sidecar.status === 'ready',
+    acknowledged: sidecar.acknowledged !== false,
+    converted: sidecar.converted !== false,
+    ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
+    updatedAt,
+    ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
+  });
 
   const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
     const cached = metaCache.get(artifactId);
@@ -348,6 +496,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     checksum,
     name,
     appVersion,
+    context,
   }: ReserveUploadParams): Promise<string> => {
     const sidecar: Sidecar = {
       version: SIDECAR_VERSION,
@@ -359,6 +508,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       checksum,
       name,
       appVersion,
+      ...(context !== undefined ? { context } : {}),
+      acknowledged: false,
+      converted: false,
     };
 
     // Fast-path rejection for the common case. Not atomic by itself (two concurrent
@@ -412,6 +564,14 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       await writeSidecar(artifactId, sidecar);
     }
 
+    if (relatedTo) {
+      // The relation index entry, written after the sidecar so a failure between the two
+      // leaves an unlisted artifact, never an entry without one.
+      await client.send(
+        new PutObjectCommand({ Bucket: bucket, Key: relatedKey(relatedTo, artifactId), Body: '' }),
+      );
+    }
+
     cacheSet(artifactId, { ext, ready: false, kind, relatedTo, checksum, name });
     // @tus/s3-store uses this as the object key for the multipart upload, so
     // the finished object lands at `<kind>/<artifactId><ext>`.
@@ -438,21 +598,46 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return { kind: 'redirect', url, statusCode: 302 };
   };
 
+  /**
+   * A read-modify-write of the sidecar that must not lose a concurrent one (an instance
+   * acknowledging a completion while another records its outcome, or finishes the upload): the
+   * rewrite is conditional on the ETag that was read, and retried from a fresh read when the
+   * object changed meanwhile. On a backend that doesn't support `IfMatch`, the write is
+   * unconditional — the same degraded mode as reserve. Resolves `null` for an unknown id.
+   */
+  const rewriteSidecar = async (
+    artifactId: string,
+    mutate: (current: Sidecar) => Sidecar | null,
+  ): Promise<Sidecar | null> => {
+    for (let attempt = 0; ; attempt++) {
+      const current = await readSidecarVersioned(artifactId);
+      if (!current) return null;
+      const next = mutate(current.sidecar);
+      if (next === null) return current.sidecar; // nothing to change
+      try {
+        await writeSidecar(artifactId, next, current.etag);
+      } catch (err) {
+        if (isPreconditionFailed(err) && attempt < 5) continue; // changed under us: re-read, retry
+        if (!isConditionalWriteUnsupported(err)) throw err;
+        warnAboutConditionalWriteFallbackOnce();
+        await writeSidecar(artifactId, next);
+      }
+      cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+      return next;
+    }
+  };
+
   const markReady = async (artifactId: string): Promise<void> => {
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) {
+    const result = await rewriteSidecar(artifactId, (sidecar) =>
+      // Idempotent: already ready leaves the sidecar alone.
+      sidecar.status === 'ready' ? null : { ...sidecar, status: 'ready', readyAt: Date.now() },
+    );
+    if (!result) {
       throw new Error(
         `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
       );
     }
-    const next = sidecarToCachedMeta(sidecar, true);
-    if (sidecar.status === 'ready') {
-      // Idempotent: already ready, just keep the cache consistent.
-      cacheSet(artifactId, next);
-      return;
-    }
-    await writeSidecar(artifactId, { ...sidecar, status: 'ready' });
-    cacheSet(artifactId, next);
+    cacheSet(artifactId, sidecarToCachedMeta(result, true));
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
@@ -479,6 +664,13 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.info` })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: `${key}.part` })),
       client.send(new DeleteObjectCommand({ Bucket: bucket, Key: sidecarKey(artifactId) })),
+      ...(meta.relatedTo
+        ? [
+            client.send(
+              new DeleteObjectCommand({ Bucket: bucket, Key: relatedKey(meta.relatedTo, artifactId) }),
+            ),
+          ]
+        : []),
     ]);
     return true;
   };
@@ -551,6 +743,68 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return meta?.name ?? null;
   };
 
+  /** Straight from the bucket, never the cache: the flags change after the cache was filled. */
+  const describeArtifact = async (artifactId: string): Promise<PulseVaultArtifactMeta | null> => {
+    if (!isUuid(artifactId)) return null;
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) return null;
+    let updatedAt = await sidecarModifiedAt(artifactId);
+    if (sidecar.status === 'uploading') {
+      // An upload in flight counts from its last byte, not from when it was reserved — so a
+      // long upload that's still moving is never taken for an idle one.
+      const key = artifactKey(artifactId, sidecar.kind ?? 'video', sidecar.ext);
+      updatedAt = Math.max(updatedAt, await lastUploadActivity(key));
+    }
+    return sidecarToMeta(artifactId, sidecar, updatedAt);
+  };
+
+  const patchArtifact = async (
+    artifactId: string,
+    patch: PulseVaultArtifactPatch,
+  ): Promise<boolean> => {
+    if (!isUuid(artifactId)) return false;
+    const result = await rewriteSidecar(artifactId, (sidecar) => {
+      const next: Sidecar = { ...sidecar };
+      if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
+      if (patch.converted !== undefined) next.converted = patch.converted;
+      if (patch.outcome !== undefined) {
+        if (patch.outcome === null) delete next.outcome;
+        else next.outcome = patch.outcome;
+      }
+      return next;
+    });
+    return result !== null;
+  };
+
+  async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {
+    if (!isUuid(artifactId)) return;
+    const prefix = `${RELATED_PREFIX}/${artifactId}/`;
+    let continuationToken: string | undefined;
+    do {
+      const page = await client.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ...(continuationToken ? { ContinuationToken: continuationToken } : {}),
+        }),
+      );
+      for (const object of page.Contents ?? []) {
+        const relatedId = object.Key?.slice(prefix.length) ?? '';
+        if (!isUuid(relatedId)) continue;
+        const sidecar = await readSidecar(relatedId);
+        if (!sidecar || sidecar.relatedTo !== artifactId) continue; // An entry whose artifact is gone.
+        yield {
+          artifactId: relatedId,
+          kind: sidecar.kind ?? 'video',
+          relatedTo: artifactId,
+          ready: sidecar.status === 'ready',
+          updatedAt: await sidecarModifiedAt(relatedId),
+        };
+      }
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken);
+  }
+
   /**
    * Walk the sidecar objects. A sidecar is rewritten only when its upload finishes, so its
    * `LastModified` is when the upload started (still uploading) or when it finished (ready).
@@ -608,6 +862,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     getChecksum,
     getName,
     listArtifacts,
+    describeArtifact,
+    patchArtifact,
+    listRelated,
     shutdown,
   };
 }
@@ -661,6 +918,12 @@ async function digestBody(
 }
 
 /** Whether an AWS SDK error represents a missing key/object (404-ish). */
+/** Whether `ListParts` answered that the multipart upload no longer exists (completed or aborted). */
+function isNoSuchUpload(err: unknown): boolean {
+  const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+  return e?.name === 'NoSuchUpload' || e?.Code === 'NoSuchUpload';
+}
+
 function isNotFound(err: unknown): boolean {
   const e = err as {
     name?: string;

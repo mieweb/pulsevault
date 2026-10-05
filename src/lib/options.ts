@@ -18,6 +18,8 @@ export type PulseVaultAllowedExtensions = {
   thumbnail: readonly string[];
 };
 
+// The defaults are exactly what the Pulse app uploads. A host that accepts other clients adds
+// their extensions (`.mov`, `.m4v`, `.srt` are served with the right content types).
 const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
 const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
 // WebVTT only — it's what the Pulse app uploads, and it carries word-level

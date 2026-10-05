@@ -183,25 +183,29 @@ logs one warning and the original bytes keep serving exactly as before.
 `brew install ffmpeg` (macOS). Nothing else changes; the hook detects it at
 first use.
 
-**New uploads** — wire it into `onUploadComplete` (the fastify-demo ships with
-this enabled):
+**New uploads** — turn on the `webReady` option (the fastify-demo and the
+meteor-demo ship with it enabled). The core runs the conversion in the
+background after the final `PATCH` is answered, one video at a time by
+default, and reports the artifact as `processing` on the status route
+meanwhile:
 
 ```js
-const storage = createLocalStorage({ workspaceDir: dataDir });
 await app.register(pulseVault, {
-  storage,
-  onUploadComplete: async (_request, { artifactId, kind }) => {
-    if (kind !== "video") return;
-    const localPath = await storage.getLocalPath(artifactId);
-    if (localPath) await ensureWebReady(localPath, { logger: app.log });
-  },
+  storage: createLocalStorage({ workspaceDir: dataDir }),
+  webReady: { concurrency: 1, completeAfter: true },
 });
 ```
 
 Options: `{ transcode: false }` restricts it to the lossless remux (no CPU
 cost beyond a file rewrite); `crf`/`preset` tune the transcode
 (defaults `23`/`veryfast`); `ffmpegPath`/`ffprobePath` point at binaries off
-`PATH`.
+`PATH`; `concurrency` runs several at once; `completeAfter: true` holds
+`onUploadComplete` until the conversion has finished, for a host that
+publishes the video from the hook. `onArtifactEvent` fires `processed` with
+what was done. A conversion a restart interrupted is resumed by the
+completion replay (`replayCompletions`). Calling `ensureWebReady` yourself
+from `onUploadComplete` still works, but holds the client's final `PATCH`
+for the whole conversion.
 
 **Existing artifacts** — uploads that landed before the hook existed are fixed
 once with the bundled migration script (idempotent; interrupt and rerun
@@ -231,6 +235,16 @@ integrity for artifacts this feature has touched.
 captions, manifest or thumbnail of a video that never finished — are cleaned
 up by the opt-in `retention` option (or `sweepAbandonedUploads` from your own
 scheduler); see the README's `retention` option. Both adapters support it.
+Separately, a create that arrives for an unfinished upload of the same id
+(the person scanned the same link again after the app died) takes it over
+once it has been idle for `reclaim.idleSeconds` (300 by default), so nobody
+waits for the sweep.
+
+**Completions the host never recorded** — an `onUploadComplete` that threw,
+or a restart between the final byte and the hook — are fired again by the
+completion replay (`replayCompletions`, every 300 seconds by default, and
+`pulseVaultCore.replayCompletions()` on demand). Nothing to schedule; make the
+hook idempotent.
 
 How long to keep **finished** content is a policy decision `pulsevault`
 leaves to the operator (see `PROTOCOL.md` §1 on lifecycle ownership). A
