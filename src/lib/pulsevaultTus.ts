@@ -112,8 +112,8 @@ function withArtifactRemoval(
   isLocked?: (artifactId: string) => Promise<boolean>,
 ): DataStore {
   const { datastore } = storage;
-  if (!storage.remove) return datastore;
-  const removeArtifact = storage.remove.bind(storage);
+  if (!storage.remove && !isLocked) return datastore;
+  const removeArtifact = storage.remove?.bind(storage);
   return new Proxy(datastore, {
     get(target, prop) {
       if (prop === 'remove') {
@@ -137,7 +137,7 @@ function withArtifactRemoval(
             // Not there, or (S3) already completed: `storage.remove` below still removes it.
             uploadError = err;
           }
-          const artifactRemoved = artifactId ? await removeArtifact(artifactId) : false;
+          const artifactRemoved = artifactId && removeArtifact ? await removeArtifact(artifactId) : false;
           if (artifactId && kind && artifactRemoved) {
             await onRemoved?.(artifactId, kind);
           }

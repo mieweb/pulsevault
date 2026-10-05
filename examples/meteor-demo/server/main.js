@@ -82,32 +82,26 @@ let appLoaded = (async () => {
     await saveApp();
   }
 })();
-// Saves run one at a time (a ticket being added while a video is delivered), each snapshot
-// written to its own temp file and renamed into place, so the file is never half-written and
-// an older snapshot never lands after a newer one.
-let saving = Promise.resolve();
-function saveApp() {
-  const run = saving.catch(() => {}).then(async () => {
+// Every change to the records is one transaction, run one at a time: copy the current records,
+// apply the change, write the copy to its own temp file, rename it into place, and only then
+// publish it as the current records. A failed save publishes nothing, and a change queued
+// behind it starts from the records that were actually saved.
+let transaction = Promise.resolve();
+function commit(change) {
+  const run = transaction.catch(() => {}).then(async () => {
+    const next = structuredClone(app);
+    const result = change(next);
     await mkdir(path.dirname(appFile), { recursive: true });
     const tmp = `${appFile}.${randomUUID()}.tmp`;
-    await writeFile(tmp, JSON.stringify(app, null, 2));
+    await writeFile(tmp, JSON.stringify(next, null, 2));
     await rename(tmp, appFile);
+    app = next;
+    return result;
   });
-  saving = run;
+  transaction = run;
   return run;
 }
-/** Apply a change to the app's records only once it's on disk, so a failed save leaves nothing behind in memory. */
-async function commit(change) {
-  const before = app;
-  app = structuredClone(app);
-  try {
-    change(app);
-    await saveApp();
-  } catch (err) {
-    app = before;
-    throw err;
-  }
-}
+const saveApp = () => commit(() => {});
 
 // ---------------------------------------------------------------------------------------------
 // Destinations: where a Pulse video can land. One entry per kind — `check` runs when the link
@@ -337,9 +331,11 @@ const api = {
     const { title } = await readJson(req);
     const clean = String(title ?? "").trim().slice(0, 80);
     if (!clean) throw httpError(400, "A title is required");
-    const ticket = { id: `T-${100 + app.tickets.length + 1}`, title: clean, attachments: [], createdAt: new Date().toISOString() };
-    await commit((next) => next.tickets.push(ticket));
-    return ticket;
+    return commit((next) => {
+      const ticket = { id: `T-${100 + next.tickets.length + 1}`, title: clean, attachments: [], createdAt: new Date().toISOString() };
+      next.tickets.push(ticket);
+      return ticket;
+    });
   },
 };
 

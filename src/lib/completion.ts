@@ -379,14 +379,17 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             await storage.patchArtifact?.(meta.artifactId, { processing: false }).catch(() => {});
           }
           if (meta.acknowledged) continue;
-        } else if (convertible && completeAfter) {
-          // Unacknowledged with `completeAfter`: the hook may only run after the conversion, and
-          // the process may have stopped between `markReady` and recording that one was due.
-          // Converting first costs nothing when the bytes are already web-ready.
+        } else if (convertible) {
+          // Unacknowledged and never marked as converting: the process may have stopped between
+          // `markReady` and recording that a conversion was due. Converting again costs a probe
+          // when the bytes are already web-ready, so convert in both modes; `completeAfter` only
+          // decides whether the hook waits for it.
           await storage.patchArtifact?.(meta.artifactId, { processing: true }).catch(() => {});
-          void convert(REPLAY_REQUEST, ctx, true);
-          replayed.push(meta.artifactId);
-          continue;
+          void convert(REPLAY_REQUEST, ctx, completeAfter);
+          if (completeAfter) {
+            replayed.push(meta.artifactId);
+            continue;
+          }
         }
         completing.add(meta.artifactId);
         try {

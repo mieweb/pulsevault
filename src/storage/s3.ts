@@ -412,12 +412,22 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       latest = Math.max(latest, info.LastModified?.getTime() ?? 0);
       const uploadId = info.Metadata?.['upload-id'];
       if (uploadId) {
-        const parts = await client.send(
-          new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
-        );
-        for (const part of parts.Parts ?? []) {
-          latest = Math.max(latest, part.LastModified?.getTime() ?? 0);
-        }
+        // Pages of at most 1,000 parts: a long upload's newest parts are on the last page.
+        let marker: string | undefined;
+        do {
+          const page = await client.send(
+            new ListPartsCommand({
+              Bucket: bucket,
+              Key: key,
+              UploadId: uploadId,
+              ...(marker ? { PartNumberMarker: marker } : {}),
+            }),
+          );
+          for (const part of page.Parts ?? []) {
+            latest = Math.max(latest, part.LastModified?.getTime() ?? 0);
+          }
+          marker = page.IsTruncated ? page.NextPartNumberMarker : undefined;
+        } while (marker);
       }
     } catch {
       // No `.info` yet, the multipart upload is gone, or ListParts isn't supported: what we have.
