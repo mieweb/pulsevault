@@ -157,6 +157,14 @@ export function validateCompletionOptions(
     if (intervalSeconds !== undefined && !(intervalSeconds > 0 && Number.isFinite(intervalSeconds))) {
       throw new TypeError('`replayCompletions.intervalSeconds` must be a positive number of seconds');
     }
+    // A replay that can find unacknowledged artifacts but can't record an acknowledgement would
+    // run the hook again on every pass, forever.
+    const { listArtifacts, describeArtifact, patchArtifact } = opts.storage;
+    if (typeof listArtifacts === 'function' && typeof describeArtifact === 'function' && typeof patchArtifact !== 'function') {
+      throw new TypeError(
+        '`replayCompletions` needs a storage adapter with `patchArtifact` to record what was replayed (or set `replayCompletions: false`)',
+      );
+    }
   }
 }
 

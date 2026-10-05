@@ -565,6 +565,21 @@ test("an adapter without describeArtifact still gets onUploadComplete on every c
   }
 });
 
+test("replay is refused at boot for an adapter that can find unacknowledged artifacts but not record them", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-hosts-"));
+  const { patchArtifact: _p, ...cannotRecord } = createLocalStorage({ workspaceDir });
+  try {
+    await assert.rejects(
+      startApp(cannotRecord, { replayCompletions: { intervalSeconds: 60 } }, async () => {}),
+      /needs a storage adapter with `patchArtifact`/,
+    );
+    const ctx = await startApp(cannotRecord, {}, async () => {}); // replay off (the test default): fine
+    await ctx.teardown();
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
 test("the poster URL is revalidated on every request, whatever cache policy the artifact URLs have", async () => {
   const ctx = await startLocal({ pluginOptions: { cache: { cacheControl: true, maxAge: "1y", immutable: true } } });
   try {
