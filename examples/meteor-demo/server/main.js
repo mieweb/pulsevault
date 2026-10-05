@@ -69,18 +69,22 @@ const LINK_SECONDS = 30 * 60;
 const appFile = path.join(workspaceDir, ".demo", "app.json");
 let app = { posts: [], tickets: [] };
 let appLoaded = (async () => {
+  // Seed only when there is no file. An unreadable or malformed one is a fault to look at, not
+  // something to overwrite: it holds posts and attachments whose completions were acknowledged.
   try {
     app = JSON.parse(await readFile(appFile, "utf8"));
-  } catch {
-    app = {
-      posts: [],
-      tickets: [
-        { id: "T-101", title: "Onboarding checklist", attachments: [], createdAt: new Date().toISOString() },
-        { id: "T-102", title: "Export fails on large files", attachments: [], createdAt: new Date().toISOString() },
-      ],
-    };
-    await saveApp();
+    return;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
   }
+  app = {
+    posts: [],
+    tickets: [
+      { id: "T-101", title: "Onboarding checklist", attachments: [], createdAt: new Date().toISOString() },
+      { id: "T-102", title: "Export fails on large files", attachments: [], createdAt: new Date().toISOString() },
+    ],
+  };
+  await saveApp();
 })();
 // Every change to the records is one transaction, run one at a time: copy the current records,
 // apply the change, write the copy to its own temp file, rename it into place, and only then
@@ -235,9 +239,15 @@ const json = (res, status, body) => {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
 };
+const MAX_JSON_BODY = 16 * 1024; // every API body here is a name, a title or a destination
 async function readJson(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_JSON_BODY) throw httpError(413, "Body too large");
+    chunks.push(chunk);
+  }
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text) return {};
   try {
