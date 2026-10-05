@@ -397,7 +397,7 @@ test("durable completion: a hook that throws is replayed with replay: true until
     assert.equal((await ctx.core.getStatus(videoId)).state, "ready", "the bytes serve");
     assert.equal((await ctx.core.getStatus(videoId)).acknowledged, false);
 
-    assert.deepEqual(await ctx.core.replayCompletions(), [], "still failing: nothing replayed");
+    assert.deepEqual(await ctx.core.replayCompletions(), [videoId], "tried again (and failed again)");
     assert.equal(seen.length, 2);
     assert.equal(seen[1].replay, true);
     assert.equal(seen[1].name, "Plan");
@@ -405,7 +405,7 @@ test("durable completion: a hook that throws is replayed with replay: true until
     fail = false;
     assert.deepEqual(await ctx.core.replayCompletions(), [videoId]);
     assert.equal((await ctx.core.getStatus(videoId)).acknowledged, true);
-    assert.deepEqual(await ctx.core.replayCompletions(), [], "acknowledged: not replayed again");
+    assert.deepEqual(await ctx.core.replayCompletions(), [], "acknowledged: nothing left to settle");
     assert.equal(seen.length, 3);
   } finally {
     await ctx.teardown();
@@ -509,7 +509,7 @@ test("replay with completeAfter converts before the hook, even when the process 
     }
     assert.equal(completions.length, 1);
     await fs.writeFile(await ctx.storage.getLocalPath(videoId), body); // the original bytes again
-    await ctx.storage.patchArtifact(videoId, { acknowledged: false, processing: false });
+    await ctx.storage.patchArtifact(videoId, { acknowledged: false, converted: false });
 
     assert.deepEqual(await ctx.core.replayCompletions(), [videoId]);
     const done = Date.now() + 20_000;
@@ -530,15 +530,15 @@ for (const [name, start] of [["local", startLocal], ["S3", startS3]]) {
     try {
       const videoId = randomUUID();
       await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "draft.mp4", kind: "video" });
-      await ctx.storage.patchArtifact(videoId, { acknowledged: false, processing: true });
+      await ctx.storage.patchArtifact(videoId, { acknowledged: false, converted: false });
       await Promise.all([
         ctx.storage.patchArtifact(videoId, { acknowledged: true }),
-        ctx.storage.patchArtifact(videoId, { processing: false }),
+        ctx.storage.patchArtifact(videoId, { converted: true }),
         ctx.storage.patchArtifact(videoId, { outcome: { state: "done" } }),
       ]);
       const meta = await ctx.storage.describeArtifact(videoId);
       assert.equal(meta.acknowledged, true);
-      assert.equal(meta.processing, false);
+      assert.equal(meta.converted, true);
       assert.deepEqual(meta.outcome, { state: "done" });
       assert.ok(meta.readyAt > 0, "readyAt is recorded at markReady");
     } finally {

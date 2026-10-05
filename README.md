@@ -550,7 +550,7 @@ Every finished video is made web-playable in the background, after the final `PA
 
 ### `replayCompletions`
 
-On by default, every 300 seconds, with the first pass shortly after start; `{ intervalSeconds }` changes the interval and `false` turns it off. Each pass fires `onUploadComplete` again (`ctx.replay: true`) for every finished artifact the host hasn't acknowledged, and resumes a `webReady` conversion a restart interrupted. `fastify.pulseVaultCore.replayCompletions()` (or `core.replayCompletions()`) runs a pass on demand, for example at boot once the host's own services are up. Finished sidecars written before PulseVault recorded acknowledgements read as acknowledged, so an upgrade replays nothing (one still uploading at the upgrade completes normally).
+On by default, every 300 seconds, with the first pass shortly after start; `{ intervalSeconds }` changes the interval and `false` turns it off. Each pass applies the one completion rule to every finished artifact that isn't settled: convert it if `webReady` applies and it isn't converted yet, then fire `onUploadComplete` again (`ctx.replay: true`) if the host hasn't acknowledged it. Both facts live on the artifact's sidecar (`converted`, `acknowledged`), written `false` at reserve, so nothing depends on what a process remembered. Turning `webReady` on later converts, on the first pass, the videos uploaded since this release that weren't. `fastify.pulseVaultCore.replayCompletions()` (or `core.replayCompletions()`) runs a pass on demand, for example at boot once the host's own services are up. Finished sidecars written before PulseVault recorded acknowledgements read as acknowledged, so an upgrade replays nothing (one still uploading at the upgrade completes normally).
 
 ### Status, outcome and pulses
 
@@ -716,7 +716,7 @@ The local adapter writes uploads into flat kind-scoped subdirectories. Downstrea
 ```text
 <workspaceRoot>/
   .pulsevault/<id>.json           # sidecar: { version, ext, filename, status, kind, relatedTo, checksum, name,
-                                  #            appVersion, context, acknowledged, processing, outcome }
+                                  #            appVersion, context, acknowledged, converted, readyAt, outcome }
   .pulsevault/related/<videoId>/<id>  # relation index: an empty marker per artifact relatedTo the video
   video/<id><ext>                 # video upload bytes    (kind="video")
   video/<id><ext>.json            # @tus/file-store offset/metadata sidecar
@@ -870,7 +870,7 @@ const storage: PulseVaultStorage = {
     // `authorize` returned for this create (the capability token's context); keep it with the row.
     await db.createArtifact({
       artifactId, filename, ext, kind, relatedTo, checksum, name, appVersion, context,
-      status: "uploading", acknowledged: false,
+      status: "uploading", acknowledged: false, converted: false,
     });
     return `${kind}/${artifactId}${ext}`;
   },
@@ -918,13 +918,13 @@ const storage: PulseVaultStorage = {
     return {
       artifactId, kind: row.kind, ext: row.ext, filename: row.filename, relatedTo: row.relatedTo,
       checksum: row.checksum, name: row.name, appVersion: row.appVersion, context: row.context,
-      ready: row.status === "ready", acknowledged: row.acknowledged, processing: row.processing === true,
-      outcome: row.outcome, updatedAt: row.updatedAt,
+      ready: row.status === "ready", acknowledged: row.acknowledged, converted: row.converted,
+      outcome: row.outcome, updatedAt: row.updatedAt, readyAt: row.readyAt,
     };
   },
-  async patchArtifact(artifactId, { acknowledged, processing, outcome }) {
+  async patchArtifact(artifactId, { acknowledged, converted, outcome }) {
     // Each field is optional; `outcome: null` clears it. Return false for an unknown id.
-    return (await db.updateArtifact(artifactId, { acknowledged, processing, outcome })).matched;
+    return (await db.updateArtifact(artifactId, { acknowledged, converted, outcome })).matched;
   },
   async *listRelated(artifactId) {
     // Every artifact whose `relatedTo` is this one — from an index, not a scan.

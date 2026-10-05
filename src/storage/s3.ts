@@ -52,8 +52,8 @@ type Sidecar = {
   context?: unknown;
   /** `false` from reserve until the core records that `onUploadComplete` finished; absent reads as `true` once finished. */
   acknowledged?: boolean;
-  /** `true` while a background web-ready conversion is rewriting the bytes. */
-  processing?: boolean;
+  /** `false` from reserve until the core records that the web-ready conversion finished; absent reads as `true` once finished. */
+  converted?: boolean;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
   /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
@@ -379,7 +379,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         // A sidecar from before the flag existed: finished means nothing to replay; still
         // uploading means its completion hasn't happened yet.
         acknowledged: parsed.acknowledged ?? status === 'ready',
-        processing: parsed.processing === true,
+        converted: parsed.converted ?? status === 'ready',
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
@@ -471,7 +471,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     ...(sidecar.context !== undefined ? { context: sidecar.context } : {}),
     ready: sidecar.status === 'ready',
     acknowledged: sidecar.acknowledged !== false,
-    processing: sidecar.processing === true,
+    converted: sidecar.converted !== false,
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
     ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
@@ -510,6 +510,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       appVersion,
       ...(context !== undefined ? { context } : {}),
       acknowledged: false,
+      converted: false,
     };
 
     // Fast-path rejection for the common case. Not atomic by itself (two concurrent
@@ -765,7 +766,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     const result = await rewriteSidecar(artifactId, (sidecar) => {
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
-      if (patch.processing !== undefined) next.processing = patch.processing;
+      if (patch.converted !== undefined) next.converted = patch.converted;
       if (patch.outcome !== undefined) {
         if (patch.outcome === null) delete next.outcome;
         else next.outcome = patch.outcome;

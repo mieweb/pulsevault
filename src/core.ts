@@ -901,7 +901,11 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
   const getStatus = async (artifactId: string): Promise<PulseVaultArtifactStatus> => {
     const meta = isUuid(artifactId) ? await describe(artifactId) : null;
     if (!meta) return { artifactId, state: 'unknown' };
-    const state = !meta.ready ? 'uploading' : meta.processing ? 'processing' : 'ready';
+    const state = !meta.ready
+      ? 'uploading'
+      : completion.converts(meta.kind) && !meta.converted
+        ? 'processing'
+        : 'ready';
     return {
       artifactId,
       state,

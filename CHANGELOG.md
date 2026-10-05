@@ -67,10 +67,11 @@ types phones send. Two defaults change; both have an escape hatch.
   `createCapabilityAuthorize` grants it to the pairing token and a view token.
 - **`webReady`**: the conversion `ensureWebReady` does, run by the core in
   the background after the final `PATCH` is answered, `concurrency` at a
-  time, with a `processing` state meanwhile, a `processed` event when done,
+  time, with a `processing` status meanwhile, a `processed` event when done,
   and `completeAfter: true` to hold `onUploadComplete` until the conversion
-  has finished (`ctx.webReady` says what it did). A conversion a restart
-  interrupted is resumed by the replay. Local storage only.
+  has finished (`ctx.webReady` says what it did). Whether it finished is
+  recorded on the sidecar (`converted`), so a conversion a restart
+  interrupted is redone by the replay. Local storage only.
 - **`lockWhenReady`**: a finished artifact, and anything `relatedTo` a
   finished video, can't be deleted through the routes (`403`); the host
   removes through `storage.remove` on its own terms.

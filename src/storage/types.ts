@@ -118,15 +118,19 @@ export type PulseVaultArtifactMeta = {
   /** `true` once the upload finished and is served. */
   ready: boolean;
   /**
-   * `true` while the host's `onUploadComplete` has not finished for this artifact: set `false` at
-   * reserve, `true` by the core once the hook returned. A completion the host never recorded
-   * (a throw, a restart) is replayed from this flag. A sidecar written before the flag existed
-   * reads as `true` when finished (an upgrade replays nothing) and `false` while still uploading
-   * (its completion is still to come).
+   * Whether the host's `onUploadComplete` has returned for this artifact: `false` from reserve,
+   * `true` once the core recorded the hook's return. A completion the host never recorded (a
+   * throw, a restart) is replayed from this flag. A sidecar written before the flag existed reads
+   * as `true` when finished (an upgrade replays nothing) and `false` while still uploading (its
+   * completion is still to come).
    */
   acknowledged: boolean;
-  /** `true` while a background web-ready conversion is rewriting the bytes. */
-  processing: boolean;
+  /**
+   * Whether the web-ready conversion has finished for this artifact: `false` from reserve, `true`
+   * once the core recorded it. Only meaningful for a video on a server with `webReady`; the core
+   * derives the `processing` status from it. Legacy sidecars read as `true` when finished.
+   */
+  converted: boolean;
   /** Whatever the host recorded with `recordOutcome` (where the upload went, why it was kept). */
   outcome?: unknown;
   /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */
@@ -142,7 +146,7 @@ export type PulseVaultArtifactMeta = {
 /** The fields `patchArtifact` may change. Each is optional; absent means unchanged. */
 export type PulseVaultArtifactPatch = {
   acknowledged?: boolean;
-  processing?: boolean;
+  converted?: boolean;
   /** `null` clears a recorded outcome. */
   outcome?: unknown;
 };
@@ -259,7 +263,7 @@ export interface PulseVaultStorage {
   describeArtifact?(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
 
   /**
-   * Change the bookkeeping flags of one artifact (`acknowledged`, `processing`, `outcome`).
+   * Change the bookkeeping flags of one artifact (`acknowledged`, `converted`, `outcome`).
    * Resolves `false` if the artifactId is unknown. Optional — completion replay, background
    * web-ready and `recordOutcome` need it.
    */

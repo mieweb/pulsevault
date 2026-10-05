@@ -54,8 +54,8 @@ type Sidecar = {
    * sidecars written before the flag existed: read as `true` when finished, `false` otherwise.
    */
   acknowledged?: boolean;
-  /** `true` while a background web-ready conversion is rewriting the bytes. */
-  processing?: boolean;
+  /** `false` from reserve until the core records that the web-ready conversion finished; absent reads as `true` once finished. */
+  converted?: boolean;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
   /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
@@ -254,7 +254,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    * Read-modify-write of a sidecar's flags runs one at a time per artifact in this process, so
    * an acknowledgement and a conversion finishing at the same moment can't lose each other's
    * write. (Across instances on a shared filesystem the last rename wins; the replay recovers a
-   * lost acknowledgement, and `processing` is only ever written by the instance converting.)
+   * lost acknowledgement or conversion record: both are redone, idempotently.)
    */
   const sidecarWrites = new Map<string, Promise<unknown>>();
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
@@ -311,7 +311,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         // A sidecar from before the flag existed: finished means nothing to replay; still
         // uploading means its completion hasn't happened yet.
         acknowledged: parsed.acknowledged ?? status === 'ready',
-        processing: parsed.processing === true,
+        converted: parsed.converted ?? status === 'ready',
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
@@ -368,7 +368,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     ...(sidecar.context !== undefined ? { context: sidecar.context } : {}),
     ready: sidecar.status === 'ready',
     acknowledged: sidecar.acknowledged !== false,
-    processing: sidecar.processing === true,
+    converted: sidecar.converted !== false,
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
     ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
@@ -420,6 +420,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       appVersion,
       ...(context !== undefined ? { context } : {}),
       acknowledged: false,
+      converted: false,
     };
 
     // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
@@ -557,7 +558,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       if (!sidecar) return false;
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
-      if (patch.processing !== undefined) next.processing = patch.processing;
+      if (patch.converted !== undefined) next.converted = patch.converted;
       if (patch.outcome !== undefined) {
         if (patch.outcome === null) delete next.outcome;
         else next.outcome = patch.outcome;
