@@ -842,19 +842,31 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     }
   };
 
-  /** Stream or redirect to a resolved artifact — the tail of the GET route, shared with the poster route. */
+  /**
+   * Stream or redirect to a resolved artifact — the tail of the GET route, shared with the poster
+   * route. An artifact URL names immutable bytes, so it takes the configured `cache`; the poster
+   * URL is a lookup whose answer changes when a newer thumbnail lands, so it is revalidated on
+   * every request (`mustRevalidate`).
+   */
   const serveResolution = async (
     req: IncomingMessage,
     res: ServerResponse,
     resolved: PulseVaultResolution,
+    mustRevalidate = false,
   ): Promise<void> => {
     if (resolved.kind === 'redirect') {
-      res.writeHead(resolved.statusCode ?? 302, { Location: resolved.url });
+      res.writeHead(resolved.statusCode ?? 302, {
+        Location: resolved.url,
+        ...(mustRevalidate ? { 'cache-control': 'no-store' } : {}),
+      });
       res.end();
       return;
     }
 
-    const result = await send(req, resolved.filename, { root: resolved.root, ...cache });
+    const cacheOptions = mustRevalidate
+      ? { cacheControl: true, maxAge: 0, immutable: false }
+      : cache;
+    const result = await send(req, resolved.filename, { root: resolved.root, ...cacheOptions });
 
     if (result.type === 'error') {
       writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
@@ -1000,7 +1012,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('No poster for this artifact'));
         return;
       }
-      await serveResolution(req, res, resolved);
+      await serveResolution(req, res, resolved, true);
     } catch (err) {
       failClosed(res, err, 'artifact poster');
     }

@@ -547,6 +547,40 @@ for (const [name, start] of [["local", startLocal], ["S3", startS3]]) {
   });
 }
 
+test("an adapter without describeArtifact still gets onUploadComplete on every completion", async () => {
+  let fired = 0;
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-hosts-"));
+  const { describeArtifact: _d, patchArtifact: _p, listRelated: _l, ...minimal } = createLocalStorage({ workspaceDir });
+  const ctx = await startApp(
+    minimal,
+    { onUploadComplete: async () => { fired++; } },
+    () => fs.rm(workspaceDir, { recursive: true, force: true }),
+  );
+  try {
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename: "a.mp4", kind: "video" });
+    assert.equal(fired, 1);
+    assert.deepEqual(await ctx.core.replayCompletions(), [], "nothing to replay from, nothing replayed");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("the poster URL is revalidated on every request, whatever cache policy the artifact URLs have", async () => {
+  const ctx = await startLocal({ pluginOptions: { cache: { cacheControl: true, maxAge: "1y", immutable: true } } });
+  try {
+    const videoId = randomUUID();
+    await uploadPulse(ctx, videoId, mint(videoId));
+    const artifact = await fetch(ctx.url(`/artifacts/${videoId}`));
+    assert.match(artifact.headers.get("cache-control"), /immutable/);
+    const poster = await fetch(ctx.url(`/artifacts/${videoId}/poster`));
+    assert.equal(poster.status, 200);
+    assert.match(poster.headers.get("cache-control"), /max-age=0/);
+    assert.doesNotMatch(poster.headers.get("cache-control"), /immutable/);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("sidecars from before the acknowledged flag read as acknowledged, so an upgrade replays nothing", async () => {
   const ctx = await startLocal({ pluginOptions: { onUploadComplete: async () => {} } });
   try {

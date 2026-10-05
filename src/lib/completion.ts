@@ -303,8 +303,10 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     const running = settling.get(upload.artifactId);
     if (running) return running;
     const ctx = contextFor(meta, upload, replay);
-    const needsConversion = converts(upload.kind) && !(meta?.converted ?? true);
-    const needsHook = !(meta?.acknowledged ?? true);
+    // An adapter without `describeArtifact` can't say what was done: run everything (the hook
+    // is at-least-once anyway, and the conversion is idempotent).
+    const needsConversion = converts(upload.kind) && !(meta ? meta.converted : false);
+    const needsHook = meta ? !meta.acknowledged : true;
     if (!needsConversion && !needsHook) return Promise.resolve();
 
     let run: Promise<void>;
