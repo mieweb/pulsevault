@@ -338,21 +338,19 @@ export async function startMockS3({ buckets = [] } = {}) {
       }
 
       if (req.method === 'PUT' && key) {
-        // PutObject — enforces `If-None-Match: *` (the reserve collision guard).
+        // PutObject — enforces `If-None-Match: *` (the reserve collision guard) and `If-Match`
+        // (a conditional rewrite). The body is read first, so the checks and the write happen
+        // without yielding: two overlapping conditional PUTs can't both pass.
+        const body = await readBody(req);
         if (req.headers['if-none-match'] === '*' && objects.has(objKey(bucket, key))) {
-          // Drain the body first so the client isn't left writing into a closed socket.
-          await readBody(req);
           sendError(res, 412, 'PreconditionFailed', 'Object already exists');
           return;
         }
-        // `If-Match` (a conditional rewrite): 412 unless the stored version has that ETag.
         const ifMatch = req.headers['if-match'];
         if (ifMatch && objects.get(objKey(bucket, key))?.etag !== ifMatch) {
-          await readBody(req);
           sendError(res, 412, 'PreconditionFailed', 'At least one of the pre-conditions you specified did not hold');
           return;
         }
-        const body = await readBody(req);
         objects.set(objKey(bucket, key), {
           body,
           etag: `"${md5Hex(body)}"`,

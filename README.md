@@ -550,7 +550,7 @@ Every finished video is made web-playable in the background, after the final `PA
 
 ### `replayCompletions`
 
-On by default, every 300 seconds, with the first pass shortly after start; `{ intervalSeconds }` changes the interval and `false` turns it off. Each pass fires `onUploadComplete` again (`ctx.replay: true`) for every finished artifact the host hasn't acknowledged, and resumes a `webReady` conversion a restart interrupted. `fastify.pulseVaultCore.replayCompletions()` (or `core.replayCompletions()`) runs a pass on demand, for example at boot once the host's own services are up. Sidecars written before PulseVault recorded acknowledgements read as acknowledged, so an upgrade replays nothing.
+On by default, every 300 seconds, with the first pass shortly after start; `{ intervalSeconds }` changes the interval and `false` turns it off. Each pass fires `onUploadComplete` again (`ctx.replay: true`) for every finished artifact the host hasn't acknowledged, and resumes a `webReady` conversion a restart interrupted. `fastify.pulseVaultCore.replayCompletions()` (or `core.replayCompletions()`) runs a pass on demand, for example at boot once the host's own services are up. Finished sidecars written before PulseVault recorded acknowledgements read as acknowledged, so an upgrade replays nothing (one still uploading at the upgrade completes normally).
 
 ### Status, outcome and pulses
 

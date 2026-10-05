@@ -51,7 +51,7 @@ type Sidecar = {
   context?: unknown;
   /**
    * `false` from reserve until the core records that `onUploadComplete` finished. Absent on
-   * sidecars written before the flag existed, read as `true` (nothing to replay).
+   * sidecars written before the flag existed: read as `true` when finished, `false` otherwise.
    */
   acknowledged?: boolean;
   /** `true` while a background web-ready conversion is rewriting the bytes. */
@@ -308,8 +308,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
         ...(parsed.context !== undefined ? { context: parsed.context } : {}),
-        // A sidecar from before the flag existed has nothing to replay.
-        acknowledged: parsed.acknowledged !== false,
+        // A sidecar from before the flag existed: finished means nothing to replay; still
+        // uploading means its completion hasn't happened yet.
+        acknowledged: parsed.acknowledged ?? status === 'ready',
         processing: parsed.processing === true,
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),

@@ -50,7 +50,7 @@ type Sidecar = {
   appVersion?: string;
   /** Optional host data from the capability token. See `ReserveUploadParams.context`. */
   context?: unknown;
-  /** `false` from reserve until the core records that `onUploadComplete` finished; absent reads as `true`. */
+  /** `false` from reserve until the core records that `onUploadComplete` finished; absent reads as `true` once finished. */
   acknowledged?: boolean;
   /** `true` while a background web-ready conversion is rewriting the bytes. */
   processing?: boolean;
@@ -376,8 +376,9 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
         name: typeof parsed.name === 'string' ? parsed.name : undefined,
         appVersion: typeof parsed.appVersion === 'string' ? parsed.appVersion : undefined,
         ...(parsed.context !== undefined ? { context: parsed.context } : {}),
-        // A sidecar from before the flag existed has nothing to replay.
-        acknowledged: parsed.acknowledged !== false,
+        // A sidecar from before the flag existed: finished means nothing to replay; still
+        // uploading means its completion hasn't happened yet.
+        acknowledged: parsed.acknowledged ?? status === 'ready',
         processing: parsed.processing === true,
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
@@ -429,8 +430,10 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
           marker = page.IsTruncated ? page.NextPartNumberMarker : undefined;
         } while (marker);
       }
-    } catch {
-      // No `.info` yet, the multipart upload is gone, or ListParts isn't supported: what we have.
+    } catch (err) {
+      // No `.info` yet, or the multipart upload is gone: nothing more to learn. Anything else
+      // (permissions, a transient failure) must not read as "idle".
+      if (!isNotFound(err) && !isNoSuchUpload(err)) throw err;
     }
     return latest;
   };
@@ -594,21 +597,46 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return { kind: 'redirect', url, statusCode: 302 };
   };
 
+  /**
+   * A read-modify-write of the sidecar that must not lose a concurrent one (an instance
+   * acknowledging a completion while another records its outcome, or finishes the upload): the
+   * rewrite is conditional on the ETag that was read, and retried from a fresh read when the
+   * object changed meanwhile. On a backend that doesn't support `IfMatch`, the write is
+   * unconditional — the same degraded mode as reserve. Resolves `null` for an unknown id.
+   */
+  const rewriteSidecar = async (
+    artifactId: string,
+    mutate: (current: Sidecar) => Sidecar | null,
+  ): Promise<Sidecar | null> => {
+    for (let attempt = 0; ; attempt++) {
+      const current = await readSidecarVersioned(artifactId);
+      if (!current) return null;
+      const next = mutate(current.sidecar);
+      if (next === null) return current.sidecar; // nothing to change
+      try {
+        await writeSidecar(artifactId, next, current.etag);
+      } catch (err) {
+        if (isPreconditionFailed(err) && attempt < 5) continue; // changed under us: re-read, retry
+        if (!isConditionalWriteUnsupported(err)) throw err;
+        warnAboutConditionalWriteFallbackOnce();
+        await writeSidecar(artifactId, next);
+      }
+      cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+      return next;
+    }
+  };
+
   const markReady = async (artifactId: string): Promise<void> => {
-    const sidecar = await readSidecar(artifactId);
-    if (!sidecar) {
+    const result = await rewriteSidecar(artifactId, (sidecar) =>
+      // Idempotent: already ready leaves the sidecar alone.
+      sidecar.status === 'ready' ? null : { ...sidecar, status: 'ready', readyAt: Date.now() },
+    );
+    if (!result) {
       throw new Error(
         `markReady: no sidecar for artifactId ${artifactId} (was reserveUpload called?)`,
       );
     }
-    const next = sidecarToCachedMeta(sidecar, true);
-    if (sidecar.status === 'ready') {
-      // Idempotent: already ready, just keep the cache consistent.
-      cacheSet(artifactId, next);
-      return;
-    }
-    await writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() });
-    cacheSet(artifactId, next);
+    cacheSet(artifactId, sidecarToCachedMeta(result, true));
   };
 
   const remove = async (artifactId: string): Promise<boolean> => {
@@ -729,41 +757,22 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     return sidecarToMeta(artifactId, sidecar, updatedAt);
   };
 
-  /**
-   * A read-modify-write that must not lose a concurrent one (an instance acknowledging a
-   * completion while another records its outcome): the rewrite is conditional on the ETag that
-   * was read, and retried from a fresh read when the object changed meanwhile. On a backend that
-   * doesn't support `IfMatch`, the write is unconditional — the same degraded mode as reserve.
-   */
   const patchArtifact = async (
     artifactId: string,
     patch: PulseVaultArtifactPatch,
   ): Promise<boolean> => {
     if (!isUuid(artifactId)) return false;
-    for (let attempt = 0; ; attempt++) {
-      const current = await readSidecarVersioned(artifactId);
-      if (!current) return false;
-      const next: Sidecar = { ...current.sidecar };
+    const result = await rewriteSidecar(artifactId, (sidecar) => {
+      const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.processing !== undefined) next.processing = patch.processing;
       if (patch.outcome !== undefined) {
         if (patch.outcome === null) delete next.outcome;
         else next.outcome = patch.outcome;
       }
-      try {
-        await writeSidecar(artifactId, next, current.etag);
-      } catch (err) {
-        if (isPreconditionFailed(err) && attempt < 5) continue; // changed under us: re-read, retry
-        if (isConditionalWriteUnsupported(err)) {
-          warnAboutConditionalWriteFallbackOnce();
-          await writeSidecar(artifactId, next);
-        } else {
-          throw err;
-        }
-      }
-      cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
-      return true;
-    }
+      return next;
+    });
+    return result !== null;
   };
 
   async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {
@@ -908,6 +917,12 @@ async function digestBody(
 }
 
 /** Whether an AWS SDK error represents a missing key/object (404-ish). */
+/** Whether `ListParts` answered that the multipart upload no longer exists (completed or aborted). */
+function isNoSuchUpload(err: unknown): boolean {
+  const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+  return e?.name === 'NoSuchUpload' || e?.Code === 'NoSuchUpload';
+}
+
 function isNotFound(err: unknown): boolean {
   const e = err as {
     name?: string;

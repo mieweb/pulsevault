@@ -38,8 +38,9 @@ types phones send. Two defaults change; both have an escape hatch.
   shortly after start (`replayCompletions`; `false` turns it off, and
   `core.replayCompletions()` / `fastify.pulseVaultCore.replayCompletions()`
   runs a pass on demand). Hosts must check their own record before writing
-  it again. Sidecars written before this release read as acknowledged, so an
-  upgrade replays nothing. A retried final `PATCH` no longer fires the hook a
+  it again. Finished sidecars written before this release read as acknowledged, so an
+  upgrade replays nothing; one still uploading at the upgrade completes
+  normally. A retried final `PATCH` no longer fires the hook a
   second time.
 - **`authorize` gains the `status` phase** (`GET /artifacts/:id/status`).
   An exhaustive `switch` on the phase needs a case for it.

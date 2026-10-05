@@ -120,8 +120,9 @@ export type PulseVaultArtifactMeta = {
   /**
    * `true` while the host's `onUploadComplete` has not finished for this artifact: set `false` at
    * reserve, `true` by the core once the hook returned. A completion the host never recorded
-   * (a throw, a restart) is replayed from this flag. Sidecars written before the flag existed
-   * read as `true`, so an upgrade replays nothing.
+   * (a throw, a restart) is replayed from this flag. A sidecar written before the flag existed
+   * reads as `true` when finished (an upgrade replays nothing) and `false` while still uploading
+   * (its completion is still to come).
    */
   acknowledged: boolean;
   /** `true` while a background web-ready conversion is rewriting the bytes. */

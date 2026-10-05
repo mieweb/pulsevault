@@ -538,7 +538,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     if (!lockWhenReady) return false;
     const meta = await describe(artifactId);
     if (meta ? meta.ready : await isFinished(artifactId)) return true;
-    const parent = relatedTo ?? meta?.relatedTo;
+    const parent =
+      relatedTo ?? meta?.relatedTo ?? (await resolveStorageRelatedTo(storage, artifactId));
     return parent !== undefined && (await isFinished(parent));
   };
 
