@@ -188,13 +188,17 @@ Four runnable example servers live under [`examples/`](examples):
   query instead of a sidecar crawl), uploads grouped by recording session
   via `relatedTo`, WebVTT captions, Swagger UI, and an `onArtifactEvent`
   live feed.
-- [`examples/express-demo`](examples/express-demo) and
-  [`examples/meteor-demo`](examples/meteor-demo) — the same demo on
-  `@mieweb/pulsevault/core` instead of the plugin, proving the core needs
-  about the same amount of glue code under a different framework. Both are
-  verified against the real frameworks, not just the test suite —
-  `meteor-demo` in particular against a real `meteor create` app, since
-  Meteor's bundler needed the compatibility fixes described above.
+- [`examples/meteor-demo`](examples/meteor-demo) — the **reference host
+  integration**, on `@mieweb/pulsevault/core` under Meteor: shaped like a
+  team app (people, destinations), it reserves an upload by signing the owner
+  and destination into the capability token, delivers the video from
+  `onUploadComplete` to where it was started, polls the status route from
+  the pairing popup, and shows every video as a card with its poster — with
+  no table of uploads, no shape check, no stale-upload cleanup and no
+  content-type fix-up of its own. Verified against a real `meteor create`
+  app, since Meteor's bundler needed the compatibility fixes described above.
+- [`examples/express-demo`](examples/express-demo) — the fastify-demo on
+  `@mieweb/pulsevault/core` under Express.
 
 ## How a pairing + upload session flows
 
@@ -231,7 +235,9 @@ The plugin mounts the following routes under `prefix` (`@mieweb/pulsevault/core`
 | `PATCH` / `HEAD` / `DELETE` \* | `/pulsevault/upload/:id` | Upload chunks, probe offset, delete the upload (TUS) |
 | `GET` | `/pulsevault/artifacts/:artifactId` | Stream or redirect to the uploaded artifact (any kind) |
 | `POST` | `/pulsevault/artifacts/:artifactId/view-link` | Mint a read-only view link to a finished artifact (only with [`issueViewLink`](#issueviewlink)) |
-| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar) |
+| `GET` | `/pulsevault/artifacts/:artifactId/status` | Where an upload is: `uploading` (with progress), `processing`, `ready`, plus the host's recorded outcome (see [Status, outcome and pulses](#status-outcome-and-pulses)) |
+| `GET` | `/pulsevault/artifacts/:artifactId/poster` | A video's poster frame: the finished thumbnail `relatedTo` it, served like the artifact route |
+| `DELETE` | `/pulsevault/artifacts/:artifactId` | Delete a finalized upload (bytes + sidecar); refused once finished with [`lockWhenReady`](#lockwhenready) |
 
 \* `DELETE /pulsevault/upload/:id` is TUS termination, addressed by the upload URL: it removes the artifact whether the upload is still in flight (a cancel) or finished, exactly as `DELETE /pulsevault/artifacts/:artifactId` does by artifactId.
 
@@ -250,12 +256,20 @@ type PulseVaultPluginOptions = {
   allowedExtensions?:
     | string[]                                                                              // legacy — treated as video-only
     | { video?: string[]; project?: string[]; captions?: string[]; thumbnail?: string[] };  // per-kind (recommended)
-  // defaults: { video: [".mp4"], project: [".pulse", ".zip"], captions: [".vtt"], thumbnail: [".jpg", ".jpeg", ".png"] }
+  // defaults: { video: [".mp4", ".mov", ".m4v"], project: [".pulse", ".zip"], captions: [".vtt", ".srt"], thumbnail: [".jpg", ".jpeg", ".png"] }
   cache?: PulseVaultCacheOptions;
   authorize?: PulseVaultAuthorize;
   validatePayload?: PulseVaultValidatePayload;          // runs for every kind; branch on ctx.kind
-  onUploadComplete?: PulseVaultOnUploadComplete;        // runs for every kind; branch on ctx.kind
+  onUploadComplete?: PulseVaultOnUploadComplete;        // runs for every kind; branch on ctx.kind; at-least-once
   onArtifactEvent?: PulseVaultOnArtifactEvent;          // low-frequency hook for metrics + audit logging
+  issueViewLink?: PulseVaultIssueViewLink;              // read-only view links
+  retention?: { abandonedAfterSeconds: number; sweepIntervalSeconds?: number };
+  pulseShape?: boolean;                                 // default true: creates must have the shape of a pulse
+  reclaim?: { idleSeconds?: number } | false;           // default { idleSeconds: 300 }: a create takes over an idle unfinished upload
+  lockWhenReady?: boolean;                              // default false: a finished pulse can't be deleted through the routes
+  webReady?: PulseVaultWebReadyOptions | boolean;       // default off: background faststart remux / H.264 transcode
+  replayCompletions?: { intervalSeconds?: number } | false; // default every 300 s: re-fire unacknowledged completions
+  coreDecoratorName?: string;                           // default "pulseVaultCore": getStatus, getPulse, recordOutcome, replayCompletions
   /** @deprecated use validatePayload + ctx.kind === "project" */
   validateProjectPayload?: PulseVaultValidatePayload;
   /** @deprecated use onUploadComplete + ctx.kind === "project" */
@@ -322,7 +336,7 @@ Upload filenames are keyed by UUID, so `immutable: true` is safe when `maxAge` i
 
 Optional async hook called before TUS create/patch, before GET resolve, before DELETE, and before minting a view link. Throw to reject — a `statusCode` or `status_code` number on the thrown error is used as the HTTP status (default `403`).
 
-Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal. `"share"` is `POST {prefix}/artifacts/<id>/view-link` — minting a read-only link — and only happens when [`issueViewLink`](#issueviewlink) is set.
+Phase mapping: `"create"` is the initial TUS `POST`; `"patch"` covers `PATCH` chunks and `HEAD` offset queries on the upload routes; `"resolve"` is `GET {prefix}/artifacts/<id>` and the poster route (authorized on the video); `"status"` is `GET {prefix}/artifacts/<id>/status`; `"delete"` is **both** ways of removing an artifact — `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE {prefix}/upload/<id>` (a cancel of an in-flight upload, or removal of a finished one). Gating `phase === "delete"` gates every removal. `"share"` is `POST {prefix}/artifacts/<id>/view-link` — minting a read-only link — and only happens when [`issueViewLink`](#issueviewlink) is set.
 
 ```ts
 type PulseVaultAuthorize = (
@@ -333,14 +347,21 @@ type PulseVaultAuthorize = (
   // `http.IncomingMessage`, etc.) — the same hook works under either.
   request: PulseVaultRequest,
   ctx: {
-    phase: "create" | "patch" | "resolve" | "delete" | "share";
+    phase: "create" | "patch" | "resolve" | "status" | "delete" | "share";
     artifactId: string;
-    kind: "video" | "project" | "captions";  // artifact kind; always present
-    token?: string;             // only on "resolve" phase
-    relatedTo?: string;         // the session-anchor artifact this one belongs to, if any
+    kind: "video" | "project" | "captions" | "thumbnail";  // artifact kind; always present
+    token?: string;             // only on the "resolve" and "status" phases
+    relatedTo?: string;         // the video this artifact belongs to, if it declared one
+    name?: string;              // Upload-Metadata.name, when sent
+    appVersion?: string;        // Upload-Metadata.appVersion, when sent
+    filename?: string;          // Upload-Metadata.filename
+    ext?: string;               // its lowercase extension, with the dot
+    context?: unknown;          // the token's context, read back from storage (absent on "create")
   },
-) => void | Promise<void>;
+) => void | { context?: unknown } | Promise<void | { context?: unknown }>;
 ```
+
+On `create` the hook may return `{ context }`: opaque host data (an owner, a destination) stored with the artifact and handed to every later `authorize`, to `onUploadComplete`, to `getStatus` and to `getPulse`. `createCapabilityAuthorize` returns the token's own `context` claim (see [Capability tokens](#capability-tokens)), so most hosts never touch this.
 
 ```ts
 await app.register(pulseVault, {
@@ -414,10 +435,25 @@ Optional async hook fired once the final byte is written, `validatePayload` has 
 
 ```ts
 type PulseVaultOnUploadComplete = (
-  request: PulseVaultRequest, // see the note under `authorize` above
-  ctx: { artifactId: string; kind: "video" | "project" | "captions"; size: number; uploadId: string },
+  request: PulseVaultRequest, // see the note under `authorize` above; `{ headers: {} }` on a replay
+  ctx: {
+    artifactId: string;
+    kind: "video" | "project" | "captions" | "thumbnail";
+    size: number;
+    uploadId: string;
+    filename: string;        // Upload-Metadata.filename
+    ext: string;             // its lowercase extension, with the dot
+    relatedTo?: string;      // the video a thumbnail, beat manifest or captions belongs to
+    name?: string;           // Upload-Metadata.name (the draft's title), when sent
+    appVersion?: string;     // Upload-Metadata.appVersion, when sent
+    context?: unknown;       // the capability token's context (see Capability tokens)
+    replay: boolean;         // true when PulseVault is firing a completion it never recorded
+    webReady?: WebReadyResult; // with `webReady.completeAfter`: what the conversion did
+  },
 ) => void | Promise<void>;
 ```
+
+**Completion is at-least-once.** PulseVault records that the hook returned (`acknowledged` in the artifact's sidecar). A finished artifact whose hook never returned — it threw, or the process stopped between the final byte and the hook — is fired again later with `ctx.replay: true` (see [`replayCompletions`](#replaycompletions)). So the hook must check its own record before writing it again: an upsert, or a claim that only one caller wins. A retried final `PATCH` for an acknowledged upload does not fire the hook a second time.
 
 ### `onArtifactEvent`
 
@@ -425,14 +461,16 @@ Optional low-frequency hook — fired on authorize rejection (every phase but pe
 
 ```ts
 type PulseVaultArtifactEvent = {
-  phase: "authorize" | "complete" | "reject" | "remove";
+  phase: "authorize" | "complete" | "reject" | "remove" | "processed";
   artifactId: string;
   kind: "video" | "project" | "captions" | "thumbnail";
   size?: number;
   // present for "authorize" and "reject"; on "remove", "deleted" (DELETE /artifacts/:id or a
-  // TUS DELETE) or "abandoned" (the `retention` sweep)
+  // TUS DELETE), "abandoned" (the `retention` sweep) or "reclaimed" (a create took over an
+  // idle unfinished upload); on "processed", what the web-ready conversion did
   reason?: string;
   appVersion?: string; // the uploading app's version, on "complete"/"reject" (protocol 2.1)
+  webReady?: WebReadyResult; // on "processed": { action, reason }
 };
 
 onArtifactEvent: (event) => {
@@ -482,6 +520,57 @@ Finished videos, and anything whose video finished, are never touched; this is n
 
 A sweep reads the metadata of every artifact older than the cutoff — one `GetObject` each on S3 — so on a large bucket sweep daily (or off-peak from a cron job) rather than hourly. Several instances may sweep the same storage (a removal that finds nothing is a no-op), but each instance caches metadata: on S3, an id another instance removed can still answer `409` on this one until the entry is evicted — the same as for `DELETE /artifacts/:id`. To schedule it yourself (a cron job, a queue), call `sweepAbandonedUploads(storage, { abandonedAfterSeconds, onRemoved? })` instead; it resolves the removed artifactIds.
 
+### `pulseShape`
+
+On by default. Every create must have the shape of a pulse (`PROTOCOL.md` §8): a video is created with no `relatedTo`, and a thumbnail, beat manifest or captions under its own id, `relatedTo` the video it belongs to. Anything else is refused at create with `403`, before any bytes move. With [`createCapabilityAuthorize`](#capability-tokens) the ids are also tied to the token: the video only under the token's own `artifactId`, the rest only `relatedTo` it. Without this, one token could create any number of videos under ids the client picks (never attached to anything, still converted, never removed), or take the video's own id with a thumbnail so the real video answers `409` for good.
+
+The Pulse app has always uploaded in this shape. For uploads that aren't pulses, pass `pulseShape: false` here **and** to `createCapabilityAuthorize`.
+
+### `reclaim`
+
+`{ idleSeconds: 300 }` by default; `false` turns it off. An app killed mid-upload sends no TUS `DELETE`, so its unfinished upload keeps its artifactId and every later create of that id — the person scanning the same link again — answers `409` until `retention` removes it. With `reclaim`, a create takes over an unfinished upload of the same artifactId once it has been idle for `idleSeconds` (no bytes written, on the local adapter; since it started, on S3): the old upload is removed (`onArtifactEvent` `remove` with `reason: "reclaimed"`) and the new one starts from byte 0. Only an upload of the same kind and `relatedTo` is taken over, so the token that authorized the new create authorized the old one; and only one whose last activity the adapter knows.
+
+### `lockWhenReady`
+
+Off by default. Once an artifact is finished, `DELETE {prefix}/artifacts/<id>` and the TUS `DELETE` answer `403` for it, and for anything `relatedTo` a finished video: a pulse that landed stays, whatever token is presented. Removal then goes through `storage.remove` on the host's own terms (an admin action, a retention policy). The check reads storage just before the removal; the TUS `DELETE` also runs under tus's per-upload lock, so it can't interleave with the final chunk of the same upload.
+
+### `webReady`
+
+Off by default. `true`, or `ensureWebReady`'s options plus:
+
+```ts
+webReady: {
+  concurrency: 1,        // conversions at once; a transcode is CPU-bound
+  completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
+  transcode: true, crf: 23, preset: "veryfast", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe",
+},
+```
+
+Every finished video is made web-playable in the background, after the final `PATCH` is answered: a lossless faststart remux when the `moov` atom is at the end, or a one-time H.264 transcode when the codec is one browsers can't play (see `OPERATIONS.md`). While it runs the artifact's status is `processing` (the original bytes serve meanwhile; the rewrite is atomic), and when it's done `onArtifactEvent` fires `processed` with what it did. With `completeAfter: true`, `onUploadComplete` waits for the conversion and receives `ctx.webReady`, so a host that publishes from the hook never publishes a video that's still being rewritten. A conversion a restart interrupted is resumed by the replay below. Needs the local storage adapter and ffmpeg on the host; without ffmpeg it logs once and serves the original bytes.
+
+### `replayCompletions`
+
+On by default, every 300 seconds, with the first pass shortly after start; `{ intervalSeconds }` changes the interval and `false` turns it off. Each pass fires `onUploadComplete` again (`ctx.replay: true`) for every finished artifact the host hasn't acknowledged, and resumes a `webReady` conversion a restart interrupted. `fastify.pulseVaultCore.replayCompletions()` (or `core.replayCompletions()`) runs a pass on demand, for example at boot once the host's own services are up. Sidecars written before PulseVault recorded acknowledgements read as acknowledged, so an upgrade replays nothing.
+
+### Status, outcome and pulses
+
+The core behind the routes is `fastify.pulseVaultCore` (rename it with `coreDecoratorName`; non-Fastify hosts have it as the object `createPulseVaultCore` returns):
+
+```ts
+// Where an upload is — what GET /artifacts/:id/status reports — for a host that polls server-side.
+await app.pulseVaultCore.getStatus(videoId);
+// → { artifactId, state: "unknown" | "uploading" | "processing" | "ready", kind, relatedTo?, name?,
+//     bytesReceived?, size?, acknowledged, outcome? }
+
+// Where it went, or why it didn't: any JSON, reported as `outcome` by the status route. `null` clears it.
+await app.pulseVaultCore.recordOutcome(videoId, { state: "done", note: "Posted to Huddle" });
+
+// A video and the finished files relatedTo it, by kind — from the adapters' relation index, never a scan.
+const { video, thumbnail, captions, manifest } = await app.pulseVaultCore.getPulse(videoId);
+```
+
+A page waiting on an upload polls `GET {prefix}/artifacts/<id>/status` (never cached) with the pairing token or a view token, and reads `outcome` once the host recorded one — no table, SSE route or polling method of the host's own. `GET {prefix}/artifacts/<videoId>/poster` serves the video's thumbnail the way the artifact route serves it, authorized as `resolve` on the video, and `404`s until the poster has landed, so a card asks by the video's id and nothing is copied onto the host's records.
+
 ### `validateProjectPayload` / `onProjectUploadComplete` (deprecated)
 
 Same lifecycle as `validatePayload`/`onUploadComplete`, but only fired for `kind=project` uploads. **Deprecated** — use the generic `validatePayload`/`onUploadComplete` with a `ctx.kind === "project"` branch instead. Still honored this release (passing either emits a one-time `DeprecationWarning` at registration); will be removed in a future major version.
@@ -492,7 +581,7 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
 
 1. **`validatePayload`** (optional, runs for every kind) — throws → `storage.remove(artifactId)`, HTTP 4xx (default 422).
 2. **`storage.markReady(artifactId)`** — flips the sidecar so `resolve()` will serve the bytes.
-3. **`onUploadComplete`** (optional, runs for every kind) — throws → HTTP 500; bytes remain ready unless the consumer removes them.
+3. **`onUploadComplete`** (optional, runs for every kind) — throws → HTTP 500; bytes remain ready unless the consumer removes them, and the completion is replayed later (`ctx.replay: true`). Once it returns, the artifact is acknowledged. With `webReady`, the conversion is queued here; with `webReady.completeAfter`, the hook runs after it instead.
 
 (`validateProjectPayload`/`onProjectUploadComplete`, if passed, run instead of the generic hooks specifically for `kind=project` — see the deprecation note above.)
 
@@ -568,7 +657,19 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. With [`pulseShape`](#pulseshape) (the default, on both the plugin and `createCapabilityAuthorize`), a create is held to that shape: the video only under the token's own `artifactId`, with no `relatedTo`; the rest only under other ids, `relatedTo` it. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`ctx`) and rationale.
+
+**Context.** The token can carry the host's own data about the upload — who it's for, where it goes — signed with the rest, so whoever holds the token can't change it:
+
+```ts
+const token = issueCapabilityToken(artifactId, keys["2026-06"], {
+  keyId: "2026-06",
+  issuer,
+  context: { userId: user.id, destination: { kind: "huddle", teamId } }, // any JSON, at most 1 KiB encoded
+});
+```
+
+`createCapabilityAuthorize` returns it from the `create` phase, PulseVault stores it with the artifact (and with every file uploaded `relatedTo` it under the same token), and every later `authorize`, `onUploadComplete` (`ctx.context`, on replays too), `getStatus` and `getPulse` get it back. Most hosts then keep no table keyed by artifactId, and "is this the person who uploaded it?" is a comparison, not a lookup.
 
 ## Upload-Metadata protocol
 
@@ -612,7 +713,9 @@ The local adapter writes uploads into flat kind-scoped subdirectories. Downstrea
 
 ```text
 <workspaceRoot>/
-  .pulsevault/<id>.json           # sidecar: { version, ext, filename, status, kind, relatedTo, checksum, name }
+  .pulsevault/<id>.json           # sidecar: { version, ext, filename, status, kind, relatedTo, checksum, name,
+                                  #            appVersion, context, acknowledged, processing, outcome }
+  .pulsevault/related/<videoId>/<id>  # relation index: an empty marker per artifact relatedTo the video
   video/<id><ext>                 # video upload bytes    (kind="video")
   video/<id><ext>.json            # @tus/file-store offset/metadata sidecar
   project/<id><ext>               # project bundle bytes  (kind="project")
@@ -623,7 +726,7 @@ The local adapter writes uploads into flat kind-scoped subdirectories. Downstrea
 
 `status` is `"uploading"` between `reserveUpload` and the successful final PATCH; `"ready"` thereafter. `GET /artifacts/:id` only serves `"ready"` uploads. `kind` defaults to `"video"` when absent (back-compat with pre-kind sidecars).
 
-The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-resource paths without re-implementing the layout. `storage.getKind(id)` returns `"video" | "project" | "captions" | null`; `storage.getRelatedTo(id)`, `storage.getChecksum(id)`, and `storage.getName(id)` return the corresponding sidecar fields, each `null` if absent/unknown.
+The adapter exposes `storage.workspaceRoot` (absolute, resolved from `workspaceDir`) so consumers can compute per-resource paths without re-implementing the layout. `storage.describeArtifact(id)` returns everything the sidecar holds plus `ready`, `acknowledged`, `processing` and `updatedAt` (`null` if unknown); `storage.listRelated(videoId)` walks the relation index; `storage.getKind(id)`, `storage.getRelatedTo(id)`, `storage.getChecksum(id)` and `storage.getName(id)` return single fields, each `null` if absent/unknown.
 
 **Horizontal scaling**: this adapter requires sticky-session routing or a shared filesystem across instances — see `OPERATIONS.md`.
 
@@ -760,9 +863,13 @@ const storage: PulseVaultStorage = {
   async shutdown() {
     /* optional teardown */
   },
-  async reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum, name }) {
-    // Called by the TUS naming function. Return the file id for the datastore.
-    await db.createArtifact({ artifactId, filename, kind, relatedTo, checksum, name, status: "uploading" });
+  async reserveUpload({ artifactId, filename, ext, kind, relatedTo, checksum, name, appVersion, context }) {
+    // Called by the TUS naming function. Return the file id for the datastore. `context` is what
+    // `authorize` returned for this create (the capability token's context); keep it with the row.
+    await db.createArtifact({
+      artifactId, filename, ext, kind, relatedTo, checksum, name, appVersion, context,
+      status: "uploading", acknowledged: false,
+    });
     return `${kind}/${artifactId}${ext}`;
   },
   async resolve(artifactId): Promise<PulseVaultResolution | null> {
@@ -793,11 +900,34 @@ const storage: PulseVaultStorage = {
   async getRelatedTo(artifactId) { return (await db.findArtifact(artifactId))?.relatedTo ?? null; },
   async getChecksum(artifactId) { return (await db.findArtifact(artifactId))?.checksum ?? null; },
   async getName(artifactId) { return (await db.findArtifact(artifactId))?.name ?? null; },
-  // Optional — needed only by `retention` / `sweepAbandonedUploads`. `updatedAt` is when the
-  // upload started while it's unfinished, and when it finished once ready (ms since epoch).
+  // Optional — needed by `retention` / `sweepAbandonedUploads` and by the completion replay.
+  // `updatedAt` is when the upload last received bytes (or started) while it's unfinished, and
+  // when it finished once ready (ms since epoch).
   async *listArtifacts({ changedBefore } = {}) {
     for (const row of await db.listArtifacts({ changedBefore })) {
       yield { artifactId: row.id, kind: row.kind, relatedTo: row.relatedTo, ready: row.ready, updatedAt: row.updatedAt };
+    }
+  },
+  // Optional — the richer hook context, `getStatus`, `getPulse`, `reclaim`, `webReady` and the
+  // completion replay need these three.
+  async describeArtifact(artifactId) {
+    const row = await db.findArtifact(artifactId);
+    if (!row) return null;
+    return {
+      artifactId, kind: row.kind, ext: row.ext, filename: row.filename, relatedTo: row.relatedTo,
+      checksum: row.checksum, name: row.name, appVersion: row.appVersion, context: row.context,
+      ready: row.status === "ready", acknowledged: row.acknowledged, processing: row.processing === true,
+      outcome: row.outcome, updatedAt: row.updatedAt,
+    };
+  },
+  async patchArtifact(artifactId, { acknowledged, processing, outcome }) {
+    // Each field is optional; `outcome: null` clears it. Return false for an unknown id.
+    return (await db.updateArtifact(artifactId, { acknowledged, processing, outcome })).matched;
+  },
+  async *listRelated(artifactId) {
+    // Every artifact whose `relatedTo` is this one — from an index, not a scan.
+    for (const row of await db.listArtifacts({ relatedTo: artifactId })) {
+      yield { artifactId: row.id, kind: row.kind, relatedTo: artifactId, ready: row.ready, updatedAt: row.updatedAt };
     }
   },
 };
