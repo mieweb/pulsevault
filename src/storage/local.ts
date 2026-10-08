@@ -395,6 +395,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     artifactId,
     kind: sidecar.kind ?? 'video',
     ext: sidecar.ext,
+    ...(sidecar.sourceExt ? { sourceExt: sidecar.sourceExt } : {}),
     filename: sidecar.filename,
     ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
     ...(sidecar.checksum ? { checksum: sidecar.checksum } : {}),

@@ -36,7 +36,7 @@ import type {
   PulseVaultStorage,
   UploadKind,
 } from './storage/types.js';
-import { parseUploadKind } from './storage/types.js';
+import { parseUploadKind, uploadIdOf } from './storage/types.js';
 import { normalizeAppVersion } from './lib/protocol.js';
 import {
   normalizeAllowedExtensions,
@@ -329,7 +329,7 @@ function describedFields(
     ...(meta.name ? { name: meta.name } : {}),
     ...(meta.appVersion ? { appVersion: meta.appVersion } : {}),
     filename: meta.filename,
-    ext: meta.ext,
+    ext: meta.sourceExt ?? meta.ext,
     ...(meta.context !== undefined ? { context: meta.context } : {}),
   };
 }
@@ -918,7 +918,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     meta: PulseVaultArtifactMeta,
   ): Promise<{ size?: number; bytesReceived?: number }> => {
     try {
-      const upload = await storage.datastore.getUpload(`${meta.kind}/${meta.artifactId}${meta.ext}`);
+      const upload = await storage.datastore.getUpload(uploadIdOf(meta));
       return {
         ...(typeof upload.size === 'number' ? { size: upload.size } : {}),
         ...(typeof upload.offset === 'number' ? { bytesReceived: upload.offset } : {}),
@@ -1146,6 +1146,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 // and `./core` for a normal setup — these are already framework-agnostic
 // and identical to what the `.` (Fastify) entry point re-exports.
 export { createLocalStorage } from './storage/local.js';
+export { uploadIdOf } from './storage/types.js';
 export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';

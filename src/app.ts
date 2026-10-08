@@ -264,6 +264,7 @@ export default fp(app, {
 });
 
 export { createLocalStorage } from './storage/local.js';
+export { uploadIdOf } from './storage/types.js';
 export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';

@@ -111,6 +111,12 @@ export type PulseVaultArtifactMeta = {
    * until a web-ready conversion turned another container into an MP4 (then `.mp4`).
    */
   ext: string;
+  /**
+   * The uploaded file's extension — `filename`'s, and the one tus's record of the upload is kept
+   * under — when a conversion stored the artifact under a different `ext`; absent otherwise. Use
+   * `uploadIdOf` to name the tus upload.
+   */
+  sourceExt?: string;
   /** Original filename from `Upload-Metadata.filename`. */
   filename: string;
   relatedTo?: string;
@@ -148,6 +154,14 @@ export type PulseVaultArtifactMeta = {
    */
   readyAt?: number;
 };
+
+/**
+ * tus's id for an artifact's upload (`<kind>/<artifactId><ext>`), under the extension it was
+ * uploaded with — which a conversion to another container doesn't change.
+ */
+export function uploadIdOf(meta: Pick<PulseVaultArtifactMeta, 'kind' | 'artifactId' | 'ext' | 'sourceExt'>): string {
+  return `${meta.kind}/${meta.artifactId}${meta.sourceExt ?? meta.ext}`;
+}
 
 /** The fields `patchArtifact` may change. Each is optional; absent means unchanged. */
 export type PulseVaultArtifactPatch = {

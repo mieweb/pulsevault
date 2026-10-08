@@ -3,6 +3,7 @@ import path from 'node:path';
 import { ensureWebReady, type WebReadyOptions, type WebReadyResult } from './web-ready.js';
 import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
 import type { PulseVaultArtifactMeta, PulseVaultStorage, UploadKind } from '../storage/types.js';
+import { uploadIdOf } from '../storage/types.js';
 
 /**
  * What `onUploadComplete` is told about a finished upload. Everything the client sent in
@@ -189,7 +190,8 @@ function contextFor(
     size: upload.size,
     uploadId: upload.uploadId,
     filename: meta?.filename ?? '',
-    ext: meta?.ext ?? '',
+    // `filename`'s extension, as documented: the uploaded one, even once a conversion changed it.
+    ext: meta ? (meta.sourceExt ?? meta.ext) : '',
     ...(meta?.relatedTo ? { relatedTo: meta.relatedTo } : {}),
     ...(meta?.name ? { name: meta.name } : {}),
     ...(meta?.appVersion ? { appVersion: meta.appVersion } : {}),
@@ -439,7 +441,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
         }
         if (!meta || !meta.ready || settling.has(meta.artifactId)) continue;
         if (meta.acknowledged && !(converts(meta.kind) && !meta.converted)) continue;
-        const uploadId = `${meta.kind}/${meta.artifactId}${meta.ext}`;
+        const uploadId = uploadIdOf(meta);
         const upload: FinishedUpload = {
           artifactId: meta.artifactId,
           kind: meta.kind,

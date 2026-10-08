@@ -794,7 +794,14 @@ test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same a
   } catch {
     return t.skip("ffmpeg build lacks libvpx/libopus");
   }
-  const ctx = await startLocal({ pluginOptions: { webReady: true, validatePayload: createVideoValidator() } });
+  const completions = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: true,
+      validatePayload: createVideoValidator(),
+      onUploadComplete: async (_req, c) => { completions.push(c); },
+    },
+  });
   try {
     assert.equal(await ctx.core.conformAvailable(), true);
     const videoId = randomUUID();
@@ -813,7 +820,17 @@ test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same a
     const videoDir = path.join(ctx.storage.workspaceRoot, "video");
     assert.ok((await fs.readdir(videoDir)).includes(`${videoId}.mp4`));
     assert.ok(!(await fs.readdir(videoDir)).includes(`${videoId}.webm`), "the original is removed once switched");
-    assert.equal((await ctx.storage.describeArtifact(videoId)).ext, ".mp4");
+    const meta = await ctx.storage.describeArtifact(videoId);
+    assert.equal(meta.ext, ".mp4");
+    assert.equal(meta.sourceExt, ".webm", "the upload keeps its own extension");
+
+    // A replayed hook still describes the upload: its filename, extension and tus id.
+    await ctx.storage.patchArtifact(videoId, { acknowledged: false });
+    await ctx.core.replayCompletions();
+    const replayed = completions.find((c) => c.replay);
+    assert.equal(replayed.filename, "Screen Recording.webm");
+    assert.equal(replayed.ext, ".webm");
+    assert.equal(replayed.uploadId, `video/${videoId}.webm`);
 
     // Removing the artifact removes every file it had, including tus's record of the upload.
     assert.equal(await ctx.storage.remove(videoId), true);
