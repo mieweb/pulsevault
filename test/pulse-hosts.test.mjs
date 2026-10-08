@@ -518,6 +518,10 @@ test("replay with completeAfter converts before the hook, even when the process 
     assert.equal(completions.length, 2);
     assert.equal(completions[1].replay, true);
     assert.equal(completions[1].webReady?.action, "remuxed", "converted before the hook ran");
+    // The acknowledgement is recorded once the hook has returned, a moment after it ran.
+    while (Date.now() < done && !(await ctx.core.getStatus(videoId)).acknowledged) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
     assert.equal((await ctx.core.getStatus(videoId)).acknowledged, true);
   } finally {
     await ctx.teardown();
