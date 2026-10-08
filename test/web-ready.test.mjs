@@ -4,7 +4,7 @@
 // ffmpeg/ffprobe are not installed, mirroring ensureWebReady's own fail-open
 // behavior on such hosts.
 
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
@@ -22,8 +22,17 @@ function hasCmd(cmd) {
 }
 const FFMPEG = hasCmd("ffmpeg") && hasCmd("ffprobe");
 
+// Every scratch directory a test makes, removed once the file's tests are done.
+const scratchDirs = [];
+async function scratchDir(prefix) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  scratchDirs.push(dir);
+  return dir;
+}
+after(() => Promise.all(scratchDirs.map((dir) => fs.rm(dir, { recursive: true, force: true }))));
+
 async function tmpFile(name, bytes) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "webready-"));
+  const dir = await scratchDir("webready-");
   const p = path.join(dir, name);
   await fs.writeFile(p, bytes);
   return p;
@@ -91,7 +100,7 @@ test("ensureWebReady: missing ffmpeg fails open as 'skipped'", async () => {
 });
 
 test("ensureWebReady: moov-at-end H.264 gets a lossless faststart remux", { skip: !FFMPEG }, async () => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "webready-"));
+  const dir = await scratchDir("webready-");
   const p = path.join(dir, "recorded.mp4");
   // No -movflags +faststart: like a mobile recorder, ffmpeg writes moov last.
   execFileSync("ffmpeg", [
@@ -110,7 +119,7 @@ test("ensureWebReady: moov-at-end H.264 gets a lossless faststart remux", { skip
 });
 
 test("ensureWebReady: HEVC is transcoded to H.264 (+faststart)", { skip: !FFMPEG }, async (t) => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "webready-"));
+  const dir = await scratchDir("webready-");
   const p = path.join(dir, "hevc.mp4");
   try {
     execFileSync("ffmpeg", [
@@ -134,7 +143,7 @@ test("ensureWebReady: HEVC is transcoded to H.264 (+faststart)", { skip: !FFMPEG
 });
 
 test("ensureWebReady: transcode:false leaves hostile codecs alone after the remux", { skip: !FFMPEG }, async (t) => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "webready-"));
+  const dir = await scratchDir("webready-");
   const p = path.join(dir, "hevc-noconvert.mp4");
   try {
     execFileSync("ffmpeg", [
@@ -156,7 +165,7 @@ test("ensureWebReady: transcode:false leaves hostile codecs alone after the remu
 
 /** Generate a fixture with ffmpeg (lavfi sources); `null` when this ffmpeg build can't. */
 async function fixture(name, args, { pipe = false } = {}) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "conform-"));
+  const dir = await scratchDir("conform-");
   const p = path.join(dir, name);
   try {
     if (pipe) {
