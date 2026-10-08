@@ -269,7 +269,7 @@ type PulseVaultPluginOptions = {
   lockWhenReady?: boolean;                              // default false: a finished pulse can't be deleted through the routes
   webReady?: PulseVaultWebReadyOptions | boolean;       // default off: background faststart remux / H.264 transcode
   replayCompletions?: { intervalSeconds?: number } | false; // default every 300 s: re-fire unacknowledged completions
-  coreDecoratorName?: string;                           // default "pulseVaultCore": getStatus, getPulse, recordOutcome, replayCompletions
+  coreDecoratorName?: string;                           // default "pulseVaultCore": getStatus, getPulse, recordOutcome, replayCompletions, conformAvailable
   /** @deprecated use validatePayload + ctx.kind === "project" */
   validateProjectPayload?: PulseVaultValidatePayload;
   /** @deprecated use onUploadComplete + ctx.kind === "project" */
@@ -306,8 +306,9 @@ import "@mieweb/pulsevault/augment";
 File extensions accepted per artifact kind. Three accepted forms:
 
 ```ts
-// 1. Omit entirely — uses all three defaults:
-//    video: [".mp4"]   project: [".pulse", ".zip"]   captions: [".vtt"]
+// 1. Omit entirely — uses the defaults:
+//    video: [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp", ".avi"]   project: [".pulse", ".zip"]
+//    captions: [".vtt"]   thumbnail: [".jpg", ".jpeg", ".png"]
 
 // 2. Flat array (legacy) — video-only; project/captions keep their defaults:
 allowedExtensions: [".mp4"]
@@ -316,7 +317,7 @@ allowedExtensions: [".mp4"]
 allowedExtensions: { video: [".mp4"], project: [".pulse"], captions: [".vtt"] }
 ```
 
-All extensions must include the leading dot and are matched case-insensitively. The `kind` field in `Upload-Metadata` determines which list is checked.
+All extensions must include the leading dot and are matched case-insensitively. The `kind` field in `Upload-Metadata` determines which list is checked. The default video list is the containers [`webReady`](#webready) conforms to MP4 (`CONFORM_VIDEO_EXTENSIONS`); the extension only decides what's accepted at `create`, so pair it with `createVideoValidator()` to check the bytes themselves.
 
 ### `cache`
 
@@ -415,6 +416,8 @@ await app.register(pulseVault, {
   validatePayload: createChecksumValidator(createMp4Sniffer(storage)),
 });
 ```
+
+For videos from anywhere (a WebM from a browser recorder, an MKV, an AVI), check them by what they are with **`createVideoValidator({ maxDurationSeconds?, probeTimeoutSeconds? })`**: ffprobe must find a video stream with a duration above zero that isn't a picture (PNG, JPEG, GIF, HEIC, a one-frame clip), or the upload is refused with `422` and a message a host can show as it is (`That file isn't a video.`, `That video is longer than the limit of 10 minutes.`, or `That video couldn't be checked in time.` when ffprobe runs past `probeTimeoutSeconds`, default 60). It checks `kind: "video"` only and lets other kinds through; without ffprobe it falls back to `sniffVideo(path)` (the container's first bytes: `ftyp`, EBML or RIFF AVI) and logs once. Local storage only.
 
 `createMp4Sniffer` reads the first 12 bytes and verifies the ISOBMFF `ftyp` header (MP4, MOV, M4V, 3GP). Uploads that pass the extension check but contain non-video bytes are rejected with 422 and the disk is cleaned up. The lower-level `sniffMp4(path)` is also exported if you want to drive your own validator.
 
@@ -542,11 +545,14 @@ Off by default. `true`, or `ensureWebReady`'s options plus:
 webReady: {
   concurrency: 1,        // conversions at once; a transcode is CPU-bound
   completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
+  maxEdge: 1920,         // longest edge of the served video
+  timeoutSeconds: undefined, // default 60 + 10 × duration in 1080p30 seconds (4K120 counts 16×): a hang guard
+  probeTimeoutSeconds: 60,   // the same guard for each ffprobe run over the upload
   transcode: true, crf: 23, preset: "veryfast", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe",
 },
 ```
 
-Every finished video is made web-playable in the background, after the final `PATCH` is answered: a lossless faststart remux when the `moov` atom is at the end, or a one-time H.264 transcode when the codec is one browsers can't play (see `OPERATIONS.md`). While it runs the artifact's status is `processing` (the original bytes serve meanwhile; the rewrite is atomic), and when it's done `onArtifactEvent` fires `processed` with what it did. With `completeAfter: true`, `onUploadComplete` waits for the conversion and receives `ctx.webReady`, so a host that publishes from the hook never publishes a video that's still being rewritten. A conversion a restart interrupted is resumed by the replay below. Needs the local storage adapter and ffmpeg on the host; without ffmpeg it logs once and serves the original bytes.
+Every finished video is conformed in the background, after the final `PATCH` is answered, to the one format the Pulse app records (`CONFORM_TARGET`: faststart MP4, H.264 8-bit SDR, longest edge at most `maxEdge`, rotation applied, AAC or silent; orientation kept). A file already in it — every Pulse upload — keeps its bytes (`none`); a `moov` at the end is a lossless remux (`remuxed`); an off-target stream is re-encoded (`transcoded`: HEVC, 10-bit HDR tone-mapped to SDR, 4K scaled, Opus/PCM to AAC); another container (`.mov`, `.webm`, `.mkv`, …) becomes a new `.mp4` served as `video/mp4` at the same artifact URL (`conformed`). See `OPERATIONS.md` for the table. While it runs the artifact's status is `processing` (the original bytes serve meanwhile, revalidated on every request instead of the configured `cache`; every rewrite is atomic), and when it's done the status reports `webReady: { action, reason }` — `skipped` with the reason when ffmpeg is missing, a run failed or timed out, and the original keeps serving — and `onArtifactEvent` fires `processed` with the same result. With `completeAfter: true`, `onUploadComplete` waits for the conversion and receives `ctx.webReady`, so a host that publishes from the hook never publishes a video that's still being rewritten. A conversion a restart interrupted is resumed by the replay below. Needs the local storage adapter and ffmpeg on the host; without ffmpeg it logs once and serves the original bytes.
 
 ### `replayCompletions`
 
@@ -560,11 +566,14 @@ The core behind the routes is `fastify.pulseVaultCore` (rename it with `coreDeco
 // Where an upload is — what GET /artifacts/:id/status reports — for a host that polls server-side.
 await app.pulseVaultCore.getStatus(videoId);
 // → { artifactId, state: "unknown" | "uploading" | "processing" | "ready", kind, relatedTo?, name?,
-//     bytesReceived?, size?, acknowledged, outcome?, context? }
+//     bytesReceived?, size?, acknowledged, webReady?: { action, reason }, outcome?, context? }
 // `context` (the token's) is for the host — an owner check is a comparison on it; the route leaves it out.
 
 // Where it went, or why it didn't: any JSON, reported as `outcome` by the status route. `null` clears it.
 await app.pulseVaultCore.recordOutcome(videoId, { state: "done", note: "Posted to Huddle" });
+
+// Whether videos are conformed here (`webReady` on, ffmpeg and ffprobe installed) — for a health check.
+await app.pulseVaultCore.conformAvailable();
 
 // A video and the finished files relatedTo it, by kind — from the adapters' relation index, never a scan.
 const { video, thumbnail, captions, manifest } = await app.pulseVaultCore.getPulse(videoId);
@@ -598,7 +607,7 @@ When the final PATCH lands the plugin runs the following steps in order, for eve
   "minSupportedVersion": 2,
   "maxSupportedVersion": 2,
   "kinds": ["video", "project", "captions", "thumbnail"],
-  "allowedExtensions": { "video": [".mp4"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
+  "allowedExtensions": { "video": [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".3gp", ".avi"], "project": [".pulse", ".zip"], "captions": [".vtt"], "thumbnail": [".jpg", ".jpeg", ".png"] },
   "maxUploadSize": 5368709120,
   "checksum": { "algorithms": ["sha256", "sha1", "md5"] }
 }

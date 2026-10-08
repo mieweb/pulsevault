@@ -360,22 +360,20 @@ await app.register(pulseVault, {
   retention: { abandonedAfterSeconds: 24 * 60 * 60 },
   // All kinds stay enabled — a pulse uploads a .pulse beat manifest, .vtt
   // captions and a .jpg thumbnail alongside its video; rejecting any of those
-  // would make this a broken pairing target.
+  // would make this a broken pairing target. Video keeps the default: every
+  // container `webReady` conforms (.mp4, .mov, .m4v, .webm, .mkv, .3gp, .avi).
   allowedExtensions: {
-    video: [".mp4"],
     project: [".pulse", ".zip"],
     captions: [".vtt"],
     thumbnail: [".jpg", ".jpeg", ".png"],
   },
-  // Web-playability backstop: mobile capture pipelines routinely upload MP4s
-  // with the moov atom at the end (seconds of browser stall before frame one)
-  // or HEVC video (undecodable in Firefox and most Chrome). The core fixes
-  // each video once, in the background after the final PATCH is answered: a
-  // lossless sub-second faststart remux, or a one-time H.264 transcode when
-  // the codec is hostile. Fail-open: without ffmpeg on PATH it logs one
-  // warning and serves the original bytes. For artifacts uploaded before
-  // this existed, run `node scripts/web-ready-migrate.mjs <dataDir>` (see
-  // OPERATIONS.md).
+  // Every video is conformed once, in the background after the final PATCH
+  // is answered, to the format the Pulse app records (faststart H.264/AAC MP4,
+  // at most 1920 on the longest edge): nothing for a Pulse upload, a lossless
+  // remux for a moov at the end, one ffmpeg run for HEVC, HDR, 4K or a WebM.
+  // Fail-open: without ffmpeg on PATH it logs one warning and serves the
+  // original bytes. For artifacts uploaded before this existed, run
+  // `node scripts/web-ready-migrate.mjs <dataDir>` (see OPERATIONS.md).
   webReady: true,
   onArtifactEvent: (event) => {
     if (event.phase === "processed" && event.webReady?.action !== "none") {

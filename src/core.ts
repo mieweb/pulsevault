@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import send from '@fastify/send';
+import { fstat, ReadStream, type Stats } from 'node:fs';
+import type { Readable } from 'node:stream';
 import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
@@ -28,6 +30,7 @@ import {
 } from './lib/retention.js';
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
+import { webReadyAvailable, type WebReadyResult } from './lib/web-ready.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type {
   PulseVaultArtifactMeta,
@@ -35,7 +38,7 @@ import type {
   PulseVaultStorage,
   UploadKind,
 } from './storage/types.js';
-import { parseUploadKind } from './storage/types.js';
+import { parseUploadKind, uploadIdOf } from './storage/types.js';
 import { normalizeAppVersion } from './lib/protocol.js';
 import {
   normalizeAllowedExtensions,
@@ -124,10 +127,11 @@ export type PulseVaultCoreOptions = {
    */
   lockWhenReady?: boolean;
   /**
-   * Convert every finished video for the web in the background (faststart remux, or an H.264
-   * transcode for a codec browsers can't play), after the final `PATCH` is answered. `true`
-   * for the defaults, or `ensureWebReady`'s options plus `concurrency` and `completeAfter`.
-   * Needs the local storage adapter. Off by default.
+   * Conform every finished video to one web-playable format (`CONFORM_TARGET`) in the
+   * background, after the final `PATCH` is answered: nothing for a file already in it, a
+   * lossless remux, or one ffmpeg run (a WebM, MKV or MOV becomes an MP4 at the same artifact
+   * URL). `true` for the defaults, or `ensureWebReady`'s options plus `concurrency` and
+   * `completeAfter`. Needs the local storage adapter. Off by default.
    */
   webReady?: PulseVaultWebReadyOptions | boolean;
   /**
@@ -203,6 +207,11 @@ export type PulseVaultCore = {
   recordOutcome: (artifactId: string, outcome: unknown) => Promise<boolean>;
   /** Run one completion-replay pass now (see `replayCompletions`). Resolves the replayed artifactIds. */
   replayCompletions: () => Promise<string[]>;
+  /**
+   * Whether finished videos are conformed: `webReady` is on and ffmpeg and ffprobe run on this
+   * host. `false` means uploads are served exactly as uploaded — for a host's health check.
+   */
+  conformAvailable: () => Promise<boolean>;
 };
 
 /** What `GET /artifacts/:id/status` and `getStatus` report. */
@@ -222,6 +231,11 @@ export type PulseVaultArtifactStatus = {
   size?: number;
   /** Whether the host's `onUploadComplete` has finished for this artifact. */
   acknowledged?: boolean;
+  /**
+   * What the web-ready conversion did, once it ran: `none`, `remuxed`, `transcoded`, `conformed`,
+   * or `skipped` with the reason (the original bytes serve).
+   */
+  webReady?: WebReadyResult;
   /** What the host recorded with `recordOutcome`, if anything. */
   outcome?: unknown;
   /** The capability token's context (`getStatus` only; the status route leaves it out). */
@@ -308,6 +322,43 @@ function extensionOf(filename: string | undefined): string | undefined {
   return dot > 0 ? filename.slice(dot).toLowerCase() : undefined;
 }
 
+/**
+ * Whether a file stream from `@fastify/send` opened something other than the file `send`
+ * described in its headers (`stat`): the file is gone, or another file was renamed onto the
+ * path in between (a conversion replacing the bytes). Then the stream is closed and nothing has
+ * been written. Streams that aren't file streams (an empty body for a `304`) resolve `false`.
+ */
+async function fileChanged(stream: Readable, stat: Stats | undefined): Promise<boolean> {
+  if (!(stream instanceof ReadStream)) return false;
+  if (stream.pending) {
+    const gone = await new Promise<boolean>((resolve, reject) => {
+      const onReady = () => {
+        stream.off('error', onError);
+        resolve(false);
+      };
+      const onError = (err: NodeJS.ErrnoException) => {
+        stream.off('ready', onReady);
+        // Any other failure to open is the server's, before anything was written: a 500.
+        if (err.code === 'ENOENT') resolve(true);
+        else reject(err);
+      };
+      stream.once('ready', onReady);
+      stream.once('error', onError);
+    });
+    if (gone) return true;
+  }
+  // The descriptor the stream opened (set once it's `ready`; not in the type definitions).
+  const fd = (stream as ReadStream & { fd?: number | null }).fd;
+  if (!stat || typeof fd !== 'number') return false;
+  const opened = await new Promise<Stats>((resolve, reject) =>
+    fstat(fd, (err, st) => (err ? reject(err) : resolve(st))),
+  );
+  const same =
+    opened.ino === stat.ino && opened.dev === stat.dev && opened.size === stat.size && opened.mtimeMs === stat.mtimeMs;
+  if (!same) stream.destroy();
+  return !same;
+}
+
 /** The hook-context fields that come from stored metadata, for every phase after `create`. */
 function describedFields(
   meta: PulseVaultArtifactMeta | null,
@@ -317,7 +368,7 @@ function describedFields(
     ...(meta.name ? { name: meta.name } : {}),
     ...(meta.appVersion ? { appVersion: meta.appVersion } : {}),
     filename: meta.filename,
-    ext: meta.ext,
+    ext: meta.sourceExt ?? meta.ext,
     ...(meta.context !== undefined ? { context: meta.context } : {}),
   };
 }
@@ -831,12 +882,24 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
       if (!prepared) return;
 
-      const resolved = await storage.resolve(artifactId);
-      if (!resolved) {
-        writeJson(res, 404, pulseVaultError('Artifact not found'));
-        return;
+      // Twice at most: a conversion can switch the artifact to its new file between the
+      // resolution and the open, and then the second resolution finds the new one.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const resolved = await storage.resolve(artifactId);
+        if (!resolved) break;
+        // While a video is being converted its URL serves the original bytes, which the
+        // conversion replaces: revalidate instead of the configured (possibly `immutable`) cache,
+        // so nobody keeps the original once the converted file is in place. Also when this
+        // instance resolved a file other than the one storage now names (another instance
+        // switched it): those bytes are about to go.
+        const meta = completion.converts('video') ? await describe(artifactId) : null;
+        const converting =
+          meta !== null &&
+          completion.converts(meta.kind) &&
+          (!meta.converted || (resolved.kind === 'stream' && !resolved.filename.endsWith(meta.ext)));
+        if (await serveResolution(req, res, resolved, converting)) return;
       }
-      await serveResolution(req, res, resolved);
+      writeJson(res, 404, pulseVaultError('Artifact not found'));
     } catch (err) {
       failClosed(res, err, 'artifact get');
     }
@@ -844,23 +907,26 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   /**
    * Stream or redirect to a resolved artifact — the tail of the GET route, shared with the poster
-   * route. An artifact URL names immutable bytes, so it takes the configured `cache`; the poster
-   * URL is a lookup whose answer changes when a newer thumbnail lands, so it is revalidated on
-   * every request (`mustRevalidate`).
+   * route. An artifact URL names immutable bytes once finished, so it takes the configured
+   * `cache`; the poster URL is a lookup whose answer changes when a newer thumbnail lands, and a
+   * video still being converted is about to change, so those are revalidated on every request
+   * (`mustRevalidate`). Resolves `false`, having written nothing, when the file opened isn't the
+   * one `send` described (a conversion removed or replaced it in between): the caller resolves
+   * again.
    */
   const serveResolution = async (
     req: IncomingMessage,
     res: ServerResponse,
     resolved: PulseVaultResolution,
     mustRevalidate = false,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     if (resolved.kind === 'redirect') {
       res.writeHead(resolved.statusCode ?? 302, {
         Location: resolved.url,
         ...(mustRevalidate ? { 'cache-control': 'no-store' } : {}),
       });
       res.end();
-      return;
+      return true;
     }
 
     const cacheOptions = mustRevalidate
@@ -869,9 +935,14 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     const result = await send(req, resolved.filename, { root: resolved.root, ...cacheOptions });
 
     if (result.type === 'error') {
+      if (result.statusCode === 404) return false;
       writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
-      return;
+      return true;
     }
+    // The file stream opens it after `send` returned: wait for that before the headers go out,
+    // and check it opened the file the headers describe. Once open, the file being replaced or
+    // removed no longer matters to this response.
+    if (await fileChanged(result.stream, (result.metadata as { stat?: Stats }).stat)) return false;
 
     const headers = { ...result.headers };
     // If the storage adapter provided an explicit content type (e.g. for
@@ -893,6 +964,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     res.on('error', () => {});
     res.on('close', () => result.stream.destroy());
     result.stream.pipe(res);
+    return true;
   };
 
   /** The declared length and bytes received of an upload, from tus's own record. */
@@ -900,7 +972,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     meta: PulseVaultArtifactMeta,
   ): Promise<{ size?: number; bytesReceived?: number }> => {
     try {
-      const upload = await storage.datastore.getUpload(`${meta.kind}/${meta.artifactId}${meta.ext}`);
+      const upload = await storage.datastore.getUpload(uploadIdOf(meta));
       return {
         ...(typeof upload.size === 'number' ? { size: upload.size } : {}),
         ...(typeof upload.offset === 'number' ? { bytesReceived: upload.offset } : {}),
@@ -926,6 +998,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       ...(meta.name ? { name: meta.name } : {}),
       ...(await uploadProgress(meta)),
       acknowledged: meta.acknowledged,
+      ...(meta.webReady ? { webReady: meta.webReady } : {}),
       ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),
       ...(meta.context !== undefined ? { context: meta.context } : {}),
     };
@@ -1012,7 +1085,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('No poster for this artifact'));
         return;
       }
-      await serveResolution(req, res, resolved, true);
+      if (!(await serveResolution(req, res, resolved, true))) {
+        res.setHeader('cache-control', 'no-store');
+        writeJson(res, 404, pulseVaultError('No poster for this artifact'));
+      }
     } catch (err) {
       failClosed(res, err, 'artifact poster');
     }
@@ -1116,6 +1192,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     getPulse,
     recordOutcome,
     replayCompletions: () => completion.replay(),
+    conformAvailable: () =>
+      options.webReady
+        ? webReadyAvailable(typeof options.webReady === 'object' ? options.webReady : {})
+        : Promise.resolve(false),
   };
 }
 
@@ -1123,6 +1203,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 // and `./core` for a normal setup — these are already framework-agnostic
 // and identical to what the `.` (Fastify) entry point re-exports.
 export { createLocalStorage } from './storage/local.js';
+export { uploadIdOf } from './storage/types.js';
 export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
@@ -1148,10 +1229,18 @@ export type {
   PulseVaultArtifactEvent,
 } from './lib/pulsevaultTus.js';
 export type { PulseVaultWebReadyOptions, PulseVaultReplayOptions } from './lib/completion.js';
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
+export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer, sniffVideo, createVideoValidator } from './lib/magic.js';
+export type { VideoValidatorOptions } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
-export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export {
+  ensureWebReady,
+  scanMoovPosition,
+  probeVideo,
+  webReadyAvailable,
+  CONFORM_TARGET,
+  CONFORM_VIDEO_EXTENSIONS,
+} from './lib/web-ready.js';
+export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition, VideoProbe } from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {

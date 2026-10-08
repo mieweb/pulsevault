@@ -18,6 +18,7 @@ import pulseVault, {
   issueCapabilityToken,
   issueViewToken,
   createCapabilityAuthorize,
+  createVideoValidator,
   MAX_CONTEXT_BYTES,
 } from "../dist/app.js";
 import { createHash } from "node:crypto";
@@ -517,6 +518,10 @@ test("replay with completeAfter converts before the hook, even when the process 
     assert.equal(completions.length, 2);
     assert.equal(completions[1].replay, true);
     assert.equal(completions[1].webReady?.action, "remuxed", "converted before the hook ran");
+    // The acknowledgement is recorded once the hook has returned, a moment after it ran.
+    while (Date.now() < done && !(await ctx.core.getStatus(videoId)).acknowledged) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
     assert.equal((await ctx.core.getStatus(videoId)).acknowledged, true);
   } finally {
     await ctx.teardown();
@@ -752,6 +757,639 @@ test("webReady: the final PATCH is answered before the conversion; completeAfter
   } finally {
     await ctx.teardown();
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** An MP4 made by ffmpeg from lavfi sources (MP4 needs a seekable output, so via a tmp file). */
+async function encodeMp4(args) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-fixture-"));
+  try {
+    const p = path.join(dir, "fixture.mp4");
+    execFileSync("ffmpeg", ["-v", "error", ...args, "-movflags", "+faststart", "-y", p], { stdio: "ignore" });
+    return await fs.readFile(p);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Poll the status until the conversion has recorded what it did. */
+async function waitForWebReady(ctx, artifactId) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const status = await ctx.core.getStatus(artifactId);
+    if (status.webReady || Date.now() > deadline) return status;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same artifact URL", { skip: !FFMPEG }, async (t) => {
+  let body;
+  try {
+    // Written to a pipe, like a browser's MediaRecorder: no duration in the header.
+    body = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=1",
+      "-f", "lavfi", "-i", "sine=duration=1", "-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libopus",
+      "-f", "webm", "pipe:1",
+    ]);
+  } catch {
+    return t.skip("ffmpeg build lacks libvpx/libopus");
+  }
+  const completions = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: true,
+      validatePayload: createVideoValidator(),
+      onUploadComplete: async (_req, c) => { completions.push(c); },
+    },
+  });
+  try {
+    assert.equal(await ctx.core.conformAvailable(), true);
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "Screen Recording.webm", kind: "video", body });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.state, "ready");
+    assert.equal(status.webReady.action, "conformed");
+    assert.match(status.webReady.reason, /container \.webm → mp4/);
+
+    const res = await fetch(ctx.url(`/artifacts/${videoId}`));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "video/mp4");
+    const served = Buffer.from(await res.arrayBuffer());
+    assert.equal(served.toString("latin1", 4, 8), "ftyp");
+
+    const videoDir = path.join(ctx.storage.workspaceRoot, "video");
+    assert.ok((await fs.readdir(videoDir)).includes(`${videoId}.mp4`));
+    assert.ok(!(await fs.readdir(videoDir)).includes(`${videoId}.webm`), "the original is removed once switched");
+    const meta = await ctx.storage.describeArtifact(videoId);
+    assert.equal(meta.ext, ".mp4");
+    assert.equal(meta.sourceExt, ".webm", "the upload keeps its own extension");
+
+    // A replayed hook still describes the upload: its filename, extension and tus id.
+    await ctx.storage.patchArtifact(videoId, { acknowledged: false });
+    await ctx.core.replayCompletions();
+    const replayed = completions.find((c) => c.replay);
+    assert.equal(replayed.filename, "Screen Recording.webm");
+    assert.equal(replayed.ext, ".webm");
+    assert.equal(replayed.uploadId, `video/${videoId}.webm`);
+
+    // Removing the artifact removes every file it had, including tus's record of the upload.
+    assert.equal(await ctx.storage.remove(videoId), true);
+    assert.deepEqual((await fs.readdir(videoDir)).filter((f) => f.startsWith(videoId)), []);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: a replayed hook after a conversion still says what the conversion did (ctx.webReady)", { skip: !FFMPEG }, async (t) => {
+  let body;
+  try {
+    body = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=1",
+      "-c:v", "libvpx-vp9", "-b:v", "200k", "-f", "webm", "pipe:1",
+    ]);
+  } catch {
+    return t.skip("ffmpeg build lacks libvpx");
+  }
+  const completions = [];
+  let failNext = true;
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      // A host whose delivery fails once (its destination briefly down), then works on the replay.
+      onUploadComplete: async (_req, c) => {
+        completions.push(c);
+        if (failNext) {
+          failNext = false;
+          throw new Error("destination unavailable");
+        }
+      },
+    },
+  });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "rec.webm", kind: "video", body });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && completions.length === 0) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(completions[0].webReady?.action, "conformed");
+    await ctx.core.replayCompletions();
+    assert.equal(completions.length, 2);
+    assert.equal(completions[1].replay, true);
+    assert.equal(completions[1].webReady?.action, "conformed", "the replay knows the file is now an MP4");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: a video still being converted is revalidated instead of the configured immutable cache", { skip: !FFMPEG }, async () => {
+  const body = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  const ctx = await startLocal({ pluginOptions: { webReady: true, cache: { maxAge: "365d", immutable: true } } });
+  try {
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "clip.mp4", kind: "video", body });
+    await waitForWebReady(ctx, videoId);
+    const cacheOf = async () => (await fetch(ctx.url(`/artifacts/${videoId}`))).headers.get("cache-control");
+    assert.match(await cacheOf(), /immutable/, "a converted video takes the configured cache");
+    // As it is between the final PATCH and the end of its conversion.
+    await ctx.storage.patchArtifact(videoId, { converted: false });
+    const converting = await cacheOf();
+    assert.match(converting, /max-age=0/);
+    assert.doesNotMatch(converting, /immutable/);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: a conversion that times out keeps serving the original and the status says why", { skip: !FFMPEG }, async () => {
+  const body = await encodeMp4([
+    "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=1",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p",
+  ]);
+  const ctx = await startLocal({ pluginOptions: { webReady: { timeoutSeconds: 0.05 } } });
+  try {
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "big.mp4", kind: "video", body });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.state, "ready");
+    assert.equal(status.webReady.action, "skipped");
+    assert.match(status.webReady.reason, /timed out/);
+    const served = Buffer.from(await (await fetch(ctx.url(`/artifacts/${videoId}`))).arrayBuffer());
+    assert.ok(served.equals(body), "the original bytes serve");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("createVideoValidator: a renamed non-video and a too-long video are refused with plain reasons", { skip: !FFMPEG }, async () => {
+  const clip = await encodeMp4([
+    "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+  ]);
+  const ctx = await startLocal({ pluginOptions: { validatePayload: createVideoValidator({ maxDurationSeconds: 1 }) } });
+  try {
+    const refused = async (filename, body) => {
+      const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename, size: body.length, kind: "video" });
+      assert.equal(create.status, 201);
+      const patch = await tusPatch(new URL(create.headers.get("location"), ctx.baseUrl).href, 0, body);
+      return { status: patch.status, text: (await patch.text()).trim() };
+    };
+    assert.deepEqual(await refused("notes.mp4", Buffer.from("%PDF-1.7 definitely not a video")), {
+      status: 422,
+      text: "That file isn't a video.",
+    });
+    // A picture isn't a video, whatever it's named.
+    const png = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120", "-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1",
+    ]);
+    assert.deepEqual(await refused("photo.mp4", png), { status: 422, text: "That file isn't a video." });
+    assert.deepEqual(await refused("long.mp4", clip), {
+      status: 422,
+      text: "That video is longer than the limit of 1 second.",
+    });
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("an upload over maxUploadSize is refused in plain words, and conformAvailable is false without webReady", async () => {
+  const ctx = await startLocal();
+  try {
+    const create = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: randomUUID(),
+      filename: "huge.mov",
+      size: 11 * 1024 * 1024,
+      kind: "video",
+    });
+    assert.equal(create.status, 413);
+    assert.equal((await create.text()).trim(), "That file is larger than 10 MB.");
+    assert.equal(await ctx.core.conformAvailable(), false);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("local storage: a delete racing a conversion's switch to a new file leaves nothing behind", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-switch-race-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    for (let i = 0; i < 50; i++) {
+      const id = randomUUID();
+      const rel = await storage.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "webm");
+      await storage.markReady(id);
+      const output = path.join(workspaceDir, "video", `${id}.mp4`);
+      await fs.writeFile(output, "mp4");
+      // What the completion runner does once the conversion wrote `<id>.mp4`.
+      const switchOver = async () => {
+        const switched = await storage.patchArtifact(id, { ext: ".mp4", converted: true });
+        await fs.rm(switched ? path.join(workspaceDir, rel) : output, { force: true });
+      };
+      await Promise.all(i % 2 ? [storage.remove(id), switchOver()] : [switchOver(), storage.remove(id)]);
+      assert.equal(await storage.describeArtifact(id), null, "the removed artifact stays removed");
+      assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage, two instances on one workspace: a delete or a stale acknowledgement racing a switch to a new file", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-two-instances-"));
+  // Two adapters over one directory: two servers on a shared disk, each with its own memory.
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    for (let i = 0; i < 40; i++) {
+      const id = randomUUID();
+      const rel = await a.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "webm");
+      await a.markReady(id);
+      await b.describeArtifact(id);
+      const output = path.join(workspaceDir, "video", `${id}.mp4`);
+      await fs.writeFile(output, "mp4");
+      const switchOver = async () => {
+        await a.patchArtifact(id, { ext: ".mp4", converted: true, unlessConverted: true });
+        const recorded = await a.describeArtifact(id);
+        if (!recorded) await fs.rm(output, { force: true });
+        else await fs.rm(recorded.ext === ".mp4" ? path.join(workspaceDir, rel) : output, { force: true });
+      };
+      if (i % 2) {
+        // A delete on the other instance: nothing may come back.
+        await Promise.all([b.remove(id), switchOver()]);
+        assert.equal(await a.describeArtifact(id), null);
+        assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
+      } else {
+        // An acknowledgement on the other instance: it must not put the old extension back.
+        await Promise.all([b.patchArtifact(id, { acknowledged: true }), switchOver()]);
+        const meta = await b.describeArtifact(id);
+        assert.equal(meta.ext, ".mp4");
+        assert.equal(meta.acknowledged, true);
+        const resolved = await b.resolve(id);
+        assert.equal(resolved?.filename, `video/${id}.mp4`, "the record and the file agree");
+      }
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: a conversion record with unlessConverted never replaces one already made", async () => {
+  const ctx = await startLocal();
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video" });
+    await ctx.storage.patchArtifact(id, { converted: false });
+    const done = { action: "conformed", reason: "first pass" };
+    assert.equal(await ctx.storage.patchArtifact(id, { converted: true, webReady: done, unlessConverted: true }), true);
+    assert.equal(
+      await ctx.storage.patchArtifact(id, { converted: true, webReady: { action: "skipped", reason: "late failure" }, unlessConverted: true }),
+      false,
+      "a condition that doesn't hold changes nothing",
+    );
+    assert.deepEqual((await ctx.storage.describeArtifact(id)).webReady, done);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("local storage: a patch for an earlier reservation of the id changes nothing, and installs no file", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-generation-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const reserve = async () => {
+      const rel = await storage.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+      await storage.markReady(id);
+    };
+    await reserve();
+    const first = (await storage.describeArtifact(id)).generation;
+    assert.ok(first);
+    // A conversion begins on the first upload; the id is removed and reserved again meanwhile.
+    await storage.remove(id);
+    await reserve();
+    const second = (await storage.describeArtifact(id)).generation;
+    assert.notEqual(second, first);
+    const converted = path.join(workspaceDir, "video", ".webready-stale.mp4");
+    await fs.writeFile(converted, "old upload, converted");
+    const applied = await storage.patchArtifact(id, { converted: true, generation: first, file: converted, ext: ".mp4" });
+    assert.equal(applied, false);
+    const meta = await storage.describeArtifact(id);
+    assert.equal(meta.ext, ".webm");
+    assert.equal(meta.converted, false);
+    assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.webm`), "utf8"), "bytes", "the new upload's bytes are untouched");
+    assert.ok(await fs.stat(converted), "the file is left for the caller to drop");
+    // The same patch for the current reservation installs it and drops the old extension's file.
+    assert.equal(await storage.patchArtifact(id, { converted: true, generation: second, file: converted, ext: ".mp4" }), true);
+    assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.mp4`), "utf8"), "old upload, converted");
+    await assert.rejects(fs.stat(path.join(workspaceDir, "video", `${id}.webm`)));
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage, two instances: a reservation racing a removal of the same id keeps its own bytes", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reserve-race-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    for (let i = 0; i < 40; i++) {
+      const id = randomUUID();
+      const params = { artifactId: id, filename: "r.mp4", ext: ".mp4", kind: "video" };
+      await fs.writeFile(path.join(workspaceDir, await a.reserveUpload(params)), "old");
+      await a.markReady(id);
+      const reserveAgain = async () => {
+        try {
+          await fs.writeFile(path.join(workspaceDir, await b.reserveUpload(params)), "new");
+          return true;
+        } catch (err) {
+          if (err.statusCode === 409) return false;
+          throw err;
+        }
+      };
+      const [, reserved] = await Promise.all([a.remove(id), reserveAgain()]);
+      if (reserved) {
+        assert.ok(await b.describeArtifact(id), "the new reservation's sidecar survives");
+        assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.mp4`), "utf8"), "new");
+      }
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: a sidecar lock is waited for while its holder lives, and taken over once it's stale", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-lock-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
+    // Another instance holds the lock and is alive: the patch waits until it's released.
+    await fs.writeFile(lockPath, "another-holder");
+    let done = false;
+    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(done, false, "waits for a live holder");
+    await fs.rm(lockPath);
+    assert.equal(await patched, true);
+    // A holder that died 60 s ago: its lock is taken over, and the patch's own lock is gone after.
+    await fs.writeFile(lockPath, "dead-holder");
+    const longAgo = new Date(Date.now() - 60_000);
+    await fs.utimes(lockPath, longAgo, longAgo);
+    assert.equal(await storage.patchArtifact(id, { outcome: { ok: true } }), true);
+    assert.deepEqual((await storage.describeArtifact(id)).outcome, { ok: true });
+    await assert.rejects(fs.stat(lockPath));
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("createVideoValidator: the limit in a refusal is the configured one, exactly", { skip: !FFMPEG }, async () => {
+  const clip = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=5:duration=62", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const ctx = await startLocal({ pluginOptions: { validatePayload: createVideoValidator({ maxDurationSeconds: 61 }) } });
+  try {
+    const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename: "c.mp4", size: clip.length, kind: "video" });
+    const patch = await tusPatch(new URL(create.headers.get("location"), ctx.baseUrl).href, 0, clip);
+    assert.equal(patch.status, 422);
+    assert.equal((await patch.text()).trim(), "That video is longer than the limit of 1 minute 1 second.");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: a conversion queued for an upload that was removed and its id reserved again leaves the new upload alone", { skip: !FFMPEG }, async () => {
+  const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-slowff-"));
+  // An ffmpeg that takes a second per run, so the second upload's conversion waits in the queue.
+  const slow = path.join(binDir, "ffmpeg");
+  await fs.writeFile(slow, [
+    "#!/bin/sh",
+    'case "$1" in -version|-hide_banner) exec ffmpeg "$@";; esac',
+    "sleep 1",
+    'exec ffmpeg "$@"',
+  ].join("\n"), { mode: 0o755 });
+  const recorded = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  // moov at the end: every upload needs a (slowed) remux.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-moovend-"));
+  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", path.join(dir, "e.mp4")]);
+  const moovEnd = await fs.readFile(path.join(dir, "e.mp4"));
+  const ctx = await startLocal({ pluginOptions: { webReady: { ffmpegPath: slow, concurrency: 1 } } });
+  try {
+    const first = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: first, filename: "first.mp4", kind: "video", body: moovEnd });
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video", body: moovEnd });
+    // While A's conversion waits behind the first one: A is removed and B reserves the same id.
+    assert.equal((await fetch(ctx.url(`/artifacts/${id}`), { method: "DELETE" })).status, 204);
+    const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: id, filename: "b.mp4", size: recorded.length, kind: "video" });
+    assert.equal(create.status, 201);
+    const b = await ctx.storage.describeArtifact(id);
+    // Let the queue drain: the first conversion, then A's turn.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !(await ctx.core.getStatus(first)).webReady) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 2500));
+    const after = await ctx.storage.describeArtifact(id);
+    assert.equal(after.generation, b.generation, "still B");
+    assert.equal(after.ready, false);
+    assert.equal(after.converted, false, "A's job didn't convert B");
+    assert.equal(after.webReady, undefined);
+    assert.equal(after.acknowledged, false);
+  } finally {
+    await ctx.teardown();
+    await fs.rm(binDir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: getLocalPath names today's file, even after another instance removed the id and reserved it again", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-fresh-path-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    const id = randomUUID();
+    await a.reserveUpload({ artifactId: id, filename: "a.webm", ext: ".webm", kind: "video" });
+    assert.equal(path.basename(await a.getLocalPath(id)), `${id}.webm`);
+    await b.remove(id);
+    await b.reserveUpload({ artifactId: id, filename: "b.mp4", ext: ".mp4", kind: "video" });
+    assert.equal(path.basename(await a.getLocalPath(id)), `${id}.mp4`);
+    await b.remove(id);
+    assert.equal(await a.getLocalPath(id), null);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("webReady: an onArtifactEvent observer that throws doesn't hide the recorded result from completeAfter's hook", { skip: !FFMPEG }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-observer-"));
+  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", path.join(dir, "e.mp4")]);
+  const body = await fs.readFile(path.join(dir, "e.mp4"));
+  const completions = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      onUploadComplete: async (_req, c) => { completions.push(c); },
+      onArtifactEvent: (e) => { if (e.phase === "processed") throw new Error("observer broke"); },
+    },
+  });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "e.mp4", kind: "video", body });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && completions.length === 0) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(completions[0]?.webReady?.action, "remuxed");
+  } finally {
+    await ctx.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: a stale lock that another waiter is already recovering isn't taken over twice", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-recovery-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
+    await fs.writeFile(lockPath, "dead-holder");
+    const longAgo = new Date(Date.now() - 60_000);
+    await fs.utimes(lockPath, longAgo, longAgo);
+    // Another waiter holds the recovery: this one waits instead of removing the lock itself.
+    await fs.writeFile(`${lockPath}.recovery`, "");
+    let done = false;
+    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(done, false);
+    assert.equal(await fs.readFile(lockPath, "utf8"), "dead-holder", "left to the waiter recovering it");
+    await fs.rm(`${lockPath}.recovery`);
+    assert.equal(await patched, true);
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("GET while a file is replaced at the same path: every response is one whole file, as its headers say", async () => {
+  const ctx = await startLocal();
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video", size: 64 * 1024 });
+    const stored = await ctx.storage.getLocalPath(id);
+    const versions = [Buffer.alloc(64 * 1024, 1), Buffer.alloc(96 * 1024, 2)];
+    let swapping = true;
+    // An in-place conversion renaming new bytes onto the path, over and over.
+    const swapper = (async () => {
+      for (let i = 0; swapping; i++) {
+        const tmp = `${stored}.${i}.tmp`;
+        await fs.writeFile(tmp, versions[i % 2]);
+        await fs.rename(tmp, stored);
+      }
+    })();
+    try {
+      for (let i = 0; i < 300; i++) {
+        const res = await fetch(ctx.url(`/artifacts/${id}`));
+        if (res.status === 404) continue; // Resolved twice into a swap: allowed, never a wrong body.
+        assert.equal(res.status, 200);
+        const body = Buffer.from(await res.arrayBuffer());
+        assert.equal(body.length, Number(res.headers.get("content-length")));
+        assert.ok(versions.some((v) => v.equals(body)), "one whole version, never a mix");
+      }
+    } finally {
+      swapping = false;
+      await swapper;
+    }
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("an upload that grows past maxUploadSize mid-stream (deferred length) gets the plain 413 too", async () => {
+  const ctx = await startLocal();
+  try {
+    const create = await fetch(ctx.url("/upload"), {
+      method: "POST",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Defer-Length": "1",
+        "Upload-Metadata": `artifactId ${Buffer.from(randomUUID()).toString("base64")},filename ${Buffer.from("big.mp4").toString("base64")},kind ${Buffer.from("video").toString("base64")}`,
+      },
+    });
+    assert.equal(create.status, 201);
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    // With a Content-Length tus refuses the chunk before reading it…
+    const declared = await tusPatch(location, 0, Buffer.alloc(11 * 1024 * 1024));
+    assert.equal(declared.status, 413);
+    assert.equal((await declared.text()).trim(), "That file is larger than 10 MB.");
+    // …and a chunked body (no Content-Length) is cut off as it streams past the limit.
+    const chunk = Buffer.alloc(1024 * 1024);
+    let sent = 0;
+    const streamed = await fetch(location, {
+      method: "PATCH",
+      headers: { "Tus-Resumable": "1.0.0", "Upload-Offset": "0", "Content-Type": "application/offset+octet-stream" },
+      duplex: "half",
+      body: new ReadableStream({
+        pull(controller) {
+          if (sent++ < 11) controller.enqueue(chunk);
+          else controller.close();
+        },
+      }),
+    });
+    assert.equal(streamed.status, 413);
+    assert.equal((await streamed.text()).trim(), "That file is larger than 10 MB.");
+    // A chunk past the length the client itself declared is its own bug: tus's words stay.
+    const small = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename: "s.mp4", size: 100, kind: "video" });
+    const overrun = await tusPatch(new URL(small.headers.get("location"), ctx.baseUrl).href, 0, Buffer.alloc(200));
+    assert.equal(overrun.status, 413);
+    assert.notEqual((await overrun.text()).trim(), "That file is larger than 10 MB.");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("local storage: an artifact is reported removed once, however stale another reader's cache", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-remove-once-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    const id = randomUUID();
+    await fs.writeFile(path.join(workspaceDir, await a.reserveUpload({ artifactId: id, filename: "r.mp4", ext: ".mp4", kind: "video" })), "x");
+    await a.markReady(id);
+    assert.equal(await b.getKind(id), "video", "b has it cached");
+    assert.equal(await a.remove(id), true);
+    assert.equal(await b.remove(id), false, "already removed: not a second removal");
+    const [first, second] = await Promise.all([a.remove(id), b.remove(id)]);
+    assert.deepEqual([first, second], [false, false]);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("GET resolves again once when the resolved file is gone (a conversion replaced it)", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reresolve-"));
+  const storage = createLocalStorage({ workspaceDir });
+  let resolves = 0;
+  // The first resolution names a file that no longer exists, as a conversion's switch leaves it.
+  const racing = {
+    ...storage,
+    resolve: async (id) => (resolves++ === 0 ? { kind: "stream", root: workspaceDir, filename: `video/${id}.webm` } : storage.resolve(id)),
+  };
+  const ctx = await startApp(racing, {}, () => fs.rm(workspaceDir, { recursive: true, force: true }));
+  try {
+    const id = randomUUID();
+    const { body } = await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video" });
+    resolves = 0;
+    const res = await fetch(ctx.url(`/artifacts/${id}`));
+    assert.equal(res.status, 200);
+    assert.ok(Buffer.from(await res.arrayBuffer()).equals(body));
+    assert.equal(resolves, 2);
+  } finally {
+    await ctx.teardown();
   }
 });
 

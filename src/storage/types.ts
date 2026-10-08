@@ -1,4 +1,5 @@
 import type { DataStore } from '@tus/server';
+import type { WebReadyResult } from '../lib/web-ready.js';
 
 /**
  * How the GET route should serve a resolved artifact. Stream means
@@ -105,8 +106,17 @@ export type ReserveUploadParams = {
 export type PulseVaultArtifactMeta = {
   artifactId: string;
   kind: UploadKind;
-  /** Lowercase extension including the leading dot. */
+  /**
+   * Lowercase extension of the stored file, including the leading dot: the uploaded file's,
+   * until a web-ready conversion turned another container into an MP4 (then `.mp4`).
+   */
   ext: string;
+  /**
+   * The uploaded file's extension — `filename`'s, and the one tus's record of the upload is kept
+   * under — when a conversion stored the artifact under a different `ext`; absent otherwise. Use
+   * `uploadIdOf` to name the tus upload.
+   */
+  sourceExt?: string;
   /** Original filename from `Upload-Metadata.filename`. */
   filename: string;
   relatedTo?: string;
@@ -131,8 +141,16 @@ export type PulseVaultArtifactMeta = {
    * derives the `processing` status from it. Legacy sidecars read as `true` when finished.
    */
   converted: boolean;
+  /** What the web-ready conversion did (`none`, `remuxed`, …, or `skipped` and why), once it ran. */
+  webReady?: WebReadyResult;
   /** Whatever the host recorded with `recordOutcome` (where the upload went, why it was kept). */
   outcome?: unknown;
+  /**
+   * A token for this reservation of the artifactId, new at every `reserveUpload`, so work that
+   * began on one upload can tell the id was removed and reserved again meanwhile (the
+   * `generation` patch condition). Absent on adapters and sidecars that don't keep one.
+   */
+  generation?: string;
   /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */
   updatedAt: number;
   /**
@@ -143,10 +161,44 @@ export type PulseVaultArtifactMeta = {
   readyAt?: number;
 };
 
+/**
+ * tus's id for an artifact's upload (`<kind>/<artifactId><ext>`), under the extension it was
+ * uploaded with — which a conversion to another container doesn't change.
+ */
+export function uploadIdOf(meta: Pick<PulseVaultArtifactMeta, 'kind' | 'artifactId' | 'ext' | 'sourceExt'>): string {
+  return `${meta.kind}/${meta.artifactId}${meta.sourceExt ?? meta.ext}`;
+}
+
 /** The fields `patchArtifact` may change. Each is optional; absent means unchanged. */
 export type PulseVaultArtifactPatch = {
   acknowledged?: boolean;
   converted?: boolean;
+  /** What the web-ready conversion did. */
+  webReady?: WebReadyResult;
+  /**
+   * The stored file's new extension, after a web-ready conversion wrote the artifact's bytes
+   * under it (`<kind>/<artifactId><ext>`): from then on the artifact is served from that file.
+   * Only adapters that store files on local disk support it; others throw.
+   */
+  ext?: string;
+  /**
+   * Apply the patch only while `converted` is still false, so a conversion's record never
+   * replaces one another pass already made (two instances converting the same artifact).
+   */
+  unlessConverted?: boolean;
+  /**
+   * Apply the patch only to this reservation of the artifactId (`PulseVaultArtifactMeta
+   * .generation`; `null` for one without a generation), not to an upload that reserved the same
+   * id after it was removed.
+   */
+  generation?: string | null;
+  /**
+   * A file to install as the artifact's stored bytes, under the same lock as the rest of the
+   * patch: renamed onto `<kind>/<artifactId><ext>` (with `ext` the new one when it changes),
+   * after which a previous stored file under another extension is deleted. Must be in the
+   * artifact's kind directory. Only adapters that store files on local disk support it.
+   */
+  file?: string;
   /** `null` clears a recorded outcome. */
   outcome?: unknown;
 };
@@ -263,9 +315,10 @@ export interface PulseVaultStorage {
   describeArtifact?(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
 
   /**
-   * Change the bookkeeping flags of one artifact (`acknowledged`, `converted`, `outcome`).
-   * Resolves `false` if the artifactId is unknown. Optional — completion replay, background
-   * web-ready and `recordOutcome` need it.
+   * Change the bookkeeping of one artifact (`acknowledged`, `converted`, `webReady`, `ext`,
+   * `outcome`, or its stored `file`). Resolves `false`, changing nothing, when the artifactId is
+   * unknown or a condition (`unlessConverted`, `generation`) doesn't hold. Optional —
+   * completion replay, background web-ready and `recordOutcome` need it.
    */
   patchArtifact?(artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean>;
 

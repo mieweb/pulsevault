@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
-import type { PulseVaultRequest } from './request.js';
+import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
+import { isBinaryAvailable, probeVideo, ProbeTimeoutError, type VideoProbe } from './web-ready.js';
 import type { LocalStorage } from '../storage/local.js';
 import type { S3Storage } from '../storage/s3.js';
 import type { UploadKind } from '../storage/types.js';
@@ -134,6 +135,123 @@ export function createS3Mp4Sniffer(storage: S3Storage): PulseVaultValidatePayloa
       throw Object.assign(new Error('Uploaded bytes are not a valid MP4 (missing ftyp header)'), {
         statusCode: 422,
       });
+    }
+  };
+}
+
+/**
+ * Whether a file's first bytes open one of the video containers PulseVault accepts: ISO base
+ * media (`ftyp`: MP4, MOV, M4V, 3GP), EBML (WebM, MKV) or RIFF `AVI `. A ~12-byte sniff, for
+ * when ffprobe isn't installed: it tells a video container from a renamed document, not a
+ * playable video from a broken one.
+ */
+export async function sniffVideo(filePath: string): Promise<boolean> {
+  let fd: fs.FileHandle;
+  try {
+    fd = await fs.open(filePath, 'r');
+  } catch {
+    return false;
+  }
+  try {
+    const buf = Buffer.alloc(12);
+    const { bytesRead } = await fd.read(buf, 0, 12, 0);
+    if (bytesRead < 12) return false;
+    const ebml = buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+    const avi = buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'AVI ';
+    return hasFtypBox(buf) || ebml || avi;
+  } finally {
+    await fd.close();
+  }
+}
+
+export type VideoValidatorOptions = {
+  /** Refuse a video longer than this many seconds. Default: no limit. */
+  maxDurationSeconds?: number;
+  /** Path to the ffprobe binary. Default `"ffprobe"` (resolved via PATH). */
+  ffprobePath?: string;
+  /**
+   * Wall-clock limit for each ffprobe run, in seconds, so a malformed file can't hold the
+   * final `PATCH` open. Default `60`.
+   */
+  probeTimeoutSeconds?: number;
+  /** Where the one-time "ffprobe not found" warning goes. Defaults to `console`. */
+  logger?: PulseVaultLogger;
+};
+
+/** The limit exactly, as said: `600` → "10 minutes", `61` → "1 minute 1 second", `45.5` → "45.5 seconds". */
+function formatDuration(seconds: number): string {
+  const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const minutes = Math.floor(seconds / 60);
+  // To the millisecond, so 61.25 reads "1 minute 1.25 seconds", never a rounded neighbour.
+  const rest = Math.round((seconds - minutes * 60) * 1000) / 1000;
+  if (minutes === 0) return unit(rest, 'second');
+  return rest === 0 ? unit(minutes, 'minute') : `${unit(minutes, 'minute')} ${unit(rest, 'second')}`;
+}
+
+const warnedNoProbe = new Set<string>();
+
+/**
+ * Build a `validatePayload` hook that checks a video by what it is, not its file name: ffprobe
+ * must find a video stream with a duration above zero (and, with `maxDurationSeconds`, not
+ * longer than that). Without ffprobe on the host it falls back to `sniffVideo` and logs once.
+ * Other kinds pass untouched. Needs the bytes on local disk (the local adapter).
+ *
+ * A refusal is a `422` whose message a host can show as it is: "That file isn't a video.",
+ * "That video is longer than the limit of 10 minutes." or, when ffprobe runs past
+ * `probeTimeoutSeconds` (a malformed file), "That video couldn't be checked in time."
+ *
+ * Usage:
+ * ```ts
+ * await app.register(pulseVault, {
+ *   storage: createLocalStorage({ workspaceDir: "./data" }),
+ *   validatePayload: createVideoValidator({ maxDurationSeconds: 600 }),
+ *   // ...
+ * });
+ * ```
+ */
+export function createVideoValidator(options: VideoValidatorOptions = {}): PulseVaultValidatePayload {
+  const ffprobePath = options.ffprobePath ?? 'ffprobe';
+  const logger = options.logger ?? consoleLogger;
+  const { maxDurationSeconds, probeTimeoutSeconds } = options;
+  for (const [name, value] of [['maxDurationSeconds', maxDurationSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
+    if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
+      throw new TypeError(`\`${name}\` must be a positive number of seconds`);
+    }
+  }
+  const refuse = (message: string): never => {
+    throw Object.assign(new Error(message), { statusCode: 422 });
+  };
+  return async (_request, { artifactId, kind, localPath }) => {
+    if (kind !== 'video') return;
+    if (!localPath) {
+      throw Object.assign(
+        new Error(`Cannot validate upload ${artifactId}: no local path available`),
+        { statusCode: 500 },
+      );
+    }
+    if (!(await isBinaryAvailable(ffprobePath))) {
+      if (!warnedNoProbe.has(ffprobePath)) {
+        warnedNoProbe.add(ffprobePath);
+        logger.error(
+          { ffprobePath },
+          'pulsevault video check: ffprobe not found — only the container bytes are checked. ' +
+            'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to check videos fully.',
+        );
+      }
+      if (!(await sniffVideo(localPath))) refuse("That file isn't a video.");
+      return;
+    }
+    let probe: VideoProbe | null;
+    try {
+      probe = await probeVideo(localPath, { ffprobePath, timeoutSeconds: probeTimeoutSeconds });
+    } catch (err) {
+      if (!(err instanceof ProbeTimeoutError)) throw err;
+      logger.error({ err, artifactId }, 'pulsevault video check: ffprobe timed out');
+      return refuse("That video couldn't be checked in time.");
+    }
+    if (!probe || probe.durationSeconds === null) refuse("That file isn't a video.");
+    if (maxDurationSeconds !== undefined && (probe?.durationSeconds ?? 0) > maxDurationSeconds) {
+      refuse(`That video is longer than the limit of ${formatDuration(maxDurationSeconds)}.`);
     }
   };
 }

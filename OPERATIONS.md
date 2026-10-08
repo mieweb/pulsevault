@@ -54,7 +54,13 @@ Two ways to actually support multiple instances:
 2. **Shared filesystem**: point every instance's `workspaceDir` at the same
    NFS/EFS mount. Verify your mount's durability/consistency guarantees
    under concurrent writes from multiple instances before relying on this in
-   production.
+   production. The local adapter changes an artifact's metadata (`.pulsevault/
+   <id>.json`) under a per-artifact lock file (`<id>.json.lock`, created
+   exclusively and holding its owner's token), so instances never write over
+   each other's changes. A holder renews its lock every 10 seconds and removes
+   it only while it's still its own; a lock not renewed for 30 seconds was left
+   by a crashed process and is taken over, one waiter at a time (under a
+   `<id>.json.lock.recovery` file), after looking at it again.
 
 **The S3/R2 adapter (`createS3Storage`) has no such requirement** — every
 instance talks to the same bucket, so it scales horizontally with zero
@@ -160,56 +166,122 @@ backup time will resume correctly via the normal TUS `HEAD`-then-resume path
 once the client retries, or will sit as abandoned partial uploads until
 `retention` removes them (see "Retention" below) if the client never retries.
 
-## Web-ready playback (faststart remux + H.264 transcode)
+## Web-ready playback (conform to one format)
 
-Browsers streaming an MP4 over progressive HTTP stall (or fail outright) on
-two things mobile capture pipelines routinely upload:
+Videos reach PulseVault from the Pulse app, which already uploads the format
+below, and from a host's own file picker: a screen recording, an iPhone HEVC
+`.mov` (often 10-bit HDR), a WebM from a browser recorder, a 4K clip. Browsers
+streaming over progressive HTTP stall on a `moov` atom at the end of the file,
+Firefox never decodes HEVC, Chrome usually can't without hardware support,
+10-bit HDR shown as SDR looks washed out, and a 4K file is far more than a
+phone needs.
 
-- **moov atom at the end of the file** — the player must fetch the file's tail
-  before rendering frame one: seconds of startup delay behind Range requests,
-  or a full download in naive players.
-- **HEVC video** — Firefox never decodes it; Chrome usually can't without
-  hardware support.
+With the `webReady` option on, every finished video is **conformed** to one
+target (`CONFORM_TARGET`, exported from the package root):
 
-The `ensureWebReady` helper (exported from the package root) fixes both, in
-place and atomically (tmp file + rename): a lossless sub-second
-`-c copy -movflags +faststart` remux when only the moov position is wrong, and
-a one-time `libx264` transcode (audio stream-copied) when the codec is
-hostile. It is fail-open by design — without `ffmpeg`/`ffprobe` on `PATH` it
-logs one warning and the original bytes keep serving exactly as before.
+| Property | Target |
+|---|---|
+| Container | MP4, `moov` at the front (faststart) |
+| Video | H.264, 8-bit `yuv420p` (limited range), even width and height |
+| Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
+| Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
+| Rotation | applied to the pixels, so every player shows it the way it was held |
+| Audio | AAC; a video with no audio stays silent |
 
-**Prerequisite:** install ffmpeg on the serving host — `apt install ffmpeg`
-(Debian/Ubuntu), `dnf install ffmpeg` (Fedora/EL + RPM Fusion), or
-`brew install ffmpeg` (macOS). Nothing else changes; the hook detects it at
-first use.
+`ensureWebReady` does the least work that gets a file there:
 
-**New uploads** — turn on the `webReady` option (the fastify-demo and the
-meteor-demo ship with it enabled). The core runs the conversion in the
-background after the final `PATCH` is answered, one video at a time by
-default, and reports the artifact as `processing` on the status route
-meanwhile:
+| The upload | What happens | `action` |
+|---|---|---|
+| Already in the target (a Pulse upload) | nothing; bytes untouched | `none` |
+| MP4 with the `moov` at the end | lossless `-c copy` faststart remux | `remuxed` |
+| MP4 with an off-target stream | one ffmpeg run, in place | `transcoded` |
+| Another container (`.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp`, `.avi`) | one ffmpeg run into a new `<id>.mp4`: a stream copy when the streams already conform, otherwise only the off-target streams re-encoded | `conformed` |
+| No ffmpeg, unreadable, failed or timed out | nothing; the original serves | `skipped` |
+
+A re-encode scales by the longest edge, applies the rotation, tone-maps HDR
+(PQ or HLG) to SDR, and converts non-AAC audio (Opus, PCM, …) to AAC. After a
+container change the artifact's stored file, extension and served
+`Content-Type` (`video/mp4`) follow the new file; the artifact id, and so every
+URL a host stored, stay the same. The new file is written beside the original,
+the artifact's sidecar switches to it, and only then is the original deleted:
+a crash at any point leaves either the original serving (the conversion is
+redone by the replay) or an unused original that is deleted with the
+artifact.
+
+While a video is being converted, its URL serves the original bytes with
+`max-age=0` instead of the configured `cache`, so a browser that fetched it
+early revalidates and gets the converted file (with a new ETag) afterwards.
+
+A failed run is recorded as `conversion failed: ffmpeg exited with code N`;
+ffmpeg's own output, which names server paths, goes only to the server log.
+
+The result is recorded on the artifact: the status route reports it as
+`webReady: { action, reason }` (a host can say "Your video is ready", or "We
+couldn't convert this video, so it may not play in every browser"),
+`onArtifactEvent` fires `processed` with it, and `completeAfter` hands it to
+`onUploadComplete` as `ctx.webReady`.
+
+**Prerequisite:** install ffmpeg (which includes ffprobe) on the serving host
+— `apt install ffmpeg` (Debian/Ubuntu), `dnf install ffmpeg` (Fedora/EL + RPM
+Fusion), or `brew install ffmpeg` (macOS). It is detected at first use; without
+it every upload is still accepted and served exactly as uploaded, one warning
+is logged, and `core.conformAvailable()` (also `fastify.pulseVaultCore`)
+resolves `false` for a health check. HDR tone mapping uses the `scale` filter
+on FFmpeg 8 and later, or `zscale` (libzimg, included in the Debian and Ubuntu
+packages) on older builds. A build with neither leaves an HDR video as
+uploaded and records `skipped` with what's missing: converting it without tone
+mapping would give wrong colours.
 
 ```js
 await app.register(pulseVault, {
   storage: createLocalStorage({ workspaceDir: dataDir }),
+  validatePayload: createVideoValidator({ maxDurationSeconds: 600 }),
   webReady: { concurrency: 1, completeAfter: true },
 });
 ```
 
-Options: `{ transcode: false }` restricts it to the lossless remux (no CPU
-cost beyond a file rewrite); `crf`/`preset` tune the transcode
-(defaults `23`/`veryfast`); `ffmpegPath`/`ffprobePath` point at binaries off
-`PATH`; `concurrency` runs several at once; `completeAfter: true` holds
-`onUploadComplete` until the conversion has finished, for a host that
-publishes the video from the hook. `onArtifactEvent` fires `processed` with
-what was done. A conversion a restart interrupted is resumed by the
-completion replay (`replayCompletions`). Calling `ensureWebReady` yourself
-from `onUploadComplete` still works, but holds the client's final `PATCH`
-for the whole conversion.
+Settings:
 
-**Existing artifacts** — uploads that landed before the hook existed are fixed
-once with the bundled migration script (idempotent; interrupt and rerun
-freely, already-fixed files are skipped for free):
+- `concurrency` (default `1`): conversions run one at a time per process; the
+  rest wait in a queue. A conversion a restart interrupted is resumed by the
+  completion replay (`replayCompletions`): an artifact isn't marked converted
+  until its result is recorded.
+- `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
+  1080p30 seconds — a second of 4K at 120 fps counts 16 — an hour when the
+  duration is unknown): a run past it is killed, the original kept, and
+  `skipped` recorded with the reason.
+- `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
+  over the upload, so a malformed file can't hold the queue.
+- `maxEdge` (default `1920`): the longest edge of the served video.
+- `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
+  moved to the front, or another container whose streams already conform copied
+  into an `.mp4`), so no CPU cost beyond a file rewrite. A file that would need
+  a re-encode is left as uploaded and recorded as `skipped` (`none` means only
+  "already conforms").
+- `crf`/`preset` (defaults `23`/`veryfast`) tune the H.264 encode;
+  `ffmpegPath`/`ffprobePath` point at binaries off `PATH`.
+
+**Accepted containers.** The default video `allowedExtensions` are `.mp4`,
+`.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp` and `.avi` (`CONFORM_VIDEO_EXTENSIONS`);
+a host's own `allowedExtensions` still overrides them. The extension only
+decides what's accepted at `create`; `createVideoValidator()` checks the
+received bytes by what they are: ffprobe must find a video stream with a
+duration above zero that isn't a picture (a PNG, JPEG, GIF, HEIC photo or
+one-frame clip is refused), and, with `maxDurationSeconds`, not longer, or the
+upload is refused with `422 That file isn't a video.` / `That video is longer
+than the limit of 10 minutes.` Each ffprobe run is bounded by
+`probeTimeoutSeconds` (default `60`), so a malformed file can't hold the final
+`PATCH` open: past it the upload is refused with `422 That video couldn't be
+checked in time.` Without ffprobe it falls back to sniffing the
+container's first bytes (`ftyp`, EBML or RIFF AVI). An upload over
+`maxUploadSize` is refused at `create` with `413 That file is larger than
+500 MB.` Without `webReady`, a WebM or MKV is served as uploaded, with its own
+content type.
+
+**Existing artifacts** — uploads that landed before `webReady` was on are
+conformed once with the bundled migration script. Stop the server while it
+runs (the server caches each artifact's extension, which a container change
+rewrites). It is idempotent; interrupt and rerun freely:
 
 ```sh
 node node_modules/@mieweb/pulsevault/scripts/web-ready-migrate.mjs /path/to/workspaceDir
@@ -219,11 +291,17 @@ node node_modules/@mieweb/pulsevault/scripts/web-ready-migrate.mjs /path/to/work
 node node_modules/@mieweb/pulsevault/scripts/web-ready-migrate.mjs /path/to/workspaceDir --no-transcode
 ```
 
-A transcode re-encodes the video stream (one-time, quality-preserving at the
-default CRF but not bit-identical). Take a backup first if that matters to
+A re-encode is one-time, quality-preserving at the default CRF but not
+bit-identical, and a conformed file replaces the upload (the original is not
+kept). Take a backup first if that matters to
 your deployment (see "Backup and restore" above).
 
-Note on checksums: a remux or transcode changes the artifact's bytes, so an
+After a container change, tus's record of the upload still names the
+uploaded file, so a client that re-sends the final `PATCH` of an upload whose
+response it lost gets `410` instead of `204` (the upload did finish; the
+status route says so). The Pulse app never uploads a container that changes.
+
+Note on checksums: a conversion changes the artifact's bytes, so an
 upload-time checksum recorded for it (the sidecar `checksum` from
 `Upload-Metadata`) describes the original upload, not the rewritten file.
 Treat `getChecksum` as upload-time provenance rather than current-file

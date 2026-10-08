@@ -172,7 +172,7 @@ export type PulseVaultPluginOptions = {
   replayCompletions?: PulseVaultReplayOptions | false;
   /**
    * Name of the decorator that exposes the core (`fastify.<name>.getStatus`, `.getPulse`,
-   * `.recordOutcome`, `.replayCompletions`). Defaults to `"pulseVaultCore"`.
+   * `.recordOutcome`, `.replayCompletions`, `.conformAvailable`). Defaults to `"pulseVaultCore"`.
    */
   coreDecoratorName?: string;
   /**
@@ -264,6 +264,7 @@ export default fp(app, {
 });
 
 export { createLocalStorage } from './storage/local.js';
+export { uploadIdOf } from './storage/types.js';
 export type { LocalStorage, LocalStorageOptions } from './storage/local.js';
 export { createS3Storage } from './storage/s3.js';
 export type { S3Storage, S3StorageOptions } from './storage/s3.js';
@@ -284,10 +285,17 @@ export type {
   PulseVaultOnArtifactEvent,
   PulseVaultArtifactEvent,
 } from './lib/pulsevaultTus.js';
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
-export type { PulseVaultValidatePayload } from './lib/magic.js';
-export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer, sniffVideo, createVideoValidator } from './lib/magic.js';
+export type { PulseVaultValidatePayload, VideoValidatorOptions } from './lib/magic.js';
+export {
+  ensureWebReady,
+  scanMoovPosition,
+  probeVideo,
+  webReadyAvailable,
+  CONFORM_TARGET,
+  CONFORM_VIDEO_EXTENSIONS,
+} from './lib/web-ready.js';
+export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition, VideoProbe } from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {

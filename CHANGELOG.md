@@ -7,6 +7,111 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+Protocol 2.4 (`PROTOCOL.md` §7.4). `webReady` becomes a **conform** step: whatever video a
+person uploads, PulseVault serves it in the one format the Pulse app records, and a Pulse upload
+is left untouched (#84).
+
+### Added
+
+- **Conform target** (`CONFORM_TARGET`): faststart MP4, H.264 8-bit `yuv420p` (limited range)
+  with even dimensions, SDR (HDR tone-mapped to BT.709; SDR colour tags kept), the longest edge at most `webReady.maxEdge` (default 1920; aspect ratio and
+  orientation kept), rotation applied, AAC or no audio. `ensureWebReady` leaves a file already
+  in it byte-for-byte (`none`), remuxes losslessly when only the container or `moov` position is
+  off, and otherwise runs ffmpeg once, re-encoding only the off-target streams: HEVC and other
+  codecs to H.264, 10-bit HDR (PQ/HLG) tone-mapped to SDR (FFmpeg 8's `scale`, or `zscale` on
+  older builds), full-range video (iPhone screen recordings) to limited range, oversized video
+  scaled down, Opus/PCM and other audio to AAC.
+- **Container change**: a `.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp` or `.avi` becomes a new
+  `<id>.mp4` (`WebReadyAction` `conformed`). The artifact's stored file, `ext` and served
+  `Content-Type` follow it; the artifact id and its URLs don't change. The sidecar switches
+  first, then the original is deleted (`sourceExt` remembers it so `remove` cleans up after a
+  crash). New patch fields `ext` and `webReady` (local adapter; the S3 adapter refuses them).
+  `describeArtifact` reports the uploaded extension as `sourceExt` once it differs, and
+  `uploadIdOf(meta)` names tus's upload by it, so a replayed hook's `ext` and `uploadId` still
+  match `filename`.
+- `webReady.timeoutSeconds` (default `60 + 10 ×` the duration in 1080p30 seconds, so 4K or high
+  frame rates get proportionally longer): a longer run is killed, the original
+  kept, and `skipped` recorded with the reason.
+- The conversion's result is recorded on the artifact: `GET /artifacts/:id/status` and
+  `getStatus` report `webReady: { action, reason }` (protocol 2.4), and `describeArtifact`
+  returns it.
+- `core.conformAvailable()` (also on `fastify.pulseVaultCore`): `false` when `webReady` is off or
+  ffmpeg/ffprobe are missing, for a host's health check.
+- `createVideoValidator({ maxDurationSeconds? })`: a `validatePayload` hook that checks a video
+  by its content with ffprobe (a video stream with a duration above zero, including a browser
+  WebM without one in its header; a picture — PNG, JPEG, GIF, HEIC, a one-frame clip, counted
+  from the first two packets when the container has no frame count — is not a video), refusing with `422 That file isn't a video.` or `That video is
+  longer than the limit of …` (the configured limit exactly: "1 minute 1 second"); falls back to `sniffVideo` (`ftyp`, EBML or RIFF AVI) without
+  ffprobe. Also exported: `probeVideo`, `webReadyAvailable`, `CONFORM_VIDEO_EXTENSIONS`.
+- An upload over `maxUploadSize` is refused with `413 That file is larger than 500 MB.` instead
+  of tus's "Maximum size exceeded".
+- `webReady.probeTimeoutSeconds` and `createVideoValidator({ probeTimeoutSeconds })` (default 60):
+  every ffprobe run over an upload is bounded; the validator refuses with `422 That video
+  couldn't be checked in time.`
+- Content types for `.webm`, `.mkv`, `.3gp` and `.avi`.
+- While a video is being converted, `GET /artifacts/:id` is served with `max-age=0` instead of
+  the configured `cache` (which may be `immutable`), so no client keeps the original bytes once
+  the converted file replaces them.
+
+### Changed
+
+- The default video `allowedExtensions` are `.mp4`, `.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp` and
+  `.avi` (was `.mp4`). A host's own `allowedExtensions` still overrides them.
+- A failed conversion is now recorded (`webReady: { action: "skipped", reason }`) as well as
+  logged, and still not retried; a conversion that never recorded a result is resumed by the
+  replay, as before.
+- The local adapter changes a sidecar under a per-artifact lock file (`.pulsevault/<id>.json.lock`,
+  created exclusively with its owner's token, renewed every 10 s while held, removed only by its
+  owner; once not renewed for 30 s, taken over by one waiter at a time under a recovery lock,
+  after a second look) as well as its in-process lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
+  workspace never write over each other's changes, so a delete racing a conversion's switch
+  can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
+- Reservations run under the same lock, and `remove` deletes the sidecar last, so a new upload
+  of a removed id never has its bytes deleted by the old removal. Each reservation gets a
+  `generation` (`describeArtifact`), new every time the id is reserved.
+- A conversion is installed in one patch under that lock: the runner converts into a temporary
+  `.mp4` (`ensureWebReady(…, { install: false })`), then `patchArtifact` with `file` renames it
+  onto the stored file, switches `ext`, records the result and deletes the original — only for
+  the reservation the conversion began on (`generation`) and only while no other pass has
+  recorded one (`unlessConverted`). When a condition doesn't hold, `patchArtifact` resolves
+  `false`, changing nothing, and the runner drops its file.
+- Completion work belongs to one reservation: a queued conversion checks, when its turn comes,
+  that the id still names the upload it was queued for (and that it's finished); the
+  acknowledgement is recorded only on that reservation; and a new upload of a removed id is never
+  joined to the old one's work in progress.
+- `GET /artifacts/:id` opens the file before sending headers, checks it's the file `send`
+  described (inode, size, mtime), and resolves once more when it's gone or another file was
+  renamed onto the path (a conversion just replaced it), instead of a 404, a cut-off response or
+  headers that don't match the bytes; bytes this
+  instance resolved under an extension storage no longer names are served with `max-age=0`.
+- A failed run's recorded reason is `ffmpeg exited with code N`, never ffmpeg's output (which
+  names server paths); an HDR video on an ffmpeg without tone mapping is left as uploaded
+  (`skipped`, saying what's missing) rather than converted with wrong colours.
+- The local adapter's `remove` decides from the sidecar alone, never its cache: an artifact
+  another reader had cached is reported removed once, not twice.
+- `webReady` needs an adapter with `describeArtifact` too (both built-in adapters have it).
+- The local adapter's `getLocalPath` reads the sidecar, not its cache, so it names the current
+  file after another instance removed the id and reserved it again.
+- ffmpeg's capability queries (`-version`, `-h filter=scale`, `-filters`) are bounded (30 s).
+- An `onArtifactEvent` observer that throws on `processed` is logged as its own failure; the
+  recorded result still reaches `completeAfter`'s hook as `ctx.webReady`.
+- A replayed `onUploadComplete` (the hook threw, or the process stopped) gets the recorded
+  conversion result as `ctx.webReady` too, so a host naming the file from it (an `.mp4` once a
+  WebM was conformed) gets it right on the retry.
+- `web-ready-migrate.mjs` rerun after an interruption deletes an original the sidecar no longer
+  names.
+- `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
+  on each sidecar and switching a changed container to its `.mp4`. Run it with the server
+  stopped.
+- `transcode: false` records a file it leaves off-target (HEVC, oversized, non-AAC audio) as
+  `skipped`, not `none`: `none` now means only that the file already conforms. (Was `none`.)
+- A browser WebM's missing duration is found by streaming ffprobe's packet list and keeping
+  only the latest end, never buffering it.
+- An upload of deferred length that grows past `maxUploadSize` (a chunk with a length, or a
+  chunked body cut off mid-stream) gets the same `413 That file is larger than …` message.
+- An MP4-family `.mov`/`.m4v` that already conformed used to be served as is (`video/quicktime`,
+  a type not every browser takes); it is now remuxed into an `.mp4`.
+
 ## [0.5.0] - 2026-10-05
 
 Protocol 2.3 (`PROTOCOL.md` §7.4). What every host rebuilt around PulseVault
