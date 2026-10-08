@@ -347,9 +347,11 @@ async function fileChanged(stream: Readable, stat: Stats | undefined): Promise<b
     });
     if (gone) return true;
   }
-  if (!stat || typeof stream.fd !== 'number') return false;
+  // The descriptor the stream opened (set once it's `ready`; not in the type definitions).
+  const fd = (stream as ReadStream & { fd?: number | null }).fd;
+  if (!stat || typeof fd !== 'number') return false;
   const opened = await new Promise<Stats>((resolve, reject) =>
-    fstat(stream.fd as number, (err, st) => (err ? reject(err) : resolve(st))),
+    fstat(fd, (err, st) => (err ? reject(err) : resolve(st))),
   );
   const same =
     opened.ino === stat.ino && opened.dev === stat.dev && opened.size === stat.size && opened.mtimeMs === stat.mtimeMs;

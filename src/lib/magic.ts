@@ -178,11 +178,14 @@ export type VideoValidatorOptions = {
   logger?: PulseVaultLogger;
 };
 
-/** `90` → "1.5 minutes", `600` → "10 minutes", `45` → "45 seconds". */
+/** The limit exactly, as said: `600` → "10 minutes", `61` → "1 minute 1 second", `45.5` → "45.5 seconds". */
 function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`;
-  const minutes = Math.round((seconds / 60) * 10) / 10;
-  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  const unit = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const minutes = Math.floor(seconds / 60);
+  // To the millisecond, so 61.25 reads "1 minute 1.25 seconds", never a rounded neighbour.
+  const rest = Math.round((seconds - minutes * 60) * 1000) / 1000;
+  if (minutes === 0) return unit(rest, 'second');
+  return rest === 0 ? unit(minutes, 'minute') : `${unit(minutes, 'minute')} ${unit(rest, 'second')}`;
 }
 
 const warnedNoProbe = new Set<string>();

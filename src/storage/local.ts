@@ -335,21 +335,28 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     }
   };
   /**
-   * Remove a lock whose holder died, by renaming it away (only one taker's rename succeeds). A
-   * taker that loses the race to another taker could rename the winner's fresh lock instead:
-   * then it puts it back with `link`, which never replaces a lock created meanwhile.
+   * Remove a lock whose holder died. Takeovers of one lock run one at a time, under a recovery
+   * lock created exclusively beside it, and look at the lock again inside it: a lock that was
+   * released and taken afresh meanwhile is fresh, and stays. (A recovery lock is held for a
+   * stat and an unlink; one older than `LOCK_STALE_MS` was left by a waiter that died in
+   * between, and is cleared for the next one.)
    */
   const takeOverStaleLock = async (lockPath: string): Promise<void> => {
-    const aside = `${lockPath}.${randomUUID()}.stale`;
+    const recoveryPath = `${lockPath}.recovery`;
     try {
-      await fs.rename(lockPath, aside);
+      await fs.writeFile(recoveryPath, '', { flag: 'wx' });
     } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return; // Another taker was first.
-      throw err;
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+      const age = await fs.stat(recoveryPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
+      if (age > LOCK_STALE_MS) await fs.rm(recoveryPath, { force: true });
+      return; // Another waiter is recovering it: wait for the lock as usual.
     }
-    const fresh = await fs.stat(aside).then((stats) => Date.now() - stats.mtimeMs <= LOCK_STALE_MS, () => false);
-    if (fresh) await fs.link(aside, lockPath).catch(() => {});
-    await fs.rm(aside, { force: true });
+    try {
+      const heldFor = await fs.stat(lockPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
+      if (heldFor > LOCK_STALE_MS) await fs.rm(lockPath, { force: true });
+    } finally {
+      await fs.rm(recoveryPath, { force: true });
+    }
   };
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
     const previous = sidecarWrites.get(artifactId) ?? Promise.resolve();

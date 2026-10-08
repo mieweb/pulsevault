@@ -59,7 +59,8 @@ Two ways to actually support multiple instances:
    exclusively and holding its owner's token), so instances never write over
    each other's changes. A holder renews its lock every 10 seconds and removes
    it only while it's still its own; a lock not renewed for 30 seconds was left
-   by a crashed process and is taken over.
+   by a crashed process and is taken over, one waiter at a time (under a
+   `<id>.json.lock.recovery` file), after looking at it again.
 
 **The S3/R2 adapter (`createS3Storage`) has no such requirement** — every
 instance talks to the same bucket, so it scales horizontally with zero

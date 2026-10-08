@@ -1109,6 +1109,79 @@ test("local storage: a sidecar lock is waited for while its holder lives, and ta
   }
 });
 
+test("createVideoValidator: the limit in a refusal is the configured one, exactly", { skip: !FFMPEG }, async () => {
+  const clip = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=5:duration=62", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const ctx = await startLocal({ pluginOptions: { validatePayload: createVideoValidator({ maxDurationSeconds: 61 }) } });
+  try {
+    const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename: "c.mp4", size: clip.length, kind: "video" });
+    const patch = await tusPatch(new URL(create.headers.get("location"), ctx.baseUrl).href, 0, clip);
+    assert.equal(patch.status, 422);
+    assert.equal((await patch.text()).trim(), "That video is longer than the limit of 1 minute 1 second.");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("local storage: a stale lock that another waiter is already recovering isn't taken over twice", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-recovery-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
+    await fs.writeFile(lockPath, "dead-holder");
+    const longAgo = new Date(Date.now() - 60_000);
+    await fs.utimes(lockPath, longAgo, longAgo);
+    // Another waiter holds the recovery: this one waits instead of removing the lock itself.
+    await fs.writeFile(`${lockPath}.recovery`, "");
+    let done = false;
+    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(done, false);
+    assert.equal(await fs.readFile(lockPath, "utf8"), "dead-holder", "left to the waiter recovering it");
+    await fs.rm(`${lockPath}.recovery`);
+    assert.equal(await patched, true);
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("GET while a file is replaced at the same path: every response is one whole file, as its headers say", async () => {
+  const ctx = await startLocal();
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video", size: 64 * 1024 });
+    const stored = await ctx.storage.getLocalPath(id);
+    const versions = [Buffer.alloc(64 * 1024, 1), Buffer.alloc(96 * 1024, 2)];
+    let swapping = true;
+    // An in-place conversion renaming new bytes onto the path, over and over.
+    const swapper = (async () => {
+      for (let i = 0; swapping; i++) {
+        const tmp = `${stored}.${i}.tmp`;
+        await fs.writeFile(tmp, versions[i % 2]);
+        await fs.rename(tmp, stored);
+      }
+    })();
+    try {
+      for (let i = 0; i < 300; i++) {
+        const res = await fetch(ctx.url(`/artifacts/${id}`));
+        if (res.status === 404) continue; // Resolved twice into a swap: allowed, never a wrong body.
+        assert.equal(res.status, 200);
+        const body = Buffer.from(await res.arrayBuffer());
+        assert.equal(body.length, Number(res.headers.get("content-length")));
+        assert.ok(versions.some((v) => v.equals(body)), "one whole version, never a mix");
+      }
+    } finally {
+      swapping = false;
+      await swapper;
+    }
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("an upload that grows past maxUploadSize mid-stream (deferred length) gets the plain 413 too", async () => {
   const ctx = await startLocal();
   try {
