@@ -81,6 +81,8 @@ is left untouched (#84).
 - A failed run's recorded reason is `ffmpeg exited with code N`, never ffmpeg's output (which
   names server paths); an HDR video on an ffmpeg without tone mapping is left as uploaded
   (`skipped`, saying what's missing) rather than converted with wrong colours.
+- The local adapter's `remove` decides from the sidecar alone, never its cache: an artifact
+  another reader had cached is reported removed once, not twice.
 - `webReady` needs an adapter with `describeArtifact` too (both built-in adapters have it).
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
   on each sidecar and switching a changed container to its `.mp4`. Run it with the server

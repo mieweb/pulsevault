@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import send from '@fastify/send';
-import { ReadStream } from 'node:fs';
+import { fstat, ReadStream, type Stats } from 'node:fs';
 import type { Readable } from 'node:stream';
 import {
   createPulsevaultTusServer,
@@ -323,25 +323,38 @@ function extensionOf(filename: string | undefined): string | undefined {
 }
 
 /**
- * Whether a file stream from `@fastify/send` failed to open its file because it no longer
- * exists. Streams that aren't file streams (an empty body for a `304`) resolve `false` at once.
+ * Whether a file stream from `@fastify/send` opened something other than the file `send`
+ * described in its headers (`stat`): the file is gone, or another file was renamed onto the
+ * path in between (a conversion replacing the bytes). Then the stream is closed and nothing has
+ * been written. Streams that aren't file streams (an empty body for a `304`) resolve `false`.
  */
-function fileGone(stream: Readable): Promise<boolean> {
-  if (!(stream instanceof ReadStream) || !stream.pending) return Promise.resolve(false);
-  return new Promise((resolve, reject) => {
-    const onReady = () => {
-      stream.off('error', onError);
-      resolve(false);
-    };
-    const onError = (err: NodeJS.ErrnoException) => {
-      stream.off('ready', onReady);
-      // Any other failure to open is the server's, before anything was written: a 500.
-      if (err.code === 'ENOENT') resolve(true);
-      else reject(err);
-    };
-    stream.once('ready', onReady);
-    stream.once('error', onError);
-  });
+async function fileChanged(stream: Readable, stat: Stats | undefined): Promise<boolean> {
+  if (!(stream instanceof ReadStream)) return false;
+  if (stream.pending) {
+    const gone = await new Promise<boolean>((resolve, reject) => {
+      const onReady = () => {
+        stream.off('error', onError);
+        resolve(false);
+      };
+      const onError = (err: NodeJS.ErrnoException) => {
+        stream.off('ready', onReady);
+        // Any other failure to open is the server's, before anything was written: a 500.
+        if (err.code === 'ENOENT') resolve(true);
+        else reject(err);
+      };
+      stream.once('ready', onReady);
+      stream.once('error', onError);
+    });
+    if (gone) return true;
+  }
+  if (!stat || typeof stream.fd !== 'number') return false;
+  const opened = await new Promise<Stats>((resolve, reject) =>
+    fstat(stream.fd as number, (err, st) => (err ? reject(err) : resolve(st))),
+  );
+  const same =
+    opened.ino === stat.ino && opened.dev === stat.dev && opened.size === stat.size && opened.mtimeMs === stat.mtimeMs;
+  if (!same) stream.destroy();
+  return !same;
 }
 
 /** The hook-context fields that come from stored metadata, for every phase after `create`. */
@@ -895,8 +908,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
    * route. An artifact URL names immutable bytes once finished, so it takes the configured
    * `cache`; the poster URL is a lookup whose answer changes when a newer thumbnail lands, and a
    * video still being converted is about to change, so those are revalidated on every request
-   * (`mustRevalidate`). Resolves `false`, having written nothing, when the file was gone by the
-   * time it was opened (a conversion replaced it): the caller resolves again.
+   * (`mustRevalidate`). Resolves `false`, having written nothing, when the file opened isn't the
+   * one `send` described (a conversion removed or replaced it in between): the caller resolves
+   * again.
    */
   const serveResolution = async (
     req: IncomingMessage,
@@ -923,9 +937,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
       return true;
     }
-    // The file stream opens it after `send` returned: wait for that before the headers go out.
-    // Once open, the file being replaced or removed no longer matters to this response.
-    if (await fileGone(result.stream)) return false;
+    // The file stream opens it after `send` returned: wait for that before the headers go out,
+    // and check it opened the file the headers describe. Once open, the file being replaced or
+    // removed no longer matters to this response.
+    if (await fileChanged(result.stream, (result.metadata as { stat?: Stats }).stat)) return false;
 
     const headers = { ...result.headers };
     // If the storage adapter provided an explicit content type (e.g. for

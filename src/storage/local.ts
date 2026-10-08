@@ -618,14 +618,15 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   // finds the sidecar gone and drops what it wrote; it can never write the sidecar back.
   const remove = (artifactId: string): Promise<boolean> =>
     withSidecarLock(artifactId, async () => {
+      // The sidecar decides, never the cache: a read racing this removal (or an earlier one) can
+      // have cached the artifact again, and a removal that trusted it would report the same
+      // artifact removed twice.
       const sidecar = await readSidecar(artifactId);
-      const meta = sidecar
-        ? sidecarToCachedMeta(sidecar, sidecar.status === 'ready')
-        : (metaCache.get(artifactId) ?? null);
       // Drop from cache before rm so a racing `resolve` arriving after the
       // rm but before cache eviction can't hand back a stale path.
       metaCache.delete(artifactId);
-      if (!meta) return false;
+      if (!sidecar) return false;
+      const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
       const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
       // The uploaded file and tus's record of it, when a conversion stored the bytes under a new
       // extension (normally already gone; left behind by a crash during the switch).
@@ -645,6 +646,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // Last: until the sidecar is gone the id can't be reserved again, so a new upload of it
       // never has its bytes removed by this one's removal.
       await fs.rm(sidecarPath(artifactId), { force: true });
+      // Again: a read during the removal may have cached it from the sidecar it still saw.
+      metaCache.delete(artifactId);
       return true;
     });
 

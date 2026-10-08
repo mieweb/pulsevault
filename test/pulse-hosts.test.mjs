@@ -1152,6 +1152,25 @@ test("an upload that grows past maxUploadSize mid-stream (deferred length) gets 
   }
 });
 
+test("local storage: an artifact is reported removed once, however stale another reader's cache", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-remove-once-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    const id = randomUUID();
+    await fs.writeFile(path.join(workspaceDir, await a.reserveUpload({ artifactId: id, filename: "r.mp4", ext: ".mp4", kind: "video" })), "x");
+    await a.markReady(id);
+    assert.equal(await b.getKind(id), "video", "b has it cached");
+    assert.equal(await a.remove(id), true);
+    assert.equal(await b.remove(id), false, "already removed: not a second removal");
+    const [first, second] = await Promise.all([a.remove(id), b.remove(id)]);
+    assert.deepEqual([first, second], [false, false]);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
 test("GET resolves again once when the resolved file is gone (a conversion replaced it)", async () => {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reresolve-"));
   const storage = createLocalStorage({ workspaceDir });
