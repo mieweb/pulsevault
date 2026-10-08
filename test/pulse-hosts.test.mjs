@@ -1122,6 +1122,49 @@ test("createVideoValidator: the limit in a refusal is the configured one, exactl
   }
 });
 
+test("webReady: a conversion queued for an upload that was removed and its id reserved again leaves the new upload alone", { skip: !FFMPEG }, async () => {
+  const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-slowff-"));
+  // An ffmpeg that takes a second per run, so the second upload's conversion waits in the queue.
+  const slow = path.join(binDir, "ffmpeg");
+  await fs.writeFile(slow, [
+    "#!/bin/sh",
+    'case "$1" in -version|-hide_banner) exec ffmpeg "$@";; esac',
+    "sleep 1",
+    'exec ffmpeg "$@"',
+  ].join("\n"), { mode: 0o755 });
+  const recorded = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  // moov at the end: every upload needs a (slowed) remux.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-moovend-"));
+  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", path.join(dir, "e.mp4")]);
+  const moovEnd = await fs.readFile(path.join(dir, "e.mp4"));
+  const ctx = await startLocal({ pluginOptions: { webReady: { ffmpegPath: slow, concurrency: 1 } } });
+  try {
+    const first = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: first, filename: "first.mp4", kind: "video", body: moovEnd });
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video", body: moovEnd });
+    // While A's conversion waits behind the first one: A is removed and B reserves the same id.
+    assert.equal((await fetch(ctx.url(`/artifacts/${id}`), { method: "DELETE" })).status, 204);
+    const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: id, filename: "b.mp4", size: recorded.length, kind: "video" });
+    assert.equal(create.status, 201);
+    const b = await ctx.storage.describeArtifact(id);
+    // Let the queue drain: the first conversion, then A's turn.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !(await ctx.core.getStatus(first)).webReady) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 2500));
+    const after = await ctx.storage.describeArtifact(id);
+    assert.equal(after.generation, b.generation, "still B");
+    assert.equal(after.ready, false);
+    assert.equal(after.converted, false, "A's job didn't convert B");
+    assert.equal(after.webReady, undefined);
+    assert.equal(after.acknowledged, false);
+  } finally {
+    await ctx.teardown();
+    await fs.rm(binDir, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("local storage: a stale lock that another waiter is already recovering isn't taken over twice", async () => {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-recovery-"));
   const storage = createLocalStorage({ workspaceDir });

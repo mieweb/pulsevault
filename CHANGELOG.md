@@ -75,6 +75,10 @@ is left untouched (#84).
   the reservation the conversion began on (`generation`) and only while no other pass has
   recorded one (`unlessConverted`). When a condition doesn't hold, `patchArtifact` resolves
   `false`, changing nothing, and the runner drops its file.
+- Completion work belongs to one reservation: a queued conversion checks, when its turn comes,
+  that the id still names the upload it was queued for (and that it's finished); the
+  acknowledgement is recorded only on that reservation; and a new upload of a removed id is never
+  joined to the old one's work in progress.
 - `GET /artifacts/:id` opens the file before sending headers, checks it's the file `send`
   described (inode, size, mtime), and resolves once more when it's gone or another file was
   renamed onto the path (a conversion just replaced it), instead of a 404, a cut-off response or

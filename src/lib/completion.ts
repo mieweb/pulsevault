@@ -257,7 +257,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
   const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
     storage.describeArtifact ? storage.describeArtifact(artifactId) : Promise.resolve(null);
 
-  const record = async (artifactId: string, patch: { acknowledged: true }) => {
+  const record = async (artifactId: string, patch: { acknowledged: true; generation?: string | null }) => {
     try {
       await storage.patchArtifact?.(artifactId, patch);
     } catch (err) {
@@ -299,16 +299,27 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     return applied;
   };
 
-  /** Rule 1. Never throws: a failed conversion serves the original bytes, and says why. */
-  const convert = (ctx: PulseVaultUploadCompleteContext): Promise<WebReadyResult | undefined> =>
+  /**
+   * Rule 1, for the reservation the work was scheduled for (`generation`; `undefined` when the
+   * adapter can't say). Never throws: a failed conversion serves the original bytes, and says why.
+   */
+  const convert = (
+    ctx: PulseVaultUploadCompleteContext,
+    generation: string | null | undefined,
+  ): Promise<WebReadyResult | undefined> =>
     new Promise((resolve) => {
       void queue.run(async () => {
         try {
           // What was read before this job waited for its slot may be stale: the artifact may
-          // have been removed, or converted by another instance on the same disk, meanwhile.
+          // have been removed — and its id reserved again by another upload, which isn't this
+          // job's — or converted by another instance on the same disk, meanwhile.
           const fresh = await describe(ctx.artifactId);
-          if (!fresh || fresh.converted) {
-            resolve(fresh?.webReady);
+          if (!fresh || !fresh.ready || (generation !== undefined && (fresh.generation ?? null) !== generation)) {
+            resolve(undefined);
+            return;
+          }
+          if (fresh.converted) {
+            resolve(fresh.webReady);
             return;
           }
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
@@ -318,7 +329,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             typeof localPath === 'string'
               ? await ensureWebReady(localPath, { ...webReady, logger, install: false })
               : { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined };
-          if (!(await recordConversion(ctx.artifactId, fresh.generation ?? null, result, outputPath))) {
+          if (!(await recordConversion(ctx.artifactId, generation !== undefined ? generation : (fresh.generation ?? null), result, outputPath))) {
             resolve((await describe(ctx.artifactId))?.webReady);
             return;
           }
@@ -338,17 +349,23 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       });
     });
 
-  /** Rule 2. Rethrows what the hook threw. */
+  /** Rule 2, recorded only on the reservation it ran for. Rethrows what the hook threw. */
   const hook = async (
     request: PulseVaultRequest,
     ctx: PulseVaultUploadCompleteContext,
+    generation: string | null | undefined,
   ): Promise<void> => {
     if (onUploadComplete) await onUploadComplete(request, ctx);
-    await record(ctx.artifactId, { acknowledged: true });
+    await record(ctx.artifactId, { acknowledged: true, ...(generation !== undefined ? { generation } : {}) });
   };
 
-  /** One artifact is settled by one caller at a time; a second caller joins the first. */
+  /**
+   * One upload is settled by one caller at a time; a second caller joins the first. Keyed by the
+   * reservation too: a new upload of an id that was removed is never joined to the old one's.
+   */
   const settling = new Map<string, Promise<void>>();
+  const settlingKey = (artifactId: string, generation: string | null | undefined): string =>
+    `${artifactId}/${generation ?? ''}`;
 
   /**
    * Apply the rule to one finished artifact. The request that finished the upload waits on the
@@ -363,7 +380,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     upload: FinishedUpload,
     replay: boolean,
   ): Promise<void> => {
-    const running = settling.get(upload.artifactId);
+    const generation = meta ? (meta.generation ?? null) : undefined;
+    const key = settlingKey(upload.artifactId, generation);
+    const running = settling.get(key);
     if (running) return running;
     const ctx = contextFor(meta, upload, replay);
     // An adapter without `describeArtifact` can't say what was done: run everything (the hook
@@ -376,10 +395,10 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     if (needsConversion && completeAfter) {
       // Nothing for the request to wait on: the hook follows the conversion.
       run = (async () => {
-        const result = await convert(ctx);
+        const result = await convert(ctx, generation);
         if (!needsHook) return;
         try {
-          await hook(request, { ...ctx, ...(result ? { webReady: result } : {}) });
+          await hook(request, { ...ctx, ...(result ? { webReady: result } : {}) }, generation);
         } catch (err) {
           logger.error(
             { err, artifactId: ctx.artifactId, kind: ctx.kind },
@@ -387,20 +406,20 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           );
         }
       })();
-      settling.set(upload.artifactId, run);
-      void run.finally(() => settling.delete(upload.artifactId));
+      settling.set(key, run);
+      void run.finally(() => settling.delete(key));
       return Promise.resolve();
     }
     run = (async () => {
-      const conversion = needsConversion ? convert(ctx) : Promise.resolve(undefined);
+      const conversion = needsConversion ? convert(ctx, generation) : Promise.resolve(undefined);
       try {
-        if (needsHook) await hook(request, ctx);
+        if (needsHook) await hook(request, ctx, generation);
       } finally {
         // The settle covers the conversion too, so a replay doesn't queue it again meanwhile.
-        void conversion.finally(() => settling.delete(upload.artifactId));
+        void conversion.finally(() => settling.delete(key));
       }
     })();
-    settling.set(upload.artifactId, run);
+    settling.set(key, run);
     return run;
   };
 
@@ -427,7 +446,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       }
       const pending: Promise<void>[] = [];
       for await (const record of storage.listArtifacts()) {
-        if (!record.ready || settling.has(record.artifactId)) continue;
+        if (!record.ready) continue;
         let meta: PulseVaultArtifactMeta | null;
         try {
           meta = await storage.describeArtifact(record.artifactId);
@@ -435,7 +454,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           logger.error({ err, artifactId: record.artifactId }, 'pulsevault replay could not read an artifact');
           continue;
         }
-        if (!meta || !meta.ready || settling.has(meta.artifactId)) continue;
+        if (!meta || !meta.ready || settling.has(settlingKey(meta.artifactId, meta.generation ?? null))) continue;
         if (meta.acknowledged && !(converts(meta.kind) && !meta.converted)) continue;
         const uploadId = uploadIdOf(meta);
         const upload: FinishedUpload = {
