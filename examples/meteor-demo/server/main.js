@@ -185,8 +185,9 @@ const core = createPulseVaultCore({
   retention: { abandonedAfterSeconds: 24 * 60 * 60 },
   // A pulse that landed stays: its pairing token can't delete it.
   lockWhenReady: true,
-  // Every video is made web-playable in the background (faststart, or H.264 for HEVC), and the
-  // feed only learns about it once that's done: nobody is handed a video mid-rewrite.
+  // Every video is conformed to one web-playable format in the background (a Pulse upload is left
+  // as is), and the feed only learns about it once that's done: nobody is handed a video
+  // mid-rewrite.
   webReady: { completeAfter: true },
   authorize: async (request, ctx) => {
     if (ctx.phase === "resolve") return; // public playback
