@@ -819,6 +819,25 @@ test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same a
   }
 });
 
+test("webReady: a video still being converted is revalidated instead of the configured immutable cache", { skip: !FFMPEG }, async () => {
+  const body = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  const ctx = await startLocal({ pluginOptions: { webReady: true, cache: { maxAge: "365d", immutable: true } } });
+  try {
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "clip.mp4", kind: "video", body });
+    await waitForWebReady(ctx, videoId);
+    const cacheOf = async () => (await fetch(ctx.url(`/artifacts/${videoId}`))).headers.get("cache-control");
+    assert.match(await cacheOf(), /immutable/, "a converted video takes the configured cache");
+    // As it is between the final PATCH and the end of its conversion.
+    await ctx.storage.patchArtifact(videoId, { converted: false });
+    const converting = await cacheOf();
+    assert.match(converting, /max-age=0/);
+    assert.doesNotMatch(converting, /immutable/);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("webReady: a conversion that times out keeps serving the original and the status says why", { skip: !FFMPEG }, async () => {
   const body = await encodeMp4([
     "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=1",
@@ -855,6 +874,11 @@ test("createVideoValidator: a renamed non-video and a too-long video are refused
       status: 422,
       text: "That file isn't a video.",
     });
+    // A picture isn't a video, whatever it's named.
+    const png = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120", "-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1",
+    ]);
+    assert.deepEqual(await refused("photo.mp4", png), { status: 422, text: "That file isn't a video." });
     assert.deepEqual(await refused("long.mp4", clip), {
       status: 422,
       text: "That video is longer than the limit of 1 second.",
@@ -878,6 +902,32 @@ test("an upload over maxUploadSize is refused in plain words, and conformAvailab
     assert.equal(await ctx.core.conformAvailable(), false);
   } finally {
     await ctx.teardown();
+  }
+});
+
+test("local storage: a delete racing a conversion's switch to a new file leaves nothing behind", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-switch-race-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    for (let i = 0; i < 50; i++) {
+      const id = randomUUID();
+      const rel = await storage.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "webm");
+      await storage.markReady(id);
+      const output = path.join(workspaceDir, "video", `${id}.mp4`);
+      await fs.writeFile(output, "mp4");
+      // What the completion runner does once the conversion wrote `<id>.mp4`.
+      const switchOver = async () => {
+        const switched = await storage.patchArtifact(id, { ext: ".mp4", converted: true });
+        await fs.rm(switched ? path.join(workspaceDir, rel) : output, { force: true });
+      };
+      await Promise.all(i % 2 ? [storage.remove(id), switchOver()] : [switchOver(), storage.remove(id)]);
+      assert.equal(await storage.describeArtifact(id), null, "the removed artifact stays removed");
+      assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 

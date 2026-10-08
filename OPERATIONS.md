@@ -176,7 +176,8 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Property | Target |
 |---|---|
 | Container | MP4, `moov` at the front (faststart) |
-| Video | H.264, 8-bit `yuv420p`, even width and height, SDR (BT.709) |
+| Video | H.264, 8-bit `yuv420p` (limited range), even width and height |
+| Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
 | Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
 | Rotation | applied to the pixels, so every player shows it the way it was held |
 | Audio | AAC; a video with no audio stays silent |
@@ -200,6 +201,10 @@ the artifact's sidecar switches to it, and only then is the original deleted:
 a crash at any point leaves either the original serving (the conversion is
 redone by the replay) or an unused original that is deleted with the
 artifact.
+
+While a video is being converted, its URL serves the original bytes with
+`max-age=0` instead of the configured `cache`, so a browser that fetched it
+early revalidates and gets the converted file (with a new ETag) afterwards.
 
 The result is recorded on the artifact: the status route reports it as
 `webReady: { action, reason }` (a host can say "Your video is ready", or "We
@@ -235,8 +240,9 @@ Settings:
   duration is unknown): a run past it is killed, the original kept, and
   `skipped` recorded with the reason.
 - `maxEdge` (default `1920`): the longest edge of the served video.
-- `transcode: false`: never re-encode; only the lossless faststart remux of an
-  MP4 (no CPU cost beyond a file rewrite).
+- `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
+  moved to the front, or another container whose streams already conform copied
+  into an `.mp4`), so no CPU cost beyond a file rewrite.
 - `crf`/`preset` (defaults `23`/`veryfast`) tune the H.264 encode;
   `ffmpegPath`/`ffprobePath` point at binaries off `PATH`.
 
@@ -245,7 +251,8 @@ Settings:
 a host's own `allowedExtensions` still overrides them. The extension only
 decides what's accepted at `create`; `createVideoValidator()` checks the
 received bytes by what they are: ffprobe must find a video stream with a
-duration above zero (and, with `maxDurationSeconds`, not longer), or the
+duration above zero that isn't a picture (a PNG, JPEG, GIF, HEIC photo or
+one-frame clip is refused), and, with `maxDurationSeconds`, not longer, or the
 upload is refused with `422 That file isn't a video.` / `That video is longer
 than the limit of 10 minutes.` Without ffprobe it falls back to sniffing the
 container's first bytes (`ftyp`, EBML or RIFF AVI). An upload over

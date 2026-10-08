@@ -31,7 +31,11 @@ export const CONFORM_TARGET = {
   /** MP4 with the `moov` atom at the front (faststart). */
   container: 'mp4',
   extension: '.mp4',
-  /** H.264, 8-bit 4:2:0, even width and height, SDR (BT.709), no rotation tag. */
+  /**
+   * H.264, 8-bit 4:2:0 in limited range, even width and height, SDR, no rotation tag. HDR (PQ,
+   * HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601),
+   * which browsers honour — so a Pulse upload from any phone keeps its bytes.
+   */
   videoCodec: 'h264',
   pixelFormat: 'yuv420p',
   /** Default cap on the longest edge, in pixels (`webReady.maxEdge`). */
@@ -50,6 +54,9 @@ export const CONFORM_VIDEO_EXTENSIONS: readonly string[] = [
   '.3gp',
   '.avi',
 ];
+
+/** ffprobe demuxers that read still or animated images, not video. */
+const IMAGE_FORMATS = /^(image2|[a-z0-9]+_pipe|gif|apng|webp)$/;
 
 /** Transfer functions of HDR video (PQ and HLG): tone-mapped to SDR on the way in. */
 const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
@@ -75,9 +82,10 @@ export type WebReadyOptions = {
   /** Path to the ffprobe binary. Default `"ffprobe"` (resolved via PATH). */
   ffprobePath?: string;
   /**
-   * Whether an off-target stream is re-encoded. Default `true`. Set `false` to only ever do the
-   * lossless faststart remux of an MP4 — useful when transcode cost on the serving host is a
-   * concern.
+   * Whether an off-target stream is re-encoded. Default `true`. Set `false` to never re-encode:
+   * only lossless remuxes still run (a `moov` moved to the front, or another container whose
+   * streams already conform copied into an `.mp4`) — useful when transcode cost on the serving
+   * host is a concern.
    */
   transcode?: boolean;
   /** Longest edge of the served video, in pixels; larger videos are scaled down. Default `1920`. */
@@ -174,6 +182,7 @@ export type VideoProbe = {
 
 type ProbeStream = {
   index?: number;
+  nb_frames?: string;
   codec_type?: string;
   codec_name?: string;
   pix_fmt?: string;
@@ -225,19 +234,20 @@ async function packetDuration(filePath: string, ffprobePath: string, index: numb
 
 /**
  * ffprobe a file: its first real video stream (not cover art), its first audio stream and its
- * duration. `null` when ffprobe can't read it or it has no video stream — it isn't a video.
+ * duration. `null` when it isn't a video: ffprobe can't read it, it has no video stream, or it
+ * is a picture (an image file, or a stream of one frame).
  */
 export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Promise<VideoProbe | null> {
-  let parsed: { streams?: ProbeStream[]; format?: { duration?: string } };
+  let parsed: { streams?: ProbeStream[]; format?: { duration?: string; format_name?: string } };
   try {
     const { stdout } = await execFileAsync(
       ffprobePath,
       [
         '-v', 'error',
         '-show_entries',
-        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer' +
+        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer,nb_frames' +
           ':stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate' +
-          ':format=duration',
+          ':format=duration,format_name',
         '-of', 'json',
         filePath,
       ],
@@ -252,6 +262,9 @@ export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Pro
     (s) => s.codec_type === 'video' && !s.disposition?.attached_pic && s.width && s.height,
   );
   if (!video || typeof video.index !== 'number') return null;
+  // A picture isn't a video: an image file (PNG, JPEG, GIF, WebP) read by an image demuxer, or
+  // a single-frame stream (an iPhone HEIC photo is an ISO-BMFF file with one HEVC frame).
+  if (IMAGE_FORMATS.test(parsed.format?.format_name ?? '') || Number(video.nb_frames) === 1) return null;
   const audio = streams.find((s) => s.codec_type === 'audio');
   const sideRotation = video.side_data_list?.find((d) => d.rotation !== undefined)?.rotation;
   const rotation = Number(sideRotation ?? video.tags?.rotate ?? 0) || 0;
@@ -324,8 +337,11 @@ function toneMapperOf(ffmpegPath: string): Promise<ToneMapper> {
   return cached;
 }
 
-/** The nearest even number, at least 2. */
-const even = (n: number): number => Math.max(2, 2 * Math.round(n / 2));
+/**
+ * Rounded to whole pixels, then down to even (at least 2): never above the limit it was scaled
+ * to (an odd `maxEdge` stays a cap), and an odd source edge loses a pixel rather than gaining one.
+ */
+const even = (n: number): number => Math.max(2, 2 * Math.floor(Math.round(n) / 2));
 
 /** The displayed size (after rotation) scaled so the longest edge is at most `maxEdge`. */
 function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
@@ -355,7 +371,9 @@ function videoFilter(
       `zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=${width}:${height}`
     );
   }
-  return `scale=${width}:${height},format=yuv420p`;
+  // `out_range=tv`: a full-range source (`yuvj420p`, as iPhone screen recordings are) is
+  // converted to the limited range of `yuv420p`; `format` alone keeps the source's range.
+  return `scale=${width}:${height}:out_range=tv,format=yuv420p`;
 }
 
 class TimeoutError extends Error {}

@@ -280,6 +280,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
   ): Promise<void> => {
     let recorded: boolean;
     try {
+      // A run that failed while another pass (another instance on the same disk) finished the
+      // conversion must not record over it.
+      if (result.action === 'skipped' && (await describe(artifactId))?.converted) return;
       recorded =
         (await storage.patchArtifact?.(artifactId, {
           converted: true,
@@ -306,6 +309,15 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     new Promise((resolve) => {
       void queue.run(async () => {
         try {
+          // What was read before this job waited for its slot may be stale: the artifact may
+          // have been removed, or converted by another instance on the same disk, meanwhile.
+          if (storage.describeArtifact) {
+            const fresh = await storage.describeArtifact(ctx.artifactId);
+            if (!fresh || fresh.converted) {
+              resolve(fresh?.webReady);
+              return;
+            }
+          }
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
           const { outputPath, ...result } =
             typeof localPath === 'string'

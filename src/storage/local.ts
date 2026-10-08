@@ -541,31 +541,38 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
     });
 
-  const remove = async (artifactId: string): Promise<boolean> => {
-    const meta = await loadMeta(artifactId);
-    // Drop from cache before rm so a racing `resolve` arriving after the
-    // rm but before cache eviction can't hand back a stale path.
-    metaCache.delete(artifactId);
-    if (!meta) return false;
-    const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
-    // The uploaded file and tus's record of it, when a conversion stored the bytes under a new
-    // extension (normally already gone; left behind by a crash during the switch).
-    const sourcePath = meta.sourceExt
-      ? path.join(workspaceRoot, meta.kind, `${artifactId}${meta.sourceExt}`)
-      : null;
-    await Promise.all([
-      fs.rm(artifactPath, { force: true }),
-      fs.rm(`${artifactPath}.json`, { force: true }),
-      ...(sourcePath
-        ? [fs.rm(sourcePath, { force: true }), fs.rm(`${sourcePath}.json`, { force: true })]
-        : []),
-      fs.rm(sidecarPath(artifactId), { force: true }),
-      ...(meta.relatedTo
-        ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
-        : []),
-    ]);
-    return true;
-  };
+  // Under the sidecar lock, from the sidecar itself: a conversion switching the artifact to a new
+  // file (`patchArtifact` with `ext`) either finishes first — and this removes the new file — or
+  // finds the sidecar gone and drops what it wrote; it can never write the sidecar back.
+  const remove = (artifactId: string): Promise<boolean> =>
+    withSidecarLock(artifactId, async () => {
+      const sidecar = await readSidecar(artifactId);
+      const meta = sidecar
+        ? sidecarToCachedMeta(sidecar, sidecar.status === 'ready')
+        : (metaCache.get(artifactId) ?? null);
+      // Drop from cache before rm so a racing `resolve` arriving after the
+      // rm but before cache eviction can't hand back a stale path.
+      metaCache.delete(artifactId);
+      if (!meta) return false;
+      const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+      // The uploaded file and tus's record of it, when a conversion stored the bytes under a new
+      // extension (normally already gone; left behind by a crash during the switch).
+      const sourcePath = meta.sourceExt
+        ? path.join(workspaceRoot, meta.kind, `${artifactId}${meta.sourceExt}`)
+        : null;
+      await Promise.all([
+        fs.rm(artifactPath, { force: true }),
+        fs.rm(`${artifactPath}.json`, { force: true }),
+        ...(sourcePath
+          ? [fs.rm(sourcePath, { force: true }), fs.rm(`${sourcePath}.json`, { force: true })]
+          : []),
+        fs.rm(sidecarPath(artifactId), { force: true }),
+        ...(meta.relatedTo
+          ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
+          : []),
+      ]);
+      return true;
+    });
 
   const getLocalPath = async (artifactId: string): Promise<string | null> => {
     const meta = await loadMeta(artifactId);

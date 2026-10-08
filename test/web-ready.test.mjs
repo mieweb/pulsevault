@@ -272,3 +272,11 @@ test("conform: a run past timeoutSeconds is killed, the original kept and the re
   assert.deepEqual(await fs.readFile(p), before);
   assert.deepEqual((await fs.readdir(path.dirname(p))).filter((f) => f.startsWith(".webready-")), [], "no tmp file left");
 });
+
+test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {
+  const p = await fixture("odd-cap.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const result = await ensureWebReady(p, { maxEdge: 321 });
+  assert.equal(result.action, "transcoded");
+  const { video } = probe(p);
+  assert.deepEqual([video.width, video.height], [320, 180]);
+});

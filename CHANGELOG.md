@@ -13,13 +13,14 @@ is left untouched (#84).
 
 ### Added
 
-- **Conform target** (`CONFORM_TARGET`): faststart MP4, H.264 8-bit `yuv420p` with even
-  dimensions, SDR, the longest edge at most `webReady.maxEdge` (default 1920; aspect ratio and
+- **Conform target** (`CONFORM_TARGET`): faststart MP4, H.264 8-bit `yuv420p` (limited range)
+  with even dimensions, SDR (HDR tone-mapped to BT.709; SDR colour tags kept), the longest edge at most `webReady.maxEdge` (default 1920; aspect ratio and
   orientation kept), rotation applied, AAC or no audio. `ensureWebReady` leaves a file already
   in it byte-for-byte (`none`), remuxes losslessly when only the container or `moov` position is
   off, and otherwise runs ffmpeg once, re-encoding only the off-target streams: HEVC and other
-  codecs to H.264, 10-bit HDR (PQ/HLG) tone-mapped to SDR, oversized video scaled down, Opus/PCM
-  and other audio to AAC.
+  codecs to H.264, 10-bit HDR (PQ/HLG) tone-mapped to SDR (FFmpeg 8's `scale`, or `zscale` on
+  older builds), full-range video (iPhone screen recordings) to limited range, oversized video
+  scaled down, Opus/PCM and other audio to AAC.
 - **Container change**: a `.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp` or `.avi` becomes a new
   `<id>.mp4` (`WebReadyAction` `conformed`). The artifact's stored file, `ext` and served
   `Content-Type` follow it; the artifact id and its URLs don't change. The sidecar switches
@@ -34,12 +35,16 @@ is left untouched (#84).
   ffmpeg/ffprobe are missing, for a host's health check.
 - `createVideoValidator({ maxDurationSeconds? })`: a `validatePayload` hook that checks a video
   by its content with ffprobe (a video stream with a duration above zero, including a browser
-  WebM without one in its header), refusing with `422 That file isn't a video.` or `That video is
+  WebM without one in its header; a picture — PNG, JPEG, GIF, HEIC, a one-frame clip — is not a
+  video), refusing with `422 That file isn't a video.` or `That video is
   longer than the limit of …`; falls back to `sniffVideo` (`ftyp`, EBML or RIFF AVI) without
   ffprobe. Also exported: `probeVideo`, `webReadyAvailable`, `CONFORM_VIDEO_EXTENSIONS`.
 - An upload over `maxUploadSize` is refused with `413 That file is larger than 500 MB.` instead
   of tus's "Maximum size exceeded".
 - Content types for `.webm`, `.mkv`, `.3gp` and `.avi`.
+- While a video is being converted, `GET /artifacts/:id` is served with `max-age=0` instead of
+  the configured `cache` (which may be `immutable`), so no client keeps the original bytes once
+  the converted file replaces them.
 
 ### Changed
 
@@ -48,6 +53,9 @@ is left untouched (#84).
 - A failed conversion is now recorded (`webReady: { action: "skipped", reason }`) as well as
   logged, and still not retried; a conversion that never recorded a result is resumed by the
   replay, as before.
+- The local adapter's `remove` runs under the same per-artifact lock as `patchArtifact`, reading
+  the sidecar itself, so a delete racing a conversion's switch to a new file can't bring the
+  sidecar back.
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
   on each sidecar and switching a changed container to its `.mp4`. Run it with the server
   stopped.

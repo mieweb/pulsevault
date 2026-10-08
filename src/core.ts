@@ -848,7 +848,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('Artifact not found'));
         return;
       }
-      await serveResolution(req, res, resolved);
+      // While a video is being converted its URL serves the original bytes, which the conversion
+      // replaces: revalidate instead of the configured (possibly `immutable`) cache, so nobody
+      // keeps the original once the converted file is in place.
+      const meta = completion.converts('video') ? await describe(artifactId) : null;
+      const converting = meta !== null && completion.converts(meta.kind) && !meta.converted;
+      await serveResolution(req, res, resolved, converting);
     } catch (err) {
       failClosed(res, err, 'artifact get');
     }
@@ -856,9 +861,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
 
   /**
    * Stream or redirect to a resolved artifact — the tail of the GET route, shared with the poster
-   * route. An artifact URL names immutable bytes, so it takes the configured `cache`; the poster
-   * URL is a lookup whose answer changes when a newer thumbnail lands, so it is revalidated on
-   * every request (`mustRevalidate`).
+   * route. An artifact URL names immutable bytes once finished, so it takes the configured
+   * `cache`; the poster URL is a lookup whose answer changes when a newer thumbnail lands, and a
+   * video still being converted is about to change, so those are revalidated on every request
+   * (`mustRevalidate`).
    */
   const serveResolution = async (
     req: IncomingMessage,

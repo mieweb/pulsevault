@@ -34,6 +34,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # The web-ready/conform tests skip without ffmpeg. Ubuntu's package (FFmpeg 6.x with
+      # zscale) is also what a Debian/Ubuntu server runs, so its HDR path is the one tested here.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: npm ci
       - run: npm test
 
