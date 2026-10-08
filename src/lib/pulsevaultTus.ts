@@ -1,4 +1,4 @@
-import { type DataStore, Server } from '@tus/server';
+import { type DataStore, ERRORS, Server } from '@tus/server';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isUuid } from './uuid.js';
@@ -263,6 +263,12 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       isLocked,
     ),
     maxSize,
+    // tus refuses an upload over `maxSize` with "Maximum size exceeded"; say it in the words a
+    // host can show the person who picked the file.
+    onResponseError: (_req, err) =>
+      err === ERRORS.ERR_MAX_SIZE_EXCEEDED
+        ? { status_code: 413, body: `That file is larger than ${formatBytes(maxSize)}.\n` }
+        : undefined,
     namingFunction: async (_req, metadata) => {
       const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =
         parseUploadMetadata(metadata);
@@ -538,6 +544,18 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
       return original(data, ...rest);
     };
   }
+}
+
+/** `524288000` → "500 MB", `1610612736` → "1.5 GB" (binary units, as hosts usually set them). */
+function formatBytes(bytes: number): string {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${Math.round(value * 10) / 10} ${units[unit]}`;
 }
 
 /**

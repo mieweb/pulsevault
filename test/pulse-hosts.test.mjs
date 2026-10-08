@@ -18,6 +18,7 @@ import pulseVault, {
   issueCapabilityToken,
   issueViewToken,
   createCapabilityAuthorize,
+  createVideoValidator,
   MAX_CONTEXT_BYTES,
 } from "../dist/app.js";
 import { createHash } from "node:crypto";
@@ -752,6 +753,131 @@ test("webReady: the final PATCH is answered before the conversion; completeAfter
   } finally {
     await ctx.teardown();
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** An MP4 made by ffmpeg from lavfi sources (MP4 needs a seekable output, so via a tmp file). */
+async function encodeMp4(args) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-fixture-"));
+  try {
+    const p = path.join(dir, "fixture.mp4");
+    execFileSync("ffmpeg", ["-v", "error", ...args, "-movflags", "+faststart", "-y", p], { stdio: "ignore" });
+    return await fs.readFile(p);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Poll the status until the conversion has recorded what it did. */
+async function waitForWebReady(ctx, artifactId) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const status = await ctx.core.getStatus(artifactId);
+    if (status.webReady || Date.now() > deadline) return status;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same artifact URL", { skip: !FFMPEG }, async (t) => {
+  let body;
+  try {
+    // Written to a pipe, like a browser's MediaRecorder: no duration in the header.
+    body = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=1",
+      "-f", "lavfi", "-i", "sine=duration=1", "-c:v", "libvpx-vp9", "-b:v", "200k", "-c:a", "libopus",
+      "-f", "webm", "pipe:1",
+    ]);
+  } catch {
+    return t.skip("ffmpeg build lacks libvpx/libopus");
+  }
+  const ctx = await startLocal({ pluginOptions: { webReady: true, validatePayload: createVideoValidator() } });
+  try {
+    assert.equal(await ctx.core.conformAvailable(), true);
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "Screen Recording.webm", kind: "video", body });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.state, "ready");
+    assert.equal(status.webReady.action, "conformed");
+    assert.match(status.webReady.reason, /container \.webm → mp4/);
+
+    const res = await fetch(ctx.url(`/artifacts/${videoId}`));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "video/mp4");
+    const served = Buffer.from(await res.arrayBuffer());
+    assert.equal(served.toString("latin1", 4, 8), "ftyp");
+
+    const videoDir = path.join(ctx.storage.workspaceRoot, "video");
+    assert.ok((await fs.readdir(videoDir)).includes(`${videoId}.mp4`));
+    assert.ok(!(await fs.readdir(videoDir)).includes(`${videoId}.webm`), "the original is removed once switched");
+    assert.equal((await ctx.storage.describeArtifact(videoId)).ext, ".mp4");
+
+    // Removing the artifact removes every file it had, including tus's record of the upload.
+    assert.equal(await ctx.storage.remove(videoId), true);
+    assert.deepEqual((await fs.readdir(videoDir)).filter((f) => f.startsWith(videoId)), []);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: a conversion that times out keeps serving the original and the status says why", { skip: !FFMPEG }, async () => {
+  const body = await encodeMp4([
+    "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=1",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p",
+  ]);
+  const ctx = await startLocal({ pluginOptions: { webReady: { timeoutSeconds: 0.05 } } });
+  try {
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "big.mp4", kind: "video", body });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.state, "ready");
+    assert.equal(status.webReady.action, "skipped");
+    assert.match(status.webReady.reason, /timed out/);
+    const served = Buffer.from(await (await fetch(ctx.url(`/artifacts/${videoId}`))).arrayBuffer());
+    assert.ok(served.equals(body), "the original bytes serve");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("createVideoValidator: a renamed non-video and a too-long video are refused with plain reasons", { skip: !FFMPEG }, async () => {
+  const clip = await encodeMp4([
+    "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+  ]);
+  const ctx = await startLocal({ pluginOptions: { validatePayload: createVideoValidator({ maxDurationSeconds: 1 }) } });
+  try {
+    const refused = async (filename, body) => {
+      const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename, size: body.length, kind: "video" });
+      assert.equal(create.status, 201);
+      const patch = await tusPatch(new URL(create.headers.get("location"), ctx.baseUrl).href, 0, body);
+      return { status: patch.status, text: (await patch.text()).trim() };
+    };
+    assert.deepEqual(await refused("notes.mp4", Buffer.from("%PDF-1.7 definitely not a video")), {
+      status: 422,
+      text: "That file isn't a video.",
+    });
+    assert.deepEqual(await refused("long.mp4", clip), {
+      status: 422,
+      text: "That video is longer than the limit of 1 second.",
+    });
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("an upload over maxUploadSize is refused in plain words, and conformAvailable is false without webReady", async () => {
+  const ctx = await startLocal();
+  try {
+    const create = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: randomUUID(),
+      filename: "huge.mov",
+      size: 11 * 1024 * 1024,
+      kind: "video",
+    });
+    assert.equal(create.status, 413);
+    assert.equal((await create.text()).trim(), "That file is larger than 10 MB.");
+    assert.equal(await ctx.core.conformAvailable(), false);
+  } finally {
+    await ctx.teardown();
   }
 });
 

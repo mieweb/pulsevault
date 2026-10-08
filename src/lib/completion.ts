@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { ensureWebReady, type WebReadyOptions, type WebReadyResult } from './web-ready.js';
 import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
 import type { PulseVaultArtifactMeta, PulseVaultStorage, UploadKind } from '../storage/types.js';
@@ -65,10 +67,10 @@ export type PulseVaultArtifactEvent = {
 export type PulseVaultOnArtifactEvent = (event: PulseVaultArtifactEvent) => void | Promise<void>;
 
 /**
- * Web-ready conversion of every finished video: a lossless faststart remux, or an H.264
- * transcode for a codec browsers can't play (`ensureWebReady`), run after the final `PATCH` is
- * answered so the client never waits on ffmpeg. Local storage only; on an adapter without
- * `getLocalPath` the option is refused at boot.
+ * Web-ready conversion of every finished video to one format (`CONFORM_TARGET`: faststart MP4,
+ * H.264 8-bit SDR at most `maxEdge` on the longest edge, AAC), by `ensureWebReady`, run after
+ * the final `PATCH` is answered so the client never waits on ffmpeg. Local storage only; on an
+ * adapter without `getLocalPath` the option is refused at boot.
  */
 export type PulseVaultWebReadyOptions = WebReadyOptions & {
   /** How many conversions run at once. A transcode is CPU-bound; defaults to 1. */
@@ -149,6 +151,13 @@ export function validateCompletionOptions(
       const { concurrency } = opts.webReady;
       if (concurrency !== undefined && !(Number.isInteger(concurrency) && concurrency >= 1)) {
         throw new TypeError('`webReady.concurrency` must be a positive integer');
+      }
+      const { maxEdge, timeoutSeconds } = opts.webReady;
+      if (maxEdge !== undefined && !(Number.isInteger(maxEdge) && maxEdge >= 2)) {
+        throw new TypeError('`webReady.maxEdge` must be an integer of at least 2 (pixels)');
+      }
+      if (timeoutSeconds !== undefined && !(timeoutSeconds > 0 && Number.isFinite(timeoutSeconds))) {
+        throw new TypeError('`webReady.timeoutSeconds` must be a positive number of seconds');
       }
     }
   }
@@ -247,7 +256,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
   const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
     storage.describeArtifact ? storage.describeArtifact(artifactId) : Promise.resolve(null);
 
-  const record = async (artifactId: string, patch: { acknowledged?: true; converted?: true }) => {
+  const record = async (artifactId: string, patch: { acknowledged: true }) => {
     try {
       await storage.patchArtifact?.(artifactId, patch);
     } catch (err) {
@@ -256,17 +265,53 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     }
   };
 
-  /** Rule 1. Never throws: a failed conversion serves the original bytes and is tried again later. */
+  /**
+   * Record a conversion's result and, when it wrote a new file (`outputPath`: another container
+   * conformed to `.mp4`), switch the artifact to it, then delete the original. Until the record
+   * is written the original serves and the conversion is redone on the next pass (its rename
+   * overwrites the earlier output); a crash after it leaves at most the original behind, which
+   * `remove` deletes with the artifact.
+   */
+  const recordConversion = async (
+    artifactId: string,
+    localPath: string | null,
+    result: WebReadyResult,
+    outputPath: string | undefined,
+  ): Promise<void> => {
+    let recorded: boolean;
+    try {
+      recorded =
+        (await storage.patchArtifact?.(artifactId, {
+          converted: true,
+          webReady: result,
+          ...(outputPath ? { ext: path.extname(outputPath) } : {}),
+        })) ?? false;
+    } catch (err) {
+      logger.error({ err, artifactId }, 'pulsevault could not record a web-ready conversion');
+      return;
+    }
+    if (!localPath) return;
+    if (!recorded) {
+      // The artifact was removed while it converted: don't leave what was written for it.
+      const rewrote = result.action !== 'none' && result.action !== 'skipped';
+      if (outputPath) await fs.rm(outputPath, { force: true });
+      else if (rewrote) await fs.rm(localPath, { force: true });
+      return;
+    }
+    if (outputPath && outputPath !== localPath) await fs.rm(localPath, { force: true });
+  };
+
+  /** Rule 1. Never throws: a failed conversion serves the original bytes, and says why. */
   const convert = (ctx: PulseVaultUploadCompleteContext): Promise<WebReadyResult | undefined> =>
     new Promise((resolve) => {
       void queue.run(async () => {
         try {
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
-          const result: WebReadyResult =
+          const { outputPath, ...result } =
             typeof localPath === 'string'
               ? await ensureWebReady(localPath, { ...webReady, logger })
-              : { action: 'skipped', reason: 'no local path for this artifact' };
-          await record(ctx.artifactId, { converted: true });
+              : { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined };
+          await recordConversion(ctx.artifactId, localPath ?? null, result, outputPath);
           await onArtifactEvent?.({
             phase: 'processed',
             artifactId: ctx.artifactId,

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isUuid } from '../lib/uuid.js';
+import type { WebReadyResult } from '../lib/web-ready.js';
 import type {
   PulseVaultArtifactMeta,
   PulseVaultArtifactPatch,
@@ -24,8 +25,13 @@ import { parseUploadKind } from './types.js';
 type Sidecar = {
   /** Sidecar schema version. Increment for breaking changes. */
   version: 1;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
+  /** Lowercase extension of the stored file, including the leading dot (e.g. `".mp4"`). */
   ext: string;
+  /**
+   * The uploaded file's extension, kept once a web-ready conversion switched `ext` (a `.webm`
+   * conformed to `.mp4`), so `remove` also deletes the original if a crash left it behind.
+   */
+  sourceExt?: string;
   /** Original filename from `Upload-Metadata.filename`. */
   filename: string;
   /**
@@ -56,6 +62,8 @@ type Sidecar = {
   acknowledged?: boolean;
   /** `false` from reserve until the core records that the web-ready conversion finished; absent reads as `true` once finished. */
   converted?: boolean;
+  /** What the web-ready conversion did, once it ran. */
+  webReady?: WebReadyResult;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
   /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
@@ -71,11 +79,14 @@ const PULSEVAULT_META_DIR = '.pulsevault';
  * `readdir` away instead of a scan of every sidecar.
  */
 const RELATED_DIR = 'related';
+/** A stored file's extension: lowercase, one dot, nothing that could leave the kind directory. */
+const STORED_EXT = /^\.[a-z0-9]+$/;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
 const DEFAULT_META_CACHE_LIMIT = 10_000;
 
 type CachedMeta = {
   ext: string;
+  sourceExt?: string;
   ready: boolean;
   kind: UploadKind;
   relatedTo?: string;
@@ -96,6 +107,14 @@ function extToContentType(ext: string): string {
       return 'video/quicktime';
     case '.m4v':
       return 'video/x-m4v';
+    case '.webm':
+      return 'video/webm';
+    case '.mkv':
+      return 'video/x-matroska';
+    case '.3gp':
+      return 'video/3gpp';
+    case '.avi':
+      return 'video/x-msvideo';
     case '.srt':
       return 'application/x-subrip';
     case '.pulse':
@@ -115,12 +134,24 @@ function extToContentType(ext: string): string {
 function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
   return {
     ext: sidecar.ext,
+    ...(sidecar.sourceExt ? { sourceExt: sidecar.sourceExt } : {}),
     ready,
     kind: sidecar.kind ?? 'video',
     relatedTo: sidecar.relatedTo,
     checksum: sidecar.checksum,
     name: sidecar.name,
   };
+}
+
+/** A recorded web-ready result read back from a sidecar. */
+function isWebReadyResult(value: unknown): value is WebReadyResult {
+  const result = value as Partial<WebReadyResult> | null;
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    typeof result.action === 'string' &&
+    typeof result.reason === 'string'
+  );
 }
 
 export type LocalStorageOptions = {
@@ -300,6 +331,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
+        ...(typeof parsed.sourceExt === 'string' && STORED_EXT.test(parsed.sourceExt)
+          ? { sourceExt: parsed.sourceExt }
+          : {}),
         filename: parsed.filename,
         status,
         kind,
@@ -312,6 +346,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         // uploading means its completion hasn't happened yet.
         acknowledged: parsed.acknowledged ?? status === 'ready',
         converted: parsed.converted ?? status === 'ready',
+        ...(isWebReadyResult(parsed.webReady) ? { webReady: parsed.webReady } : {}),
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
@@ -369,6 +404,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     ready: sidecar.status === 'ready',
     acknowledged: sidecar.acknowledged !== false,
     converted: sidecar.converted !== false,
+    ...(sidecar.webReady ? { webReady: sidecar.webReady } : {}),
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
     ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
@@ -461,7 +497,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return artifactRelPath(artifactId, kind, ext);
   };
 
-  const resolve = async (artifactId: string): Promise<PulseVaultResolution | null> => {
+  const resolve = async (artifactId: string, reread = false): Promise<PulseVaultResolution | null> => {
     const meta = await loadMeta(artifactId);
     // Only serve ready uploads. In-progress uploads stay hidden — a client
     // GETting mid-upload would otherwise receive a truncated file.
@@ -471,8 +507,12 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       const stat = await fs.stat(path.join(workspaceRoot, relFile));
       if (!stat.isFile()) return null;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-      throw err;
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+      // Another instance on the same disk may have switched the artifact to a new file (a
+      // conversion changed its extension) since this one cached it: read the sidecar once more.
+      if (reread) return null;
+      metaCache.delete(artifactId);
+      return resolve(artifactId, true);
     }
     return {
       kind: 'stream',
@@ -508,9 +548,17 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     metaCache.delete(artifactId);
     if (!meta) return false;
     const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+    // The uploaded file and tus's record of it, when a conversion stored the bytes under a new
+    // extension (normally already gone; left behind by a crash during the switch).
+    const sourcePath = meta.sourceExt
+      ? path.join(workspaceRoot, meta.kind, `${artifactId}${meta.sourceExt}`)
+      : null;
     await Promise.all([
       fs.rm(artifactPath, { force: true }),
       fs.rm(`${artifactPath}.json`, { force: true }),
+      ...(sourcePath
+        ? [fs.rm(sourcePath, { force: true }), fs.rm(`${sourcePath}.json`, { force: true })]
+        : []),
       fs.rm(sidecarPath(artifactId), { force: true }),
       ...(meta.relatedTo
         ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
@@ -554,11 +602,19 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const patchArtifact = (artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean> =>
     withSidecarLock(artifactId, async () => {
+      if (patch.ext !== undefined && !STORED_EXT.test(patch.ext)) {
+        throw new TypeError(`patchArtifact: invalid ext ${JSON.stringify(patch.ext)}`);
+      }
       const sidecar = await readSidecar(artifactId);
       if (!sidecar) return false;
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.converted !== undefined) next.converted = patch.converted;
+      if (patch.webReady !== undefined) next.webReady = patch.webReady;
+      if (patch.ext !== undefined && patch.ext !== sidecar.ext) {
+        next.sourceExt = sidecar.sourceExt ?? sidecar.ext;
+        next.ext = patch.ext;
+      }
       if (patch.outcome !== undefined) {
         if (patch.outcome === null) delete next.outcome;
         else next.outcome = patch.outcome;
@@ -647,7 +703,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     workspaceRoot,
     initialize,
     reserveUpload,
-    resolve,
+    resolve: (artifactId: string) => resolve(artifactId),
     markReady,
     remove,
     getLocalPath,

@@ -151,3 +151,124 @@ test("ensureWebReady: transcode:false leaves hostile codecs alone after the remu
   assert.equal(result.action, "none");
   assert.match(result.reason, /transcode disabled/);
 });
+
+// ---------- conform to CONFORM_TARGET (#84) ----------
+
+/** Generate a fixture with ffmpeg (lavfi sources); `null` when this ffmpeg build can't. */
+async function fixture(name, args, { pipe = false } = {}) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "conform-"));
+  const p = path.join(dir, name);
+  try {
+    if (pipe) {
+      // Written to a pipe, a WebM has no duration in its header — like a browser's MediaRecorder.
+      await fs.writeFile(p, execFileSync("ffmpeg", ["-v", "error", ...args, "pipe:1"], { maxBuffer: 64 * 1024 * 1024 }));
+    } else {
+      execFileSync("ffmpeg", ["-v", "error", ...args, "-y", p], { stdio: "ignore" });
+    }
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+const VIDEO = (size, duration = 1) => ["-f", "lavfi", "-i", `testsrc2=size=${size}:rate=30:duration=${duration}`];
+const TONE = (duration = 1) => ["-f", "lavfi", "-i", `sine=frequency=440:duration=${duration}`];
+
+/** The first video and audio streams of a file, as ffprobe reports them. */
+function probe(p) {
+  const out = JSON.parse(execFileSync("ffprobe", [
+    "-v", "error", "-show_entries",
+    "stream=codec_type,codec_name,pix_fmt,width,height,color_transfer:stream_side_data=rotation",
+    "-of", "json", p,
+  ]).toString());
+  const video = out.streams.find((s) => s.codec_type === "video");
+  const audio = out.streams.find((s) => s.codec_type === "audio");
+  return { video, audio, rotation: video?.side_data_list?.find((d) => d.rotation !== undefined)?.rotation ?? 0 };
+}
+
+test("conform: a Pulse-like portrait 1080×1920 H.264/AAC faststart MP4 is left byte-for-byte", { skip: !FFMPEG }, async () => {
+  const p = await fixture("pulse.mp4", [...VIDEO("1080x1920"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]);
+  const before = await fs.readFile(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "none");
+  assert.equal(result.outputPath, undefined);
+  assert.deepEqual(await fs.readFile(p), before);
+});
+
+test("conform: a browser-recorded WebM (VP9/Opus, no duration) becomes a new MP4 beside it", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("rec.webm", [...VIDEO("640x360", 2), ...TONE(2), "-c:v", "libvpx-vp9", "-b:v", "300k", "-c:a", "libopus", "-f", "webm"], { pipe: true });
+  if (!p) return t.skip("ffmpeg build lacks libvpx/libopus");
+  const before = await fs.readFile(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.equal(result.outputPath, p.replace(/\.webm$/, ".mp4"));
+  assert.deepEqual(await fs.readFile(p), before, "the original is left for the caller to remove");
+  const { video, audio } = probe(result.outputPath);
+  assert.equal(video.codec_name, "h264");
+  assert.equal(video.pix_fmt, "yuv420p");
+  assert.equal(audio.codec_name, "aac");
+  assert.equal(await scanMoovPosition(result.outputPath), "front");
+});
+
+test("conform: an MKV with H.264/AAC is remuxed into an MP4 without re-encoding", { skip: !FFMPEG }, async () => {
+  const p = await fixture("clip.mkv", [...VIDEO("320x240"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /container \.mkv → mp4/);
+  assert.doesNotMatch(result.reason, /→ h264/);
+  assert.equal(probe(result.outputPath).video.codec_name, "h264");
+});
+
+test("conform: landscape 4K is scaled to 1920×1080 and stays landscape", { skip: !FFMPEG }, async () => {
+  const p = await fixture("land4k.mp4", [...VIDEO("3840x2160"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  const { video, audio } = probe(p);
+  assert.deepEqual([video.width, video.height], [1920, 1080]);
+  assert.equal(audio, undefined, "no audio stays silent");
+});
+
+test("conform: a rotation tag is applied, so the file plays upright without it", { skip: !FFMPEG }, async () => {
+  const flat = await fixture("flat.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  const p = path.join(path.dirname(flat), "rot.mp4");
+  execFileSync("ffmpeg", ["-v", "error", "-display_rotation", "90", "-i", flat, "-c", "copy", "-movflags", "+faststart", "-y", p]);
+  assert.equal(Math.abs(probe(p).rotation), 90, "fixture must carry a rotation tag");
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  const { video, rotation } = probe(p);
+  assert.deepEqual([video.width, video.height], [360, 640], "portrait, as it was held");
+  assert.equal(rotation, 0);
+});
+
+test("conform: 10-bit HLG HEVC is tone-mapped to 8-bit BT.709 H.264", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("hlg.mov", [...VIDEO("640x360"), ...TONE(),
+    "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p10le",
+    // x265 writes the colour tags into the stream only from its own params.
+    "-x265-params", "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error", "-c:a", "aac"]);
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /HDR \(arib-std-b67\)/);
+  const { video } = probe(result.outputPath);
+  assert.equal(video.codec_name, "h264");
+  assert.equal(video.pix_fmt, "yuv420p");
+  assert.equal(video.color_transfer, "bt709");
+});
+
+test("conform: non-AAC audio in an MP4-family file is converted to AAC", { skip: !FFMPEG }, async () => {
+  const p = await fixture("pcm.mov", [...VIDEO("320x240"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le"]);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /audio pcm_s16le → aac/);
+  assert.equal(probe(result.outputPath).audio.codec_name, "aac");
+});
+
+test("conform: a run past timeoutSeconds is killed, the original kept and the reason given", { skip: !FFMPEG }, async () => {
+  const p = await fixture("slow.mp4", [...VIDEO("3840x2160", 3), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const before = await fs.readFile(p);
+  const result = await ensureWebReady(p, { timeoutSeconds: 0.05 });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /timed out/);
+  assert.deepEqual(await fs.readFile(p), before);
+  assert.deepEqual((await fs.readdir(path.dirname(p))).filter((f) => f.startsWith(".webready-")), [], "no tmp file left");
+});

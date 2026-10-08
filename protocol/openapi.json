@@ -3,7 +3,7 @@
   "info": {
     "title": "Pulse upload protocol",
     "description": "The HTTP surface of the Pulse upload protocol, as implemented by @mieweb/pulsevault. Generated from the plugin's route schemas — see PROTOCOL.md for the full contract.",
-    "version": "2.3"
+    "version": "2.4"
   },
   "components": {
     "schemas": {}
@@ -1078,12 +1078,12 @@
         ],
         "responses": {
           "200": {
-            "description": "Where an upload is (PROTOCOL.md §6.5, protocol 2.3): for a page waiting on it, so the host needs no table of its own. Authorized like opening the artifact. Never cached.",
+            "description": "Where an upload is (PROTOCOL.md §6.5, protocol 2.3; `webReady` 2.4): for a page waiting on it, so the host needs no table of its own. Authorized like opening the artifact. Never cached.",
             "content": {
               "application/json": {
                 "schema": {
                   "title": "GET /artifacts/<id>/status response",
-                  "description": "Where an upload is (PROTOCOL.md §6.5, protocol 2.3): for a page waiting on it, so the host needs no table of its own. Authorized like opening the artifact. Never cached.",
+                  "description": "Where an upload is (PROTOCOL.md §6.5, protocol 2.3; `webReady` 2.4): for a page waiting on it, so the host needs no table of its own. Authorized like opening the artifact. Never cached.",
                   "type": "object",
                   "required": [
                     "artifactId",
@@ -1135,6 +1135,29 @@
                     "acknowledged": {
                       "type": "boolean",
                       "description": "Whether the host has finished handling the completed upload (its `onUploadComplete` returned)."
+                    },
+                    "webReady": {
+                      "type": "object",
+                      "required": [
+                        "action",
+                        "reason"
+                      ],
+                      "description": "What the server's web-ready conversion did, once it ran (protocol 2.4): `none` (already in the served format), `remuxed`, `transcoded`, `conformed` (another container became an MP4), or `skipped` (the original bytes serve) — with a reason a person can read. Absent until it has run, and on servers that don't convert.",
+                      "properties": {
+                        "action": {
+                          "type": "string",
+                          "enum": [
+                            "none",
+                            "remuxed",
+                            "transcoded",
+                            "conformed",
+                            "skipped"
+                          ]
+                        },
+                        "reason": {
+                          "type": "string"
+                        }
+                      }
                     },
                     "outcome": {
                       "description": "What the host recorded about where the upload went, or why it didn't. Any JSON; absent until the host records one."

@@ -8,34 +8,64 @@ import type { PulseVaultLogger } from './request.js';
 const execFileAsync = promisify(execFile);
 
 /**
- * Web-playability backstop for uploaded MP4 artifacts.
+ * Conform uploaded videos to one web-playable format: the one the Pulse app records.
  *
- * Browsers streaming an MP4 over progressive HTTP need two things the mobile
- * capture pipelines frequently don't provide:
+ * A video reaches PulseVault from the Pulse app (already in the target format) or from a host's
+ * own file picker: a screen recording, an iPhone HEVC `.mov` (often 10-bit HDR), a WebM from a
+ * browser recorder, a 4K clip. Browsers streaming over progressive HTTP need the `moov` atom at
+ * the front, a codec they all decode, and 8-bit SDR colour; a phone needs a sane size.
  *
- * 1. The `moov` atom at the FRONT of the file ("faststart"). iOS/Android
- *    recorders finalize the moov at the end, so a `<video>` tag must fetch the
- *    file's tail before it can render frame one — a multi-second stall behind
- *    Range requests, or a full download in naive players.
- * 2. A codec browsers actually decode. iPhones record HEVC by default, which
- *    Firefox never plays and Chrome usually can't without hardware support.
- *
- * `ensureWebReady` fixes both in place: a lossless sub-second remux
- * (`-c copy -movflags +faststart`) when only the moov position is wrong, and a
- * one-time H.264 transcode when the codec is hostile. Fail-open by design —
- * if `ffmpeg`/`ffprobe` are not installed, or the file isn't MP4-family, the
- * artifact is left byte-for-byte as uploaded and serving continues exactly as
- * before.
+ * `ensureWebReady` does the least work that gets a file there: nothing when it already
+ * conforms (a Pulse upload keeps its bytes), a lossless remux when only the container or the
+ * `moov` position is off, and otherwise one ffmpeg run that re-encodes only the streams that
+ * are off-target. Fail-open by design: without `ffmpeg`/`ffprobe`, or when a run fails or
+ * times out, the original bytes keep serving and the result says why.
  */
 
-/** Codecs every mainstream browser decodes without hardware caveats. */
-const WEB_SAFE_VIDEO_CODECS = new Set(['h264']);
+/**
+ * The format every video is served in. "Already conforms" checks exactly these properties —
+ * never the orientation: a landscape video stays landscape and a portrait one portrait, with no
+ * crop, pad or stretch.
+ */
+export const CONFORM_TARGET = {
+  /** MP4 with the `moov` atom at the front (faststart). */
+  container: 'mp4',
+  extension: '.mp4',
+  /** H.264, 8-bit 4:2:0, even width and height, SDR (BT.709), no rotation tag. */
+  videoCodec: 'h264',
+  pixelFormat: 'yuv420p',
+  /** Default cap on the longest edge, in pixels (`webReady.maxEdge`). */
+  maxEdge: 1920,
+  /** AAC; a video without audio stays silent. */
+  audioCodec: 'aac',
+} as const;
 
-export type WebReadyAction = 'none' | 'remuxed' | 'transcoded' | 'skipped';
+/** The containers the conform step turns into the target: the default video `allowedExtensions`. */
+export const CONFORM_VIDEO_EXTENSIONS: readonly string[] = [
+  '.mp4',
+  '.mov',
+  '.m4v',
+  '.webm',
+  '.mkv',
+  '.3gp',
+  '.avi',
+];
+
+/** Transfer functions of HDR video (PQ and HLG): tone-mapped to SDR on the way in. */
+const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
+
+/**
+ * - `none`: already in the target format; the bytes are untouched.
+ * - `remuxed`: only the `moov` position was off; rewritten losslessly, same file.
+ * - `transcoded`: an MP4 whose video or audio was re-encoded, same file.
+ * - `conformed`: a different container (WebM, MKV, MOV, …) rewritten as a new `.mp4`.
+ * - `skipped`: nothing was done (no ffmpeg, a failed or timed-out run); the original serves.
+ */
+export type WebReadyAction = 'none' | 'remuxed' | 'transcoded' | 'conformed' | 'skipped';
 
 export type WebReadyResult = {
   action: WebReadyAction;
-  /** Human-readable explanation (what was detected, or why nothing was done). */
+  /** Human-readable explanation (what was detected and done, or why nothing was done). */
   reason: string;
 };
 
@@ -45,15 +75,22 @@ export type WebReadyOptions = {
   /** Path to the ffprobe binary. Default `"ffprobe"` (resolved via PATH). */
   ffprobePath?: string;
   /**
-   * Whether a non-web-safe codec triggers a full H.264 transcode. Default
-   * `true`. Set `false` to only ever do the lossless faststart remux —
-   * useful when transcode cost on the serving host is a concern.
+   * Whether an off-target stream is re-encoded. Default `true`. Set `false` to only ever do the
+   * lossless faststart remux of an MP4 — useful when transcode cost on the serving host is a
+   * concern.
    */
   transcode?: boolean;
+  /** Longest edge of the served video, in pixels; larger videos are scaled down. Default `1920`. */
+  maxEdge?: number;
   /** x264 CRF for the transcode path (lower = better/larger). Default `23`. */
   crf?: number;
   /** x264 preset for the transcode path. Default `"veryfast"`. */
   preset?: string;
+  /**
+   * Wall-clock limit for one ffmpeg run, in seconds; the run is killed and the original kept.
+   * Default `60 + 10 × the video's duration`, or an hour when the duration is unknown.
+   */
+  timeoutSeconds?: number;
   /** Optional logger; `error` fires when ffmpeg/ffprobe are missing or a rewrite fails. */
   logger?: PulseVaultLogger;
 };
@@ -68,7 +105,7 @@ export type MoovPosition = 'front' | 'end' | 'unknown';
  * costs microseconds regardless of file size.
  *
  * Returns `"unknown"` for non-MP4 bytes, truncated headers, or files missing
- * either box — callers should treat that as "leave the file alone".
+ * either box.
  */
 export async function scanMoovPosition(filePath: string): Promise<MoovPosition> {
   let fd: fs.FileHandle;
@@ -89,7 +126,7 @@ export async function scanMoovPosition(filePath: string): Promise<MoovPosition> 
       let boxSize = header.readUInt32BE(0);
       const boxType = header.toString('latin1', 4, 8);
       if (first) {
-        // Anything that doesn't open with ftyp isn't MP4-family — don't touch it.
+        // Anything that doesn't open with ftyp isn't MP4-family.
         if (boxType !== 'ftyp') return 'unknown';
         first = false;
       }
@@ -116,28 +153,130 @@ export async function scanMoovPosition(filePath: string): Promise<MoovPosition> 
   }
 }
 
-/** ffprobe the first video stream's codec name; `null` when unprobeable. */
-async function probeVideoCodec(filePath: string, ffprobePath: string): Promise<string | null> {
+/** What ffprobe says about a video: the streams the conform step maps, and its length. */
+export type VideoProbe = {
+  video: {
+    index: number;
+    codec: string;
+    pixelFormat: string;
+    width: number;
+    height: number;
+    /** The colour transfer (`bt709`, `arib-std-b67`, …), when tagged. */
+    transfer?: string;
+    /** Display rotation in degrees from the stream's matrix (`0`, `90`, `-90`, `180`). */
+    rotation: number;
+  };
+  /** The first audio stream, or `null` for a silent video. */
+  audio: { index: number; codec: string } | null;
+  /** Seconds, or `null` when neither the header nor the packets say. */
+  durationSeconds: number | null;
+};
+
+type ProbeStream = {
+  index?: number;
+  codec_type?: string;
+  codec_name?: string;
+  pix_fmt?: string;
+  width?: number;
+  height?: number;
+  color_transfer?: string;
+  disposition?: { attached_pic?: number };
+  side_data_list?: Array<{ rotation?: number | string }>;
+  tags?: { rotate?: string };
+};
+
+/** Degrees to the nearest quarter turn in (-180, 180]: 270 → -90, -180 → 180, 360 → 0. */
+const quarterTurn = (degrees: number): number =>
+  [0, 90, 180, -90][(((Math.round(degrees / 90) % 4) + 4) % 4)] ?? 0;
+
+const positive = (value: unknown): number | null => {
+  const n = typeof value === 'number' ? value : Number.parseFloat(String(value));
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+/**
+ * The end of the last video packet, for a file whose header carries no duration (a WebM from
+ * a browser's MediaRecorder is written without one). Demuxes the file without decoding it.
+ */
+async function packetDuration(filePath: string, ffprobePath: string, index: number): Promise<number | null> {
   try {
-    const { stdout } = await execFileAsync(ffprobePath, [
-      '-v', 'error',
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=codec_name',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      filePath,
-    ]);
-    const codec = stdout.trim();
-    return codec.length > 0 ? codec : null;
+    const { stdout } = await execFileAsync(
+      ffprobePath,
+      [
+        '-v', 'error',
+        '-select_streams', String(index),
+        '-show_entries', 'packet=pts_time,duration_time',
+        '-of', 'csv=p=0',
+        filePath,
+      ],
+      { maxBuffer: 256 * 1024 * 1024 },
+    );
+    let end = 0;
+    for (const line of stdout.split('\n')) {
+      const [pts, duration] = line.split(',');
+      const start = positive(pts) ?? 0;
+      end = Math.max(end, start + (positive(duration) ?? 0));
+    }
+    return end > 0 ? end : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * ffprobe a file: its first real video stream (not cover art), its first audio stream and its
+ * duration. `null` when ffprobe can't read it or it has no video stream — it isn't a video.
+ */
+export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Promise<VideoProbe | null> {
+  let parsed: { streams?: ProbeStream[]; format?: { duration?: string } };
+  try {
+    const { stdout } = await execFileAsync(
+      ffprobePath,
+      [
+        '-v', 'error',
+        '-show_entries',
+        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer' +
+          ':stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate' +
+          ':format=duration',
+        '-of', 'json',
+        filePath,
+      ],
+      { maxBuffer: 16 * 1024 * 1024 },
+    );
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  const streams = parsed.streams ?? [];
+  const video = streams.find(
+    (s) => s.codec_type === 'video' && !s.disposition?.attached_pic && s.width && s.height,
+  );
+  if (!video || typeof video.index !== 'number') return null;
+  const audio = streams.find((s) => s.codec_type === 'audio');
+  const sideRotation = video.side_data_list?.find((d) => d.rotation !== undefined)?.rotation;
+  const rotation = Number(sideRotation ?? video.tags?.rotate ?? 0) || 0;
+  const durationSeconds =
+    positive(parsed.format?.duration) ?? (await packetDuration(filePath, ffprobePath, video.index));
+  return {
+    video: {
+      index: video.index,
+      codec: video.codec_name ?? '',
+      pixelFormat: video.pix_fmt ?? '',
+      width: video.width ?? 0,
+      height: video.height ?? 0,
+      ...(video.color_transfer ? { transfer: video.color_transfer } : {}),
+      rotation: quarterTurn(rotation),
+    },
+    audio: audio && typeof audio.index === 'number' ? { index: audio.index, codec: audio.codec_name ?? '' } : null,
+    durationSeconds,
+  };
 }
 
 // One availability probe per (binary path) per process — a missing ffmpeg
 // should cost one spawn and one warning, not one of each per upload.
 const binaryAvailable = new Map<string, Promise<boolean>>();
 const warnedMissing = new Set<string>();
-function isBinaryAvailable(binPath: string): Promise<boolean> {
+export function isBinaryAvailable(binPath: string): Promise<boolean> {
   let cached = binaryAvailable.get(binPath);
   if (!cached) {
     cached = execFileAsync(binPath, ['-version']).then(
@@ -149,45 +288,144 @@ function isBinaryAvailable(binPath: string): Promise<boolean> {
   return cached;
 }
 
-/** Run ffmpeg writing to a sibling tmp file, then atomically replace the original. */
-async function rewriteInPlace(filePath: string, ffmpegPath: string, args: string[]): Promise<void> {
-  const dir = path.dirname(filePath);
+/** Whether this host can conform videos: both `ffmpeg` and `ffprobe` run. */
+export async function webReadyAvailable(
+  options: Pick<WebReadyOptions, 'ffmpegPath' | 'ffprobePath'> = {},
+): Promise<boolean> {
+  const [ffmpeg, ffprobe] = await Promise.all([
+    isBinaryAvailable(options.ffmpegPath ?? 'ffmpeg'),
+    isBinaryAvailable(options.ffprobePath ?? 'ffprobe'),
+  ]);
+  return ffmpeg && ffprobe;
+}
+
+/**
+ * How this ffmpeg can tone-map HDR to SDR: FFmpeg 8+'s `scale` converts transfer and primaries
+ * itself; older builds need the `zscale` filter (libzimg, in the Debian/Ubuntu packages); a
+ * build with neither converts the pixels without tone mapping.
+ */
+type ToneMapper = 'scale' | 'zscale' | null;
+const toneMappers = new Map<string, Promise<ToneMapper>>();
+function toneMapperOf(ffmpegPath: string): Promise<ToneMapper> {
+  let cached = toneMappers.get(ffmpegPath);
+  if (!cached) {
+    cached = (async (): Promise<ToneMapper> => {
+      try {
+        const { stdout: scaleHelp } = await execFileAsync(ffmpegPath, ['-hide_banner', '-h', 'filter=scale']);
+        if (scaleHelp.includes('out_transfer')) return 'scale';
+        const { stdout: filters } = await execFileAsync(ffmpegPath, ['-hide_banner', '-filters']);
+        return /\szscale\s/.test(filters) ? 'zscale' : null;
+      } catch {
+        return null;
+      }
+    })();
+    toneMappers.set(ffmpegPath, cached);
+  }
+  return cached;
+}
+
+/** The nearest even number, at least 2. */
+const even = (n: number): number => Math.max(2, 2 * Math.round(n / 2));
+
+/** The displayed size (after rotation) scaled so the longest edge is at most `maxEdge`. */
+function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
+  const sideways = Math.abs(video.rotation) === 90;
+  const width = sideways ? video.height : video.width;
+  const height = sideways ? video.width : video.height;
+  const scale = Math.min(1, maxEdge / Math.max(width, height));
+  return { width: even(width * scale), height: even(height * scale) };
+}
+
+/** The `-vf` chain for a re-encode: tone map (HDR), scale to the target size, 8-bit 4:2:0. */
+function videoFilter(
+  size: { width: number; height: number },
+  hdr: boolean,
+  toneMapper: ToneMapper,
+): string {
+  const { width, height } = size;
+  if (hdr && toneMapper === 'scale') {
+    return (
+      `scale=w=${width}:h=${height}:out_transfer=bt709:out_primaries=bt709` +
+      ':out_color_matrix=bt709:out_range=tv:intent=perceptual,format=yuv420p'
+    );
+  }
+  if (hdr && toneMapper === 'zscale') {
+    return (
+      'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,' +
+      `zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=${width}:${height}`
+    );
+  }
+  return `scale=${width}:${height},format=yuv420p`;
+}
+
+class TimeoutError extends Error {}
+
+/**
+ * Run ffmpeg into a sibling tmp file, then rename it onto `outputPath` (the input itself, or a
+ * new `.mp4` beside it). The rename is atomic, so a crash never leaves a half-written artifact.
+ */
+async function rewrite(
+  inputPath: string,
+  outputPath: string,
+  ffmpegPath: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<void> {
   // randomUUID in the name: every video artifact shares one kind directory, so
   // a pid+timestamp tmp name collides when two uploads finish in the same
   // millisecond — both ffmpegs would interleave writes into one file and the
   // winner's rename would install garbage bytes over a real artifact.
-  const tmp = path.join(dir, `.webready-${randomUUID()}${path.extname(filePath) || '.mp4'}`);
+  const tmp = path.join(path.dirname(inputPath), `.webready-${randomUUID()}${CONFORM_TARGET.extension}`);
   try {
-    await execFileAsync(ffmpegPath, ['-y', '-i', filePath, ...args, tmp], {
-      // A transcode of a long upload legitimately takes minutes; cap the
-      // buffered stderr instead of the wall clock.
-      maxBuffer: 16 * 1024 * 1024,
-    });
+    try {
+      await execFileAsync(ffmpegPath, ['-y', '-v', 'error', '-i', inputPath, ...args, tmp], {
+        // Cap the buffered stderr; the wall clock is capped by the timeout.
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+      });
+    } catch (err) {
+      if ((err as { killed?: boolean }).killed) {
+        throw new TimeoutError(`timed out after ${Math.round(timeoutMs / 100) / 10} s`);
+      }
+      throw err;
+    }
     // ffmpeg exiting 0 with an empty/absent output would still be a corrupt
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
     if (stat.size === 0) throw new Error('ffmpeg produced an empty output');
-    await fs.rename(tmp, filePath);
+    await fs.rename(tmp, outputPath);
   } catch (err) {
     await fs.rm(tmp, { force: true });
     throw err;
   }
 }
 
+/** The first line of an ffmpeg failure, for a reason a person can read. */
+function failureOf(err: unknown): string {
+  if (err instanceof TimeoutError) return err.message;
+  const stderr = (err as { stderr?: string }).stderr?.trim().split('\n').pop();
+  return stderr || (err as Error).message || String(err);
+}
+
 /**
- * Make the MP4 at `filePath` web-playable, in place:
+ * Bring the video at `filePath` to `CONFORM_TARGET`:
  *
- * - moov at the end + web-safe codec → lossless `-c copy -movflags +faststart`
- *   remux (sub-second, no quality change);
- * - non-web-safe codec (HEVC etc.) → one-time `libx264` transcode (audio
- *   stream-copied) with faststart;
- * - already faststart H.264, non-MP4 bytes, unprobeable files, or missing
- *   ffmpeg/ffprobe → untouched (`skipped`/`none`).
+ * - already conforming → `none`, bytes untouched;
+ * - an MP4 with conforming streams but the `moov` at the end → lossless faststart remux in
+ *   place (`remuxed`);
+ * - any other container with conforming streams → lossless remux into a new `.mp4` beside it
+ *   (`conformed`);
+ * - otherwise one ffmpeg run: the video re-encoded to H.264 when its codec, pixel format, bit
+ *   depth, size, rotation or dynamic range is off (scaled by the longest edge, rotation
+ *   applied, HDR tone-mapped), the audio re-encoded to AAC unless it already is — in place for
+ *   an MP4 (`transcoded`), into a new `.mp4` otherwise (`conformed`);
+ * - no ffmpeg/ffprobe, a file ffprobe can't read, a failed or timed-out run → `skipped` with
+ *   the reason; the original is untouched.
  *
- * The rewrite is atomic (tmp file + rename in the same directory), so a crash
- * mid-way never corrupts the served artifact. Never throws for pipeline
- * reasons — a failed ffmpeg run resolves to `skipped` with the reason, and the
- * original bytes keep serving.
+ * When the result carries `outputPath`, the conformed file was written there (`<name>.mp4`)
+ * and the original is left in place: the caller switches the artifact over, then removes it.
+ * Never throws for pipeline reasons.
  *
  * NOTE: a rewrite changes the artifact's bytes, so any upload-time checksum
  * recorded for it (e.g. the local adapter's sidecar `checksum` from
@@ -198,63 +436,109 @@ async function rewriteInPlace(filePath: string, ffmpegPath: string, args: string
 export async function ensureWebReady(
   filePath: string,
   options: WebReadyOptions = {},
-): Promise<WebReadyResult> {
+): Promise<WebReadyResult & { outputPath?: string }> {
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
   const transcode = options.transcode ?? true;
+  const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
   const crf = options.crf ?? 23;
   const preset = options.preset ?? 'veryfast';
 
-  const moov = await scanMoovPosition(filePath);
-  if (moov === 'unknown') {
-    return { action: 'skipped', reason: 'not an MP4-family file (or no moov/mdat found)' };
-  }
-
-  if (!(await isBinaryAvailable(ffprobePath)) || !(await isBinaryAvailable(ffmpegPath))) {
+  if (!(await webReadyAvailable({ ffmpegPath, ffprobePath }))) {
     const key = `${ffmpegPath}|${ffprobePath}`;
     if (!warnedMissing.has(key)) {
       warnedMissing.add(key);
       options.logger?.error(
         { filePath },
         'pulsevault web-ready: ffmpeg/ffprobe not found — uploads are served as-is. ' +
-          'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to enable faststart remux and H.264 transcode.',
+          'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to conform videos for the web.',
       );
     }
     return { action: 'skipped', reason: 'ffmpeg/ffprobe not available' };
   }
 
-  const codec = await probeVideoCodec(filePath, ffprobePath);
-  const codecHostile = codec !== null && !WEB_SAFE_VIDEO_CODECS.has(codec);
+  const probe = await probeVideo(filePath, ffprobePath);
+  if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
+  const { video, audio } = probe;
+  const moov = await scanMoovPosition(filePath);
+  const isMp4 = path.extname(filePath).toLowerCase() === CONFORM_TARGET.extension && moov !== 'unknown';
 
-  if (codecHostile && transcode) {
-    try {
-      await rewriteInPlace(filePath, ffmpegPath, [
-        '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'copy',
-        '-movflags', '+faststart',
-      ]);
-      return { action: 'transcoded', reason: `video codec ${codec} → h264 (+faststart)` };
-    } catch (err) {
-      options.logger?.error({ err, filePath }, 'pulsevault web-ready: transcode failed; serving original bytes');
-      return { action: 'skipped', reason: `transcode failed: ${(err as Error).message}` };
-    }
+  // What's off-target, stream by stream.
+  const hdr = video.transfer !== undefined && HDR_TRANSFERS.has(video.transfer);
+  const size = targetSize(video, maxEdge);
+  const videoOff: string[] = [];
+  if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
+  if (video.pixelFormat !== CONFORM_TARGET.pixelFormat) videoOff.push(`pixel format ${video.pixelFormat}`);
+  if (hdr) videoOff.push(`HDR (${video.transfer})`);
+  if (video.rotation !== 0) videoOff.push(`rotation ${video.rotation}°`);
+  if (video.rotation === 0 && (size.width !== video.width || size.height !== video.height)) {
+    videoOff.push(`size ${video.width}×${video.height}`);
+  }
+  const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
+
+  if (videoOff.length === 0 && !audioOff && isMp4 && moov === 'front') {
+    return { action: 'none', reason: 'already web-ready' };
   }
 
-  if (moov === 'end') {
-    try {
-      await rewriteInPlace(filePath, ffmpegPath, ['-c', 'copy', '-movflags', '+faststart']);
-      return { action: 'remuxed', reason: 'moov was at end of file; remuxed to faststart' };
-    } catch (err) {
-      options.logger?.error({ err, filePath }, 'pulsevault web-ready: faststart remux failed; serving original bytes');
-      return { action: 'skipped', reason: `remux failed: ${(err as Error).message}` };
+  if ((videoOff.length > 0 || audioOff) && !transcode) {
+    const off = [...videoOff, ...(audioOff ? [`audio ${audio?.codec}`] : [])].join(', ');
+    if (isMp4 && moov === 'end') {
+      try {
+        await rewrite(filePath, filePath, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], timeoutOf(options, probe));
+        return { action: 'remuxed', reason: `moov was at end of file; remuxed to faststart (${off} left as-is: transcode disabled)` };
+      } catch (err) {
+        options.logger?.error({ err, filePath }, 'pulsevault web-ready: faststart remux failed; serving original bytes');
+        return { action: 'skipped', reason: `remux failed: ${failureOf(err)}` };
+      }
     }
+    return { action: 'none', reason: `${off} left as-is (transcode disabled)` };
   }
 
-  return {
-    action: 'none',
-    reason: codecHostile
-      ? `already faststart; codec ${codec} left as-is (transcode disabled)`
-      : 'already web-ready',
-  };
+  const args = ['-map', `0:${video.index}`, ...(audio ? ['-map', `0:${audio.index}`] : []), '-sn', '-dn'];
+  const done: string[] = [];
+  if (videoOff.length > 0) {
+    const toneMapper = hdr ? await toneMapperOf(ffmpegPath) : null;
+    args.push(
+      '-vf', videoFilter(size, hdr, toneMapper),
+      '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
+    );
+    // An 8-bit SDR output must not keep the source's HDR colour tags.
+    if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
+    const toneMapped = !hdr ? '' : toneMapper ? ', tone-mapped' : ', not tone-mapped (this ffmpeg can\'t)';
+    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}`);
+  } else {
+    args.push('-c:v', 'copy');
+  }
+  if (audioOff) {
+    args.push('-c:a', 'aac', '-b:a', '160k');
+    done.push(`audio ${audio?.codec} → aac`);
+  } else if (audio) {
+    args.push('-c:a', 'copy');
+  }
+  args.push('-movflags', '+faststart');
+
+  const outputPath = isMp4
+    ? filePath
+    : path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}${CONFORM_TARGET.extension}`);
+  const action: WebReadyAction = !isMp4 ? 'conformed' : done.length > 0 ? 'transcoded' : 'remuxed';
+  if (!isMp4) {
+    const ext = path.extname(filePath).toLowerCase();
+    done.unshift(`container ${ext && ext !== CONFORM_TARGET.extension ? ext : 'not MP4'} → mp4`);
+  }
+  if (isMp4 && moov === 'end') done.push('moov moved to the front');
+  try {
+    await rewrite(filePath, outputPath, ffmpegPath, args, timeoutOf(options, probe));
+  } catch (err) {
+    options.logger?.error({ err, filePath }, `pulsevault web-ready: ${action === 'remuxed' ? 'remux' : 'conversion'} failed; serving original bytes`);
+    return { action: 'skipped', reason: `${action === 'remuxed' ? 'remux' : 'conversion'} failed: ${failureOf(err)}` };
+  }
+  const reason = action === 'remuxed' ? 'moov was at end of file; remuxed to faststart' : `${done.join('; ')} (+faststart)`;
+  return { action, reason, ...(outputPath !== filePath ? { outputPath } : {}) };
+}
+
+/** The wall-clock limit for one run over this video, in ms. */
+function timeoutOf(options: WebReadyOptions, probe: VideoProbe): number {
+  const seconds =
+    options.timeoutSeconds ?? (probe.durationSeconds !== null ? 60 + 10 * probe.durationSeconds : 3600);
+  return Math.max(1, Math.round(seconds * 1000));
 }

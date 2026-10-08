@@ -1,4 +1,5 @@
 import type { DataStore } from '@tus/server';
+import type { WebReadyResult } from '../lib/web-ready.js';
 
 /**
  * How the GET route should serve a resolved artifact. Stream means
@@ -105,7 +106,10 @@ export type ReserveUploadParams = {
 export type PulseVaultArtifactMeta = {
   artifactId: string;
   kind: UploadKind;
-  /** Lowercase extension including the leading dot. */
+  /**
+   * Lowercase extension of the stored file, including the leading dot: the uploaded file's,
+   * until a web-ready conversion turned another container into an MP4 (then `.mp4`).
+   */
   ext: string;
   /** Original filename from `Upload-Metadata.filename`. */
   filename: string;
@@ -131,6 +135,8 @@ export type PulseVaultArtifactMeta = {
    * derives the `processing` status from it. Legacy sidecars read as `true` when finished.
    */
   converted: boolean;
+  /** What the web-ready conversion did (`none`, `remuxed`, …, or `skipped` and why), once it ran. */
+  webReady?: WebReadyResult;
   /** Whatever the host recorded with `recordOutcome` (where the upload went, why it was kept). */
   outcome?: unknown;
   /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */
@@ -147,6 +153,14 @@ export type PulseVaultArtifactMeta = {
 export type PulseVaultArtifactPatch = {
   acknowledged?: boolean;
   converted?: boolean;
+  /** What the web-ready conversion did. */
+  webReady?: WebReadyResult;
+  /**
+   * The stored file's new extension, after a web-ready conversion wrote the artifact's bytes
+   * under it (`<kind>/<artifactId><ext>`): from then on the artifact is served from that file.
+   * Only adapters that store files on local disk support it; others throw.
+   */
+  ext?: string;
   /** `null` clears a recorded outcome. */
   outcome?: unknown;
 };
@@ -263,7 +277,8 @@ export interface PulseVaultStorage {
   describeArtifact?(artifactId: string): Promise<PulseVaultArtifactMeta | null>;
 
   /**
-   * Change the bookkeeping flags of one artifact (`acknowledged`, `converted`, `outcome`).
+   * Change the bookkeeping of one artifact (`acknowledged`, `converted`, `webReady`, `ext`,
+   * `outcome`).
    * Resolves `false` if the artifactId is unknown. Optional — completion replay, background
    * web-ready and `recordOutcome` need it.
    */

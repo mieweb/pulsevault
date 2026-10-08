@@ -28,6 +28,7 @@ import {
 } from './lib/retention.js';
 import { pulseVaultError, statusCodeOf } from './lib/errors.js';
 import { isUuid } from './lib/uuid.js';
+import { webReadyAvailable, type WebReadyResult } from './lib/web-ready.js';
 import { type PulseVaultLogger, consoleLogger } from './lib/request.js';
 import type {
   PulseVaultArtifactMeta,
@@ -124,10 +125,11 @@ export type PulseVaultCoreOptions = {
    */
   lockWhenReady?: boolean;
   /**
-   * Convert every finished video for the web in the background (faststart remux, or an H.264
-   * transcode for a codec browsers can't play), after the final `PATCH` is answered. `true`
-   * for the defaults, or `ensureWebReady`'s options plus `concurrency` and `completeAfter`.
-   * Needs the local storage adapter. Off by default.
+   * Conform every finished video to one web-playable format (`CONFORM_TARGET`) in the
+   * background, after the final `PATCH` is answered: nothing for a file already in it, a
+   * lossless remux, or one ffmpeg run (a WebM, MKV or MOV becomes an MP4 at the same artifact
+   * URL). `true` for the defaults, or `ensureWebReady`'s options plus `concurrency` and
+   * `completeAfter`. Needs the local storage adapter. Off by default.
    */
   webReady?: PulseVaultWebReadyOptions | boolean;
   /**
@@ -203,6 +205,11 @@ export type PulseVaultCore = {
   recordOutcome: (artifactId: string, outcome: unknown) => Promise<boolean>;
   /** Run one completion-replay pass now (see `replayCompletions`). Resolves the replayed artifactIds. */
   replayCompletions: () => Promise<string[]>;
+  /**
+   * Whether finished videos are conformed: `webReady` is on and ffmpeg and ffprobe run on this
+   * host. `false` means uploads are served exactly as uploaded — for a host's health check.
+   */
+  conformAvailable: () => Promise<boolean>;
 };
 
 /** What `GET /artifacts/:id/status` and `getStatus` report. */
@@ -222,6 +229,11 @@ export type PulseVaultArtifactStatus = {
   size?: number;
   /** Whether the host's `onUploadComplete` has finished for this artifact. */
   acknowledged?: boolean;
+  /**
+   * What the web-ready conversion did, once it ran: `none`, `remuxed`, `transcoded`, `conformed`,
+   * or `skipped` with the reason (the original bytes serve).
+   */
+  webReady?: WebReadyResult;
   /** What the host recorded with `recordOutcome`, if anything. */
   outcome?: unknown;
   /** The capability token's context (`getStatus` only; the status route leaves it out). */
@@ -926,6 +938,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       ...(meta.name ? { name: meta.name } : {}),
       ...(await uploadProgress(meta)),
       acknowledged: meta.acknowledged,
+      ...(meta.webReady ? { webReady: meta.webReady } : {}),
       ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),
       ...(meta.context !== undefined ? { context: meta.context } : {}),
     };
@@ -1116,6 +1129,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     getPulse,
     recordOutcome,
     replayCompletions: () => completion.replay(),
+    conformAvailable: () =>
+      options.webReady
+        ? webReadyAvailable(typeof options.webReady === 'object' ? options.webReady : {})
+        : Promise.resolve(false),
   };
 }
 
@@ -1148,10 +1165,18 @@ export type {
   PulseVaultArtifactEvent,
 } from './lib/pulsevaultTus.js';
 export type { PulseVaultWebReadyOptions, PulseVaultReplayOptions } from './lib/completion.js';
-export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer } from './lib/magic.js';
+export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer, sniffVideo, createVideoValidator } from './lib/magic.js';
+export type { VideoValidatorOptions } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
-export { ensureWebReady, scanMoovPosition } from './lib/web-ready.js';
-export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition } from './lib/web-ready.js';
+export {
+  ensureWebReady,
+  scanMoovPosition,
+  probeVideo,
+  webReadyAvailable,
+  CONFORM_TARGET,
+  CONFORM_VIDEO_EXTENSIONS,
+} from './lib/web-ready.js';
+export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition, VideoProbe } from './lib/web-ready.js';
 export { buildUploadLink } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {

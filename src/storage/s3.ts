@@ -95,6 +95,14 @@ function extToContentType(ext: string): string {
       return 'video/quicktime';
     case '.m4v':
       return 'video/x-m4v';
+    case '.webm':
+      return 'video/webm';
+    case '.mkv':
+      return 'video/x-matroska';
+    case '.3gp':
+      return 'video/3gpp';
+    case '.avi':
+      return 'video/x-msvideo';
     case '.srt':
       return 'application/x-subrip';
     case '.pulse':
@@ -762,6 +770,11 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     artifactId: string,
     patch: PulseVaultArtifactPatch,
   ): Promise<boolean> => {
+    // Web-ready conversion rewrites files on local disk; it never runs against this adapter
+    // (the core refuses `webReady` without `getLocalPath`), so neither do its records.
+    if (patch.ext !== undefined || patch.webReady !== undefined) {
+      throw new TypeError('S3 storage does not support web-ready conversion (`ext`, `webReady`)');
+    }
     if (!isUuid(artifactId)) return false;
     const result = await rewriteSidecar(artifactId, (sidecar) => {
       const next: Sidecar = { ...sidecar };
