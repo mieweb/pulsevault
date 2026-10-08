@@ -65,8 +65,15 @@ is left untouched (#84).
   lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
   workspace never write over each other's changes, so a delete racing a conversion's switch
   can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
-- Patch field `unlessConverted`: a conversion's record never replaces one another pass already
-  made; after recording, the runner makes the files match whichever record stands.
+- Reservations run under the same lock, and `remove` deletes the sidecar last, so a new upload
+  of a removed id never has its bytes deleted by the old removal. Each reservation gets a
+  `generation` (`describeArtifact`), new every time the id is reserved.
+- A conversion is installed in one patch under that lock: the runner converts into a temporary
+  `.mp4` (`ensureWebReady(…, { install: false })`), then `patchArtifact` with `file` renames it
+  onto the stored file, switches `ext`, records the result and deletes the original — only for
+  the reservation the conversion began on (`generation`) and only while no other pass has
+  recorded one (`unlessConverted`). When a condition doesn't hold, `patchArtifact` resolves
+  `false`, changing nothing, and the runner drops its file.
 - `GET /artifacts/:id` opens the file before sending headers and resolves once more when it's
   gone (a conversion just replaced it), instead of a 404 or a cut-off response; bytes this
   instance resolved under an extension storage no longer names are served with `max-age=0`.

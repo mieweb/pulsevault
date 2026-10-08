@@ -1,6 +1,11 @@
 import fs from 'node:fs/promises';
-import path from 'node:path';
-import { ensureWebReady, validateWebReadyOptions, type WebReadyOptions, type WebReadyResult } from './web-ready.js';
+import {
+  CONFORM_TARGET,
+  ensureWebReady,
+  validateWebReadyOptions,
+  type WebReadyOptions,
+  type WebReadyResult,
+} from './web-ready.js';
 import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
 import type { PulseVaultArtifactMeta, PulseVaultStorage, UploadKind } from '../storage/types.js';
 import { uploadIdOf } from '../storage/types.js';
@@ -262,45 +267,36 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
   };
 
   /**
-   * Record a conversion's result — only while no other pass has recorded one, so a failed run
-   * never replaces a finished conversion — and, when it wrote a new file (`outputPath`: another
-   * container conformed to `.mp4`), switch the artifact to it. Then make the files match the
-   * record, whoever wrote it: the original goes only once the record names the new file; a new
-   * file the record doesn't name goes; a file rewritten for an artifact removed meanwhile goes.
-   * Until the record is written the original serves and the conversion is redone on the next
-   * pass (its rename overwrites the earlier output); a crash after it leaves at most the
-   * original behind, which `remove` deletes with the artifact.
+   * Record a conversion's result, and install the file it wrote (`outputPath`, a temporary
+   * `.mp4` beside the stored file), in one patch under the adapter's lock: only for the upload
+   * the conversion began on (`generation`) and only while no other pass has recorded one
+   * (`unlessConverted`). Another container's original is deleted by the patch once the sidecar
+   * names the `.mp4`. When the patch doesn't apply — the artifact was removed, or reserved again,
+   * or converted elsewhere meanwhile — or fails, the file it wrote goes and nothing else
+   * changes. Until a record is written the original serves and the next pass converts again.
+   * Resolves whether this record applied.
    */
   const recordConversion = async (
     artifactId: string,
-    localPath: string | null,
+    generation: string | null,
     result: WebReadyResult,
     outputPath: string | undefined,
-  ): Promise<void> => {
-    let recorded: PulseVaultArtifactMeta | null;
+  ): Promise<boolean> => {
+    let applied = false;
     try {
-      await storage.patchArtifact?.(artifactId, {
-        converted: true,
-        webReady: result,
-        ...(outputPath ? { ext: path.extname(outputPath) } : {}),
-        unlessConverted: true,
-      });
-      recorded = await describe(artifactId);
+      applied =
+        (await storage.patchArtifact?.(artifactId, {
+          converted: true,
+          webReady: result,
+          unlessConverted: true,
+          generation,
+          ...(outputPath ? { file: outputPath, ext: CONFORM_TARGET.extension } : {}),
+        })) ?? false;
     } catch (err) {
       logger.error({ err, artifactId }, 'pulsevault could not record a web-ready conversion');
-      return;
     }
-    if (!localPath) return;
-    if (!recorded) {
-      // Removed while it converted: don't leave what was written for it.
-      const rewrote = result.action !== 'none' && result.action !== 'skipped';
-      if (outputPath) await fs.rm(outputPath, { force: true });
-      else if (rewrote) await fs.rm(localPath, { force: true });
-      return;
-    }
-    if (outputPath && outputPath !== localPath) {
-      await fs.rm(recorded.ext === path.extname(outputPath) ? localPath : outputPath, { force: true });
-    }
+    if (!applied && outputPath) await fs.rm(outputPath, { force: true });
+    return applied;
   };
 
   /** Rule 1. Never throws: a failed conversion serves the original bytes, and says why. */
@@ -310,19 +306,22 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
         try {
           // What was read before this job waited for its slot may be stale: the artifact may
           // have been removed, or converted by another instance on the same disk, meanwhile.
-          if (storage.describeArtifact) {
-            const fresh = await storage.describeArtifact(ctx.artifactId);
-            if (!fresh || fresh.converted) {
-              resolve(fresh?.webReady);
-              return;
-            }
+          const fresh = await describe(ctx.artifactId);
+          if (!fresh || fresh.converted) {
+            resolve(fresh?.webReady);
+            return;
           }
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
+          // `install: false`: the file is installed by the record below, under the adapter's
+          // lock and conditions, never renamed over the stored file from here.
           const { outputPath, ...result } =
             typeof localPath === 'string'
-              ? await ensureWebReady(localPath, { ...webReady, logger })
+              ? await ensureWebReady(localPath, { ...webReady, logger, install: false })
               : { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined };
-          await recordConversion(ctx.artifactId, localPath ?? null, result, outputPath);
+          if (!(await recordConversion(ctx.artifactId, fresh.generation ?? null, result, outputPath))) {
+            resolve((await describe(ctx.artifactId))?.webReady);
+            return;
+          }
           await onArtifactEvent?.({
             phase: 'processed',
             artifactId: ctx.artifactId,

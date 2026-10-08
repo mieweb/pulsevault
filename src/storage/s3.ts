@@ -772,12 +772,17 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
   ): Promise<boolean> => {
     // Web-ready conversion rewrites files on local disk; it never runs against this adapter
     // (the core refuses `webReady` without `getLocalPath`), so neither do its records.
-    if (patch.ext !== undefined || patch.webReady !== undefined) {
-      throw new TypeError('S3 storage does not support web-ready conversion (`ext`, `webReady`)');
+    if (patch.ext !== undefined || patch.webReady !== undefined || patch.file !== undefined) {
+      throw new TypeError('S3 storage does not support web-ready conversion (`ext`, `webReady`, `file`)');
     }
     if (!isUuid(artifactId)) return false;
+    let conditionsHold = true;
     const result = await rewriteSidecar(artifactId, (sidecar) => {
-      if (patch.unlessConverted && sidecar.converted !== false) return null; // another pass recorded it
+      // Conditions that don't hold change nothing (S3 sidecars carry no generation: `null`).
+      conditionsHold =
+        !(patch.unlessConverted && sidecar.converted !== false) &&
+        (patch.generation === undefined || patch.generation === null);
+      if (!conditionsHold) return null;
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.converted !== undefined) next.converted = patch.converted;
@@ -787,7 +792,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
       }
       return next;
     });
-    return result !== null;
+    return result !== null && conditionsHold;
   };
 
   async function* listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord> {

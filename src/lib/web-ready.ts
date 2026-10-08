@@ -101,6 +101,12 @@ export type WebReadyOptions = {
    * the duration is unknown.
    */
   timeoutSeconds?: number;
+  /**
+   * `false`: leave every rewrite at a temporary `.mp4` path beside the input (the result's
+   * `outputPath`) instead of renaming it into place, so the caller can install it under its own
+   * lock and conditions. Default `true`.
+   */
+  install?: boolean;
   /** Wall-clock limit for each ffprobe run over the upload, in seconds. Default `60`. */
   probeTimeoutSeconds?: number;
   /** Optional logger; `error` fires when ffmpeg/ffprobe are missing or a rewrite fails. */
@@ -444,11 +450,11 @@ class TimeoutError extends Error {}
  */
 async function rewrite(
   inputPath: string,
-  outputPath: string,
+  outputPath: string | null,
   ffmpegPath: string,
   args: string[],
   timeoutMs: number,
-): Promise<void> {
+): Promise<string> {
   // randomUUID in the name: every video artifact shares one kind directory, so
   // a pid+timestamp tmp name collides when two uploads finish in the same
   // millisecond — both ffmpegs would interleave writes into one file and the
@@ -472,7 +478,10 @@ async function rewrite(
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
     if (stat.size === 0) throw new Error('ffmpeg produced an empty output');
+    // `null`: the caller installs the file itself (`install: false`).
+    if (outputPath === null) return tmp;
     await fs.rename(tmp, outputPath);
+    return outputPath;
   } catch (err) {
     await fs.rm(tmp, { force: true });
     throw err;
@@ -519,6 +528,8 @@ export function validateWebReadyOptions(options: WebReadyOptions): void {
  *
  * When the result carries `outputPath`, the conformed file was written there (`<name>.mp4`)
  * and the original is left in place: the caller switches the artifact over, then removes it.
+ * With `install: false` nothing is renamed: every rewrite is left at a temporary path beside
+ * the input, returned as `outputPath`, for the caller to install (or remove).
  * Never throws for pipeline reasons.
  *
  * NOTE: a rewrite changes the artifact's bytes, so any upload-time checksum
@@ -535,6 +546,7 @@ export async function ensureWebReady(
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
   const transcode = options.transcode ?? true;
+  const install = options.install ?? true;
   const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
   const crf = options.crf ?? 23;
   const preset = options.preset ?? 'veryfast';
@@ -587,8 +599,12 @@ export async function ensureWebReady(
     const off = [...videoOff, ...(audioOff ? [`audio ${audio?.codec}`] : [])].join(', ');
     if (isMp4 && moov === 'end') {
       try {
-        await rewrite(filePath, filePath, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], timeoutOf(options, probe));
-        return { action: 'remuxed', reason: `moov was at end of file; remuxed to faststart (${off} left as-is: transcode disabled)` };
+        const written = await rewrite(filePath, install ? filePath : null, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], timeoutOf(options, probe));
+        return {
+          action: 'remuxed',
+          reason: `moov was at end of file; remuxed to faststart (${off} left as-is: transcode disabled)`,
+          ...(install ? {} : { outputPath: written }),
+        };
       } catch (err) {
         options.logger?.error({ err, filePath }, 'pulsevault web-ready: faststart remux failed; serving original bytes');
         return { action: 'skipped', reason: `remux failed: ${failureOf(err)}` };
@@ -639,14 +655,15 @@ export async function ensureWebReady(
     done.unshift(`container ${ext && ext !== CONFORM_TARGET.extension ? ext : 'not MP4'} → mp4`);
   }
   if (isMp4 && moov === 'end') done.push('moov moved to the front');
+  let written: string;
   try {
-    await rewrite(filePath, outputPath, ffmpegPath, args, timeoutOf(options, probe));
+    written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe));
   } catch (err) {
     options.logger?.error({ err, filePath }, `pulsevault web-ready: ${action === 'remuxed' ? 'remux' : 'conversion'} failed; serving original bytes`);
     return { action: 'skipped', reason: `${action === 'remuxed' ? 'remux' : 'conversion'} failed: ${failureOf(err)}` };
   }
   const reason = action === 'remuxed' ? 'moov was at end of file; remuxed to faststart' : `${done.join('; ')} (+faststart)`;
-  return { action, reason, ...(outputPath !== filePath ? { outputPath } : {}) };
+  return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
 
 /** The wall-clock limit for one run over this video, in ms. */

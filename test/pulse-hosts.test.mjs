@@ -1001,10 +1001,82 @@ test("local storage: a conversion record with unlessConverted never replaces one
     await ctx.storage.patchArtifact(id, { converted: false });
     const done = { action: "conformed", reason: "first pass" };
     assert.equal(await ctx.storage.patchArtifact(id, { converted: true, webReady: done, unlessConverted: true }), true);
-    assert.equal(await ctx.storage.patchArtifact(id, { converted: true, webReady: { action: "skipped", reason: "late failure" }, unlessConverted: true }), true);
+    assert.equal(
+      await ctx.storage.patchArtifact(id, { converted: true, webReady: { action: "skipped", reason: "late failure" }, unlessConverted: true }),
+      false,
+      "a condition that doesn't hold changes nothing",
+    );
     assert.deepEqual((await ctx.storage.describeArtifact(id)).webReady, done);
   } finally {
     await ctx.teardown();
+  }
+});
+
+test("local storage: a patch for an earlier reservation of the id changes nothing, and installs no file", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-generation-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const reserve = async () => {
+      const rel = await storage.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+      await storage.markReady(id);
+    };
+    await reserve();
+    const first = (await storage.describeArtifact(id)).generation;
+    assert.ok(first);
+    // A conversion begins on the first upload; the id is removed and reserved again meanwhile.
+    await storage.remove(id);
+    await reserve();
+    const second = (await storage.describeArtifact(id)).generation;
+    assert.notEqual(second, first);
+    const converted = path.join(workspaceDir, "video", ".webready-stale.mp4");
+    await fs.writeFile(converted, "old upload, converted");
+    const applied = await storage.patchArtifact(id, { converted: true, generation: first, file: converted, ext: ".mp4" });
+    assert.equal(applied, false);
+    const meta = await storage.describeArtifact(id);
+    assert.equal(meta.ext, ".webm");
+    assert.equal(meta.converted, false);
+    assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.webm`), "utf8"), "bytes", "the new upload's bytes are untouched");
+    assert.ok(await fs.stat(converted), "the file is left for the caller to drop");
+    // The same patch for the current reservation installs it and drops the old extension's file.
+    assert.equal(await storage.patchArtifact(id, { converted: true, generation: second, file: converted, ext: ".mp4" }), true);
+    assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.mp4`), "utf8"), "old upload, converted");
+    await assert.rejects(fs.stat(path.join(workspaceDir, "video", `${id}.webm`)));
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage, two instances: a reservation racing a removal of the same id keeps its own bytes", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reserve-race-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    for (let i = 0; i < 40; i++) {
+      const id = randomUUID();
+      const params = { artifactId: id, filename: "r.mp4", ext: ".mp4", kind: "video" };
+      await fs.writeFile(path.join(workspaceDir, await a.reserveUpload(params)), "old");
+      await a.markReady(id);
+      const reserveAgain = async () => {
+        try {
+          await fs.writeFile(path.join(workspaceDir, await b.reserveUpload(params)), "new");
+          return true;
+        } catch (err) {
+          if (err.statusCode === 409) return false;
+          throw err;
+        }
+      };
+      const [, reserved] = await Promise.all([a.remove(id), reserveAgain()]);
+      if (reserved) {
+        assert.ok(await b.describeArtifact(id), "the new reservation's sidecar survives");
+        assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.mp4`), "utf8"), "new");
+      }
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 
