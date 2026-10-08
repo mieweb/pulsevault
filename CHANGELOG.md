@@ -41,7 +41,7 @@ is left untouched (#84).
   by its content with ffprobe (a video stream with a duration above zero, including a browser
   WebM without one in its header; a picture — PNG, JPEG, GIF, HEIC, a one-frame clip, counted
   from the first two packets when the container has no frame count — is not a video), refusing with `422 That file isn't a video.` or `That video is
-  longer than the limit of …`; falls back to `sniffVideo` (`ftyp`, EBML or RIFF AVI) without
+  longer than the limit of …` (the configured limit exactly: "1 minute 1 second"); falls back to `sniffVideo` (`ftyp`, EBML or RIFF AVI) without
   ffprobe. Also exported: `probeVideo`, `webReadyAvailable`, `CONFORM_VIDEO_EXTENSIONS`.
 - An upload over `maxUploadSize` is refused with `413 That file is larger than 500 MB.` instead
   of tus's "Maximum size exceeded".
@@ -62,8 +62,8 @@ is left untouched (#84).
   replay, as before.
 - The local adapter changes a sidecar under a per-artifact lock file (`.pulsevault/<id>.json.lock`,
   created exclusively with its owner's token, renewed every 10 s while held, removed only by its
-  owner, taken over by an atomic rename once not renewed for 30 s) as well as its in-process
-  lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
+  owner; once not renewed for 30 s, taken over by one waiter at a time under a recovery lock,
+  after a second look) as well as its in-process lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
   workspace never write over each other's changes, so a delete racing a conversion's switch
   can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
 - Reservations run under the same lock, and `remove` deletes the sidecar last, so a new upload
@@ -75,8 +75,10 @@ is left untouched (#84).
   the reservation the conversion began on (`generation`) and only while no other pass has
   recorded one (`unlessConverted`). When a condition doesn't hold, `patchArtifact` resolves
   `false`, changing nothing, and the runner drops its file.
-- `GET /artifacts/:id` opens the file before sending headers and resolves once more when it's
-  gone (a conversion just replaced it), instead of a 404 or a cut-off response; bytes this
+- `GET /artifacts/:id` opens the file before sending headers, checks it's the file `send`
+  described (inode, size, mtime), and resolves once more when it's gone or another file was
+  renamed onto the path (a conversion just replaced it), instead of a 404, a cut-off response or
+  headers that don't match the bytes; bytes this
   instance resolved under an extension storage no longer names are served with `max-age=0`.
 - A failed run's recorded reason is `ffmpeg exited with code N`, never ffmpeg's output (which
   names server paths); an HDR video on an ffmpeg without tone mapping is left as uploaded
