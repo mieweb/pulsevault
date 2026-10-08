@@ -61,7 +61,8 @@ is left untouched (#84).
   logged, and still not retried; a conversion that never recorded a result is resumed by the
   replay, as before.
 - The local adapter changes a sidecar under a per-artifact lock file (`.pulsevault/<id>.json.lock`,
-  created exclusively, taken over after 30 s from a crashed holder) as well as its in-process
+  created exclusively with its owner's token, renewed every 10 s while held, removed only by its
+  owner, taken over by an atomic rename once not renewed for 30 s) as well as its in-process
   lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
   workspace never write over each other's changes, so a delete racing a conversion's switch
   can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
@@ -84,6 +85,12 @@ is left untouched (#84).
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
   on each sidecar and switching a changed container to its `.mp4`. Run it with the server
   stopped.
+- `transcode: false` records a file it leaves off-target (HEVC, oversized, non-AAC audio) as
+  `skipped`, not `none`: `none` now means only that the file already conforms. (Was `none`.)
+- A browser WebM's missing duration is found by streaming ffprobe's packet list and keeping
+  only the latest end, never buffering it.
+- An upload of deferred length that grows past `maxUploadSize` (a chunk with a length, or a
+  chunked body cut off mid-stream) gets the same `413 That file is larger than …` message.
 - An MP4-family `.mov`/`.m4v` that already conformed used to be served as is (`video/quicktime`,
   a type not every browser takes); it is now remuxed into an `.mp4`.
 

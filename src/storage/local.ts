@@ -83,7 +83,7 @@ const PULSEVAULT_META_DIR = '.pulsevault';
 const RELATED_DIR = 'related';
 /** A stored file's extension: lowercase, one dot, nothing that could leave the kind directory. */
 const STORED_EXT = /^\.[a-z0-9]+$/;
-/** A sidecar lock held longer than this was left by a process that died holding it. */
+/** A sidecar lock not renewed for this long (holders renew it every third of it) was left by a dead process. */
 const LOCK_STALE_MS = 30_000;
 /** How long a sidecar write waits for another instance's lock before failing. */
 const LOCK_WAIT_MS = 60_000;
@@ -299,28 +299,57 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const sidecarWrites = new Map<string, Promise<unknown>>();
   const withLockFile = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
     const lockPath = `${sidecarPath(artifactId)}.lock`;
+    // Who holds it: release removes the lock only while it's still this holder's.
+    const token = randomUUID();
     await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
     const giveUpAt = Date.now() + LOCK_WAIT_MS;
     for (let pause = 2; ; pause = Math.min(pause * 2, 50)) {
       try {
-        await (await fs.open(lockPath, 'wx')).close();
+        await fs.writeFile(lockPath, token, { flag: 'wx' });
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
         const heldFor = await fs.stat(lockPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
         if (heldFor > LOCK_STALE_MS) {
-          await fs.rm(lockPath, { force: true });
+          await takeOverStaleLock(lockPath);
           continue;
         }
         if (Date.now() > giveUpAt) throw new Error(`timed out waiting for the sidecar lock of ${artifactId}`);
         await new Promise((resolve) => setTimeout(resolve, pause + Math.random() * pause));
       }
     }
+    // The lease: a holder that is slow but alive keeps its lock fresh, so it's never taken for
+    // one that died.
+    const renew = setInterval(() => {
+      const now = new Date();
+      void fs.utimes(lockPath, now, now).catch(() => {});
+    }, LOCK_STALE_MS / 3);
+    renew.unref();
     try {
       return await work();
     } finally {
-      await fs.rm(lockPath, { force: true });
+      clearInterval(renew);
+      if ((await fs.readFile(lockPath, 'utf8').catch(() => null)) === token) {
+        await fs.rm(lockPath, { force: true });
+      }
     }
+  };
+  /**
+   * Remove a lock whose holder died, by renaming it away (only one taker's rename succeeds). A
+   * taker that loses the race to another taker could rename the winner's fresh lock instead:
+   * then it puts it back with `link`, which never replaces a lock created meanwhile.
+   */
+  const takeOverStaleLock = async (lockPath: string): Promise<void> => {
+    const aside = `${lockPath}.${randomUUID()}.stale`;
+    try {
+      await fs.rename(lockPath, aside);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return; // Another taker was first.
+      throw err;
+    }
+    const fresh = await fs.stat(aside).then((stats) => Date.now() - stats.mtimeMs <= LOCK_STALE_MS, () => false);
+    if (fresh) await fs.link(aside, lockPath).catch(() => {});
+    await fs.rm(aside, { force: true });
   };
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
     const previous = sidecarWrites.get(artifactId) ?? Promise.resolve();

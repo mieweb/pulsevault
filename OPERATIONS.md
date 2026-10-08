@@ -56,8 +56,10 @@ Two ways to actually support multiple instances:
    under concurrent writes from multiple instances before relying on this in
    production. The local adapter changes an artifact's metadata (`.pulsevault/
    <id>.json`) under a per-artifact lock file (`<id>.json.lock`, created
-   exclusively), so instances never write over each other's changes; a lock
-   left by a crashed process is taken over after 30 seconds.
+   exclusively and holding its owner's token), so instances never write over
+   each other's changes. A holder renews its lock every 10 seconds and removes
+   it only while it's still its own; a lock not renewed for 30 seconds was left
+   by a crashed process and is taken over.
 
 **The S3/R2 adapter (`createS3Storage`) has no such requirement** — every
 instance talks to the same bucket, so it scales horizontally with zero
@@ -252,7 +254,9 @@ Settings:
 - `maxEdge` (default `1920`): the longest edge of the served video.
 - `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
   moved to the front, or another container whose streams already conform copied
-  into an `.mp4`), so no CPU cost beyond a file rewrite.
+  into an `.mp4`), so no CPU cost beyond a file rewrite. A file that would need
+  a re-encode is left as uploaded and recorded as `skipped` (`none` means only
+  "already conforms").
 - `crf`/`preset` (defaults `23`/`veryfast`) tune the H.264 encode;
   `ffmpegPath`/`ffprobePath` point at binaries off `PATH`.
 

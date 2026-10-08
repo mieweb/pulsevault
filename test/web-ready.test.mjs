@@ -157,7 +157,7 @@ test("ensureWebReady: transcode:false leaves hostile codecs alone after the remu
   }
 
   const result = await ensureWebReady(p, { transcode: false });
-  assert.equal(result.action, "none");
+  assert.equal(result.action, "skipped", "left off-target on purpose: not `none`, which means it conforms");
   assert.match(result.reason, /transcode disabled/);
 });
 

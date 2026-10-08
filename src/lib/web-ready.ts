@@ -1,7 +1,8 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import type { PulseVaultLogger } from './request.js';
 
@@ -244,8 +245,9 @@ const positive = (value: unknown): number | null => {
  */
 async function runProbe(ffprobePath: string, args: string[], timeoutMs: number): Promise<string | null> {
   try {
+    // Small, bounded output only (the metadata, two packets); the packet scan streams instead.
     const { stdout } = await execFileAsync(ffprobePath, ['-v', 'error', ...args], {
-      maxBuffer: 256 * 1024 * 1024,
+      maxBuffer: 16 * 1024 * 1024,
       timeout: timeoutMs,
       killSignal: 'SIGKILL',
     });
@@ -263,17 +265,34 @@ async function runProbe(ffprobePath: string, args: string[], timeoutMs: number):
  * a browser's MediaRecorder is written without one). Demuxes the file without decoding it.
  */
 async function packetDuration(filePath: string, ffprobePath: string, index: number, timeoutMs: number): Promise<number | null> {
-  const stdout = await runProbe(
+  // One line per packet, read as it comes and kept only as the latest end: a crafted file with
+  // millions of tiny packets costs time (bounded by the timeout), never memory.
+  const child = spawn(
     ffprobePath,
-    ['-select_streams', String(index), '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', filePath],
-    timeoutMs,
+    ['-v', 'error', '-select_streams', String(index), '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', filePath],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
   );
-  if (stdout === null) return null;
+  // Settles once the process is gone, whether it exited or never started (a bad path).
+  const exited = new Promise<number | null>((resolve) => {
+    child.once('close', (exitCode) => resolve(exitCode));
+    child.once('error', () => resolve(null));
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+  }, timeoutMs);
   let end = 0;
-  for (const line of stdout.split('\n')) {
-    const [pts, duration] = line.split(',');
-    const start = positive(pts) ?? 0;
-    end = Math.max(end, start + (positive(duration) ?? 0));
+  try {
+    for await (const line of createInterface({ input: child.stdout })) {
+      const [pts, duration] = line.split(',');
+      end = Math.max(end, (positive(pts) ?? 0) + (positive(duration) ?? 0));
+    }
+    const code = await exited;
+    if (timedOut) throw new ProbeTimeoutError(`ffprobe timed out after ${Math.round(timeoutMs / 100) / 10} s`);
+    if (code !== 0) return null;
+  } finally {
+    clearTimeout(timer);
   }
   return end > 0 ? end : null;
 }
@@ -610,7 +629,8 @@ export async function ensureWebReady(
         return { action: 'skipped', reason: `remux failed: ${failureOf(err)}` };
       }
     }
-    return { action: 'none', reason: `${off} left as-is (transcode disabled)` };
+    // Not `none`: that means the file already conforms. This one is left off-target on purpose.
+    return { action: 'skipped', reason: `${off} left as-is (transcode disabled)` };
   }
 
   // HDR without a way to tone-map it would come out with wrong colours tagged as right: keep

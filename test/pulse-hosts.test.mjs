@@ -1080,6 +1080,78 @@ test("local storage, two instances: a reservation racing a removal of the same i
   }
 });
 
+test("local storage: a sidecar lock is waited for while its holder lives, and taken over once it's stale", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-lock-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
+    // Another instance holds the lock and is alive: the patch waits until it's released.
+    await fs.writeFile(lockPath, "another-holder");
+    let done = false;
+    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(done, false, "waits for a live holder");
+    await fs.rm(lockPath);
+    assert.equal(await patched, true);
+    // A holder that died 60 s ago: its lock is taken over, and the patch's own lock is gone after.
+    await fs.writeFile(lockPath, "dead-holder");
+    const longAgo = new Date(Date.now() - 60_000);
+    await fs.utimes(lockPath, longAgo, longAgo);
+    assert.equal(await storage.patchArtifact(id, { outcome: { ok: true } }), true);
+    assert.deepEqual((await storage.describeArtifact(id)).outcome, { ok: true });
+    await assert.rejects(fs.stat(lockPath));
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("an upload that grows past maxUploadSize mid-stream (deferred length) gets the plain 413 too", async () => {
+  const ctx = await startLocal();
+  try {
+    const create = await fetch(ctx.url("/upload"), {
+      method: "POST",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Defer-Length": "1",
+        "Upload-Metadata": `artifactId ${Buffer.from(randomUUID()).toString("base64")},filename ${Buffer.from("big.mp4").toString("base64")},kind ${Buffer.from("video").toString("base64")}`,
+      },
+    });
+    assert.equal(create.status, 201);
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    // With a Content-Length tus refuses the chunk before reading it…
+    const declared = await tusPatch(location, 0, Buffer.alloc(11 * 1024 * 1024));
+    assert.equal(declared.status, 413);
+    assert.equal((await declared.text()).trim(), "That file is larger than 10 MB.");
+    // …and a chunked body (no Content-Length) is cut off as it streams past the limit.
+    const chunk = Buffer.alloc(1024 * 1024);
+    let sent = 0;
+    const streamed = await fetch(location, {
+      method: "PATCH",
+      headers: { "Tus-Resumable": "1.0.0", "Upload-Offset": "0", "Content-Type": "application/offset+octet-stream" },
+      duplex: "half",
+      body: new ReadableStream({
+        pull(controller) {
+          if (sent++ < 11) controller.enqueue(chunk);
+          else controller.close();
+        },
+      }),
+    });
+    assert.equal(streamed.status, 413);
+    assert.equal((await streamed.text()).trim(), "That file is larger than 10 MB.");
+    // A chunk past the length the client itself declared is its own bug: tus's words stay.
+    const small = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: randomUUID(), filename: "s.mp4", size: 100, kind: "video" });
+    const overrun = await tusPatch(new URL(small.headers.get("location"), ctx.baseUrl).href, 0, Buffer.alloc(200));
+    assert.equal(overrun.status, 413);
+    assert.notEqual((await overrun.text()).trim(), "That file is larger than 10 MB.");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("GET resolves again once when the resolved file is gone (a conversion replaced it)", async () => {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reresolve-"));
   const storage = createLocalStorage({ workspaceDir });

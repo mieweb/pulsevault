@@ -263,12 +263,26 @@ export function createPulsevaultTusServer(options: PulsevaultTusOptions) {
       isLocked,
     ),
     maxSize,
-    // tus refuses an upload over `maxSize` with "Maximum size exceeded"; say it in the words a
-    // host can show the person who picked the file.
-    onResponseError: (_req, err) =>
-      err === ERRORS.ERR_MAX_SIZE_EXCEEDED
-        ? { status_code: 413, body: `That file is larger than ${formatBytes(maxSize)}.\n` }
-        : undefined,
+    // tus refuses an upload over `maxSize` with "Maximum size exceeded" at create (the constant)
+    // or mid-stream (`StreamLimiter`'s own error, same status and body), and one whose length was
+    // deferred with "upload's size exceeded" when a chunk would take it past `maxSize`. Say it in
+    // the words a host can show the person who picked the file. (That second error also means a
+    // chunk past the length the client declared — a client bug, left as tus words it.)
+    onResponseError: async (req, err) => {
+      const { status_code, body } = err as { status_code?: number; body?: string };
+      const tooLarge = { status_code: 413, body: `That file is larger than ${formatBytes(maxSize)}.\n` };
+      if (status_code === ERRORS.ERR_MAX_SIZE_EXCEEDED.status_code && body === ERRORS.ERR_MAX_SIZE_EXCEEDED.body) {
+        return tooLarge;
+      }
+      if (status_code === ERRORS.ERR_SIZE_EXCEEDED.status_code && body === ERRORS.ERR_SIZE_EXCEEDED.body) {
+        const encoded = new URL(req.url).pathname.split('/').pop();
+        const upload = encoded
+          ? await storage.datastore.getUpload(Buffer.from(encoded, 'base64url').toString('utf8')).catch(() => null)
+          : null;
+        if (upload?.sizeIsDeferred) return tooLarge;
+      }
+      return undefined;
+    },
     namingFunction: async (_req, metadata) => {
       const { artifactId, filename, kind, relatedTo, checksum, name, appVersion } =
         parseUploadMetadata(metadata);
