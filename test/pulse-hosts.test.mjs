@@ -840,6 +840,46 @@ test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same a
   }
 });
 
+test("webReady: a replayed hook after a conversion still says what the conversion did (ctx.webReady)", { skip: !FFMPEG }, async (t) => {
+  let body;
+  try {
+    body = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=1",
+      "-c:v", "libvpx-vp9", "-b:v", "200k", "-f", "webm", "pipe:1",
+    ]);
+  } catch {
+    return t.skip("ffmpeg build lacks libvpx");
+  }
+  const completions = [];
+  let failNext = true;
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      // A host whose delivery fails once (its destination briefly down), then works on the replay.
+      onUploadComplete: async (_req, c) => {
+        completions.push(c);
+        if (failNext) {
+          failNext = false;
+          throw new Error("destination unavailable");
+        }
+      },
+    },
+  });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "rec.webm", kind: "video", body });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && completions.length === 0) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(completions[0].webReady?.action, "conformed");
+    await ctx.core.replayCompletions();
+    assert.equal(completions.length, 2);
+    assert.equal(completions[1].replay, true);
+    assert.equal(completions[1].webReady?.action, "conformed", "the replay knows the file is now an MP4");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("webReady: a video still being converted is revalidated instead of the configured immutable cache", { skip: !FFMPEG }, async () => {
   const body = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
   const ctx = await startLocal({ pluginOptions: { webReady: true, cache: { maxAge: "365d", immutable: true } } });

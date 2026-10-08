@@ -40,7 +40,10 @@ export type PulseVaultUploadCompleteContext = {
    * check their own record before writing it again.
    */
   replay: boolean;
-  /** With `webReady.completeAfter`, what the conversion did — the hook runs once it has finished. */
+  /**
+   * What the web-ready conversion did, once it has run: with `webReady.completeAfter` the hook
+   * runs after it, and a replayed hook gets the recorded result too.
+   */
   webReady?: WebReadyResult;
 };
 
@@ -195,6 +198,9 @@ function contextFor(
     ...(meta?.name ? { name: meta.name } : {}),
     ...(meta?.appVersion ? { appVersion: meta.appVersion } : {}),
     ...(meta?.context !== undefined ? { context: meta.context } : {}),
+    // What a conversion did, once one was recorded: a replayed hook gets it too, so a host that
+    // names the file from it (an `.mp4` once a WebM was conformed) gets it right the second time.
+    ...(meta?.converted && meta.webReady ? { webReady: meta.webReady } : {}),
     replay,
   };
 }

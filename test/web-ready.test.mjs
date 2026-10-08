@@ -240,7 +240,12 @@ test("conform: landscape 4K is scaled to 1920×1080 and stays landscape", { skip
 test("conform: a rotation tag is applied, so the file plays upright without it", { skip: !FFMPEG }, async () => {
   const flat = await fixture("flat.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
   const p = path.join(path.dirname(flat), "rot.mp4");
-  execFileSync("ffmpeg", ["-v", "error", "-display_rotation", "90", "-i", flat, "-c", "copy", "-movflags", "+faststart", "-y", p]);
+  try {
+    execFileSync("ffmpeg", ["-v", "error", "-display_rotation", "90", "-i", flat, "-c", "copy", "-movflags", "+faststart", "-y", p], { stdio: "ignore" });
+  } catch {
+    // FFmpeg before 6.0 has no -display_rotation: the stream's `rotate` tag writes the same matrix.
+    execFileSync("ffmpeg", ["-v", "error", "-i", flat, "-c", "copy", "-metadata:s:v:0", "rotate=90", "-movflags", "+faststart", "-y", p]);
+  }
   assert.equal(Math.abs(probe(p).rotation), 90, "fixture must carry a rotation tag");
   const result = await ensureWebReady(p);
   assert.equal(result.action, "transcoded");

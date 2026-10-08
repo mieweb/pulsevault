@@ -95,6 +95,9 @@ is left untouched (#84).
 - ffmpeg's capability queries (`-version`, `-h filter=scale`, `-filters`) are bounded (30 s).
 - An `onArtifactEvent` observer that throws on `processed` is logged as its own failure; the
   recorded result still reaches `completeAfter`'s hook as `ctx.webReady`.
+- A replayed `onUploadComplete` (the hook threw, or the process stopped) gets the recorded
+  conversion result as `ctx.webReady` too, so a host naming the file from it (an `.mp4` once a
+  WebM was conformed) gets it right on the retry.
 - `web-ready-migrate.mjs` rerun after an interruption deletes an original the sidecar no longer
   names.
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
