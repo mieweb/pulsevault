@@ -39,12 +39,15 @@ is left untouched (#84).
   ffmpeg/ffprobe are missing, for a host's health check.
 - `createVideoValidator({ maxDurationSeconds? })`: a `validatePayload` hook that checks a video
   by its content with ffprobe (a video stream with a duration above zero, including a browser
-  WebM without one in its header; a picture — PNG, JPEG, GIF, HEIC, a one-frame clip — is not a
-  video), refusing with `422 That file isn't a video.` or `That video is
+  WebM without one in its header; a picture — PNG, JPEG, GIF, HEIC, a one-frame clip, counted
+  from the first two packets when the container has no frame count — is not a video), refusing with `422 That file isn't a video.` or `That video is
   longer than the limit of …`; falls back to `sniffVideo` (`ftyp`, EBML or RIFF AVI) without
   ffprobe. Also exported: `probeVideo`, `webReadyAvailable`, `CONFORM_VIDEO_EXTENSIONS`.
 - An upload over `maxUploadSize` is refused with `413 That file is larger than 500 MB.` instead
   of tus's "Maximum size exceeded".
+- `webReady.probeTimeoutSeconds` and `createVideoValidator({ probeTimeoutSeconds })` (default 60):
+  every ffprobe run over an upload is bounded; the validator refuses with `422 That video
+  couldn't be checked in time.`
 - Content types for `.webm`, `.mkv`, `.3gp` and `.avi`.
 - While a video is being converted, `GET /artifacts/:id` is served with `max-age=0` instead of
   the configured `cache` (which may be `immutable`), so no client keeps the original bytes once
@@ -57,9 +60,20 @@ is left untouched (#84).
 - A failed conversion is now recorded (`webReady: { action: "skipped", reason }`) as well as
   logged, and still not retried; a conversion that never recorded a result is resumed by the
   replay, as before.
-- The local adapter's `remove` runs under the same per-artifact lock as `patchArtifact`, reading
-  the sidecar itself, so a delete racing a conversion's switch to a new file can't bring the
-  sidecar back.
+- The local adapter changes a sidecar under a per-artifact lock file (`.pulsevault/<id>.json.lock`,
+  created exclusively, taken over after 30 s from a crashed holder) as well as its in-process
+  lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
+  workspace never write over each other's changes, so a delete racing a conversion's switch
+  can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
+- Patch field `unlessConverted`: a conversion's record never replaces one another pass already
+  made; after recording, the runner makes the files match whichever record stands.
+- `GET /artifacts/:id` opens the file before sending headers and resolves once more when it's
+  gone (a conversion just replaced it), instead of a 404 or a cut-off response; bytes this
+  instance resolved under an extension storage no longer names are served with `max-age=0`.
+- A failed run's recorded reason is `ffmpeg exited with code N`, never ffmpeg's output (which
+  names server paths); an HDR video on an ffmpeg without tone mapping is left as uploaded
+  (`skipped`, saying what's missing) rather than converted with wrong colours.
+- `webReady` needs an adapter with `describeArtifact` too (both built-in adapters have it).
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
   on each sidecar and switching a changed container to its `.mp4`. Run it with the server
   stopped.

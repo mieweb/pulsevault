@@ -175,6 +175,12 @@ export type PulseVaultArtifactPatch = {
    * Only adapters that store files on local disk support it; others throw.
    */
   ext?: string;
+  /**
+   * Apply the patch only while `converted` is still false, so a conversion's record never
+   * replaces one another pass already made (two instances converting the same artifact).
+   * Resolves `true` either way when the artifact exists.
+   */
+  unlessConverted?: boolean;
   /** `null` clears a recorded outcome. */
   outcome?: unknown;
 };

@@ -952,6 +952,85 @@ test("local storage: a delete racing a conversion's switch to a new file leaves 
   }
 });
 
+test("local storage, two instances on one workspace: a delete or a stale acknowledgement racing a switch to a new file", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-two-instances-"));
+  // Two adapters over one directory: two servers on a shared disk, each with its own memory.
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    for (let i = 0; i < 40; i++) {
+      const id = randomUUID();
+      const rel = await a.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+      await fs.writeFile(path.join(workspaceDir, rel), "webm");
+      await a.markReady(id);
+      await b.describeArtifact(id);
+      const output = path.join(workspaceDir, "video", `${id}.mp4`);
+      await fs.writeFile(output, "mp4");
+      const switchOver = async () => {
+        await a.patchArtifact(id, { ext: ".mp4", converted: true, unlessConverted: true });
+        const recorded = await a.describeArtifact(id);
+        if (!recorded) await fs.rm(output, { force: true });
+        else await fs.rm(recorded.ext === ".mp4" ? path.join(workspaceDir, rel) : output, { force: true });
+      };
+      if (i % 2) {
+        // A delete on the other instance: nothing may come back.
+        await Promise.all([b.remove(id), switchOver()]);
+        assert.equal(await a.describeArtifact(id), null);
+        assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
+      } else {
+        // An acknowledgement on the other instance: it must not put the old extension back.
+        await Promise.all([b.patchArtifact(id, { acknowledged: true }), switchOver()]);
+        const meta = await b.describeArtifact(id);
+        assert.equal(meta.ext, ".mp4");
+        assert.equal(meta.acknowledged, true);
+        const resolved = await b.resolve(id);
+        assert.equal(resolved?.filename, `video/${id}.mp4`, "the record and the file agree");
+      }
+    }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: a conversion record with unlessConverted never replaces one already made", async () => {
+  const ctx = await startLocal();
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video" });
+    await ctx.storage.patchArtifact(id, { converted: false });
+    const done = { action: "conformed", reason: "first pass" };
+    assert.equal(await ctx.storage.patchArtifact(id, { converted: true, webReady: done, unlessConverted: true }), true);
+    assert.equal(await ctx.storage.patchArtifact(id, { converted: true, webReady: { action: "skipped", reason: "late failure" }, unlessConverted: true }), true);
+    assert.deepEqual((await ctx.storage.describeArtifact(id)).webReady, done);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("GET resolves again once when the resolved file is gone (a conversion replaced it)", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-reresolve-"));
+  const storage = createLocalStorage({ workspaceDir });
+  let resolves = 0;
+  // The first resolution names a file that no longer exists, as a conversion's switch leaves it.
+  const racing = {
+    ...storage,
+    resolve: async (id) => (resolves++ === 0 ? { kind: "stream", root: workspaceDir, filename: `video/${id}.webm` } : storage.resolve(id)),
+  };
+  const ctx = await startApp(racing, {}, () => fs.rm(workspaceDir, { recursive: true, force: true }));
+  try {
+    const id = randomUUID();
+    const { body } = await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "a.mp4", kind: "video" });
+    resolves = 0;
+    const res = await fetch(ctx.url(`/artifacts/${id}`));
+    assert.equal(res.status, 200);
+    assert.ok(Buffer.from(await res.arrayBuffer()).equals(body));
+    assert.equal(resolves, 2);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("webReady needs the local adapter", async () => {
   await assert.rejects(startS3({ pluginOptions: { webReady: true } }), /getLocalPath/);
 });

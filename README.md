@@ -417,7 +417,7 @@ await app.register(pulseVault, {
 });
 ```
 
-For videos from anywhere (a WebM from a browser recorder, an MKV, an AVI), check them by what they are with **`createVideoValidator({ maxDurationSeconds? })`**: ffprobe must find a video stream with a duration above zero that isn't a picture (PNG, JPEG, GIF, HEIC, a one-frame clip), or the upload is refused with `422` and a message a host can show as it is (`That file isn't a video.`, `That video is longer than the limit of 10 minutes.`). It checks `kind: "video"` only and lets other kinds through; without ffprobe it falls back to `sniffVideo(path)` (the container's first bytes: `ftyp`, EBML or RIFF AVI) and logs once. Local storage only.
+For videos from anywhere (a WebM from a browser recorder, an MKV, an AVI), check them by what they are with **`createVideoValidator({ maxDurationSeconds?, probeTimeoutSeconds? })`**: ffprobe must find a video stream with a duration above zero that isn't a picture (PNG, JPEG, GIF, HEIC, a one-frame clip), or the upload is refused with `422` and a message a host can show as it is (`That file isn't a video.`, `That video is longer than the limit of 10 minutes.`, or `That video couldn't be checked in time.` when ffprobe runs past `probeTimeoutSeconds`, default 60). It checks `kind: "video"` only and lets other kinds through; without ffprobe it falls back to `sniffVideo(path)` (the container's first bytes: `ftyp`, EBML or RIFF AVI) and logs once. Local storage only.
 
 `createMp4Sniffer` reads the first 12 bytes and verifies the ISOBMFF `ftyp` header (MP4, MOV, M4V, 3GP). Uploads that pass the extension check but contain non-video bytes are rejected with 422 and the disk is cleaned up. The lower-level `sniffMp4(path)` is also exported if you want to drive your own validator.
 
@@ -547,6 +547,7 @@ webReady: {
   completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
   maxEdge: 1920,         // longest edge of the served video
   timeoutSeconds: undefined, // default 60 + 10 × duration in 1080p30 seconds (4K120 counts 16×): a hang guard
+  probeTimeoutSeconds: 60,   // the same guard for each ffprobe run over the upload
   transcode: true, crf: 23, preset: "veryfast", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe",
 },
 ```

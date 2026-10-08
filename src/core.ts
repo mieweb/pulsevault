@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import send from '@fastify/send';
+import { ReadStream } from 'node:fs';
+import type { Readable } from 'node:stream';
 import {
   createPulsevaultTusServer,
   pulseVaultTusContext,
@@ -318,6 +320,28 @@ function extensionOf(filename: string | undefined): string | undefined {
   if (!filename) return undefined;
   const dot = filename.lastIndexOf('.');
   return dot > 0 ? filename.slice(dot).toLowerCase() : undefined;
+}
+
+/**
+ * Whether a file stream from `@fastify/send` failed to open its file because it no longer
+ * exists. Streams that aren't file streams (an empty body for a `304`) resolve `false` at once.
+ */
+function fileGone(stream: Readable): Promise<boolean> {
+  if (!(stream instanceof ReadStream) || !stream.pending) return Promise.resolve(false);
+  return new Promise((resolve, reject) => {
+    const onReady = () => {
+      stream.off('error', onError);
+      resolve(false);
+    };
+    const onError = (err: NodeJS.ErrnoException) => {
+      stream.off('ready', onReady);
+      // Any other failure to open is the server's, before anything was written: a 500.
+      if (err.code === 'ENOENT') resolve(true);
+      else reject(err);
+    };
+    stream.once('ready', onReady);
+    stream.once('error', onError);
+  });
 }
 
 /** The hook-context fields that come from stored metadata, for every phase after `create`. */
@@ -843,17 +867,24 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
       if (!prepared) return;
 
-      const resolved = await storage.resolve(artifactId);
-      if (!resolved) {
-        writeJson(res, 404, pulseVaultError('Artifact not found'));
-        return;
+      // Twice at most: a conversion can switch the artifact to its new file between the
+      // resolution and the open, and then the second resolution finds the new one.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const resolved = await storage.resolve(artifactId);
+        if (!resolved) break;
+        // While a video is being converted its URL serves the original bytes, which the
+        // conversion replaces: revalidate instead of the configured (possibly `immutable`) cache,
+        // so nobody keeps the original once the converted file is in place. Also when this
+        // instance resolved a file other than the one storage now names (another instance
+        // switched it): those bytes are about to go.
+        const meta = completion.converts('video') ? await describe(artifactId) : null;
+        const converting =
+          meta !== null &&
+          completion.converts(meta.kind) &&
+          (!meta.converted || (resolved.kind === 'stream' && !resolved.filename.endsWith(meta.ext)));
+        if (await serveResolution(req, res, resolved, converting)) return;
       }
-      // While a video is being converted its URL serves the original bytes, which the conversion
-      // replaces: revalidate instead of the configured (possibly `immutable`) cache, so nobody
-      // keeps the original once the converted file is in place.
-      const meta = completion.converts('video') ? await describe(artifactId) : null;
-      const converting = meta !== null && completion.converts(meta.kind) && !meta.converted;
-      await serveResolution(req, res, resolved, converting);
+      writeJson(res, 404, pulseVaultError('Artifact not found'));
     } catch (err) {
       failClosed(res, err, 'artifact get');
     }
@@ -864,21 +895,22 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
    * route. An artifact URL names immutable bytes once finished, so it takes the configured
    * `cache`; the poster URL is a lookup whose answer changes when a newer thumbnail lands, and a
    * video still being converted is about to change, so those are revalidated on every request
-   * (`mustRevalidate`).
+   * (`mustRevalidate`). Resolves `false`, having written nothing, when the file was gone by the
+   * time it was opened (a conversion replaced it): the caller resolves again.
    */
   const serveResolution = async (
     req: IncomingMessage,
     res: ServerResponse,
     resolved: PulseVaultResolution,
     mustRevalidate = false,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     if (resolved.kind === 'redirect') {
       res.writeHead(resolved.statusCode ?? 302, {
         Location: resolved.url,
         ...(mustRevalidate ? { 'cache-control': 'no-store' } : {}),
       });
       res.end();
-      return;
+      return true;
     }
 
     const cacheOptions = mustRevalidate
@@ -887,9 +919,13 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     const result = await send(req, resolved.filename, { root: resolved.root, ...cacheOptions });
 
     if (result.type === 'error') {
+      if (result.statusCode === 404) return false;
       writeJson(res, result.statusCode, pulseVaultError(result.metadata.error.message));
-      return;
+      return true;
     }
+    // The file stream opens it after `send` returned: wait for that before the headers go out.
+    // Once open, the file being replaced or removed no longer matters to this response.
+    if (await fileGone(result.stream)) return false;
 
     const headers = { ...result.headers };
     // If the storage adapter provided an explicit content type (e.g. for
@@ -911,6 +947,7 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     res.on('error', () => {});
     res.on('close', () => result.stream.destroy());
     result.stream.pipe(res);
+    return true;
   };
 
   /** The declared length and bytes received of an upload, from tus's own record. */
@@ -1031,7 +1068,10 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
         writeJson(res, 404, pulseVaultError('No poster for this artifact'));
         return;
       }
-      await serveResolution(req, res, resolved, true);
+      if (!(await serveResolution(req, res, resolved, true))) {
+        res.setHeader('cache-control', 'no-store');
+        writeJson(res, 404, pulseVaultError('No poster for this artifact'));
+      }
     } catch (err) {
       failClosed(res, err, 'artifact poster');
     }

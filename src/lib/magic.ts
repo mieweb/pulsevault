@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
-import type { PulseVaultLogger, PulseVaultRequest } from './request.js';
-import { isBinaryAvailable, probeVideo } from './web-ready.js';
+import { consoleLogger, type PulseVaultLogger, type PulseVaultRequest } from './request.js';
+import { isBinaryAvailable, probeVideo, ProbeTimeoutError, type VideoProbe } from './web-ready.js';
 import type { LocalStorage } from '../storage/local.js';
 import type { S3Storage } from '../storage/s3.js';
 import type { UploadKind } from '../storage/types.js';
@@ -169,7 +169,12 @@ export type VideoValidatorOptions = {
   maxDurationSeconds?: number;
   /** Path to the ffprobe binary. Default `"ffprobe"` (resolved via PATH). */
   ffprobePath?: string;
-  /** Optional logger; `error` fires once when ffprobe is missing. */
+  /**
+   * Wall-clock limit for each ffprobe run, in seconds, so a malformed file can't hold the
+   * final `PATCH` open. Default `60`.
+   */
+  probeTimeoutSeconds?: number;
+  /** Where the one-time "ffprobe not found" warning goes. Defaults to `console`. */
   logger?: PulseVaultLogger;
 };
 
@@ -188,8 +193,9 @@ const warnedNoProbe = new Set<string>();
  * longer than that). Without ffprobe on the host it falls back to `sniffVideo` and logs once.
  * Other kinds pass untouched. Needs the bytes on local disk (the local adapter).
  *
- * A refusal is a `422` whose message a host can show as it is: "That file isn't a video." or
- * "That video is longer than the limit of 10 minutes."
+ * A refusal is a `422` whose message a host can show as it is: "That file isn't a video.",
+ * "That video is longer than the limit of 10 minutes." or, when ffprobe runs past
+ * `probeTimeoutSeconds` (a malformed file), "That video couldn't be checked in time."
  *
  * Usage:
  * ```ts
@@ -202,9 +208,12 @@ const warnedNoProbe = new Set<string>();
  */
 export function createVideoValidator(options: VideoValidatorOptions = {}): PulseVaultValidatePayload {
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
-  const { maxDurationSeconds } = options;
-  if (maxDurationSeconds !== undefined && !(maxDurationSeconds > 0 && Number.isFinite(maxDurationSeconds))) {
-    throw new TypeError('`maxDurationSeconds` must be a positive number of seconds');
+  const logger = options.logger ?? consoleLogger;
+  const { maxDurationSeconds, probeTimeoutSeconds } = options;
+  for (const [name, value] of [['maxDurationSeconds', maxDurationSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
+    if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
+      throw new TypeError(`\`${name}\` must be a positive number of seconds`);
+    }
   }
   const refuse = (message: string): never => {
     throw Object.assign(new Error(message), { statusCode: 422 });
@@ -220,7 +229,7 @@ export function createVideoValidator(options: VideoValidatorOptions = {}): Pulse
     if (!(await isBinaryAvailable(ffprobePath))) {
       if (!warnedNoProbe.has(ffprobePath)) {
         warnedNoProbe.add(ffprobePath);
-        options.logger?.error(
+        logger.error(
           { ffprobePath },
           'pulsevault video check: ffprobe not found — only the container bytes are checked. ' +
             'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to check videos fully.',
@@ -229,7 +238,14 @@ export function createVideoValidator(options: VideoValidatorOptions = {}): Pulse
       if (!(await sniffVideo(localPath))) refuse("That file isn't a video.");
       return;
     }
-    const probe = await probeVideo(localPath, ffprobePath);
+    let probe: VideoProbe | null;
+    try {
+      probe = await probeVideo(localPath, { ffprobePath, timeoutSeconds: probeTimeoutSeconds });
+    } catch (err) {
+      if (!(err instanceof ProbeTimeoutError)) throw err;
+      logger.error({ err, artifactId }, 'pulsevault video check: ffprobe timed out');
+      return refuse("That video couldn't be checked in time.");
+    }
     if (!probe || probe.durationSeconds === null) refuse("That file isn't a video.");
     if (maxDurationSeconds !== undefined && (probe?.durationSeconds ?? 0) > maxDurationSeconds) {
       refuse(`That video is longer than the limit of ${formatDuration(maxDurationSeconds)}.`);

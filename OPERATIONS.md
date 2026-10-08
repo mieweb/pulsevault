@@ -54,7 +54,10 @@ Two ways to actually support multiple instances:
 2. **Shared filesystem**: point every instance's `workspaceDir` at the same
    NFS/EFS mount. Verify your mount's durability/consistency guarantees
    under concurrent writes from multiple instances before relying on this in
-   production.
+   production. The local adapter changes an artifact's metadata (`.pulsevault/
+   <id>.json`) under a per-artifact lock file (`<id>.json.lock`, created
+   exclusively), so instances never write over each other's changes; a lock
+   left by a crashed process is taken over after 30 seconds.
 
 **The S3/R2 adapter (`createS3Storage`) has no such requirement** — every
 instance talks to the same bucket, so it scales horizontally with zero
@@ -206,6 +209,9 @@ While a video is being converted, its URL serves the original bytes with
 `max-age=0` instead of the configured `cache`, so a browser that fetched it
 early revalidates and gets the converted file (with a new ETag) afterwards.
 
+A failed run is recorded as `conversion failed: ffmpeg exited with code N`;
+ffmpeg's own output, which names server paths, goes only to the server log.
+
 The result is recorded on the artifact: the status route reports it as
 `webReady: { action, reason }` (a host can say "Your video is ready", or "We
 couldn't convert this video, so it may not play in every browser"),
@@ -219,8 +225,9 @@ it every upload is still accepted and served exactly as uploaded, one warning
 is logged, and `core.conformAvailable()` (also `fastify.pulseVaultCore`)
 resolves `false` for a health check. HDR tone mapping uses the `scale` filter
 on FFmpeg 8 and later, or `zscale` (libzimg, included in the Debian and Ubuntu
-packages) on older builds; a build with neither converts HDR without tone
-mapping and says so in the reason.
+packages) on older builds. A build with neither leaves an HDR video as
+uploaded and records `skipped` with what's missing: converting it without tone
+mapping would give wrong colours.
 
 ```js
 await app.register(pulseVault, {
@@ -240,6 +247,8 @@ Settings:
   1080p30 seconds — a second of 4K at 120 fps counts 16 — an hour when the
   duration is unknown): a run past it is killed, the original kept, and
   `skipped` recorded with the reason.
+- `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
+  over the upload, so a malformed file can't hold the queue.
 - `maxEdge` (default `1920`): the longest edge of the served video.
 - `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
   moved to the front, or another container whose streams already conform copied
@@ -255,7 +264,10 @@ received bytes by what they are: ffprobe must find a video stream with a
 duration above zero that isn't a picture (a PNG, JPEG, GIF, HEIC photo or
 one-frame clip is refused), and, with `maxDurationSeconds`, not longer, or the
 upload is refused with `422 That file isn't a video.` / `That video is longer
-than the limit of 10 minutes.` Without ffprobe it falls back to sniffing the
+than the limit of 10 minutes.` Each ffprobe run is bounded by
+`probeTimeoutSeconds` (default `60`), so a malformed file can't hold the final
+`PATCH` open: past it the upload is refused with `422 That video couldn't be
+checked in time.` Without ffprobe it falls back to sniffing the
 container's first bytes (`ftyp`, EBML or RIFF AVI). An upload over
 `maxUploadSize` is refused at `create` with `413 That file is larger than
 500 MB.` Without `webReady`, a WebM or MKV is served as uploaded, with its own

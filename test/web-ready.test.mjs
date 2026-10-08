@@ -289,3 +289,64 @@ test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !
   const { video } = probe(p);
   assert.deepEqual([video.width, video.height], [320, 180]);
 });
+
+/**
+ * A stand-in for ffmpeg/ffprobe: `-version` (and ffmpeg's `-h`/`-filters` queries unless
+ * `queries` is "empty") pass through to the real binary; anything else runs `body`.
+ */
+async function fakeBinary(real, body, { queries = "real" } = {}) {
+  const dir = await scratchDir("fakebin-");
+  const p = path.join(dir, real);
+  const passQueries = queries === "real" ? `exec ${real} "$@"` : "exit 0";
+  await fs.writeFile(p, [
+    "#!/bin/sh",
+    `case "$1" in -version) exec ${real} "$@";; esac`,
+    `case "$*" in *"-h filter=scale"*|*"-filters"*) ${passQueries};; esac`,
+    body,
+  ].join("\n"), { mode: 0o755 });
+  return p;
+}
+
+test("conform: a one-frame MKV (no frame count in the container) isn't a video", { skip: !FFMPEG }, async () => {
+  const p = await fixture("one.mkv", [...VIDEO("320x240"), "-frames:v", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "matroska"]);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /not a video/);
+});
+
+test("conform: options that can't work are refused", async () => {
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxEdge: 1 }), /maxEdge/);
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { timeoutSeconds: 0 }), /timeoutSeconds/);
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { probeTimeoutSeconds: -1 }), /probeTimeoutSeconds/);
+});
+
+test("conform: a failed run records a plain reason, never ffmpeg's output with server paths", { skip: !FFMPEG }, async () => {
+  const p = await fixture("fail.webm", [...VIDEO("320x240"), "-c:v", "libvpx", "-f", "webm"]);
+  const ffmpegPath = await fakeBinary("ffmpeg", 'echo "Error opening output /srv/secret/workspace/video/x.mp4" >&2; exit 1');
+  const result = await ensureWebReady(p, { ffmpegPath });
+  assert.equal(result.action, "skipped");
+  assert.equal(result.reason, "conversion failed: ffmpeg exited with code 1");
+});
+
+test("conform: a hung ffprobe is cut off at probeTimeoutSeconds", { skip: !FFMPEG }, async () => {
+  const p = await fixture("hang.mp4", [...VIDEO("320x240"), "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  const ffprobePath = await fakeBinary("ffprobe", "sleep 10");
+  const started = Date.now();
+  const result = await ensureWebReady(p, { ffprobePath, probeTimeoutSeconds: 0.3 });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /ffprobe timed out/);
+  assert.ok(Date.now() - started < 5000, "the probe was killed, not waited out");
+});
+
+test("conform: HDR on an ffmpeg that can't tone-map keeps the original and says why", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("hdr.mov", [...VIDEO("320x240"),
+    "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p10le",
+    "-x265-params", "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error"]);
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const before = await fs.readFile(p);
+  const ffmpegPath = await fakeBinary("ffmpeg", 'exec ffmpeg "$@"', { queries: "empty" });
+  const result = await ensureWebReady(p, { ffmpegPath });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /needs tone mapping/);
+  assert.deepEqual(await fs.readFile(p), before);
+});

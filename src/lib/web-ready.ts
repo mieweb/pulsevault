@@ -101,6 +101,8 @@ export type WebReadyOptions = {
    * the duration is unknown.
    */
   timeoutSeconds?: number;
+  /** Wall-clock limit for each ffprobe run over the upload, in seconds. Default `60`. */
+  probeTimeoutSeconds?: number;
   /** Optional logger; `error` fires when ffmpeg/ffprobe are missing or a rewrite fails. */
   logger?: PulseVaultLogger;
 };
@@ -173,6 +175,8 @@ export type VideoProbe = {
     height: number;
     /** The colour transfer (`bt709`, `arib-std-b67`, …), when tagged. */
     transfer?: string;
+    /** `pc` for full range, `tv` for limited, when tagged. */
+    range?: string;
     /** Display rotation in degrees from the stream's matrix (`0`, `90`, `-90`, `180`). */
     rotation: number;
     /** Average frames per second, when ffprobe can tell. */
@@ -184,6 +188,18 @@ export type VideoProbe = {
   durationSeconds: number | null;
 };
 
+export type ProbeOptions = {
+  /** Path to the ffprobe binary. Default `"ffprobe"` (resolved via PATH). */
+  ffprobePath?: string;
+  /** Wall-clock limit for each ffprobe run, in seconds; past it the probe fails. Default `60`. */
+  timeoutSeconds?: number;
+};
+
+/** An ffprobe run past its `timeoutSeconds`: the file couldn't be read in time. */
+export class ProbeTimeoutError extends Error {}
+
+const DEFAULT_PROBE_TIMEOUT_SECONDS = 60;
+
 type ProbeStream = {
   index?: number;
   nb_frames?: string;
@@ -194,6 +210,7 @@ type ProbeStream = {
   width?: number;
   height?: number;
   color_transfer?: string;
+  color_range?: string;
   disposition?: { attached_pic?: number };
   side_data_list?: Array<{ rotation?: number | string }>;
   tags?: { rotate?: string };
@@ -216,55 +233,79 @@ const positive = (value: unknown): number | null => {
 };
 
 /**
- * The end of the last video packet, for a file whose header carries no duration (a WebM from
- * a browser's MediaRecorder is written without one). Demuxes the file without decoding it.
+ * Run ffprobe on an untrusted upload, bounded: killed past `timeoutMs` (`ProbeTimeoutError`).
+ * Resolves its stdout, or `null` when ffprobe fails on the file.
  */
-async function packetDuration(filePath: string, ffprobePath: string, index: number): Promise<number | null> {
+async function runProbe(ffprobePath: string, args: string[], timeoutMs: number): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      ffprobePath,
-      [
-        '-v', 'error',
-        '-select_streams', String(index),
-        '-show_entries', 'packet=pts_time,duration_time',
-        '-of', 'csv=p=0',
-        filePath,
-      ],
-      { maxBuffer: 256 * 1024 * 1024 },
-    );
-    let end = 0;
-    for (const line of stdout.split('\n')) {
-      const [pts, duration] = line.split(',');
-      const start = positive(pts) ?? 0;
-      end = Math.max(end, start + (positive(duration) ?? 0));
+    const { stdout } = await execFileAsync(ffprobePath, ['-v', 'error', ...args], {
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+    });
+    return stdout;
+  } catch (err) {
+    if ((err as { killed?: boolean }).killed) {
+      throw new ProbeTimeoutError(`ffprobe timed out after ${Math.round(timeoutMs / 100) / 10} s`);
     }
-    return end > 0 ? end : null;
-  } catch {
     return null;
   }
 }
 
 /**
+ * The end of the last video packet, for a file whose header carries no duration (a WebM from
+ * a browser's MediaRecorder is written without one). Demuxes the file without decoding it.
+ */
+async function packetDuration(filePath: string, ffprobePath: string, index: number, timeoutMs: number): Promise<number | null> {
+  const stdout = await runProbe(
+    ffprobePath,
+    ['-select_streams', String(index), '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', filePath],
+    timeoutMs,
+  );
+  if (stdout === null) return null;
+  let end = 0;
+  for (const line of stdout.split('\n')) {
+    const [pts, duration] = line.split(',');
+    const start = positive(pts) ?? 0;
+    end = Math.max(end, start + (positive(duration) ?? 0));
+  }
+  return end > 0 ? end : null;
+}
+
+/** Whether a stream has at least two packets: reads only the first two. */
+async function hasTwoPackets(filePath: string, ffprobePath: string, index: number, timeoutMs: number): Promise<boolean> {
+  const stdout = await runProbe(
+    ffprobePath,
+    ['-select_streams', String(index), '-read_intervals', '%+#2', '-show_entries', 'packet=pts', '-of', 'csv=p=0', filePath],
+    timeoutMs,
+  );
+  return (stdout ?? '').split('\n').filter((line) => line.trim() !== '').length >= 2;
+}
+
+/**
  * ffprobe a file: its first real video stream (not cover art), its first audio stream and its
  * duration. `null` when it isn't a video: ffprobe can't read it, it has no video stream, or it
- * is a picture (an image file, or a stream of one frame).
+ * is a picture (an image file, or a stream of one frame). Each ffprobe run is bounded by
+ * `timeoutSeconds`; past it, rejects with `ProbeTimeoutError`.
  */
-export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Promise<VideoProbe | null> {
+export async function probeVideo(filePath: string, options: ProbeOptions = {}): Promise<VideoProbe | null> {
+  const ffprobePath = options.ffprobePath ?? 'ffprobe';
+  const timeoutMs = Math.round((options.timeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000);
+  const stdout = await runProbe(
+    ffprobePath,
+    [
+      '-show_entries',
+      'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer,color_range,nb_frames,avg_frame_rate' +
+        ':stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate' +
+        ':format=duration,format_name',
+      '-of', 'json',
+      filePath,
+    ],
+    timeoutMs,
+  );
+  if (stdout === null) return null;
   let parsed: { streams?: ProbeStream[]; format?: { duration?: string; format_name?: string } };
   try {
-    const { stdout } = await execFileAsync(
-      ffprobePath,
-      [
-        '-v', 'error',
-        '-show_entries',
-        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer,nb_frames,avg_frame_rate' +
-          ':stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate' +
-          ':format=duration,format_name',
-        '-of', 'json',
-        filePath,
-      ],
-      { maxBuffer: 16 * 1024 * 1024 },
-    );
     parsed = JSON.parse(stdout);
   } catch {
     return null;
@@ -275,13 +316,18 @@ export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Pro
   );
   if (!video || typeof video.index !== 'number') return null;
   // A picture isn't a video: an image file (PNG, JPEG, GIF, WebP) read by an image demuxer, or
-  // a single-frame stream (an iPhone HEIC photo is an ISO-BMFF file with one HEVC frame).
-  if (IMAGE_FORMATS.test(parsed.format?.format_name ?? '') || Number(video.nb_frames) === 1) return null;
+  // a single-frame stream (an iPhone HEIC photo is an ISO-BMFF file with one HEVC frame). A
+  // container that doesn't record a frame count (MKV, WebM) is asked for its first two packets.
+  if (IMAGE_FORMATS.test(parsed.format?.format_name ?? '')) return null;
+  const frames = Number(video.nb_frames);
+  if (Number.isFinite(frames) ? frames < 2 : !(await hasTwoPackets(filePath, ffprobePath, video.index, timeoutMs))) {
+    return null;
+  }
   const audio = streams.find((s) => s.codec_type === 'audio');
   const sideRotation = video.side_data_list?.find((d) => d.rotation !== undefined)?.rotation;
   const rotation = Number(sideRotation ?? video.tags?.rotate ?? 0) || 0;
   const durationSeconds =
-    positive(parsed.format?.duration) ?? (await packetDuration(filePath, ffprobePath, video.index));
+    positive(parsed.format?.duration) ?? (await packetDuration(filePath, ffprobePath, video.index, timeoutMs));
   return {
     video: {
       index: video.index,
@@ -290,6 +336,7 @@ export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Pro
       width: video.width ?? 0,
       height: video.height ?? 0,
       ...(video.color_transfer ? { transfer: video.color_transfer } : {}),
+      ...(video.color_range && video.color_range !== 'unknown' ? { range: video.color_range } : {}),
       rotation: quarterTurn(rotation),
       ...(frameRateOf(video.avg_frame_rate) ? { frameRate: frameRateOf(video.avg_frame_rate) } : {}),
     },
@@ -432,11 +479,27 @@ async function rewrite(
   }
 }
 
-/** The first line of an ffmpeg failure, for a reason a person can read. */
+/**
+ * A failed run, in words fit for the status route: never ffmpeg's stderr, which names server
+ * paths (the full error goes to the log).
+ */
 function failureOf(err: unknown): string {
   if (err instanceof TimeoutError) return err.message;
-  const stderr = (err as { stderr?: string }).stderr?.trim().split('\n').pop();
-  return stderr || (err as Error).message || String(err);
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'number' ? `ffmpeg exited with code ${code}` : 'ffmpeg could not write the file';
+}
+
+/** Fail at once on an option that can't work, for `ensureWebReady` and the core's `webReady`. */
+export function validateWebReadyOptions(options: WebReadyOptions): void {
+  const { maxEdge, timeoutSeconds, probeTimeoutSeconds } = options;
+  if (maxEdge !== undefined && !(Number.isInteger(maxEdge) && maxEdge >= 2)) {
+    throw new TypeError('`webReady.maxEdge` must be an integer of at least 2 (pixels)');
+  }
+  for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
+    if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
+      throw new TypeError(`\`webReady.${name}\` must be a positive number of seconds`);
+    }
+  }
 }
 
 /**
@@ -468,6 +531,7 @@ export async function ensureWebReady(
   filePath: string,
   options: WebReadyOptions = {},
 ): Promise<WebReadyResult & { outputPath?: string }> {
+  validateWebReadyOptions(options);
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
   const transcode = options.transcode ?? true;
@@ -488,7 +552,14 @@ export async function ensureWebReady(
     return { action: 'skipped', reason: 'ffmpeg/ffprobe not available' };
   }
 
-  const probe = await probeVideo(filePath, ffprobePath);
+  let probe: VideoProbe | null;
+  try {
+    probe = await probeVideo(filePath, { ffprobePath, timeoutSeconds: options.probeTimeoutSeconds });
+  } catch (err) {
+    if (!(err instanceof ProbeTimeoutError)) throw err;
+    options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
+    return { action: 'skipped', reason: err.message };
+  }
   if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
   const { video, audio } = probe;
   const moov = await scanMoovPosition(filePath);
@@ -500,6 +571,7 @@ export async function ensureWebReady(
   const videoOff: string[] = [];
   if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
   if (video.pixelFormat !== CONFORM_TARGET.pixelFormat) videoOff.push(`pixel format ${video.pixelFormat}`);
+  else if (video.range === 'pc') videoOff.push('full range');
   if (hdr) videoOff.push(`HDR (${video.transfer})`);
   if (video.rotation !== 0) videoOff.push(`rotation ${video.rotation}°`);
   if (video.rotation === 0 && (size.width !== video.width || size.height !== video.height)) {
@@ -525,17 +597,27 @@ export async function ensureWebReady(
     return { action: 'none', reason: `${off} left as-is (transcode disabled)` };
   }
 
+  // HDR without a way to tone-map it would come out with wrong colours tagged as right: keep
+  // the original and say what's missing instead.
+  const toneMapper = hdr ? await toneMapperOf(ffmpegPath) : null;
+  if (hdr && !toneMapper) {
+    options.logger?.error({ filePath }, 'pulsevault web-ready: HDR video, but this ffmpeg can\'t tone-map; serving original bytes');
+    return {
+      action: 'skipped',
+      reason: `HDR (${video.transfer}) needs tone mapping, which this ffmpeg can't do: FFmpeg 8 or later, or a build with zscale`,
+    };
+  }
+
   const args = ['-map', `0:${video.index}`, ...(audio ? ['-map', `0:${audio.index}`] : []), '-sn', '-dn'];
   const done: string[] = [];
   if (videoOff.length > 0) {
-    const toneMapper = hdr ? await toneMapperOf(ffmpegPath) : null;
     args.push(
       '-vf', videoFilter(size, hdr, toneMapper),
       '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
     );
     // An 8-bit SDR output must not keep the source's HDR colour tags.
     if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
-    const toneMapped = !hdr ? '' : toneMapper ? ', tone-mapped' : ', not tone-mapped (this ffmpeg can\'t)';
+    const toneMapped = hdr ? ', tone-mapped' : '';
     done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}`);
   } else {
     args.push('-c:v', 'copy');

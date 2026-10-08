@@ -81,6 +81,10 @@ const PULSEVAULT_META_DIR = '.pulsevault';
 const RELATED_DIR = 'related';
 /** A stored file's extension: lowercase, one dot, nothing that could leave the kind directory. */
 const STORED_EXT = /^\.[a-z0-9]+$/;
+/** A sidecar lock held longer than this was left by a process that died holding it. */
+const LOCK_STALE_MS = 30_000;
+/** How long a sidecar write waits for another instance's lock before failing. */
+const LOCK_WAIT_MS = 60_000;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
 const DEFAULT_META_CACHE_LIMIT = 10_000;
 
@@ -282,15 +286,44 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   /**
-   * Read-modify-write of a sidecar's flags runs one at a time per artifact in this process, so
-   * an acknowledgement and a conversion finishing at the same moment can't lose each other's
-   * write. (Across instances on a shared filesystem the last rename wins; the replay recovers a
-   * lost acknowledgement or conversion record: both are redone, idempotently.)
+   * Read-modify-write of a sidecar runs one at a time per artifact: in this process through a
+   * promise chain, and across instances sharing the workspace (OPERATIONS.md, "Horizontal
+   * scaling") through a lock file, `.pulsevault/<artifactId>.json.lock`, created exclusively
+   * (`wx`: atomic on a local disk and on NFS). So an acknowledgement, a conversion switching
+   * the stored file and a removal each act on the sidecar as the last of them left it, never on
+   * a stale copy. Each critical section is a read and a rename; a lock older than
+   * `LOCK_STALE_MS` was left by a process that died holding it, and is taken over.
    */
   const sidecarWrites = new Map<string, Promise<unknown>>();
+  const withLockFile = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
+    const lockPath = `${sidecarPath(artifactId)}.lock`;
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
+    const giveUpAt = Date.now() + LOCK_WAIT_MS;
+    for (let pause = 2; ; pause = Math.min(pause * 2, 50)) {
+      try {
+        await (await fs.open(lockPath, 'wx')).close();
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        const heldFor = await fs.stat(lockPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
+        if (heldFor > LOCK_STALE_MS) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+        if (Date.now() > giveUpAt) throw new Error(`timed out waiting for the sidecar lock of ${artifactId}`);
+        await new Promise((resolve) => setTimeout(resolve, pause + Math.random() * pause));
+      }
+    }
+    try {
+      return await work();
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+  };
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
     const previous = sidecarWrites.get(artifactId) ?? Promise.resolve();
-    const run = previous.catch(() => {}).then(work);
+    // A non-UUID id names no sidecar (`readSidecar` refuses it): nothing to lock, no path built.
+    const run = previous.catch(() => {}).then(() => (isUuid(artifactId) ? withLockFile(artifactId, work) : work()));
     sidecarWrites.set(artifactId, run);
     try {
       return await run;
@@ -615,6 +648,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       }
       const sidecar = await readSidecar(artifactId);
       if (!sidecar) return false;
+      // Another pass already recorded its conversion: this one's record doesn't replace it.
+      if (patch.unlessConverted && sidecar.converted !== false) return true;
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.converted !== undefined) next.converted = patch.converted;

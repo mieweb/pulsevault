@@ -777,6 +777,7 @@ export async function createS3Storage(opts: S3StorageOptions): Promise<S3Storage
     }
     if (!isUuid(artifactId)) return false;
     const result = await rewriteSidecar(artifactId, (sidecar) => {
+      if (patch.unlessConverted && sidecar.converted !== false) return null; // another pass recorded it
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.converted !== undefined) next.converted = patch.converted;
