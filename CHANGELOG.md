@@ -90,6 +90,13 @@ is left untouched (#84).
 - The local adapter's `remove` decides from the sidecar alone, never its cache: an artifact
   another reader had cached is reported removed once, not twice.
 - `webReady` needs an adapter with `describeArtifact` too (both built-in adapters have it).
+- The local adapter's `getLocalPath` reads the sidecar, not its cache, so it names the current
+  file after another instance removed the id and reserved it again.
+- ffmpeg's capability queries (`-version`, `-h filter=scale`, `-filters`) are bounded (30 s).
+- An `onArtifactEvent` observer that throws on `processed` is logged as its own failure; the
+  recorded result still reaches `completeAfter`'s hook as `ctx.webReady`.
+- `web-ready-migrate.mjs` rerun after an interruption deletes an original the sidecar no longer
+  names.
 - `scripts/web-ready-migrate.mjs` conforms existing artifacts the same way, recording the result
   on each sidecar and switching a changed container to its `.mp4`. Run it with the server
   stopped.

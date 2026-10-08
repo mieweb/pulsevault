@@ -374,10 +374,15 @@ export async function probeVideo(filePath: string, options: ProbeOptions = {}): 
 // should cost one spawn and one warning, not one of each per upload.
 const binaryAvailable = new Map<string, Promise<boolean>>();
 const warnedMissing = new Set<string>();
+/** Capability queries (`-version`, `-h`, `-filters`) answer at once; one that hangs is killed. */
+const QUERY_TIMEOUT_MS = 30_000;
+const query = (binPath: string, args: string[]) =>
+  execFileAsync(binPath, args, { timeout: QUERY_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024 });
+
 export function isBinaryAvailable(binPath: string): Promise<boolean> {
   let cached = binaryAvailable.get(binPath);
   if (!cached) {
-    cached = execFileAsync(binPath, ['-version']).then(
+    cached = query(binPath, ['-version']).then(
       () => true,
       () => false,
     );
@@ -409,9 +414,9 @@ function toneMapperOf(ffmpegPath: string): Promise<ToneMapper> {
   if (!cached) {
     cached = (async (): Promise<ToneMapper> => {
       try {
-        const { stdout: scaleHelp } = await execFileAsync(ffmpegPath, ['-hide_banner', '-h', 'filter=scale']);
+        const { stdout: scaleHelp } = await query(ffmpegPath, ['-hide_banner', '-h', 'filter=scale']);
         if (scaleHelp.includes('out_transfer')) return 'scale';
-        const { stdout: filters } = await execFileAsync(ffmpegPath, ['-hide_banner', '-filters']);
+        const { stdout: filters } = await query(ffmpegPath, ['-hide_banner', '-filters']);
         return /\szscale\s/.test(filters) ? 'zscale' : null;
       } catch {
         return null;

@@ -333,14 +333,20 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             resolve((await describe(ctx.artifactId))?.webReady);
             return;
           }
-          await onArtifactEvent?.({
-            phase: 'processed',
-            artifactId: ctx.artifactId,
-            kind: ctx.kind,
-            size: ctx.size,
-            reason: result.reason,
-            webReady: result,
-          });
+          // The result is recorded: an observer that throws is the observer's failure, not the
+          // conversion's, and doesn't hide the result from the hook that follows it.
+          try {
+            await onArtifactEvent?.({
+              phase: 'processed',
+              artifactId: ctx.artifactId,
+              kind: ctx.kind,
+              size: ctx.size,
+              reason: result.reason,
+              webReady: result,
+            });
+          } catch (err) {
+            logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault onArtifactEvent (processed) failed');
+          }
           resolve(result);
         } catch (err) {
           logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault web-ready conversion failed');

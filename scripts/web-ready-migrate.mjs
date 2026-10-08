@@ -92,8 +92,14 @@ for (const sidecarFile of sidecarFiles) {
   // Record what was done on the sidecar, as the server does; a new container also switches the
   // artifact to its `.mp4` (keeping the uploaded extension as `sourceExt`), then the original
   // goes. Atomic tmp + rename, like the adapter's own sidecar writes.
-  // A rerun finds a converted file already in the format: keep what the conversion recorded.
-  if (result.action === "none" && sidecar.webReady) continue;
+  // A rerun finds a converted file already in the format: keep what the conversion recorded,
+  // and finish what an interrupted run left: the original, once the sidecar names the `.mp4`.
+  if (result.action === "none" && sidecar.webReady) {
+    if (sidecar.sourceExt && sidecar.sourceExt !== sidecar.ext) {
+      await fs.rm(path.join(root, kind, `${artifactId}${sidecar.sourceExt}`), { force: true });
+    }
+    continue;
+  }
   const next = { ...sidecar, converted: true, webReady: result };
   if (outputPath) {
     next.sourceExt = sidecar.sourceExt ?? sidecar.ext;

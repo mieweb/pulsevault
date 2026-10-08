@@ -658,10 +658,19 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return true;
     });
 
+  /**
+   * From the sidecar, not the cache: another instance on the same workspace may have removed
+   * the artifact and reserved its id again (a new extension) since this one cached it, and a
+   * caller about to read or rewrite the bytes must get today's file.
+   */
   const getLocalPath = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    if (!meta) return null;
-    return path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) {
+      metaCache.delete(artifactId);
+      return null;
+    }
+    cacheSet(artifactId, sidecarToCachedMeta(sidecar, sidecar.status === 'ready'));
+    return path.join(workspaceRoot, sidecar.kind ?? 'video', `${artifactId}${sidecar.ext}`);
   };
 
   const getKind = async (artifactId: string): Promise<UploadKind | null> => {

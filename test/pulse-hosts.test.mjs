@@ -1165,6 +1165,49 @@ test("webReady: a conversion queued for an upload that was removed and its id re
   }
 });
 
+test("local storage: getLocalPath names today's file, even after another instance removed the id and reserved it again", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-fresh-path-"));
+  const a = createLocalStorage({ workspaceDir });
+  const b = createLocalStorage({ workspaceDir });
+  await a.initialize();
+  try {
+    const id = randomUUID();
+    await a.reserveUpload({ artifactId: id, filename: "a.webm", ext: ".webm", kind: "video" });
+    assert.equal(path.basename(await a.getLocalPath(id)), `${id}.webm`);
+    await b.remove(id);
+    await b.reserveUpload({ artifactId: id, filename: "b.mp4", ext: ".mp4", kind: "video" });
+    assert.equal(path.basename(await a.getLocalPath(id)), `${id}.mp4`);
+    await b.remove(id);
+    assert.equal(await a.getLocalPath(id), null);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("webReady: an onArtifactEvent observer that throws doesn't hide the recorded result from completeAfter's hook", { skip: !FFMPEG }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-observer-"));
+  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", path.join(dir, "e.mp4")]);
+  const body = await fs.readFile(path.join(dir, "e.mp4"));
+  const completions = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      onUploadComplete: async (_req, c) => { completions.push(c); },
+      onArtifactEvent: (e) => { if (e.phase === "processed") throw new Error("observer broke"); },
+    },
+  });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "e.mp4", kind: "video", body });
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && completions.length === 0) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(completions[0]?.webReady?.action, "remuxed");
+  } finally {
+    await ctx.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("local storage: a stale lock that another waiter is already recovering isn't taken over twice", async () => {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-recovery-"));
   const storage = createLocalStorage({ workspaceDir });
