@@ -96,7 +96,9 @@ export type WebReadyOptions = {
   preset?: string;
   /**
    * Wall-clock limit for one ffmpeg run, in seconds; the run is killed and the original kept.
-   * Default `60 + 10 × the video's duration`, or an hour when the duration is unknown.
+   * A guard against a run that hangs, not a speed limit. Default `60 + 10 ×` the video's
+   * duration counted in 1080p30 seconds (a second of 4K at 120 fps counts 16), or an hour when
+   * the duration is unknown.
    */
   timeoutSeconds?: number;
   /** Optional logger; `error` fires when ffmpeg/ffprobe are missing or a rewrite fails. */
@@ -173,6 +175,8 @@ export type VideoProbe = {
     transfer?: string;
     /** Display rotation in degrees from the stream's matrix (`0`, `90`, `-90`, `180`). */
     rotation: number;
+    /** Average frames per second, when ffprobe can tell. */
+    frameRate?: number;
   };
   /** The first audio stream, or `null` for a silent video. */
   audio: { index: number; codec: string } | null;
@@ -183,6 +187,7 @@ export type VideoProbe = {
 type ProbeStream = {
   index?: number;
   nb_frames?: string;
+  avg_frame_rate?: string;
   codec_type?: string;
   codec_name?: string;
   pix_fmt?: string;
@@ -197,6 +202,13 @@ type ProbeStream = {
 /** Degrees to the nearest quarter turn in (-180, 180]: 270 → -90, -180 → 180, 360 → 0. */
 const quarterTurn = (degrees: number): number =>
   [0, 90, 180, -90][(((Math.round(degrees / 90) % 4) + 4) % 4)] ?? 0;
+
+/** ffprobe's `120/1` or `30000/1001` as frames per second; `undefined` for `0/0`. */
+const frameRateOf = (ratio: string | undefined): number | undefined => {
+  const [num, den] = (ratio ?? '').split('/').map(Number);
+  const fps = num && den ? num / den : NaN;
+  return Number.isFinite(fps) && fps > 0 ? fps : undefined;
+};
 
 const positive = (value: unknown): number | null => {
   const n = typeof value === 'number' ? value : Number.parseFloat(String(value));
@@ -245,7 +257,7 @@ export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Pro
       [
         '-v', 'error',
         '-show_entries',
-        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer,nb_frames' +
+        'stream=index,codec_type,codec_name,pix_fmt,width,height,color_transfer,nb_frames,avg_frame_rate' +
           ':stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate' +
           ':format=duration,format_name',
         '-of', 'json',
@@ -279,6 +291,7 @@ export async function probeVideo(filePath: string, ffprobePath = 'ffprobe'): Pro
       height: video.height ?? 0,
       ...(video.color_transfer ? { transfer: video.color_transfer } : {}),
       rotation: quarterTurn(rotation),
+      ...(frameRateOf(video.avg_frame_rate) ? { frameRate: frameRateOf(video.avg_frame_rate) } : {}),
     },
     audio: audio && typeof audio.index === 'number' ? { index: audio.index, codec: audio.codec_name ?? '' } : null,
     durationSeconds,
@@ -556,7 +569,16 @@ export async function ensureWebReady(
 
 /** The wall-clock limit for one run over this video, in ms. */
 function timeoutOf(options: WebReadyOptions, probe: VideoProbe): number {
-  const seconds =
-    options.timeoutSeconds ?? (probe.durationSeconds !== null ? 60 + 10 * probe.durationSeconds : 3600);
+  const seconds = options.timeoutSeconds ?? (probe.durationSeconds !== null ? 60 + 10 * workSeconds(probe) : 3600);
   return Math.max(1, Math.round(seconds * 1000));
+}
+
+/**
+ * The video's duration in seconds of 1080p30, the work of a conversion: a second of 4K at
+ * 120 fps (an iPhone recording) decodes and scales 16 times the pixels of a 1080p30 second.
+ */
+function workSeconds(probe: VideoProbe): number {
+  const { width, height, frameRate } = probe.video;
+  const pixelRate = width * height * (frameRate ?? 30);
+  return (probe.durationSeconds ?? 0) * Math.max(1, pixelRate / (1920 * 1080 * 30));
 }

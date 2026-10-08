@@ -236,7 +236,8 @@ Settings:
   rest wait in a queue. A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
   until its result is recorded.
-- `timeoutSeconds` (default `60 + 10 ×` the video's duration, an hour when the
+- `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
+  1080p30 seconds — a second of 4K at 120 fps counts 16 — an hour when the
   duration is unknown): a run past it is killed, the original kept, and
   `skipped` recorded with the reason.
 - `maxEdge` (default `1920`): the longest edge of the served video.

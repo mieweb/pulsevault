@@ -26,7 +26,8 @@ is left untouched (#84).
   `Content-Type` follow it; the artifact id and its URLs don't change. The sidecar switches
   first, then the original is deleted (`sourceExt` remembers it so `remove` cleans up after a
   crash). New patch fields `ext` and `webReady` (local adapter; the S3 adapter refuses them).
-- `webReady.timeoutSeconds` (default `60 + 10 ×` duration): a longer run is killed, the original
+- `webReady.timeoutSeconds` (default `60 + 10 ×` the duration in 1080p30 seconds, so 4K or high
+  frame rates get proportionally longer): a longer run is killed, the original
   kept, and `skipped` recorded with the reason.
 - The conversion's result is recorded on the artifact: `GET /artifacts/:id/status` and
   `getStatus` report `webReady: { action, reason }` (protocol 2.4), and `describeArtifact`

@@ -546,7 +546,7 @@ webReady: {
   concurrency: 1,        // conversions at once; a transcode is CPU-bound
   completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
   maxEdge: 1920,         // longest edge of the served video
-  timeoutSeconds: undefined, // default 60 + 10 × duration: a longer run is killed, the original kept
+  timeoutSeconds: undefined, // default 60 + 10 × duration in 1080p30 seconds (4K120 counts 16×): a hang guard
   transcode: true, crf: 23, preset: "veryfast", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe",
 },
 ```
