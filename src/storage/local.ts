@@ -1,8 +1,12 @@
 import { FileStore } from '@tus/file-store';
+import { ERRORS, Upload } from '@tus/server';
+import type { Readable } from 'node:stream';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isUuid } from '../lib/uuid.js';
+import { EXTENSION_REGEX } from '../lib/options.js';
+import { CONFORM_TARGET, type WebReadyResult } from '../lib/web-ready.js';
 import type {
   PulseVaultArtifactMeta,
   PulseVaultArtifactPatch,
@@ -24,8 +28,13 @@ import { parseUploadKind } from './types.js';
 type Sidecar = {
   /** Sidecar schema version. Increment for breaking changes. */
   version: 1;
-  /** Lowercase extension including the leading dot (e.g. `".mp4"`). */
+  /** Lowercase extension of the stored file, including the leading dot (e.g. `".mp4"`). */
   ext: string;
+  /**
+   * The uploaded file's extension, kept once a web-ready conversion switched `ext` (a `.webm`
+   * conformed to `.mp4`), so `remove` also deletes the original if a crash left it behind.
+   */
+  sourceExt?: string;
   /** Original filename from `Upload-Metadata.filename`. */
   filename: string;
   /**
@@ -56,6 +65,10 @@ type Sidecar = {
   acknowledged?: boolean;
   /** `false` from reserve until the core records that the web-ready conversion finished; absent reads as `true` once finished. */
   converted?: boolean;
+  /** What the web-ready conversion did, once it ran. */
+  webReady?: WebReadyResult;
+  /** New at every reservation of the id. See `PulseVaultArtifactMeta.generation`. */
+  generation?: string;
   /** Whatever the host recorded with `recordOutcome`. */
   outcome?: unknown;
   /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
@@ -76,6 +89,7 @@ const DEFAULT_META_CACHE_LIMIT = 10_000;
 
 type CachedMeta = {
   ext: string;
+  sourceExt?: string;
   ready: boolean;
   kind: UploadKind;
   relatedTo?: string;
@@ -96,6 +110,14 @@ function extToContentType(ext: string): string {
       return 'video/quicktime';
     case '.m4v':
       return 'video/x-m4v';
+    case '.webm':
+      return 'video/webm';
+    case '.mkv':
+      return 'video/x-matroska';
+    case '.3gp':
+      return 'video/3gpp';
+    case '.avi':
+      return 'video/x-msvideo';
     case '.srt':
       return 'application/x-subrip';
     case '.pulse':
@@ -115,12 +137,24 @@ function extToContentType(ext: string): string {
 function sidecarToCachedMeta(sidecar: Sidecar, ready: boolean): CachedMeta {
   return {
     ext: sidecar.ext,
+    ...(sidecar.sourceExt ? { sourceExt: sidecar.sourceExt } : {}),
     ready,
     kind: sidecar.kind ?? 'video',
     relatedTo: sidecar.relatedTo,
     checksum: sidecar.checksum,
     name: sidecar.name,
   };
+}
+
+/** A recorded web-ready result read back from a sidecar. */
+function isWebReadyResult(value: unknown): value is WebReadyResult {
+  const result = value as Partial<WebReadyResult> | null;
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    typeof result.action === 'string' &&
+    typeof result.reason === 'string'
+  );
 }
 
 export type LocalStorageOptions = {
@@ -189,7 +223,56 @@ export type LocalStorage = PulseVaultStorage & {
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const workspaceRoot = path.resolve(opts.workspaceDir);
-  const datastore = new FileStore({ directory: workspaceRoot });
+
+  /**
+   * Whether the tus upload `uploadId` (`<kind>/<artifactId><ext>`) finished and a conversion then
+   * replaced its file: the sidecar is ready, names this upload's extension as `sourceExt`, and the
+   * file is gone. tus still has its record of the upload (`<uploadId>.json`).
+   */
+  const replacedByConversion = async (uploadId: string): Promise<boolean> => {
+    const slash = uploadId.indexOf('/');
+    const kind = uploadId.slice(0, slash);
+    const artifactId = uploadId.slice(slash + 1, slash + 37);
+    const ext = uploadId.slice(slash + 37);
+    if (slash < 0 || !isUuid(artifactId) || !EXTENSION_REGEX.test(ext)) return false;
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar || sidecar.status !== 'ready' || (sidecar.kind ?? 'video') !== kind) return false;
+    if (sidecar.sourceExt !== ext || sidecar.ext === ext) return false;
+    return (await storedExt(artifactId, sidecar.kind ?? 'video', ext)) !== ext;
+  };
+
+  /**
+   * tus's store for the workspace, which also answers for an upload a conversion replaced (a
+   * finished `.webm` conformed to `<id>.mp4`): tus would answer a client re-sending the final
+   * `PATCH` whose response it lost with `410`, the file being gone. Such an upload reads as
+   * complete, and its (empty) tail is taken without a write, so the retry reaches
+   * `onUploadFinish`'s already-finished branch and gets `204`, as one without a conversion does.
+   */
+  class LocalFileStore extends FileStore {
+    override async getUpload(id: string): Promise<Upload> {
+      try {
+        return await super.getUpload(id);
+      } catch (err) {
+        if (err !== ERRORS.FILE_NO_LONGER_EXISTS || !(await replacedByConversion(id))) throw err;
+        const record = await this.configstore.get(id);
+        if (!record || typeof record.size !== 'number') throw err;
+        return new Upload({
+          id,
+          size: record.size,
+          offset: record.size,
+          metadata: record.metadata,
+          creation_date: record.creation_date,
+        });
+      }
+    }
+
+    override async write(readable: Readable, id: string, offset: number): Promise<number> {
+      if (!(await replacedByConversion(id))) return super.write(readable, id, offset);
+      for await (const _ of readable); // a finished upload: nothing more to store
+      return offset;
+    }
+  }
+  const datastore = new LocalFileStore({ directory: workspaceRoot });
   const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
   // Metadata cache keyed by artifactId. Populated eagerly on reserve and
   // lazily from the sidecar on cache-miss — so we never do a workspace-wide
@@ -232,6 +315,36 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   /** Relative path (from workspaceRoot) to the artifact bytes. */
   const artifactRelPath = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
+  /** The artifact's bytes file, strictly inside its kind directory, as `sidecarPath` checks. */
+  const storedPath = (artifactId: string, kind: UploadKind, ext: string): string => {
+    const base = path.resolve(workspaceRoot, kind);
+    const resolved = path.resolve(base, `${artifactId}${ext}`);
+    if (!resolved.startsWith(`${base}${path.sep}`)) {
+      throw new Error('artifactId escapes the kind directory');
+    }
+    return resolved;
+  };
+
+  /**
+   * The extension of the file that holds an artifact's bytes, given the `ext` its sidecar names:
+   * that file, or for a video the conform target (`<id>.mp4`) when only that exists. A sidecar
+   * another instance wrote from a copy older than a conversion still names the uploaded file,
+   * which the conversion deleted; its bytes are in the converted file. `null` when neither exists.
+   */
+  const storedExt = async (artifactId: string, kind: UploadKind, ext: string): Promise<string | null> => {
+    // Only a real id becomes a path, as everywhere else in this adapter.
+    if (!isUuid(artifactId) || !EXTENSION_REGEX.test(ext)) return null;
+    const candidates = kind === 'video' && ext !== CONFORM_TARGET.extension ? [ext, CONFORM_TARGET.extension] : [ext];
+    for (const candidate of candidates) {
+      try {
+        const stat = await fs.stat(storedPath(artifactId, kind, candidate));
+        if (stat.isFile()) return candidate;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+      }
+    }
+    return null;
+  };
 
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     // Atomic tmp + rename so a crash mid-write can never leave a truncated
@@ -251,10 +364,14 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   /**
-   * Read-modify-write of a sidecar's flags runs one at a time per artifact in this process, so
-   * an acknowledgement and a conversion finishing at the same moment can't lose each other's
-   * write. (Across instances on a shared filesystem the last rename wins; the replay recovers a
-   * lost acknowledgement or conversion record: both are redone, idempotently.)
+   * Read-modify-write of a sidecar runs one at a time per artifact in this process, so an
+   * acknowledgement, a conversion switching the stored file and a removal each act on the sidecar
+   * as the last of them left it. Across instances sharing the workspace (OPERATIONS.md,
+   * "Horizontal scaling") there is no lock: the last rename wins. The completion bookkeeping
+   * recovers: the replay redoes a lost acknowledgement or conversion record, idempotently, and a
+   * sidecar written from a copy older than a conversion still finds the bytes: a conversion's file
+   * is always `<id>.mp4`, which `resolve` and `getLocalPath` fall back to (`storedExt`). A lost
+   * `outcome` isn't redone; nothing records it a second time.
    */
   const sidecarWrites = new Map<string, Promise<unknown>>();
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
@@ -300,6 +417,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
+        ...(typeof parsed.sourceExt === 'string' && EXTENSION_REGEX.test(parsed.sourceExt)
+          ? { sourceExt: parsed.sourceExt }
+          : {}),
         filename: parsed.filename,
         status,
         kind,
@@ -312,6 +432,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         // uploading means its completion hasn't happened yet.
         acknowledged: parsed.acknowledged ?? status === 'ready',
         converted: parsed.converted ?? status === 'ready',
+        ...(isWebReadyResult(parsed.webReady) ? { webReady: parsed.webReady } : {}),
+        ...(typeof parsed.generation === 'string' ? { generation: parsed.generation } : {}),
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
       };
@@ -360,6 +482,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     artifactId,
     kind: sidecar.kind ?? 'video',
     ext: sidecar.ext,
+    ...(sidecar.sourceExt ? { sourceExt: sidecar.sourceExt } : {}),
     filename: sidecar.filename,
     ...(sidecar.relatedTo ? { relatedTo: sidecar.relatedTo } : {}),
     ...(sidecar.checksum ? { checksum: sidecar.checksum } : {}),
@@ -369,6 +492,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     ready: sidecar.status === 'ready',
     acknowledged: sidecar.acknowledged !== false,
     converted: sidecar.converted !== false,
+    ...(sidecar.webReady ? { webReady: sidecar.webReady } : {}),
+    ...(sidecar.generation ? { generation: sidecar.generation } : {}),
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
     ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
@@ -421,30 +546,35 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       ...(context !== undefined ? { context } : {}),
       acknowledged: false,
       converted: false,
+      generation: randomUUID(),
     };
 
-    // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
-    // this artifactId, rather than the previous read-then-write (`loadMeta` then
-    // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
-    // the check before either had written — letting the second silently clobber the first's
-    // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
-    // @tus/server's error path, same as before.
-    try {
-      await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      // A file already exists at this path, but `readSidecar` treats a malformed/corrupt
-      // one as absent (e.g. debris from a crash mid-write) — re-check before deciding this
-      // is a genuine collision rather than debris that's safe to overwrite.
-      const existing = await readSidecar(artifactId);
-      if (existing) {
-        throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
-          statusCode: 409,
-          status_code: 409,
-        });
+    // Under the sidecar lock, so a removal of the same id in this process either finished
+    // (its sidecar went last) or hasn't started.
+    await withSidecarLock(artifactId, async () => {
+      // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
+      // this artifactId, rather than the previous read-then-write (`loadMeta` then
+      // `writeSidecar`) which left a window for two concurrent/retried requests to both pass
+      // the check before either had written — letting the second silently clobber the first's
+      // sidecar and race @tus/file-store's own offset tracking. Translates to HTTP 409 via
+      // @tus/server's error path, same as before.
+      try {
+        await fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
+        // A file already exists at this path, but `readSidecar` treats a malformed/corrupt
+        // one as absent (e.g. debris from a crash mid-write) — re-check before deciding this
+        // is a genuine collision rather than debris that's safe to overwrite.
+        const existing = await readSidecar(artifactId);
+        if (existing) {
+          throw Object.assign(new Error(`artifactId ${artifactId} already has an upload`), {
+            statusCode: 409,
+            status_code: 409,
+          });
+        }
+        await writeSidecar(artifactId, sidecar);
       }
-      await writeSidecar(artifactId, sidecar);
-    }
+    });
 
     if (relatedTo) {
       // The relation index entry. Written after the sidecar so a crash between the two leaves
@@ -461,24 +591,24 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return artifactRelPath(artifactId, kind, ext);
   };
 
-  const resolve = async (artifactId: string): Promise<PulseVaultResolution | null> => {
+  const resolve = async (artifactId: string, reread = false): Promise<PulseVaultResolution | null> => {
     const meta = await loadMeta(artifactId);
     // Only serve ready uploads. In-progress uploads stay hidden — a client
     // GETting mid-upload would otherwise receive a truncated file.
     if (!meta || !meta.ready) return null;
-    const relFile = artifactRelPath(artifactId, meta.kind, meta.ext);
-    try {
-      const stat = await fs.stat(path.join(workspaceRoot, relFile));
-      if (!stat.isFile()) return null;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-      throw err;
+    const ext = await storedExt(artifactId, meta.kind, meta.ext);
+    if (ext === null) {
+      // The cache may be older than another instance's removal and new upload of the id: read
+      // the sidecar once more.
+      if (reread) return null;
+      metaCache.delete(artifactId);
+      return resolve(artifactId, true);
     }
     return {
       kind: 'stream',
       root: workspaceRoot,
-      filename: relFile,
-      contentType: extToContentType(meta.ext),
+      filename: artifactRelPath(artifactId, meta.kind, ext),
+      contentType: extToContentType(ext),
     };
   };
 
@@ -497,32 +627,75 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
         return;
       }
-      await writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() });
+      // An upload reserved before generations were kept gets one now, so its conversion runs.
+      await writeSidecar(artifactId, {
+        ...sidecar,
+        status: 'ready',
+        readyAt: Date.now(),
+        generation: sidecar.generation ?? randomUUID(),
+      });
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
     });
 
-  const remove = async (artifactId: string): Promise<boolean> => {
-    const meta = await loadMeta(artifactId);
-    // Drop from cache before rm so a racing `resolve` arriving after the
-    // rm but before cache eviction can't hand back a stale path.
-    metaCache.delete(artifactId);
-    if (!meta) return false;
-    const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
-    await Promise.all([
-      fs.rm(artifactPath, { force: true }),
-      fs.rm(`${artifactPath}.json`, { force: true }),
-      fs.rm(sidecarPath(artifactId), { force: true }),
-      ...(meta.relatedTo
-        ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
-        : []),
-    ]);
-    return true;
-  };
+  // Under the sidecar lock, from the sidecar itself: in this process, a conversion switching the
+  // artifact to a new file (`patchArtifact` with `ext`) either finishes first — and this removes
+  // the new file — or finds the sidecar gone and drops what it wrote.
+  const remove = (artifactId: string): Promise<boolean> =>
+    withSidecarLock(artifactId, async () => {
+      // The sidecar decides, never the cache: a read racing this removal (or an earlier one) can
+      // have cached the artifact again, and a removal that trusted it would report the same
+      // artifact removed twice.
+      const sidecar = await readSidecar(artifactId);
+      // Drop from cache before rm so a racing `resolve` arriving after the
+      // rm but before cache eviction can't hand back a stale path.
+      metaCache.delete(artifactId);
+      if (!sidecar) return false;
+      const meta = sidecarToCachedMeta(sidecar, sidecar.status === 'ready');
+      const artifactPath = path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+      // The uploaded file and tus's record of it, when a conversion stored the bytes under a new
+      // extension (normally already gone; left behind by a crash during the switch).
+      const sourcePath = meta.sourceExt
+        ? path.join(workspaceRoot, meta.kind, `${artifactId}${meta.sourceExt}`)
+        : null;
+      // A video's conversion output, whatever this sidecar's copy says (`storedExt`).
+      const conformedPath =
+        meta.kind === 'video' && meta.ext !== CONFORM_TARGET.extension
+          ? path.join(workspaceRoot, artifactRelPath(artifactId, meta.kind, CONFORM_TARGET.extension))
+          : null;
+      await Promise.all([
+        fs.rm(artifactPath, { force: true }),
+        fs.rm(`${artifactPath}.json`, { force: true }),
+        ...(sourcePath
+          ? [fs.rm(sourcePath, { force: true }), fs.rm(`${sourcePath}.json`, { force: true })]
+          : []),
+        ...(conformedPath ? [fs.rm(conformedPath, { force: true })] : []),
+        ...(meta.relatedTo
+          ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
+          : []),
+      ]);
+      // Last: until the sidecar is gone the id can't be reserved again, so a new upload of it
+      // never has its bytes removed by this one's removal.
+      await fs.rm(sidecarPath(artifactId), { force: true });
+      // Again: a read during the removal may have cached it from the sidecar it still saw.
+      metaCache.delete(artifactId);
+      return true;
+    });
 
+  /**
+   * From the sidecar, not the cache: another instance on the same workspace may have removed
+   * the artifact and reserved its id again (a new extension) since this one cached it, and a
+   * caller about to read or rewrite the bytes must get today's file.
+   */
   const getLocalPath = async (artifactId: string): Promise<string | null> => {
-    const meta = await loadMeta(artifactId);
-    if (!meta) return null;
-    return path.join(workspaceRoot, meta.kind, `${artifactId}${meta.ext}`);
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar) {
+      metaCache.delete(artifactId);
+      return null;
+    }
+    cacheSet(artifactId, sidecarToCachedMeta(sidecar, sidecar.status === 'ready'));
+    const kind = sidecar.kind ?? 'video';
+    const ext = (await storedExt(artifactId, kind, sidecar.ext)) ?? sidecar.ext;
+    return path.join(workspaceRoot, artifactRelPath(artifactId, kind, ext));
   };
 
   const getKind = async (artifactId: string): Promise<UploadKind | null> => {
@@ -554,11 +727,32 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const patchArtifact = (artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean> =>
     withSidecarLock(artifactId, async () => {
+      if (patch.ext !== undefined && !EXTENSION_REGEX.test(patch.ext)) {
+        throw new TypeError(`patchArtifact: invalid ext ${JSON.stringify(patch.ext)}`);
+      }
       const sidecar = await readSidecar(artifactId);
       if (!sidecar) return false;
+      // Another pass already recorded its conversion, or the id was removed and reserved again:
+      // this patch belongs to neither.
+      if (patch.unlessConverted && sidecar.converted !== false) return false;
+      if (patch.generation !== undefined && (sidecar.generation ?? null) !== patch.generation) return false;
+      const kind = sidecar.kind ?? 'video';
+      const stored = (ext: string) => path.join(workspaceRoot, kind, `${artifactId}${ext}`);
+      const ext = patch.ext ?? sidecar.ext;
+      if (patch.file !== undefined) {
+        if (path.dirname(path.resolve(patch.file)) !== path.join(workspaceRoot, kind)) {
+          throw new TypeError('patchArtifact: `file` must be in the artifact\'s kind directory');
+        }
+        await fs.rename(patch.file, stored(ext));
+      }
       const next: Sidecar = { ...sidecar };
       if (patch.acknowledged !== undefined) next.acknowledged = patch.acknowledged;
       if (patch.converted !== undefined) next.converted = patch.converted;
+      if (patch.webReady !== undefined) next.webReady = patch.webReady;
+      if (patch.ext !== undefined && patch.ext !== sidecar.ext) {
+        next.sourceExt = sidecar.sourceExt ?? sidecar.ext;
+        next.ext = patch.ext;
+      }
       if (patch.outcome !== undefined) {
         if (patch.outcome === null) delete next.outcome;
         else next.outcome = patch.outcome;
@@ -567,6 +761,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // The cache holds nothing a patch changes, but a `ready` flip elsewhere must not be undone
       // by a stale entry either — keep it consistent with what was just written.
       cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
+      // The sidecar names the new file: the one under the old extension goes. (A crash before
+      // this leaves it for `remove`, which deletes `sourceExt` too. A sidecar copy that still
+      // names it finds the new file instead: `storedExt`.)
+      if (ext !== sidecar.ext) await fs.rm(stored(sidecar.ext), { force: true });
       return true;
     });
 
@@ -647,7 +845,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     workspaceRoot,
     initialize,
     reserveUpload,
-    resolve,
+    resolve: (artifactId: string) => resolve(artifactId),
     markReady,
     remove,
     getLocalPath,

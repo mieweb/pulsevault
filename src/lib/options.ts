@@ -1,4 +1,5 @@
 import type { PulseVaultValidatePayload } from './magic.js';
+import { CONFORM_VIDEO_EXTENSIONS } from './web-ready.js';
 import type { PulseVaultOnUploadComplete } from './pulsevaultTus.js';
 
 /** Per-kind form of `PulseVaultAllowedExtensionsInput`, named once so it isn't re-declared at every use site. */
@@ -18,16 +19,19 @@ export type PulseVaultAllowedExtensions = {
   thumbnail: readonly string[];
 };
 
-// The defaults are exactly what the Pulse app uploads. A host that accepts other clients adds
-// their extensions (`.mov`, `.m4v`, `.srt` are served with the right content types).
-const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = ['.mp4'];
+// Video: the containers `webReady` conforms to the format the Pulse app records (an `.mp4`), so
+// a host's own file picker can take a screen recording, a camera-roll `.mov` or a browser's
+// `.webm`. The other kinds are exactly what the Pulse app uploads; a host that accepts other
+// clients adds their extensions (`.srt` is served with the right content type).
+const DEFAULT_VIDEO_EXTENSIONS: readonly string[] = CONFORM_VIDEO_EXTENSIONS;
 const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
 // WebVTT only — it's what the Pulse app uploads, and it carries word-level
 // inline cue timestamps (`<00:00:01.500>word`) for karaoke rendering.
 const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
 // The pulse's poster frame (the draft's first-clip thumbnail).
 const DEFAULT_THUMBNAIL_EXTENSIONS: readonly string[] = ['.jpg', '.jpeg', '.png'];
-const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
+/** An allowed extension: one dot, then no dot, whitespace or path separator. */
+export const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**
  * Normalize the consumer's `allowedExtensions` option (legacy array or per-kind
