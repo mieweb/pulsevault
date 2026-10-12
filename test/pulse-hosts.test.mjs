@@ -21,6 +21,7 @@ import pulseVault, {
   createVideoValidator,
   MAX_CONTEXT_BYTES,
   uploadIdOf,
+  probeVideo,
 } from "../dist/app.js";
 import { createHash } from "node:crypto";
 import { makeMp4, tusCreate, tusPatch, tusDelete, tusHead, uploadFull } from "./helpers.mjs";
@@ -584,6 +585,26 @@ test("webReady: a video rotated by an angle other than a quarter turn is served 
     assert.deepEqual(await fs.readFile(await ctx.storage.getLocalPath(videoId)), body, "the upload's bytes, untouched");
   } finally {
     await ctx.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("probeVideo: a WebM without a duration whose timestamps don't start at zero is measured by its span", { skip: !FFMPEG }, async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-offset-"));
+  try {
+    const file = path.join(dir, "offset.webm");
+    try {
+      // Written to a pipe (no duration in the header), timestamps starting at 100 s.
+      await fs.writeFile(file, execFileSync("ffmpeg", [
+        "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1",
+        "-c:v", "libvpx-vp9", "-b:v", "100k", "-output_ts_offset", "100", "-f", "webm", "pipe:1",
+      ]));
+    } catch {
+      return t.skip("ffmpeg build lacks libvpx");
+    }
+    const probe = await probeVideo(file);
+    assert.ok(Math.abs(probe.durationSeconds - 1) < 0.1, `1 s, not the last timestamp (${probe.durationSeconds})`);
+  } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
 });

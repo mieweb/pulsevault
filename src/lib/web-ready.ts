@@ -272,12 +272,13 @@ async function runProbe(ffprobePath: string, args: string[], timeoutMs: number):
 }
 
 /**
- * The end of the last video packet, for a file whose header carries no duration (a WebM from
- * a browser's MediaRecorder is written without one). Demuxes the file without decoding it.
+ * The span of the video packets — from the first packet's start to the last one's end — for a
+ * file whose header carries no duration (a WebM from a browser's MediaRecorder is written without
+ * one). Timestamps needn't start at zero, and may be negative. Demuxes without decoding.
  */
 async function packetDuration(filePath: string, ffprobePath: string, index: number, timeoutMs: number): Promise<number | null> {
-  // One line per packet, read as it comes and kept only as the latest end: a crafted file with
-  // millions of tiny packets costs time (bounded by the timeout), never memory.
+  // One line per packet, read as it comes and kept only as the earliest start and latest end: a
+  // crafted file with millions of tiny packets costs time (bounded by the timeout), never memory.
   const child = spawn(
     ffprobePath,
     ['-v', 'error', '-select_streams', String(index), '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', filePath],
@@ -293,11 +294,15 @@ async function packetDuration(filePath: string, ffprobePath: string, index: numb
     timedOut = true;
     child.kill('SIGKILL');
   }, timeoutMs);
-  let end = 0;
+  let start = Infinity;
+  let end = -Infinity;
   try {
     for await (const line of createInterface({ input: child.stdout })) {
       const [pts, duration] = line.split(',');
-      end = Math.max(end, (positive(pts) ?? 0) + (positive(duration) ?? 0));
+      const at = Number.parseFloat(pts ?? '');
+      if (!Number.isFinite(at)) continue; // `N/A`
+      start = Math.min(start, at);
+      end = Math.max(end, at + (positive(duration) ?? 0));
     }
     const code = await exited;
     if (timedOut) throw new ProbeTimeoutError(`ffprobe timed out after ${Math.round(timeoutMs / 100) / 10} s`);
@@ -305,7 +310,8 @@ async function packetDuration(filePath: string, ffprobePath: string, index: numb
   } finally {
     clearTimeout(timer);
   }
-  return end > 0 ? end : null;
+  const span = end - start;
+  return Number.isFinite(span) && span > 0 ? span : null;
 }
 
 /** Whether a stream has at least two packets: reads only the first two. */
