@@ -3,7 +3,7 @@
   "info": {
     "title": "Pulse upload protocol",
     "description": "The HTTP surface of the Pulse upload protocol, as implemented by @mieweb/pulsevault. Generated from the plugin's route schemas — see PROTOCOL.md for the full contract.",
-    "version": "2.3"
+    "version": "2.4"
   },
   "components": {
     "schemas": {}

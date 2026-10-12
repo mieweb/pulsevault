@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/deep-link.schema.json",
-  "title": "Pairing link query parameters",
-  "description": "The query parameters of a `pulsecam://?…` pairing link (PROTOCOL.md §3), as built by `buildUploadLink`. Clients must ignore parameters they don't recognize.",
+  "title": "Pairing link parameters",
+  "description": "The parameters of a pairing link (PROTOCOL.md §3), as built by `buildUploadLink`: the query string of `pulsecam://?…`, or the fragment of `https://mieweb.github.io/pulse/open#…`. Clients must ignore parameters they don't recognize.",
   "type": "object",
   "required": ["v", "artifactId", "server"],
   "properties": {

@@ -7,6 +7,20 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+Protocol 2.4 (`PROTOCOL.md` §7.4).
+
+### Added
+
+- **https pairing links** (#83): `buildUploadLink({ …, form: 'https' })`
+  returns `https://mieweb.github.io/pulse/open#v=1&artifactId=…&server=…&token=…`,
+  the same parameters as the `pulsecam://` form, in the fragment. It is a
+  Universal Link / App Link: a phone camera opens it, Pulse opens straight
+  from it when installed, and the page sends the person to the store when it
+  isn't. Browsers never send the fragment, so the link host never receives the
+  token. `PULSE_OPEN_URL` is exported. Without `form` the output is
+  unchanged, `pulsecam://`, because Pulse releases from before the link host
+  was claimed open the https form only through the page's button.
+
 ## [0.5.0] - 2026-10-05
 
 Protocol 2.3 (`PROTOCOL.md` §7.4). What every host rebuilt around PulseVault
