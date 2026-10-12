@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.4` |
+| Spec revision | `2.5` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -335,7 +335,7 @@ body is defined by
 bytes for the web) or `ready`, with the bytes received against the declared
 length while uploading, and whatever outcome the host recorded once finished.
 A server that converts videos for the web also reports what the conversion did
-(`webReady`, protocol 2.4): nothing, a remux, a transcode, a new container, or
+(`webReady`, protocol 2.5): nothing, a remux, a transcode, a new container, or
 why it was skipped (the original then serves). The response MUST NOT be cached.
 
 A server MAY also expose `GET {prefix}/artifacts/<videoId>/poster`: the finished
@@ -427,7 +427,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.1 | Added `protocolRevision` to `/capabilities`, the `Pulse-Client` header with `426 Upgrade Required` (§7.2), and `Upload-Metadata.appVersion` (§4.1). |
 | 2.2 | Added read-only view links: `viewLinks` in `/capabilities`, `POST {prefix}/artifacts/<id>/view-link` (§6.4), and the view token's `use` claim (§5.5). |
 | 2.3 | Added `GET {prefix}/artifacts/<id>/status` and `GET {prefix}/artifacts/<id>/poster` (§6.5), the capability token's `ctx` claim (§5.4), and the pulse-shape rule for creates (§5.4). |
-| 2.4 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
+| 2.5 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
 
 ## 8. Artifact relationships (`relatedTo`)
 

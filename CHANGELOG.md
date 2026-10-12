@@ -7,7 +7,7 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
-Protocol 2.4 (`PROTOCOL.md` §7.4). `webReady` becomes a **conform** step: whatever video a
+Protocol 2.5 (`PROTOCOL.md` §7.4). `webReady` becomes a **conform** step: whatever video a
 person uploads, PulseVault serves it in the one format the Pulse app records, and a Pulse upload
 is left untouched (#84).
 
@@ -33,7 +33,7 @@ is left untouched (#84).
   frame rates get proportionally longer): a longer run is killed, the original
   kept, and `skipped` recorded with the reason.
 - The conversion's result is recorded on the artifact: `GET /artifacts/:id/status` and
-  `getStatus` report `webReady: { action, reason }` (protocol 2.4), and `describeArtifact`
+  `getStatus` report `webReady: { action, reason }` (protocol 2.5), and `describeArtifact`
   returns it.
 - `core.conformAvailable()` (also on `fastify.pulseVaultCore`): `false` when `webReady` is off or
   ffmpeg/ffprobe are missing, for a host's health check.
