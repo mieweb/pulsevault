@@ -248,8 +248,10 @@ Settings:
   completion replay (`replayCompletions`): an artifact isn't marked converted
   until its result is recorded.
 - `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
-  1080p30 seconds — a second of 4K at 120 fps counts 16 — an hour when the
-  duration is unknown): a run past it is killed, the original kept, and
+  1080p30 seconds — a second of 4K at 120 fps counts 16 — at most an hour,
+  and an hour when the duration is unknown; the default comes from the
+  upload's own metadata, so set this for longer runs): a run past it is
+  killed, the original kept, and
   `skipped` recorded with the reason.
 - `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
   over the upload, so a malformed file can't hold the queue.

@@ -40,7 +40,8 @@ is left untouched (#84).
   `uploadIdOf(meta)` names tus's upload by it, so a replayed hook's `ext` and `uploadId` still
   match `filename`.
 - `webReady.timeoutSeconds` (default `60 + 10 ×` the duration in 1080p30 seconds, so 4K or high
-  frame rates get proportionally longer): a longer run is killed, the original
+  frame rates get proportionally longer, at most an hour since it comes from the upload's own
+  metadata; set it explicitly for longer runs): a longer run is killed, the original
   kept, and `skipped` recorded with the reason.
 - The conversion's result is recorded on the artifact: `GET /artifacts/:id/status` and
   `getStatus` report `webReady: { action, reason }` (protocol 2.5), and `describeArtifact`

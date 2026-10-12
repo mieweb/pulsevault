@@ -98,8 +98,9 @@ export type WebReadyOptions = {
   /**
    * Wall-clock limit for one ffmpeg run, in seconds; the run is killed and the original kept.
    * A guard against a run that hangs, not a speed limit. Default `60 + 10 ×` the video's
-   * duration counted in 1080p30 seconds (a second of 4K at 120 fps counts 16), or an hour when
-   * the duration is unknown.
+   * duration counted in 1080p30 seconds (a second of 4K at 120 fps counts 16), at most an hour,
+   * and an hour when the duration is unknown. The default comes from the upload's own metadata,
+   * so it's capped: a file can't claim its way to a days-long run. Set this for longer runs.
    */
   timeoutSeconds?: number;
   /**
@@ -691,9 +692,15 @@ export async function ensureWebReady(
   return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
 
+/** The longest default run: the default is computed from the upload's own (untrusted) metadata. */
+const MAX_DEFAULT_TIMEOUT_SECONDS = 3600;
+
 /** The wall-clock limit for one run over this video, in ms. */
 function timeoutOf(options: WebReadyOptions, probe: VideoProbe): number {
-  const seconds = options.timeoutSeconds ?? (probe.durationSeconds !== null ? 60 + 10 * workSeconds(probe) : 3600);
+  const computed = probe.durationSeconds !== null ? 60 + 10 * workSeconds(probe) : MAX_DEFAULT_TIMEOUT_SECONDS;
+  const seconds =
+    options.timeoutSeconds ??
+    (Number.isFinite(computed) ? Math.min(computed, MAX_DEFAULT_TIMEOUT_SECONDS) : MAX_DEFAULT_TIMEOUT_SECONDS);
   return Math.max(1, Math.round(seconds * 1000));
 }
 
