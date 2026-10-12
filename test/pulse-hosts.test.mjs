@@ -832,6 +832,20 @@ test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same a
     assert.equal(replayed.ext, ".webm");
     assert.equal(replayed.uploadId, `video/${videoId}.webm`);
 
+    // Another instance on the same disk writes the sidecar back from its copy older than the
+    // conversion: the `.webm` it names is gone, so the converted file serves, and the replay's
+    // pass names it again.
+    const sidecarFile = path.join(ctx.storage.workspaceRoot, ".pulsevault", `${videoId}.json`);
+    const { sourceExt: _sourceExt, webReady: _webReady, ...current } = JSON.parse(await fs.readFile(sidecarFile, "utf8"));
+    await fs.writeFile(sidecarFile, JSON.stringify({ ...current, ext: ".webm", converted: false }));
+    const stale = createLocalStorage({ workspaceDir: ctx.storage.workspaceRoot });
+    assert.equal((await stale.resolve(videoId))?.contentType, "video/mp4", "a stale record still finds the converted file");
+    await ctx.storage.patchArtifact(videoId, { acknowledged: true }); // only the conversion is left to redo
+    await ctx.core.replayCompletions();
+    const repaired = await waitForWebReady(ctx, videoId);
+    assert.equal(repaired.webReady.action, "none", "the converted file needed nothing");
+    assert.equal((await ctx.storage.describeArtifact(videoId)).ext, ".mp4", "the record names the converted file again");
+
     // Removing the artifact removes every file it had, including tus's record of the upload.
     assert.equal(await ctx.storage.remove(videoId), true);
     assert.deepEqual((await fs.readdir(videoDir)).filter((f) => f.startsWith(videoId)), []);
@@ -992,42 +1006,34 @@ test("local storage: a delete racing a conversion's switch to a new file leaves 
   }
 });
 
-test("local storage, two instances on one workspace: a delete or a stale acknowledgement racing a switch to a new file", async () => {
+test("local storage, two instances on one workspace: a sidecar written from a copy older than a switch to a new file still serves the new file", async () => {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-two-instances-"));
-  // Two adapters over one directory: two servers on a shared disk, each with its own memory.
+  // Two servers on a shared disk: no lock spans them, so the last sidecar write wins. One that
+  // read the sidecar before another's conversion switched the file to `.mp4` (deleting the
+  // `.webm`) can write that old copy back; the artifact must still serve the converted file.
   const a = createLocalStorage({ workspaceDir });
-  const b = createLocalStorage({ workspaceDir });
   await a.initialize();
   try {
-    for (let i = 0; i < 40; i++) {
-      const id = randomUUID();
-      const rel = await a.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
-      await fs.writeFile(path.join(workspaceDir, rel), "webm");
-      await a.markReady(id);
-      await b.describeArtifact(id);
-      const output = path.join(workspaceDir, "video", `${id}.mp4`);
-      await fs.writeFile(output, "mp4");
-      const switchOver = async () => {
-        await a.patchArtifact(id, { ext: ".mp4", converted: true, unlessConverted: true });
-        const recorded = await a.describeArtifact(id);
-        if (!recorded) await fs.rm(output, { force: true });
-        else await fs.rm(recorded.ext === ".mp4" ? path.join(workspaceDir, rel) : output, { force: true });
-      };
-      if (i % 2) {
-        // A delete on the other instance: nothing may come back.
-        await Promise.all([b.remove(id), switchOver()]);
-        assert.equal(await a.describeArtifact(id), null);
-        assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
-      } else {
-        // An acknowledgement on the other instance: it must not put the old extension back.
-        await Promise.all([b.patchArtifact(id, { acknowledged: true }), switchOver()]);
-        const meta = await b.describeArtifact(id);
-        assert.equal(meta.ext, ".mp4");
-        assert.equal(meta.acknowledged, true);
-        const resolved = await b.resolve(id);
-        assert.equal(resolved?.filename, `video/${id}.mp4`, "the record and the file agree");
-      }
-    }
+    const id = randomUUID();
+    const rel = await a.reserveUpload({ artifactId: id, filename: "r.webm", ext: ".webm", kind: "video" });
+    await fs.writeFile(path.join(workspaceDir, rel), "webm");
+    await a.markReady(id);
+    const sidecar = path.join(workspaceDir, ".pulsevault", `${id}.json`);
+    const before = await fs.readFile(sidecar, "utf8");
+    const output = path.join(workspaceDir, "video", `.conv-${id}.mp4`);
+    await fs.writeFile(output, "mp4");
+    assert.equal(await a.patchArtifact(id, { file: output, ext: ".mp4", converted: true, unlessConverted: true }), true);
+    await fs.writeFile(sidecar, before); // the other instance's write, from its older copy
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.includes(id)), [`${id}.mp4`]);
+    const b = createLocalStorage({ workspaceDir });
+    assert.equal((await b.describeArtifact(id)).ext, ".webm", "the old copy won");
+    const resolved = await b.resolve(id);
+    assert.equal(resolved?.filename, `video/${id}.mp4`);
+    assert.equal(resolved?.contentType, "video/mp4");
+    assert.equal(await b.getLocalPath(id), path.join(workspaceDir, "video", `${id}.mp4`));
+    // And removing it removes the converted file the old copy doesn't name.
+    assert.equal(await b.remove(id), true);
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.includes(id)), []);
   } finally {
     await fs.rm(workspaceDir, { recursive: true, force: true });
   }
@@ -1115,35 +1121,6 @@ test("local storage, two instances: a reservation racing a removal of the same i
         assert.equal(await fs.readFile(path.join(workspaceDir, "video", `${id}.mp4`), "utf8"), "new");
       }
     }
-  } finally {
-    await fs.rm(workspaceDir, { recursive: true, force: true });
-  }
-});
-
-test("local storage: a sidecar lock is waited for while its holder lives, and taken over once it's stale", async () => {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-lock-"));
-  const storage = createLocalStorage({ workspaceDir });
-  await storage.initialize();
-  try {
-    const id = randomUUID();
-    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
-    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
-    // Another instance holds the lock and is alive: the patch waits until it's released.
-    await fs.writeFile(lockPath, "another-holder");
-    let done = false;
-    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
-    await new Promise((r) => setTimeout(r, 200));
-    assert.equal(done, false, "waits for a live holder");
-    await fs.rm(lockPath);
-    assert.equal(await patched, true);
-    // A holder that died 60 s ago: its lock is taken over, and the patch's own lock is gone after.
-    await fs.writeFile(lockPath, "dead-holder");
-    const longAgo = new Date(Date.now() - 60_000);
-    await fs.utimes(lockPath, longAgo, longAgo);
-    assert.equal(await storage.patchArtifact(id, { outcome: { ok: true } }), true);
-    assert.deepEqual((await storage.describeArtifact(id)).outcome, { ok: true });
-    await assert.rejects(fs.stat(lockPath));
-    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
   } finally {
     await fs.rm(workspaceDir, { recursive: true, force: true });
   }
@@ -1245,32 +1222,6 @@ test("webReady: an onArtifactEvent observer that throws doesn't hide the recorde
   } finally {
     await ctx.teardown();
     await fs.rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("local storage: a stale lock that another waiter is already recovering isn't taken over twice", async () => {
-  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-recovery-"));
-  const storage = createLocalStorage({ workspaceDir });
-  await storage.initialize();
-  try {
-    const id = randomUUID();
-    await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
-    const lockPath = path.join(workspaceDir, ".pulsevault", `${id}.json.lock`);
-    await fs.writeFile(lockPath, "dead-holder");
-    const longAgo = new Date(Date.now() - 60_000);
-    await fs.utimes(lockPath, longAgo, longAgo);
-    // Another waiter holds the recovery: this one waits instead of removing the lock itself.
-    await fs.writeFile(`${lockPath}.recovery`, "");
-    let done = false;
-    const patched = storage.patchArtifact(id, { acknowledged: true }).then((ok) => { done = true; return ok; });
-    await new Promise((r) => setTimeout(r, 200));
-    assert.equal(done, false);
-    assert.equal(await fs.readFile(lockPath, "utf8"), "dead-holder", "left to the waiter recovering it");
-    await fs.rm(`${lockPath}.recovery`);
-    assert.equal(await patched, true);
-    assert.deepEqual((await fs.readdir(path.join(workspaceDir, ".pulsevault"))).filter((f) => f.includes(".lock")), []);
-  } finally {
-    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 

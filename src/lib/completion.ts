@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import {
   CONFORM_TARGET,
   ensureWebReady,
@@ -280,13 +281,17 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
    * names the `.mp4`. When the patch doesn't apply — the artifact was removed, or reserved again,
    * or converted elsewhere meanwhile — or fails, the file it wrote goes and nothing else
    * changes. Until a record is written the original serves and the next pass converts again.
-   * Resolves whether this record applied.
+   * `storedExt`: the extension of the file the conversion ran on, when it isn't the one the
+   * sidecar names (the local adapter found the converted `.mp4` under a sidecar written from a
+   * copy older than the conversion): the record names that file again. Resolves whether this
+   * record applied.
    */
   const recordConversion = async (
     artifactId: string,
     generation: string | null,
     result: WebReadyResult,
     outputPath: string | undefined,
+    storedExt?: string,
   ): Promise<boolean> => {
     let applied = false;
     try {
@@ -296,7 +301,11 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           webReady: result,
           unlessConverted: true,
           generation,
-          ...(outputPath ? { file: outputPath, ext: CONFORM_TARGET.extension } : {}),
+          ...(outputPath
+            ? { file: outputPath, ext: CONFORM_TARGET.extension }
+            : storedExt
+              ? { ext: storedExt }
+              : {}),
         })) ?? false;
     } catch (err) {
       logger.error({ err, artifactId }, 'pulsevault could not record a web-ready conversion');
@@ -335,8 +344,14 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
             typeof localPath === 'string'
               ? await ensureWebReady(localPath, { ...webReady, logger, install: false })
               : { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined };
-          if (!(await recordConversion(ctx.artifactId, generation !== undefined ? generation : (fresh.generation ?? null), result, outputPath))) {
-            resolve((await describe(ctx.artifactId))?.webReady);
+          const expected = generation !== undefined ? generation : (fresh.generation ?? null);
+          const localExt = typeof localPath === 'string' ? path.extname(localPath).toLowerCase() : '';
+          const storedExt = localExt && localExt !== fresh.ext ? localExt : undefined;
+          if (!(await recordConversion(ctx.artifactId, expected, result, outputPath, storedExt))) {
+            // Lost to another pass: its result, but only while the id is still this reservation's
+            // (a removal and a new upload of the id would hand back the new upload's result).
+            const now = await describe(ctx.artifactId);
+            resolve(now && (now.generation ?? null) === expected ? now.webReady : undefined);
             return;
           }
           // The result is recorded: an observer that throws is the observer's failure, not the

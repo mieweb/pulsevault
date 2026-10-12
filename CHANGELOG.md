@@ -70,16 +70,16 @@ is left untouched (#84).
 - A failed conversion is now recorded (`webReady: { action: "skipped", reason }`) as well as
   logged, and still not retried; a conversion that never recorded a result is resumed by the
   replay, as before.
-- The local adapter changes a sidecar under a per-artifact lock file (`.pulsevault/<id>.json.lock`,
-  created exclusively with its owner's token, renewed every 10 s while held, removed only by its
-  owner; once not renewed for 30 s, taken over by one waiter at a time under a recovery lock,
-  after a second look) as well as its in-process lock, and `remove` runs under it too, reading the sidecar itself: instances sharing a
-  workspace never write over each other's changes, so a delete racing a conversion's switch
-  can't bring the sidecar back and a stale acknowledgement can't put the old extension back.
-- Reservations run under the same lock, and `remove` deletes the sidecar last, so a new upload
+- The local adapter's `remove` reads the sidecar itself (not its cache) and deletes the
+  converted `<id>.mp4` and the uploaded file as well as the stored one. A converted video's bytes
+  are always at `<id>.mp4`, and `resolve`/`getLocalPath` fall back to it when the sidecar's `ext`
+  file is gone: across instances sharing a workspace, where the last sidecar write wins (as
+  before; there is no cross-instance lock), a write from a copy older than a conversion still
+  serves the converted file.
+- Reservations run under the in-process sidecar lock, and `remove` deletes the sidecar last, so a new upload
   of a removed id never has its bytes deleted by the old removal. Each reservation gets a
   `generation` (`describeArtifact`), new every time the id is reserved.
-- A conversion is installed in one patch under that lock: the runner converts into a temporary
+- A conversion is installed in one patch under the sidecar lock: the runner converts into a temporary
   `.mp4` (`ensureWebReady(…, { install: false })`), then `patchArtifact` with `file` renames it
   onto the stored file, switches `ext`, records the result and deletes the original — only for
   the reservation the conversion began on (`generation`) and only while no other pass has

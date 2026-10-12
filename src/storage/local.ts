@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isUuid } from '../lib/uuid.js';
-import type { WebReadyResult } from '../lib/web-ready.js';
+import { CONFORM_TARGET, type WebReadyResult } from '../lib/web-ready.js';
 import type {
   PulseVaultArtifactMeta,
   PulseVaultArtifactPatch,
@@ -83,10 +83,6 @@ const PULSEVAULT_META_DIR = '.pulsevault';
 const RELATED_DIR = 'related';
 /** A stored file's extension: lowercase, one dot, nothing that could leave the kind directory. */
 const STORED_EXT = /^\.[a-z0-9]+$/;
-/** A sidecar lock not renewed for this long (holders renew it every third of it) was left by a dead process. */
-const LOCK_STALE_MS = 30_000;
-/** How long a sidecar write waits for another instance's lock before failing. */
-const LOCK_WAIT_MS = 60_000;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
 const DEFAULT_META_CACHE_LIMIT = 10_000;
 
@@ -270,6 +266,25 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const artifactRelPath = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
 
+  /**
+   * The extension of the file that holds an artifact's bytes, given the `ext` its sidecar names:
+   * that file, or for a video the conform target (`<id>.mp4`) when only that exists. A sidecar
+   * another instance wrote from a copy older than a conversion still names the uploaded file,
+   * which the conversion deleted; its bytes are in the converted file. `null` when neither exists.
+   */
+  const storedExt = async (artifactId: string, kind: UploadKind, ext: string): Promise<string | null> => {
+    const candidates = kind === 'video' && ext !== CONFORM_TARGET.extension ? [ext, CONFORM_TARGET.extension] : [ext];
+    for (const candidate of candidates) {
+      try {
+        const stat = await fs.stat(path.join(workspaceRoot, artifactRelPath(artifactId, kind, candidate)));
+        if (stat.isFile()) return candidate;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+      }
+    }
+    return null;
+  };
+
   const writeSidecar = async (artifactId: string, sidecar: Sidecar): Promise<void> => {
     // Atomic tmp + rename so a crash mid-write can never leave a truncated
     // JSON blob that `loadMeta` would then treat as corrupt. The tmp name is
@@ -288,80 +303,18 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   };
 
   /**
-   * Read-modify-write of a sidecar runs one at a time per artifact: in this process through a
-   * promise chain, and across instances sharing the workspace (OPERATIONS.md, "Horizontal
-   * scaling") through a lock file, `.pulsevault/<artifactId>.json.lock`, created exclusively
-   * (`wx`: atomic on a local disk and on NFS). So an acknowledgement, a conversion switching
-   * the stored file and a removal each act on the sidecar as the last of them left it, never on
-   * a stale copy. Each critical section is a read and a rename; a lock older than
-   * `LOCK_STALE_MS` was left by a process that died holding it, and is taken over.
+   * Read-modify-write of a sidecar runs one at a time per artifact in this process, so an
+   * acknowledgement, a conversion switching the stored file and a removal each act on the sidecar
+   * as the last of them left it. Across instances sharing the workspace (OPERATIONS.md,
+   * "Horizontal scaling") there is no lock: the last rename wins, and nothing is lost for good.
+   * The replay redoes a lost acknowledgement or conversion record, idempotently, and a sidecar
+   * written from a copy older than a conversion still finds the bytes: a conversion's file is
+   * always `<id>.mp4`, which `resolve` and `getLocalPath` fall back to (`storedExt`).
    */
   const sidecarWrites = new Map<string, Promise<unknown>>();
-  const withLockFile = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
-    const lockPath = `${sidecarPath(artifactId)}.lock`;
-    // Who holds it: release removes the lock only while it's still this holder's.
-    const token = randomUUID();
-    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
-    const giveUpAt = Date.now() + LOCK_WAIT_MS;
-    for (let pause = 2; ; pause = Math.min(pause * 2, 50)) {
-      try {
-        await fs.writeFile(lockPath, token, { flag: 'wx' });
-        break;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-        const heldFor = await fs.stat(lockPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
-        if (heldFor > LOCK_STALE_MS) {
-          await takeOverStaleLock(lockPath);
-          continue;
-        }
-        if (Date.now() > giveUpAt) throw new Error(`timed out waiting for the sidecar lock of ${artifactId}`);
-        await new Promise((resolve) => setTimeout(resolve, pause + Math.random() * pause));
-      }
-    }
-    // The lease: a holder that is slow but alive keeps its lock fresh, so it's never taken for
-    // one that died.
-    const renew = setInterval(() => {
-      const now = new Date();
-      void fs.utimes(lockPath, now, now).catch(() => {});
-    }, LOCK_STALE_MS / 3);
-    renew.unref();
-    try {
-      return await work();
-    } finally {
-      clearInterval(renew);
-      if ((await fs.readFile(lockPath, 'utf8').catch(() => null)) === token) {
-        await fs.rm(lockPath, { force: true });
-      }
-    }
-  };
-  /**
-   * Remove a lock whose holder died. Takeovers of one lock run one at a time, under a recovery
-   * lock created exclusively beside it, and look at the lock again inside it: a lock that was
-   * released and taken afresh meanwhile is fresh, and stays. (A recovery lock is held for a
-   * stat and an unlink; one older than `LOCK_STALE_MS` was left by a waiter that died in
-   * between, and is cleared for the next one.)
-   */
-  const takeOverStaleLock = async (lockPath: string): Promise<void> => {
-    const recoveryPath = `${lockPath}.recovery`;
-    try {
-      await fs.writeFile(recoveryPath, '', { flag: 'wx' });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      const age = await fs.stat(recoveryPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
-      if (age > LOCK_STALE_MS) await fs.rm(recoveryPath, { force: true });
-      return; // Another waiter is recovering it: wait for the lock as usual.
-    }
-    try {
-      const heldFor = await fs.stat(lockPath).then((stats) => Date.now() - stats.mtimeMs, () => 0);
-      if (heldFor > LOCK_STALE_MS) await fs.rm(lockPath, { force: true });
-    } finally {
-      await fs.rm(recoveryPath, { force: true });
-    }
-  };
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {
     const previous = sidecarWrites.get(artifactId) ?? Promise.resolve();
-    // A non-UUID id names no sidecar (`readSidecar` refuses it): nothing to lock, no path built.
-    const run = previous.catch(() => {}).then(() => (isUuid(artifactId) ? withLockFile(artifactId, work) : work()));
+    const run = previous.catch(() => {}).then(work);
     sidecarWrites.set(artifactId, run);
     try {
       return await run;
@@ -534,7 +487,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       generation: randomUUID(),
     };
 
-    // Under the sidecar lock, so a removal of the same id on any instance either finished
+    // Under the sidecar lock, so a removal of the same id in this process either finished
     // (its sidecar went last) or hasn't started.
     await withSidecarLock(artifactId, async () => {
       // Collision guard: `wx` fails atomically with EEXIST if a sidecar already exists for
@@ -581,14 +534,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     // Only serve ready uploads. In-progress uploads stay hidden — a client
     // GETting mid-upload would otherwise receive a truncated file.
     if (!meta || !meta.ready) return null;
-    const relFile = artifactRelPath(artifactId, meta.kind, meta.ext);
-    try {
-      const stat = await fs.stat(path.join(workspaceRoot, relFile));
-      if (!stat.isFile()) return null;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
-      // Another instance on the same disk may have switched the artifact to a new file (a
-      // conversion changed its extension) since this one cached it: read the sidecar once more.
+    const ext = await storedExt(artifactId, meta.kind, meta.ext);
+    if (ext === null) {
+      // The cache may be older than another instance's removal and new upload of the id: read
+      // the sidecar once more.
       if (reread) return null;
       metaCache.delete(artifactId);
       return resolve(artifactId, true);
@@ -596,8 +545,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     return {
       kind: 'stream',
       root: workspaceRoot,
-      filename: relFile,
-      contentType: extToContentType(meta.ext),
+      filename: artifactRelPath(artifactId, meta.kind, ext),
+      contentType: extToContentType(ext),
     };
   };
 
@@ -620,9 +569,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
     });
 
-  // Under the sidecar lock, from the sidecar itself: a conversion switching the artifact to a new
-  // file (`patchArtifact` with `ext`) either finishes first — and this removes the new file — or
-  // finds the sidecar gone and drops what it wrote; it can never write the sidecar back.
+  // Under the sidecar lock, from the sidecar itself: in this process, a conversion switching the
+  // artifact to a new file (`patchArtifact` with `ext`) either finishes first — and this removes
+  // the new file — or finds the sidecar gone and drops what it wrote.
   const remove = (artifactId: string): Promise<boolean> =>
     withSidecarLock(artifactId, async () => {
       // The sidecar decides, never the cache: a read racing this removal (or an earlier one) can
@@ -640,12 +589,18 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       const sourcePath = meta.sourceExt
         ? path.join(workspaceRoot, meta.kind, `${artifactId}${meta.sourceExt}`)
         : null;
+      // A video's conversion output, whatever this sidecar's copy says (`storedExt`).
+      const conformedPath =
+        meta.kind === 'video' && meta.ext !== CONFORM_TARGET.extension
+          ? path.join(workspaceRoot, artifactRelPath(artifactId, meta.kind, CONFORM_TARGET.extension))
+          : null;
       await Promise.all([
         fs.rm(artifactPath, { force: true }),
         fs.rm(`${artifactPath}.json`, { force: true }),
         ...(sourcePath
           ? [fs.rm(sourcePath, { force: true }), fs.rm(`${sourcePath}.json`, { force: true })]
           : []),
+        ...(conformedPath ? [fs.rm(conformedPath, { force: true })] : []),
         ...(meta.relatedTo
           ? [fs.rm(path.join(relatedDir(meta.relatedTo), artifactId), { force: true })]
           : []),
@@ -670,7 +625,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return null;
     }
     cacheSet(artifactId, sidecarToCachedMeta(sidecar, sidecar.status === 'ready'));
-    return path.join(workspaceRoot, sidecar.kind ?? 'video', `${artifactId}${sidecar.ext}`);
+    const kind = sidecar.kind ?? 'video';
+    const ext = (await storedExt(artifactId, kind, sidecar.ext)) ?? sidecar.ext;
+    return path.join(workspaceRoot, artifactRelPath(artifactId, kind, ext));
   };
 
   const getKind = async (artifactId: string): Promise<UploadKind | null> => {
@@ -737,7 +694,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // by a stale entry either — keep it consistent with what was just written.
       cacheSet(artifactId, sidecarToCachedMeta(next, next.status === 'ready'));
       // The sidecar names the new file: the one under the old extension goes. (A crash before
-      // this leaves it for `remove`, which deletes `sourceExt` too.)
+      // this leaves it for `remove`, which deletes `sourceExt` too. A sidecar copy that still
+      // names it finds the new file instead: `storedExt`.)
       if (ext !== sidecar.ext) await fs.rm(stored(sidecar.ext), { force: true });
       return true;
     });

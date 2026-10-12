@@ -54,13 +54,14 @@ Two ways to actually support multiple instances:
 2. **Shared filesystem**: point every instance's `workspaceDir` at the same
    NFS/EFS mount. Verify your mount's durability/consistency guarantees
    under concurrent writes from multiple instances before relying on this in
-   production. The local adapter changes an artifact's metadata (`.pulsevault/
-   <id>.json`) under a per-artifact lock file (`<id>.json.lock`, created
-   exclusively and holding its owner's token), so instances never write over
-   each other's changes. A holder renews its lock every 10 seconds and removes
-   it only while it's still its own; a lock not renewed for 30 seconds was left
-   by a crashed process and is taken over, one waiter at a time (under a
-   `<id>.json.lock.recovery` file), after looking at it again.
+   production. Each instance changes an artifact's metadata (`.pulsevault/
+   <id>.json`) one write at a time, but no lock spans instances: when two
+   write the same artifact's metadata at once, the last write wins. Nothing is
+   lost for good: the replay redoes a lost acknowledgement or conversion
+   record, and a converted video's bytes are always at `<id>.mp4`, which is
+   served even when the metadata that won still names the uploaded file. A
+   removal racing another instance's write to the same artifact can leave its
+   metadata behind; for strict guarantees across instances, use S3.
 
 **The S3/R2 adapter (`createS3Storage`) has no such requirement** — every
 instance talks to the same bucket, so it scales horizontally with zero
