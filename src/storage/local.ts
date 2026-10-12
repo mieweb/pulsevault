@@ -273,6 +273,8 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    * which the conversion deleted; its bytes are in the converted file. `null` when neither exists.
    */
   const storedExt = async (artifactId: string, kind: UploadKind, ext: string): Promise<string | null> => {
+    // Only a real id becomes a path, as everywhere else in this adapter.
+    if (!isUuid(artifactId) || !STORED_EXT.test(ext)) return null;
     const candidates = kind === 'video' && ext !== CONFORM_TARGET.extension ? [ext, CONFORM_TARGET.extension] : [ext];
     for (const candidate of candidates) {
       try {
