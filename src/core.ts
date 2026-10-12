@@ -1241,7 +1241,7 @@ export {
   CONFORM_VIDEO_EXTENSIONS,
 } from './lib/web-ready.js';
 export type { WebReadyAction, WebReadyOptions, WebReadyResult, MoovPosition, VideoProbe } from './lib/web-ready.js';
-export { buildUploadLink } from './lib/deeplinks.js';
+export { buildUploadLink, PULSE_OPEN_URL } from './lib/deeplinks.js';
 export type { UploadLinkOptions } from './lib/deeplinks.js';
 export {
   issueCapabilityToken,

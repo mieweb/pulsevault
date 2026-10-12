@@ -16,7 +16,23 @@ export type UploadLinkOptions = {
    * step. Generate with `crypto.randomUUID()`.
    */
   artifactId: string;
+  /**
+   * Which of the two equivalent link forms to build (PROTOCOL.md §3):
+   * - `'pulsecam'` (default): `pulsecam://?<params>`, which every Pulse app opens.
+   * - `'https'`: `https://mieweb.github.io/pulse/open#<params>`, a Universal Link / App Link.
+   *   Phone cameras open it, it opens Pulse when it's installed, and its page sends the person
+   *   to the store when it isn't. The parameters ride in the fragment, so the link host never
+   *   receives the token. Only Pulse releases that claim the link host open it directly; an
+   *   older Pulse lands on the page, whose "Open it" button falls back to `pulsecam://`.
+   */
+  form?: 'pulsecam' | 'https';
 };
+
+/**
+ * Where the https form of a pairing link points: the page on the link host the Pulse app
+ * claims. Fixed, because an app can only claim domains it was built with.
+ */
+export const PULSE_OPEN_URL = 'https://mieweb.github.io/pulse/open';
 
 /** Deep-link wire format version. Bump when the param shape changes incompatibly. */
 const LINK_VERSION = '1';
@@ -45,8 +61,9 @@ function isPrivateDevOrigin(url: URL): boolean {
 }
 
 /**
- * Build a `pulsecam://` deep link that opens the Pulse app directly on the
- * upload screen for a specific artifact, pointed at this server.
+ * Build a pairing link that opens the Pulse app directly on the upload screen
+ * for a specific artifact, pointed at this server: `pulsecam://?<params>`, or
+ * with `form: 'https'`, `${PULSE_OPEN_URL}#<params>`.
  *
  * No `mode` param — there's only one mode, so it was always redundant. `v`
  * lets the app refuse/explain a future incompatible link shape instead of
@@ -59,6 +76,9 @@ function isPrivateDevOrigin(url: URL): boolean {
  * issued in the first place.
  */
 export function buildUploadLink(opts: UploadLinkOptions): string {
+  if (opts.form !== undefined && opts.form !== 'pulsecam' && opts.form !== 'https') {
+    throw new Error(`buildUploadLink: \`form\` must be 'pulsecam' or 'https' (got "${String(opts.form)}")`);
+  }
   let server: URL;
   try {
     server = new URL(opts.server);
@@ -78,5 +98,6 @@ export function buildUploadLink(opts: UploadLinkOptions): string {
     server: opts.server,
   });
   if (opts.token) params.set('token', opts.token);
+  if (opts.form === 'https') return `${PULSE_OPEN_URL}#${params.toString()}`;
   return `pulsecam://?${params.toString()}`;
 }

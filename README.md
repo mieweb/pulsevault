@@ -946,7 +946,7 @@ const storage: PulseVaultStorage = {
 
 ## Deep link helper
 
-Use this to generate a `pulsecam://` deep link for pairing the Pulse mobile app with your server. Typically encoded as a QR code on a pairing page.
+Use this to generate a pairing link for the Pulse mobile app and your server. Typically encoded as a QR code on a pairing page.
 
 ```ts
 import { buildUploadLink } from "@mieweb/pulsevault";
@@ -961,7 +961,18 @@ const uploadLink = buildUploadLink({
   token: "secret", // optional — forwarded to your authorize hook; see Capability tokens
 });
 // pulsecam://?v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
+
+// The https form, a Universal Link / App Link (PROTOCOL.md §3):
+const httpsLink = buildUploadLink({
+  server: "https://example.com/pulsevault",
+  artifactId: randomUUID(),
+  token: "secret",
+  form: "https",
+});
+// https://mieweb.github.io/pulse/open#v=1&artifactId=...&server=https%3A%2F%2Fexample.com%2Fpulsevault&token=secret
 ```
+
+The `https` form is what a phone camera opens: Pulse opens straight from it when installed, and its page sends the person to the store when not. The parameters are after `#`, which browsers never send, so the link host never sees the token. Pulse releases from before the link host was claimed land on the page instead and open Pulse from its button, so `pulsecam://` stays the default.
 
 ## Pulse logo and store badges
 
