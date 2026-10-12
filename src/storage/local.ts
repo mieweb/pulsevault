@@ -265,6 +265,15 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   /** Relative path (from workspaceRoot) to the artifact bytes. */
   const artifactRelPath = (artifactId: string, kind: UploadKind, ext: string): string =>
     `${kind}/${artifactId}${ext}`;
+  /** The artifact's bytes file, strictly inside its kind directory, as `sidecarPath` checks. */
+  const storedPath = (artifactId: string, kind: UploadKind, ext: string): string => {
+    const base = path.resolve(workspaceRoot, kind);
+    const resolved = path.resolve(base, `${artifactId}${ext}`);
+    if (!resolved.startsWith(`${base}${path.sep}`)) {
+      throw new Error('artifactId escapes the kind directory');
+    }
+    return resolved;
+  };
 
   /**
    * The extension of the file that holds an artifact's bytes, given the `ext` its sidecar names:
@@ -278,7 +287,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     const candidates = kind === 'video' && ext !== CONFORM_TARGET.extension ? [ext, CONFORM_TARGET.extension] : [ext];
     for (const candidate of candidates) {
       try {
-        const stat = await fs.stat(path.join(workspaceRoot, artifactRelPath(artifactId, kind, candidate)));
+        const stat = await fs.stat(storedPath(artifactId, kind, candidate));
         if (stat.isFile()) return candidate;
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
