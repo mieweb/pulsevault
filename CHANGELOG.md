@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-12
+
 Protocol 2.5 (`PROTOCOL.md` §7.4): 2.4 adds the https pairing link form (#83), 2.5 the conform
 step's `webReady` result. `webReady` becomes a **conform** step: whatever video a
 person uploads, PulseVault serves it in the one format the Pulse app records, and a Pulse upload
@@ -622,7 +624,9 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/mieweb/pulsevault/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/mieweb/pulsevault/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/mieweb/pulsevault/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/mieweb/pulsevault/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/mieweb/pulsevault/compare/v0.3.0...v0.4.0
