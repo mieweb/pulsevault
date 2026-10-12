@@ -367,10 +367,11 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    * Read-modify-write of a sidecar runs one at a time per artifact in this process, so an
    * acknowledgement, a conversion switching the stored file and a removal each act on the sidecar
    * as the last of them left it. Across instances sharing the workspace (OPERATIONS.md,
-   * "Horizontal scaling") there is no lock: the last rename wins, and nothing is lost for good.
-   * The replay redoes a lost acknowledgement or conversion record, idempotently, and a sidecar
-   * written from a copy older than a conversion still finds the bytes: a conversion's file is
-   * always `<id>.mp4`, which `resolve` and `getLocalPath` fall back to (`storedExt`).
+   * "Horizontal scaling") there is no lock: the last rename wins. The completion bookkeeping
+   * recovers: the replay redoes a lost acknowledgement or conversion record, idempotently, and a
+   * sidecar written from a copy older than a conversion still finds the bytes: a conversion's file
+   * is always `<id>.mp4`, which `resolve` and `getLocalPath` fall back to (`storedExt`). A lost
+   * `outcome` isn't redone; nothing records it a second time.
    */
   const sidecarWrites = new Map<string, Promise<unknown>>();
   const withSidecarLock = async <T>(artifactId: string, work: () => Promise<T>): Promise<T> => {

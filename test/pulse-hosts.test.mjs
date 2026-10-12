@@ -567,6 +567,27 @@ test("local storage: an upload reserved before generations were kept gets one wh
   }
 });
 
+test("webReady: a video rotated by an angle other than a quarter turn is served as uploaded", { skip: !FFMPEG }, async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-rotation-"));
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const plain = path.join(dir, "plain.mp4");
+    const tilted = path.join(dir, "tilted.mp4");
+    execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", plain]);
+    execFileSync("ffmpeg", ["-v", "error", "-display_rotation", "45", "-i", plain, "-c", "copy", "-y", tilted]);
+    const body = await fs.readFile(tilted);
+    const videoId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "tilted.mp4", kind: "video", body });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.webReady.action, "skipped");
+    assert.match(status.webReady.reason, /rotation -?45° isn't a quarter turn/);
+    assert.deepEqual(await fs.readFile(await ctx.storage.getLocalPath(videoId)), body, "the upload's bytes, untouched");
+  } finally {
+    await ctx.teardown();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("replay with completeAfter converts before the hook, even when the process stopped before the conversion was recorded", { skip: !FFMPEG }, async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-replay-"));
   const recorded = path.join(dir, "recorded.mp4");

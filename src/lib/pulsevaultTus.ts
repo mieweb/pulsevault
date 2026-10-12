@@ -562,6 +562,7 @@ function hardenAgainstClientAbort(server: Server, logger: PulseVaultLogger): voi
 
 /** `524288000` → "500 MB", `1610612736` → "1.5 GB" (binary units, as hosts usually set them). */
 function formatBytes(bytes: number): string {
+  if (bytes === 1) return '1 byte';
   const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
   let unit = 0;

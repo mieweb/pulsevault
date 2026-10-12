@@ -56,10 +56,11 @@ Two ways to actually support multiple instances:
    under concurrent writes from multiple instances before relying on this in
    production. Each instance changes an artifact's metadata (`.pulsevault/
    <id>.json`) one write at a time, but no lock spans instances: when two
-   write the same artifact's metadata at once, the last write wins. Nothing is
-   lost for good: the replay redoes a lost acknowledgement or conversion
-   record, and a converted video's bytes are always at `<id>.mp4`, which is
-   served even when the metadata that won still names the uploaded file. A
+   write the same artifact's metadata at once, the last write wins. The
+   completion bookkeeping recovers: the replay redoes a lost acknowledgement
+   or conversion record, and a converted video's bytes are always at
+   `<id>.mp4`, which is served even when the metadata that won still names
+   the uploaded file. A host's `recordOutcome` lost that way is not redone. A
    removal racing another instance's write to the same artifact can leave its
    metadata behind; for strict guarantees across instances, use S3.
 

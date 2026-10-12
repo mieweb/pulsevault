@@ -185,7 +185,10 @@ export type VideoProbe = {
     transfer?: string;
     /** `pc` for full range, `tv` for limited, when tagged. */
     range?: string;
-    /** Display rotation in degrees from the stream's matrix (`0`, `90`, `-90`, `180`). */
+    /**
+     * Display rotation in degrees from the stream's matrix: `0`, `90`, `-90` or `180`, or another
+     * angle in (-180, 180] when the matrix isn't within a degree of a quarter turn (not converted).
+     */
     rotation: number;
     /** Average frames per second, when ffprobe can tell. */
     frameRate?: number;
@@ -224,9 +227,16 @@ type ProbeStream = {
   tags?: { rotate?: string };
 };
 
-/** Degrees to the nearest quarter turn in (-180, 180]: 270 → -90, -180 → 180, 360 → 0. */
-const quarterTurn = (degrees: number): number =>
-  [0, 90, 180, -90][(((Math.round(degrees / 90) % 4) + 4) % 4)] ?? 0;
+/**
+ * Degrees as a display rotation in (-180, 180]: the nearest quarter turn when within a degree of
+ * one (270 → -90, -180 → 180, 360 → 0, 89.9 → 90), else the angle itself (45 → 45).
+ */
+const displayRotation = (degrees: number): number => {
+  const turns = Math.round(degrees / 90);
+  if (Math.abs(degrees - turns * 90) <= 1) return [0, 90, 180, -90][((turns % 4) + 4) % 4] ?? 0;
+  const angle = ((degrees % 360) + 360) % 360;
+  return angle > 180 ? angle - 360 : angle;
+};
 
 /** ffprobe's `120/1` or `30000/1001` as frames per second; `undefined` for `0/0`. */
 const frameRateOf = (ratio: string | undefined): number | undefined => {
@@ -316,7 +326,8 @@ async function hasTwoPackets(filePath: string, ffprobePath: string, index: numbe
  */
 export async function probeVideo(filePath: string, options: ProbeOptions = {}): Promise<VideoProbe | null> {
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
-  const timeoutMs = Math.round((options.timeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000);
+  // At least 1 ms: Node treats a timeout of 0 as none.
+  const timeoutMs = Math.max(1, Math.round((options.timeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
   const stdout = await runProbe(
     ffprobePath,
     [
@@ -363,7 +374,7 @@ export async function probeVideo(filePath: string, options: ProbeOptions = {}): 
       height: video.height ?? 0,
       ...(video.color_transfer ? { transfer: video.color_transfer } : {}),
       ...(video.color_range && video.color_range !== 'unknown' ? { range: video.color_range } : {}),
-      rotation: quarterTurn(rotation),
+      rotation: displayRotation(rotation),
       ...(frameRateOf(video.avg_frame_rate) ? { frameRate: frameRateOf(video.avg_frame_rate) } : {}),
     },
     audio: audio && typeof audio.index === 'number' ? { index: audio.index, codec: audio.codec_name ?? '' } : null,
@@ -598,6 +609,10 @@ export async function ensureWebReady(
     return { action: 'skipped', reason: err.message };
   }
   if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
+  // Phones only record quarter turns; any other angle would need its own geometry.
+  if (probe.video.rotation % 90 !== 0) {
+    return { action: 'skipped', reason: `rotation ${probe.video.rotation}° isn't a quarter turn` };
+  }
   const { video, audio } = probe;
   const moov = await scanMoovPosition(filePath);
   const isMp4 = path.extname(filePath).toLowerCase() === CONFORM_TARGET.extension && moov !== 'unknown';
