@@ -20,6 +20,7 @@ import pulseVault, {
   createCapabilityAuthorize,
   createVideoValidator,
   MAX_CONTEXT_BYTES,
+  uploadIdOf,
 } from "../dist/app.js";
 import { createHash } from "node:crypto";
 import { makeMp4, tusCreate, tusPatch, tusDelete, uploadFull } from "./helpers.mjs";
@@ -1001,6 +1002,32 @@ test("local storage: a delete racing a conversion's switch to a new file leaves 
       assert.equal(await storage.describeArtifact(id), null, "the removed artifact stays removed");
       assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.startsWith(id)), []);
     }
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("local storage: a video with a custom allowed extension serves, and keeps it as sourceExt once converted", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-custom-ext-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const rel = await storage.reserveUpload({ artifactId: id, filename: "clip.my-video", ext: ".my-video", kind: "video" });
+    await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+    await fs.writeFile(path.join(workspaceDir, `${rel}.json`), "{}"); // tus's record of the upload
+    await storage.markReady(id);
+    assert.equal((await storage.resolve(id))?.filename, `video/${id}.my-video`, "served before any conversion");
+    const output = path.join(workspaceDir, "video", `.conv-${id}.mp4`);
+    await fs.writeFile(output, "mp4");
+    assert.equal(await storage.patchArtifact(id, { file: output, ext: ".mp4", converted: true, unlessConverted: true }), true);
+    const fresh = createLocalStorage({ workspaceDir }); // reads the sidecar, not a cache
+    const meta = await fresh.describeArtifact(id);
+    assert.equal(meta.ext, ".mp4");
+    assert.equal(meta.sourceExt, ".my-video", "the uploaded extension survives a re-read");
+    assert.equal(uploadIdOf(meta), `video/${id}.my-video`);
+    assert.equal(await fresh.remove(id), true);
+    assert.deepEqual((await fs.readdir(path.join(workspaceDir, "video"))).filter((f) => f.includes(id)), [], "tus's record goes too");
   } finally {
     await fs.rm(workspaceDir, { recursive: true, force: true });
   }

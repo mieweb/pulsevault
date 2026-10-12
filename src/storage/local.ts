@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isUuid } from '../lib/uuid.js';
+import { EXTENSION_REGEX } from '../lib/options.js';
 import { CONFORM_TARGET, type WebReadyResult } from '../lib/web-ready.js';
 import type {
   PulseVaultArtifactMeta,
@@ -81,8 +82,6 @@ const PULSEVAULT_META_DIR = '.pulsevault';
  * `readdir` away instead of a scan of every sidecar.
  */
 const RELATED_DIR = 'related';
-/** A stored file's extension: lowercase, one dot, nothing that could leave the kind directory. */
-const STORED_EXT = /^\.[a-z0-9]+$/;
 /** Default cap on the in-memory metadata cache before evicting the oldest entry. */
 const DEFAULT_META_CACHE_LIMIT = 10_000;
 
@@ -283,7 +282,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
    */
   const storedExt = async (artifactId: string, kind: UploadKind, ext: string): Promise<string | null> => {
     // Only a real id becomes a path, as everywhere else in this adapter.
-    if (!isUuid(artifactId) || !STORED_EXT.test(ext)) return null;
+    if (!isUuid(artifactId) || !EXTENSION_REGEX.test(ext)) return null;
     const candidates = kind === 'video' && ext !== CONFORM_TARGET.extension ? [ext, CONFORM_TARGET.extension] : [ext];
     for (const candidate of candidates) {
       try {
@@ -366,7 +365,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       return {
         version: SIDECAR_VERSION,
         ext: parsed.ext,
-        ...(typeof parsed.sourceExt === 'string' && STORED_EXT.test(parsed.sourceExt)
+        ...(typeof parsed.sourceExt === 'string' && EXTENSION_REGEX.test(parsed.sourceExt)
           ? { sourceExt: parsed.sourceExt }
           : {}),
         filename: parsed.filename,
@@ -670,7 +669,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   const patchArtifact = (artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean> =>
     withSidecarLock(artifactId, async () => {
-      if (patch.ext !== undefined && !STORED_EXT.test(patch.ext)) {
+      if (patch.ext !== undefined && !EXTENSION_REGEX.test(patch.ext)) {
         throw new TypeError(`patchArtifact: invalid ext ${JSON.stringify(patch.ext)}`);
       }
       const sidecar = await readSidecar(artifactId);

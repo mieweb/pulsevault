@@ -30,7 +30,8 @@ const DEFAULT_PROJECT_EXTENSIONS: readonly string[] = ['.pulse', '.zip'];
 const DEFAULT_CAPTIONS_EXTENSIONS: readonly string[] = ['.vtt'];
 // The pulse's poster frame (the draft's first-clip thumbnail).
 const DEFAULT_THUMBNAIL_EXTENSIONS: readonly string[] = ['.jpg', '.jpeg', '.png'];
-const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
+/** An allowed extension: one dot, then no dot, whitespace or path separator. */
+export const EXTENSION_REGEX = /^\.[^.\s/\\]+$/;
 
 /**
  * Normalize the consumer's `allowedExtensions` option (legacy array or per-kind
