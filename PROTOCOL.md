@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.3` |
+| Spec revision | `2.4` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -69,11 +69,29 @@ the integer from `protocolVersion`.
 
 ## 3. Pairing (deep link)
 
-A server presents a pairing link or QR code of the form:
+A server presents a pairing link or QR code in one of two equivalent forms
+(since 2.4), carrying the same parameters:
 
 ```
 pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
+https://mieweb.github.io/pulse/open#v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
 ```
+
+- **`pulsecam://`**: the parameters are the query string. Every Pulse release
+  opens it, but phone cameras and browsers don't open custom schemes reliably.
+- **`https://`**: a Universal Link (iOS) / App Link (Android) on the link host
+  the Pulse app claims. When Pulse is installed the OS opens it straight from
+  the link; when it isn't, the link opens a static page that sends the person
+  to the store and offers a `pulsecam://` fallback. The parameters are the
+  **fragment**, which is never sent in an HTTP request, so the link host never
+  receives the token. The link host is fixed (an app can only claim domains it
+  was built with); `server` still points at the deployment's own server, so
+  uploads never touch the link host.
+
+A client that accepts the `https://` form MUST treat it exactly like the
+`pulsecam://` form with the same parameters. A server that wants every Pulse
+release to open its links directly keeps the `pulsecam://` form until the
+releases that claim the link host are installed.
 
 - `v` (REQUIRED): the deep-link schema version. A client MUST refuse and
   explain (not silently misparse) a `v` it doesn't recognize.
@@ -95,7 +113,7 @@ pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
   credential — see §5.4 for the recommended (but not required) capability-
   token shape.
 
-A client SHOULD ignore query params it does not recognize, so links minted by
+A client SHOULD ignore parameters it does not recognize, so links minted by
 an older or newer server stay valid. The parameters are defined by
 [`protocol/schemas/deep-link.schema.json`](protocol/schemas/deep-link.schema.json).
 
@@ -410,7 +428,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | [`beat-manifest.schema.json`](protocol/schemas/beat-manifest.schema.json) | Beat manifest |
 | [`capabilities.schema.json`](protocol/schemas/capabilities.schema.json) | GET /capabilities response |
 | [`capability-token.schema.json`](protocol/schemas/capability-token.schema.json) | Capability token claims |
-| [`deep-link.schema.json`](protocol/schemas/deep-link.schema.json) | Pairing link query parameters |
+| [`deep-link.schema.json`](protocol/schemas/deep-link.schema.json) | Pairing link parameters |
 | [`pulse-client.schema.json`](protocol/schemas/pulse-client.schema.json) | Pulse-Client request header |
 | [`upload-metadata.schema.json`](protocol/schemas/upload-metadata.schema.json) | TUS Upload-Metadata keys |
 | [`view-link.schema.json`](protocol/schemas/view-link.schema.json) | POST /artifacts/<id>/view-link response |
@@ -425,6 +443,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.1 | Added `protocolRevision` to `/capabilities`, the `Pulse-Client` header with `426 Upgrade Required` (§7.2), and `Upload-Metadata.appVersion` (§4.1). |
 | 2.2 | Added read-only view links: `viewLinks` in `/capabilities`, `POST {prefix}/artifacts/<id>/view-link` (§6.4), and the view token's `use` claim (§5.5). |
 | 2.3 | Added `GET {prefix}/artifacts/<id>/status` and `GET {prefix}/artifacts/<id>/poster` (§6.5), the capability token's `ctx` claim (§5.4), and the pulse-shape rule for creates (§5.4). |
+| 2.4 | Added the `https://mieweb.github.io/pulse/open#…` pairing link form (§3), with the parameters in the fragment. |
 
 ## 8. Artifact relationships (`relatedTo`)
 

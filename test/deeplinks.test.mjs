@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildUploadLink } from "../dist/lib/deeplinks.js";
+import { buildUploadLink, PULSE_OPEN_URL } from "../dist/lib/deeplinks.js";
 
 const ARTIFACT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -78,4 +78,46 @@ test("never carries an uploadUnit param, even if one is passed", () => {
   });
   assert.equal(params(stale).get("uploadUnit"), null);
   assert.deepEqual([...params(stale).keys()].sort(), ["artifactId", "server", "v"]);
+});
+
+// The https form (PROTOCOL.md §3): the same parameters as `pulsecam://`, in the fragment of a
+// link on the host the Pulse app claims.
+const HTTPS_OPTS = {
+  server: "https://vault.example.org/pulsevault",
+  artifactId: ARTIFACT_ID,
+  token: "a.b+c/d=", // the characters that break a hand-rolled query string
+};
+
+test("form 'https' builds the link on the fixed link host, parameters in the fragment", () => {
+  assert.equal(PULSE_OPEN_URL, "https://mieweb.github.io/pulse/open");
+  const link = new URL(buildUploadLink({ ...HTTPS_OPTS, form: "https" }));
+  assert.equal(link.origin + link.pathname, PULSE_OPEN_URL);
+  assert.equal(link.search, "", "nothing in the query string, which the link host would receive");
+  const params = new URLSearchParams(link.hash.slice(1));
+  assert.equal(params.get("v"), "1");
+  assert.equal(params.get("artifactId"), ARTIFACT_ID);
+  assert.equal(params.get("server"), HTTPS_OPTS.server);
+  assert.equal(params.get("token"), HTTPS_OPTS.token);
+});
+
+test("form 'https' carries exactly the parameters of the pulsecam form", () => {
+  const https = buildUploadLink({ ...HTTPS_OPTS, form: "https" });
+  const pulsecam = buildUploadLink(HTTPS_OPTS);
+  assert.equal(https.slice(https.indexOf("#") + 1), pulsecam.slice(pulsecam.indexOf("?") + 1));
+});
+
+test("no form and form 'pulsecam' build the same link", () => {
+  assert.equal(buildUploadLink(HTTPS_OPTS), buildUploadLink({ ...HTTPS_OPTS, form: "pulsecam" }));
+});
+
+test("form 'https' validates the server like the pulsecam form", () => {
+  assert.throws(() =>
+    buildUploadLink({ server: "http://vault.example.org/pulsevault", artifactId: ARTIFACT_ID, form: "https" }),
+  );
+});
+
+test("rejects an unknown form", () => {
+  for (const form of ["http", "HTTPS", "", null]) {
+    assert.throws(() => buildUploadLink({ ...HTTPS_OPTS, form }), /`form` must be/, `expected ${form} to throw`);
+  }
 });
