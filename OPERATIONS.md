@@ -299,11 +299,6 @@ bit-identical, and a conformed file replaces the upload (the original is not
 kept). Take a backup first if that matters to
 your deployment (see "Backup and restore" above).
 
-After a container change, tus's record of the upload still names the
-uploaded file, so a client that re-sends the final `PATCH` of an upload whose
-response it lost gets `410` instead of `204` (the upload did finish; the
-status route says so). The Pulse app never uploads a container that changes.
-
 Note on checksums: a conversion changes the artifact's bytes, so an
 upload-time checksum recorded for it (the sidecar `checksum` from
 `Upload-Metadata`) describes the original upload, not the rewritten file.

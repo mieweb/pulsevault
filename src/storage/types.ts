@@ -148,7 +148,10 @@ export type PulseVaultArtifactMeta = {
   /**
    * A token for this reservation of the artifactId, new at every `reserveUpload`, so work that
    * began on one upload can tell the id was removed and reserved again meanwhile (the
-   * `generation` patch condition). Absent on adapters and sidecars that don't keep one.
+   * `generation` patch condition). Required for `webReady` conversions: an adapter that offers
+   * `getLocalPath` but keeps no generation has its videos recorded `skipped`, never converted,
+   * since a queued conversion couldn't tell its upload from a later one of the same id. (The
+   * local adapter keeps one, and gives one at `markReady` to an upload reserved before it did.)
    */
   generation?: string;
   /** Same meaning as `PulseVaultArtifactRecord.updatedAt`. */

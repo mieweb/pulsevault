@@ -1,4 +1,6 @@
 import { FileStore } from '@tus/file-store';
+import { ERRORS, Upload } from '@tus/server';
+import type { Readable } from 'node:stream';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -221,7 +223,56 @@ export type LocalStorage = PulseVaultStorage & {
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
   const workspaceRoot = path.resolve(opts.workspaceDir);
-  const datastore = new FileStore({ directory: workspaceRoot });
+
+  /**
+   * Whether the tus upload `uploadId` (`<kind>/<artifactId><ext>`) finished and a conversion then
+   * replaced its file: the sidecar is ready, names this upload's extension as `sourceExt`, and the
+   * file is gone. tus still has its record of the upload (`<uploadId>.json`).
+   */
+  const replacedByConversion = async (uploadId: string): Promise<boolean> => {
+    const slash = uploadId.indexOf('/');
+    const kind = uploadId.slice(0, slash);
+    const artifactId = uploadId.slice(slash + 1, slash + 37);
+    const ext = uploadId.slice(slash + 37);
+    if (slash < 0 || !isUuid(artifactId) || !EXTENSION_REGEX.test(ext)) return false;
+    const sidecar = await readSidecar(artifactId);
+    if (!sidecar || sidecar.status !== 'ready' || (sidecar.kind ?? 'video') !== kind) return false;
+    if (sidecar.sourceExt !== ext || sidecar.ext === ext) return false;
+    return (await storedExt(artifactId, sidecar.kind ?? 'video', ext)) !== ext;
+  };
+
+  /**
+   * tus's store for the workspace, which also answers for an upload a conversion replaced (a
+   * finished `.webm` conformed to `<id>.mp4`): tus would answer a client re-sending the final
+   * `PATCH` whose response it lost with `410`, the file being gone. Such an upload reads as
+   * complete, and its (empty) tail is taken without a write, so the retry reaches
+   * `onUploadFinish`'s already-finished branch and gets `204`, as one without a conversion does.
+   */
+  class LocalFileStore extends FileStore {
+    override async getUpload(id: string): Promise<Upload> {
+      try {
+        return await super.getUpload(id);
+      } catch (err) {
+        if (err !== ERRORS.FILE_NO_LONGER_EXISTS || !(await replacedByConversion(id))) throw err;
+        const record = await this.configstore.get(id);
+        if (!record || typeof record.size !== 'number') throw err;
+        return new Upload({
+          id,
+          size: record.size,
+          offset: record.size,
+          metadata: record.metadata,
+          creation_date: record.creation_date,
+        });
+      }
+    }
+
+    override async write(readable: Readable, id: string, offset: number): Promise<number> {
+      if (!(await replacedByConversion(id))) return super.write(readable, id, offset);
+      for await (const _ of readable); // a finished upload: nothing more to store
+      return offset;
+    }
+  }
+  const datastore = new LocalFileStore({ directory: workspaceRoot });
   const metaCacheLimit = opts.metaCacheLimit ?? DEFAULT_META_CACHE_LIMIT;
   // Metadata cache keyed by artifactId. Populated eagerly on reserve and
   // lazily from the sidecar on cache-miss — so we never do a workspace-wide
@@ -575,7 +626,13 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
         return;
       }
-      await writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() });
+      // An upload reserved before generations were kept gets one now, so its conversion runs.
+      await writeSidecar(artifactId, {
+        ...sidecar,
+        status: 'ready',
+        readyAt: Date.now(),
+        generation: sidecar.generation ?? randomUUID(),
+      });
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
     });
 

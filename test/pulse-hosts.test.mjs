@@ -23,7 +23,7 @@ import pulseVault, {
   uploadIdOf,
 } from "../dist/app.js";
 import { createHash } from "node:crypto";
-import { makeMp4, tusCreate, tusPatch, tusDelete, uploadFull } from "./helpers.mjs";
+import { makeMp4, tusCreate, tusPatch, tusDelete, tusHead, uploadFull } from "./helpers.mjs";
 import { startMockS3 } from "./mock-s3.mjs";
 
 const PREFIX = "/pulsevault";
@@ -482,6 +482,88 @@ test("a retried final PATCH after a web-ready rewrite skips payload validation, 
   } finally {
     await ctx?.teardown();
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a retried final PATCH after a container change still gets 204, and HEAD reports the upload complete", { skip: !FFMPEG }, async (t) => {
+  let body;
+  try {
+    body = execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=1",
+      "-c:v", "libvpx-vp9", "-b:v", "100k", "-f", "webm", "pipe:1",
+    ]);
+  } catch {
+    return t.skip("ffmpeg build lacks libvpx");
+  }
+  let fired = 0;
+  const ctx = await startLocal({ pluginOptions: { webReady: true, onUploadComplete: async () => { fired++; } } });
+  try {
+    const videoId = randomUUID();
+    const create = await tusCreate(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "clip.webm", size: body.length, kind: "video" });
+    const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+    assert.equal((await tusPatch(location, 0, body)).status, 204);
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.webReady.action, "conformed");
+    const videoDir = path.join(ctx.storage.workspaceRoot, "video");
+    assert.ok(!(await fs.readdir(videoDir)).includes(`${videoId}.webm`), "the uploaded file was replaced");
+    // The client lost the 204 and sends the (empty) tail again.
+    const head = await tusHead(location);
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get("upload-offset"), String(body.length), "the upload reads as complete");
+    const retry = await tusPatch(location, body.length, Buffer.alloc(0));
+    assert.equal(retry.status, 204);
+    assert.equal(fired, 1, "the hook isn't fired again");
+    assert.ok(!(await fs.readdir(videoDir)).includes(`${videoId}.webm`), "nothing was written back");
+    const res = await fetch(ctx.url(`/artifacts/${videoId}`));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "video/mp4");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: an adapter that keeps no generation has its video skipped, not converted", { skip: !FFMPEG }, async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-no-generation-"));
+  const local = createLocalStorage({ workspaceDir });
+  // A custom adapter with getLocalPath but no generations: the local one with them hidden.
+  const storage = {
+    ...local,
+    describeArtifact: async (id) => {
+      const meta = await local.describeArtifact(id);
+      if (meta) delete meta.generation;
+      return meta;
+    },
+    patchArtifact: (id, patch) => local.patchArtifact(id, { ...patch, generation: undefined }),
+  };
+  const ctx = await startApp(storage, { webReady: true }, () => fs.rm(workspaceDir, { recursive: true, force: true }));
+  try {
+    const videoId = randomUUID();
+    // The generation check comes before ffmpeg looks at the bytes, so any video upload will do.
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: videoId, filename: "a.mp4", kind: "video", body: makeMp4(4096) });
+    const status = await waitForWebReady(ctx, videoId);
+    assert.equal(status.webReady.action, "skipped");
+    assert.match(status.webReady.reason, /keeps no generation/);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("local storage: an upload reserved before generations were kept gets one when it finishes", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-legacy-generation-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const rel = await storage.reserveUpload({ artifactId: id, filename: "a.webm", ext: ".webm", kind: "video" });
+    await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+    const sidecar = path.join(workspaceDir, ".pulsevault", `${id}.json`);
+    const { generation: _generation, ...older } = JSON.parse(await fs.readFile(sidecar, "utf8"));
+    await fs.writeFile(sidecar, JSON.stringify(older)); // as an older release wrote it
+    await storage.markReady(id);
+    const fresh = createLocalStorage({ workspaceDir });
+    assert.ok((await fresh.describeArtifact(id)).generation, "markReady gave it one");
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
   }
 });
 

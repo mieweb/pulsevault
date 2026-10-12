@@ -77,6 +77,12 @@ is left untouched (#84).
   file is gone: across instances sharing a workspace, where the last sidecar write wins (as
   before; there is no cross-instance lock), a write from a copy older than a conversion still
   serves the converted file.
+- A client that re-sends the final `PATCH` of a finished upload whose file a conversion replaced
+  (a `.webm` conformed to `<id>.mp4`) gets `204`, as without a conversion: the local adapter's tus
+  store reads such an upload as complete and takes its empty tail without a write.
+- A `webReady` conversion needs the adapter's `generation`: an adapter with `getLocalPath` but no
+  generation has its videos recorded `skipped` (`the storage adapter keeps no generation for this
+  upload`). The local adapter gives one at `markReady` to an upload reserved before this release.
 - Reservations run under the in-process sidecar lock, and `remove` deletes the sidecar last, so a new upload
   of a removed id never has its bytes deleted by the old removal. Each reservation gets a
   `generation` (`describeArtifact`), new every time the id is reserved.

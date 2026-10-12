@@ -339,11 +339,15 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           }
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
           // `install: false`: the file is installed by the record below, under the adapter's
-          // lock and conditions, never renamed over the stored file from here.
+          // lock and conditions, never renamed over the stored file from here. Only with a
+          // generation: a conversion takes long enough for the id to be removed and uploaded
+          // again, and without one the record couldn't tell this upload from that one.
           const { outputPath, ...result } =
-            typeof localPath === 'string'
-              ? await ensureWebReady(localPath, { ...webReady, logger, install: false })
-              : { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined };
+            typeof localPath !== 'string'
+              ? { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined }
+              : !fresh.generation
+                ? { action: 'skipped' as const, reason: 'the storage adapter keeps no generation for this upload', outputPath: undefined }
+                : await ensureWebReady(localPath, { ...webReady, logger, install: false });
           const expected = generation !== undefined ? generation : (fresh.generation ?? null);
           const localExt = typeof localPath === 'string' ? path.extname(localPath).toLowerCase() : '';
           const storedExt = localExt && localExt !== fresh.ext ? localExt : undefined;
