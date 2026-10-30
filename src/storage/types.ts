@@ -162,6 +162,11 @@ export type PulseVaultArtifactMeta = {
    * acknowledgement or outcome moves it). Absent on sidecars written before it was recorded.
    */
   readyAt?: number;
+  /**
+   * `true` for an artifact PulseVault made itself (`storeArtifact`: a poster frame), not one a
+   * client uploaded. A client's own thumbnail always wins over one of these.
+   */
+  generated?: boolean;
 };
 
 /**
@@ -331,4 +336,33 @@ export interface PulseVaultStorage {
    * from an index the adapter keeps at reserve time, so it never scans every artifact.
    */
   listRelated?(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
+
+  /**
+   * Store a finished artifact PulseVault made itself, not one a client uploaded: a poster frame
+   * for a video that arrived without a thumbnail. Ready at once, listed under `relatedTo`, and
+   * already acknowledged, so no host hook runs for it, and marked `generated`. Resolves `false`,
+   * storing nothing, when `relatedTo` is no longer the ready artifact of `relatedGeneration`
+   * (deleted, or its id reserved again while the bytes were made). Optional — without it no
+   * poster is made.
+   */
+  storeArtifact?(params: StoreArtifactParams): Promise<boolean>;
 }
+
+/** What `storeArtifact` stores. */
+export type StoreArtifactParams = {
+  /** A new UUID: never an id a client could have reserved. */
+  artifactId: string;
+  kind: UploadKind;
+  /** Lowercase extension of the bytes, with the leading dot (e.g. `".jpg"`). */
+  ext: string;
+  filename: string;
+  /** The artifact this one belongs to. */
+  relatedTo: string;
+  /**
+   * `relatedTo`'s `generation` when the bytes were made from it (`null` for one stored before
+   * generations were kept): stored only while it is still ready with that generation, so a frame
+   * of a deleted video never lands on a new upload of its id, which always gets a generation.
+   */
+  relatedGeneration: string | null;
+  bytes: Uint8Array;
+};

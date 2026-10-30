@@ -1020,11 +1020,17 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
               : null;
       if (!slot) continue;
       // One per kind: a pulse uploads each once, and a retry that re-sent one is the newer —
-      // by when it finished (`readyAt`), which later bookkeeping never moves.
+      // by when it finished (`readyAt`), which later bookkeeping never moves. A thumbnail the
+      // client sent beats one PulseVault made (`generated`), however late it landed.
       const meta = await describe(record.artifactId);
       if (!meta) continue;
       const current = pulse[slot];
-      if (current && (current.readyAt ?? current.updatedAt) >= (meta.readyAt ?? meta.updatedAt)) continue;
+      if (current) {
+        const byClient = (m: PulseVaultArtifactMeta): number => (m.generated ? 0 : 1);
+        if (byClient(current) !== byClient(meta)) {
+          if (byClient(current) > byClient(meta)) continue;
+        } else if ((current.readyAt ?? current.updatedAt) >= (meta.readyAt ?? meta.updatedAt)) continue;
+      }
       pulse[slot] = meta;
     }
     return pulse;
@@ -1078,9 +1084,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     try {
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
       if (!prepared) return;
-      const { thumbnail } = await getPulse(artifactId);
+      const { video, thumbnail } = await getPulse(artifactId);
       const resolved = thumbnail ? await storage.resolve(thumbnail.artifactId) : null;
       if (!resolved) {
+        // A video stored before posters were made: one is made in the background, and the
+        // client's next look finds it. This answer doesn't wait on ffmpeg.
+        if (video && !thumbnail) completion.posterFor(artifactId);
         res.setHeader('cache-control', 'no-store');
         writeJson(res, 404, pulseVaultError('No poster for this artifact'));
         return;
@@ -1214,6 +1223,7 @@ export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  StoreArtifactParams,
   UploadKind,
 } from './storage/types.js';
 export type {
@@ -1234,6 +1244,7 @@ export type { VideoValidatorOptions } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export {
   ensureWebReady,
+  extractPosterFrame,
   scanMoovPosition,
   probeVideo,
   webReadyAvailable,

@@ -7,6 +7,28 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+
+- **A poster for every video** (`webReady.poster`, on by default): a video that arrived without
+  a thumbnail — a file from a host's own picker — gets one frame as its poster after the
+  conversion, stored as a thumbnail `relatedTo` it, so `GET /artifacts/:artifactId/poster`
+  serves it like a pulse's. A video whose pulse sent a thumbnail is left alone. A video stored
+  before this gets its poster the first time it's asked for, in the background.
+- `extractPosterFrame(path, { ffmpegPath })`: one frame of a video as a JPEG, at most 640 px.
+- `storeArtifact` on the storage contract (and the local adapter): stores a finished artifact
+  PulseVault made itself, ready and acknowledged, under `relatedTo`, only while that artifact is
+  still the ready one of `relatedGeneration`. Resolves whether it stored it.
+- `generated` on artifact metadata, `true` for one PulseVault made. `getPulse` (and so the poster
+  route) prefers a thumbnail the client sent over a generated one, whichever finished last.
+
+### Changed
+
+- **Hosts with `webReady` on now get posters without opting in**: each conversion is followed by
+  a poster frame (another ffmpeg run, a new thumbnail artifact and file per video), and
+  `/artifacts/:artifactId/poster` answers 200 for videos it used to 404 for. Set
+  `webReady: { poster: false }` to keep the old behaviour. A thumbnail still uploading holds the
+  poster back until it finishes or is given up; one that arrives while the frame is made wins.
+
 ## [0.6.0] - 2026-10-12
 
 Protocol 2.5 (`PROTOCOL.md` §7.4): 2.4 adds the https pairing link form (#83), 2.5 the conform

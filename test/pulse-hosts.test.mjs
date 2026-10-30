@@ -568,6 +568,35 @@ test("local storage: an upload reserved before generations were kept gets one wh
   }
 });
 
+test("local storage: a video from before generations takes a poster, until its id is uploaded again", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-legacy-poster-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const rel = await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+    await storage.markReady(id);
+    const sidecar = path.join(workspaceDir, ".pulsevault", `${id}.json`);
+    const { generation, ...older } = JSON.parse(await fs.readFile(sidecar, "utf8"));
+    await fs.writeFile(sidecar, JSON.stringify(older)); // a ready video as an older release wrote it
+    const legacy = createLocalStorage({ workspaceDir });
+    const poster = (relatedGeneration) => legacy.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: id, relatedGeneration, bytes: Buffer.from("made"),
+    });
+    assert.equal(await poster(null), true, "no generation, as when the frame was made");
+    // Uploaded again: the id has a generation now, so a frame made before can't land on it.
+    await fs.writeFile(sidecar, JSON.stringify({ ...older, generation }));
+    assert.equal(await createLocalStorage({ workspaceDir }).storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: id, relatedGeneration: null, bytes: Buffer.from("made"),
+    }), false);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
 test("webReady: a video rotated by an angle other than a quarter turn is served as uploaded", { skip: !FFMPEG }, async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-rotation-"));
   const ctx = await startLocal({ pluginOptions: { webReady: true } });
@@ -906,6 +935,172 @@ async function waitForWebReady(ctx, artifactId) {
     await new Promise((r) => setTimeout(r, 100));
   }
 }
+
+/** A two-second H.264 clip, as a file uploaded from a browser would be: no thumbnail of its own. */
+async function clipBytes() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-clip-"));
+  try {
+    const out = path.join(dir, "clip.mp4");
+    execFileSync("ffmpeg", [
+      "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", out,
+    ]);
+    return await fs.readFile(out);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** A small JPEG, as Pulse sends for its chosen cover. */
+function coverBytes() {
+  return execFileSync("ffmpeg", [
+    "-v", "error", "-f", "lavfi", "-i", "color=c=red:size=64x64", "-frames:v", "1", "-f", "mjpeg", "pipe:1",
+  ]);
+}
+
+/** Upload `body` whole as one artifact; the tus response. */
+async function uploadArtifact(ctx, meta, body) {
+  const create = await tusCreate(ctx.baseUrl, PREFIX, { ...meta, size: body.length });
+  const location = new URL(create.headers.get("location"), ctx.baseUrl).href;
+  return { location, res: await tusPatch(location, 0, body) };
+}
+
+/** The poster the vault serves for `videoId`, waiting up to `ms` for it to be made. */
+async function pollPoster(ctx, videoId, ms = 20_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const res = await fetch(ctx.url(`/artifacts/${videoId}/poster`));
+    if (res.status === 200 || Date.now() > deadline) return res;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+/** `videoId`'s thumbnail in `getPulse`, waiting up to `ms` for one; never asks the poster route. */
+async function waitForThumbnail(ctx, videoId, ms = 20_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const { thumbnail } = await ctx.core.getPulse(videoId);
+    if (thumbnail || Date.now() > deadline) return thumbnail;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+test("poster: a video uploaded without a thumbnail gets one from its conform step", { skip: !FFMPEG }, async () => {
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const videoId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, await clipBytes());
+    // Made by the conform step itself: the poster route, which makes one on a miss, isn't asked
+    // until the thumbnail is there.
+    const thumbnail = await waitForThumbnail(ctx, videoId);
+    assert.ok(thumbnail, "a thumbnail before any poster request");
+    assert.equal(thumbnail.generated, true);
+    const res = await fetch(ctx.url(`/artifacts/${videoId}/poster`));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "image/jpeg");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: a video whose client sent its cover keeps that cover", { skip: !FFMPEG }, async () => {
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const videoId = randomUUID();
+    const cover = coverBytes();
+    await uploadArtifact(
+      ctx,
+      { artifactId: randomUUID(), filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId },
+      cover,
+    );
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, await clipBytes());
+    await waitForWebReady(ctx, videoId);
+    const res = await pollPoster(ctx, videoId);
+    assert.equal(res.status, 200);
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), cover, "the client's cover, not a made one");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: a client's cover beats a made poster, whichever finished last", async () => {
+  const ctx = await startLocal();
+  try {
+    const videoId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, Buffer.from("not a real video"));
+    const coverId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: coverId, filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId }, JPG);
+    // A poster stored after the cover, as when the cover lands while the frame is being made.
+    const { generation } = await ctx.storage.describeArtifact(videoId);
+    const stored = await ctx.storage.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: videoId, relatedGeneration: generation, bytes: Buffer.from("made"),
+    });
+    assert.equal(stored, true);
+    assert.equal((await ctx.core.getPulse(videoId)).thumbnail.artifactId, coverId);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: a frame of a video that was replaced meanwhile isn't stored", async () => {
+  const ctx = await startLocal();
+  try {
+    const videoId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, Buffer.from("not a real video"));
+    const stored = await ctx.storage.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: videoId, relatedGeneration: randomUUID(), bytes: Buffer.from("made"),
+    });
+    assert.equal(stored, false);
+    assert.equal((await ctx.core.getPulse(videoId)).thumbnail, undefined);
+    const related = [];
+    for await (const record of ctx.storage.listRelated(videoId)) related.push(record);
+    assert.deepEqual(related, [], "nothing left on its way, to stop a later try");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: an abandoned thumbnail upload doesn't stop the poster for good", { skip: !FFMPEG }, async () => {
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const videoId = randomUUID();
+    // A cover reserved and never sent: it may yet arrive, so no poster is made meanwhile.
+    const pending = await tusCreate(ctx.baseUrl, PREFIX, {
+      artifactId: randomUUID(), filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId, size: 100,
+    });
+    const pendingUrl = new URL(pending.headers.get("location"), ctx.baseUrl).href;
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, await clipBytes());
+    await waitForWebReady(ctx, videoId);
+    assert.equal((await pollPoster(ctx, videoId, 1500)).status, 404, "none while a cover is on its way");
+    // The reservation is given up: the next request for the poster makes one.
+    assert.equal((await tusDelete(pendingUrl)).status, 204);
+    const res = await pollPoster(ctx, videoId);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "image/jpeg");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("storeArtifact: a kind that isn't one of the vault's is refused before anything is written", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-store-"));
+  try {
+    const storage = createLocalStorage({ workspaceDir });
+    await assert.rejects(
+      storage.storeArtifact({
+        artifactId: randomUUID(), kind: "../escape", ext: ".jpg", filename: "x.jpg",
+        relatedTo: randomUUID(), bytes: Buffer.from("x"),
+      }),
+      /bad kind/,
+    );
+    assert.deepEqual(await fs.readdir(workspaceDir), [], "nothing was created");
+    await assert.rejects(fs.access(path.join(workspaceDir, "..", "escape")));
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
 
 test("webReady: a WebM is conformed to MP4 and served as video/mp4 at the same artifact URL", { skip: !FFMPEG }, async (t) => {
   let body;

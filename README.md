@@ -545,6 +545,7 @@ Off by default. `true`, or `ensureWebReady`'s options plus:
 webReady: {
   concurrency: 1,        // conversions at once; a transcode is CPU-bound
   completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
+  poster: true,          // a video that arrived without a thumbnail gets one frame as its poster
   maxEdge: 1920,         // longest edge of the served video
   timeoutSeconds: undefined, // default 60 + 10 × duration in 1080p30 seconds (4K120 counts 16×), at most 1 h: a hang guard
   probeTimeoutSeconds: 60,   // the same guard for each ffprobe run over the upload
@@ -553,6 +554,8 @@ webReady: {
 ```
 
 Every finished video is conformed in the background, after the final `PATCH` is answered, to the one format the Pulse app records (`CONFORM_TARGET`: faststart MP4, H.264 8-bit SDR, longest edge at most `maxEdge`, rotation applied, AAC or silent; orientation kept). A file already in it — every Pulse upload — keeps its bytes (`none`); a `moov` at the end is a lossless remux (`remuxed`); an off-target stream is re-encoded (`transcoded`: HEVC, 10-bit HDR tone-mapped to SDR, 4K scaled, Opus/PCM to AAC); another container (`.mov`, `.webm`, `.mkv`, …) becomes a new `.mp4` served as `video/mp4` at the same artifact URL (`conformed`). See `OPERATIONS.md` for the table. While it runs the artifact's status is `processing` (the original bytes serve meanwhile, revalidated on every request instead of the configured `cache`; every rewrite is atomic), and when it's done the status reports `webReady: { action, reason }` — `skipped` with the reason when ffmpeg is missing, a run failed or timed out, and the original keeps serving — and `onArtifactEvent` fires `processed` with the same result. With `completeAfter: true`, `onUploadComplete` waits for the conversion and receives `ctx.webReady`, so a host that publishes from the hook never publishes a video that's still being rewritten. A conversion a restart interrupted is resumed by the replay below. Needs the local storage adapter and ffmpeg on the host; without ffmpeg it logs once and serves the original bytes.
+
+With `poster` (on by default), a video that arrived without a thumbnail — a file from a host's own picker rather than a pulse — gets one: a frame a second in (the first frame of a shorter clip), its longest edge at most 640 px, turned the way the video plays, stored as a thumbnail `relatedTo` the video exactly as a pulse uploads one. So `getPulse`, the status route and `GET /artifacts/:artifactId/poster` find it like any other, and it goes with the video. It's taken in the conversion's slot, before `onUploadComplete` with `completeAfter`, so the host never publishes the video without it. A video whose pulse sent a thumbnail (or is still sending one) is left alone. A video stored before this (or whose frame couldn't be taken) gets one the first time its poster is asked for: that request answers `404` at once and the poster is made in the background, once per video per process, for the next look. Needs `storeArtifact` on the storage adapter (the local adapter has it).
 
 ### `replayCompletions`
 

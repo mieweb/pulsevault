@@ -540,6 +540,43 @@ function failureOf(err: unknown): string {
   return typeof code === 'number' ? `ffmpeg exited with code ${code}` : 'ffmpeg could not write the file';
 }
 
+/** Longest edge of a poster frame, in pixels: a card's size, not the video's. */
+const POSTER_MAX_EDGE = 640;
+const POSTER_TIMEOUT_MS = 60_000;
+/** A second in, past a fade from black; a shorter clip falls back to its first frame. */
+const POSTER_SEEK_SECONDS = [1, 0];
+
+/**
+ * One frame of a video as a JPEG, for a video that arrived without a thumbnail (a file from a
+ * host's own picker): its longest edge at most 640 px, turned the way the video plays. Resolves
+ * `null` when there's no frame to take (no video stream, ffmpeg missing or failing); the video
+ * then has no poster, and nothing else changes.
+ */
+export async function extractPosterFrame(
+  filePath: string,
+  options: Pick<WebReadyOptions, 'ffmpegPath' | 'logger'> = {},
+): Promise<Buffer | null> {
+  const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
+  if (!(await isBinaryAvailable(ffmpegPath))) return null;
+  const scale = `scale='min(${POSTER_MAX_EDGE},iw)':'min(${POSTER_MAX_EDGE},ih)':force_original_aspect_ratio=decrease`;
+  for (const seconds of POSTER_SEEK_SECONDS) {
+    try {
+      const { stdout } = await execFileAsync(
+        ffmpegPath,
+        ['-v', 'error', '-ss', String(seconds), '-i', filePath, '-frames:v', '1', '-vf', scale]
+          .concat(['-pix_fmt', 'yuvj420p', '-q:v', '3', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1']),
+        { encoding: 'buffer', maxBuffer: 8 * 1024 * 1024, timeout: POSTER_TIMEOUT_MS, killSignal: 'SIGKILL' },
+      );
+      // A seek past the end exits 0 with no frame: try the next one.
+      if (stdout.length > 0) return stdout;
+    } catch (err) {
+      options.logger?.error({ err, filePath }, 'pulsevault could not take a poster frame');
+      return null;
+    }
+  }
+  return null;
+}
+
 /** Fail at once on an option that can't work, for `ensureWebReady` and the core's `webReady`. */
 export function validateWebReadyOptions(options: WebReadyOptions): void {
   const { maxEdge, timeoutSeconds, probeTimeoutSeconds } = options;

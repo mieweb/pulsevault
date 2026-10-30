@@ -1,8 +1,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   CONFORM_TARGET,
   ensureWebReady,
+  extractPosterFrame,
   validateWebReadyOptions,
   type WebReadyOptions,
   type WebReadyResult,
@@ -91,6 +93,14 @@ export type PulseVaultWebReadyOptions = WebReadyOptions & {
    * being rewritten. Defaults to `false`: the hook runs at once and the conversion follows.
    */
   completeAfter?: boolean;
+  /**
+   * Give a video that arrived without a thumbnail (a file from a host's own picker) a poster:
+   * one frame, taken after the conversion and stored as a thumbnail `relatedTo` it, as a pulse
+   * uploads one. A video that has a thumbnail is left alone. Before the hook with
+   * `completeAfter`, so the host never publishes it without its poster. Needs a storage adapter
+   * with `storeArtifact` (the local adapter). Defaults to `true`.
+   */
+  poster?: boolean;
 };
 
 export type PulseVaultReplayOptions = {
@@ -128,6 +138,12 @@ export type CompletionRunner = {
   replay(): Promise<string[]>;
   /** Whether a web-ready conversion applies to an artifact of this kind: `webReady` is on and it's a video. */
   converts(kind: UploadKind): boolean;
+  /**
+   * Make a poster for a finished video stored before posters were made (or whose first try
+   * failed), in the conversion queue: once per video per process, a no-op when it has a
+   * thumbnail or `webReady.poster` is off. Never rejects. For the poster route's miss.
+   */
+  posterFor(artifactId: string): void;
   /** Start the periodic replay (no-op when replay is off). The timer never keeps the process alive. */
   start(): void;
   /** Stop the periodic replay and wait for conversions and hooks in progress. */
@@ -261,6 +277,109 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
 
   const converts = (kind: UploadKind): boolean => webReady !== undefined && kind === 'video';
 
+  const postersOn =
+    webReady !== undefined &&
+    webReady.poster !== false &&
+    typeof storage.storeArtifact === 'function' &&
+    typeof storage.listRelated === 'function';
+
+  /**
+   * `videoId`'s thumbnail: `'ready'` once one is stored (its pulse sent one, or one was made),
+   * `'pending'` while one is still uploading — it may yet arrive, or be abandoned — else `'none'`.
+   */
+  const thumbnailState = async (videoId: string): Promise<'ready' | 'pending' | 'none'> => {
+    let state: 'pending' | 'none' = 'none';
+    for await (const record of storage.listRelated!(videoId)) {
+      if (record.kind !== 'thumbnail') continue;
+      if (record.ready) return 'ready';
+      state = 'pending';
+    }
+    return state;
+  };
+
+  /**
+   * A poster for `videoId` when it has no thumbnail: a frame of the stored (conformed) file,
+   * stored as a thumbnail `relatedTo` it. One at a time per video as it is now (its id and
+   * `generation`), whichever path asked: a new upload of the id never joins a run on the old one.
+   * Never throws: a video without a poster still plays. Resolves `'retry'` when it should be
+   * tried again later (a thumbnail still uploading, the frame or the store failed, or the video
+   * changed meanwhile), else `'done'`.
+   */
+  const posterRuns = new Map<string, Promise<'done' | 'retry'>>();
+  const makePoster = async (videoId: string): Promise<'done' | 'retry'> => {
+    if (!postersOn) return 'done';
+    let video: PulseVaultArtifactMeta | null;
+    try {
+      video = await describe(videoId);
+    } catch (err) {
+      logger.error({ err, artifactId: videoId }, 'pulsevault could not make a poster');
+      return 'retry';
+    }
+    if (!video?.ready) return 'done';
+    // A video stored before generations were kept has none; any new upload of its id gets one.
+    const generation = video.generation ?? null;
+    const key = `${videoId}:${generation ?? ''}`;
+    const running = posterRuns.get(key);
+    if (running) return running;
+    const run = (async (): Promise<'done' | 'retry'> => {
+      try {
+        const before = await thumbnailState(videoId);
+        if (before !== 'none') return before === 'ready' ? 'done' : 'retry';
+        const localPath = await (storage as LocalPathStorage).getLocalPath?.(videoId);
+        if (typeof localPath !== 'string') return 'done';
+        const bytes = await extractPosterFrame(localPath, { ...webReady, logger });
+        if (!bytes) return 'retry';
+        // A client thumbnail that arrived while the frame was made: no poster needed. One that
+        // lands after this check still wins, in `getPulse`, over the `generated` poster.
+        const after = await thumbnailState(videoId);
+        if (after !== 'none') return after === 'ready' ? 'done' : 'retry';
+        // Refused when the video was deleted or uploaded again meanwhile: not done, so the next
+        // ask for its poster tries the video as it is then.
+        const stored = await storage.storeArtifact!({
+          artifactId: randomUUID(),
+          kind: 'thumbnail',
+          ext: '.jpg',
+          filename: 'poster.jpg',
+          relatedTo: videoId,
+          relatedGeneration: generation,
+          bytes,
+        });
+        return stored ? 'done' : 'retry';
+      } catch (err) {
+        logger.error({ err, artifactId: videoId }, 'pulsevault could not make a poster');
+        return 'retry';
+      }
+    })().finally(() => posterRuns.delete(key));
+    posterRuns.set(key, run);
+    return run;
+  };
+
+  /**
+   * Videos `posterFor` settled in this process, so a feed of old videos asks once each. A video
+   * that should be tried again (a thumbnail still uploading, a failed frame, a conversion not
+   * done yet) leaves the set, and its next poster request tries again. Cleared past the cap,
+   * which only means a retry.
+   */
+  const POSTER_TRIED_LIMIT = 10_000;
+  const posterTried = new Set<string>();
+  const posterFor = (artifactId: string): void => {
+    if (!postersOn || posterTried.has(artifactId)) return;
+    if (posterTried.size >= POSTER_TRIED_LIMIT) posterTried.clear();
+    posterTried.add(artifactId);
+    void queue.run(async () => {
+      let outcome: 'done' | 'retry' = 'retry';
+      try {
+        const meta = await describe(artifactId);
+        if (!meta || meta.kind !== 'video') outcome = 'done';
+        // A video still waiting on its conversion gets its poster there.
+        else if (meta.ready && meta.converted) outcome = await makePoster(artifactId);
+      } catch (err) {
+        logger.error({ err, artifactId }, 'pulsevault could not make a poster');
+      }
+      if (outcome === 'retry') posterTried.delete(artifactId);
+    });
+  };
+
   const describe = (artifactId: string): Promise<PulseVaultArtifactMeta | null> =>
     storage.describeArtifact ? storage.describeArtifact(artifactId) : Promise.resolve(null);
 
@@ -372,7 +491,13 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           } catch (err) {
             logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault onArtifactEvent (processed) failed');
           }
+          // In the same slot. With `completeAfter` the hook waits for it, so the host is told of
+          // the video with its poster; otherwise the conversion settles first, as it always has.
+          // A new upload of the id starts fresh for the poster route's make-on-miss, too.
+          posterTried.delete(ctx.artifactId);
+          if (completeAfter) await makePoster(ctx.artifactId);
           resolve(result);
+          if (!completeAfter) await makePoster(ctx.artifactId);
         } catch (err) {
           logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault web-ready conversion failed');
           resolve(undefined);
@@ -529,6 +654,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     complete,
     replay,
     converts,
+    posterFor,
     start: () => {
       if (timer || stopped) return;
       schedule(Math.min(FIRST_REPLAY_DELAY_MS, replayEvery ?? FIRST_REPLAY_DELAY_MS));
@@ -539,7 +665,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       timer = null;
       await replaying?.catch(() => []);
       await queue.drain();
-      await Promise.allSettled([...settling.values()]);
+      await Promise.allSettled([...settling.values(), ...posterRuns.values()]);
     },
   };
 }
