@@ -568,6 +568,35 @@ test("local storage: an upload reserved before generations were kept gets one wh
   }
 });
 
+test("local storage: a video from before generations takes a poster, until its id is uploaded again", async () => {
+  const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-legacy-poster-"));
+  const storage = createLocalStorage({ workspaceDir });
+  await storage.initialize();
+  try {
+    const id = randomUUID();
+    const rel = await storage.reserveUpload({ artifactId: id, filename: "a.mp4", ext: ".mp4", kind: "video" });
+    await fs.writeFile(path.join(workspaceDir, rel), "bytes");
+    await storage.markReady(id);
+    const sidecar = path.join(workspaceDir, ".pulsevault", `${id}.json`);
+    const { generation, ...older } = JSON.parse(await fs.readFile(sidecar, "utf8"));
+    await fs.writeFile(sidecar, JSON.stringify(older)); // a ready video as an older release wrote it
+    const legacy = createLocalStorage({ workspaceDir });
+    const poster = (relatedGeneration) => legacy.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: id, relatedGeneration, bytes: Buffer.from("made"),
+    });
+    assert.equal(await poster(null), true, "no generation, as when the frame was made");
+    // Uploaded again: the id has a generation now, so a frame made before can't land on it.
+    await fs.writeFile(sidecar, JSON.stringify({ ...older, generation }));
+    assert.equal(await createLocalStorage({ workspaceDir }).storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: id, relatedGeneration: null, bytes: Buffer.from("made"),
+    }), false);
+  } finally {
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  }
+});
+
 test("webReady: a video rotated by an angle other than a quarter turn is served as uploaded", { skip: !FFMPEG }, async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-rotation-"));
   const ctx = await startLocal({ pluginOptions: { webReady: true } });
@@ -1000,7 +1029,7 @@ test("poster: a client's cover beats a made poster, whichever finished last", as
     const videoId = randomUUID();
     await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, Buffer.from("not a real video"));
     const coverId = randomUUID();
-    await uploadArtifact(ctx, { artifactId: coverId, filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId }, coverBytes());
+    await uploadArtifact(ctx, { artifactId: coverId, filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId }, JPG);
     // A poster stored after the cover, as when the cover lands while the frame is being made.
     const { generation } = await ctx.storage.describeArtifact(videoId);
     const stored = await ctx.storage.storeArtifact({

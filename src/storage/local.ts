@@ -700,7 +700,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       // Under the video's lock, so it can't be deleted or reserved again in between.
       const stored = await withSidecarLock(relatedTo, async () => {
         const parent = await readSidecar(relatedTo);
-        if (parent?.status !== 'ready' || parent.generation !== relatedGeneration) return false;
+        if (parent?.status !== 'ready' || (parent.generation ?? null) !== relatedGeneration) return false;
         await withSidecarLock(artifactId, () =>
           writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() }),
         );

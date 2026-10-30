@@ -359,9 +359,10 @@ export type StoreArtifactParams = {
   /** The artifact this one belongs to. */
   relatedTo: string;
   /**
-   * `relatedTo`'s `generation` when the bytes were made from it: stored only while it is still
-   * ready with that generation, so a frame of a deleted video never lands on its replacement.
+   * `relatedTo`'s `generation` when the bytes were made from it (`null` for one stored before
+   * generations were kept): stored only while it is still ready with that generation, so a frame
+   * of a deleted video never lands on a new upload of its id, which always gets a generation.
    */
-  relatedGeneration: string;
+  relatedGeneration: string | null;
   bytes: Uint8Array;
 };
