@@ -312,19 +312,25 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       try {
         const before = await thumbnailState(videoId);
         if (before !== 'none') return before === 'ready' ? 'done' : 'retry';
+        // The frame is stored only while the video is still this one (see `storeArtifact`).
+        const video = await describe(videoId);
+        if (!video?.ready || !video.generation) return 'done';
         const localPath = await (storage as LocalPathStorage).getLocalPath?.(videoId);
         if (typeof localPath !== 'string') return 'done';
         const bytes = await extractPosterFrame(localPath, { ...webReady, logger });
         if (!bytes) return 'retry';
-        // A client thumbnail that arrived while the frame was made wins: it's the one chosen.
+        // A client thumbnail that arrived while the frame was made: no poster needed. One that
+        // lands after this check still wins, in `getPulse`, over the `generated` poster.
         const after = await thumbnailState(videoId);
         if (after !== 'none') return after === 'ready' ? 'done' : 'retry';
+        // Not stored when the video was deleted or replaced meanwhile: a replacement gets its own.
         await storage.storeArtifact!({
           artifactId: randomUUID(),
           kind: 'thumbnail',
           ext: '.jpg',
           filename: 'poster.jpg',
           relatedTo: videoId,
+          relatedGeneration: video.generation,
           bytes,
         });
         return 'done';

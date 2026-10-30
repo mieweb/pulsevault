@@ -74,6 +74,8 @@ type Sidecar = {
   outcome?: unknown;
   /** When the upload finished (ms since the epoch), set by `markReady`, never changed after. */
   readyAt?: number;
+  /** Made by PulseVault (`storeArtifact`), not uploaded. See `PulseVaultArtifactMeta.generated`. */
+  generated?: boolean;
 };
 
 const SIDECAR_VERSION = 1 as const;
@@ -221,7 +223,7 @@ export type LocalStorage = PulseVaultStorage & {
   /** Satisfies the optional `PulseVaultStorage.listRelated` contract. */
   listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
   /** Satisfies the optional `PulseVaultStorage.storeArtifact` contract. */
-  storeArtifact(params: StoreArtifactParams): Promise<void>;
+  storeArtifact(params: StoreArtifactParams): Promise<boolean>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
@@ -439,6 +441,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
         ...(typeof parsed.generation === 'string' ? { generation: parsed.generation } : {}),
         ...(parsed.outcome !== undefined ? { outcome: parsed.outcome } : {}),
         ...(typeof parsed.readyAt === 'number' ? { readyAt: parsed.readyAt } : {}),
+        ...(parsed.generated === true ? { generated: true } : {}),
       };
     } catch {
       // Malformed sidecar — treat as absent. `reserveUpload` will rewrite
@@ -500,6 +503,7 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     ...(sidecar.outcome !== undefined ? { outcome: sidecar.outcome } : {}),
     updatedAt,
     ...(sidecar.readyAt !== undefined ? { readyAt: sidecar.readyAt } : {}),
+    ...(sidecar.generated ? { generated: true } : {}),
   });
 
   const loadMeta = async (artifactId: string): Promise<CachedMeta | null> => {
@@ -642,8 +646,10 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
 
   /**
    * The steps an upload takes, at once: claim the id (`wx`, as `reserveUpload`), index it under
-   * `relatedTo`, rename the bytes into place, then mark it ready. A crash part-way leaves an
-   * `"uploading"` artifact the retention sweep removes, never a ready one without its bytes.
+   * `relatedTo`, rename the bytes into place, then mark it ready, under `relatedTo`'s lock and
+   * only while it's still the ready artifact of `relatedGeneration`. Anything that fails after
+   * the claim is rolled back, so no half-stored artifact reads as one on its way and stops the
+   * next try. A crash part-way leaves an `"uploading"` one the retention sweep removes.
    */
   const storeArtifact = async ({
     artifactId,
@@ -651,8 +657,9 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     ext,
     filename,
     relatedTo,
+    relatedGeneration,
     bytes,
-  }: StoreArtifactParams): Promise<void> => {
+  }: StoreArtifactParams): Promise<boolean> => {
     if (!isUuid(artifactId) || !isUuid(relatedTo)) throw new Error('storeArtifact needs UUID artifactIds');
     if (!EXTENSION_REGEX.test(ext)) throw new Error(`storeArtifact: bad extension ${ext}`);
     // Before any path is made from it: `kind` names a directory under the workspace.
@@ -670,29 +677,45 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       acknowledged: true,
       converted: true,
       generation: randomUUID(),
+      generated: true,
     };
     await withSidecarLock(artifactId, () =>
       fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' }),
     );
     const dir = relatedDir(relatedTo);
-    await fs.mkdir(dir, { recursive: true, mode: 0o750 });
-    await fs.writeFile(path.join(dir, artifactId), '', { flag: 'w' });
     const finalPath = storedPath(artifactId, kind, ext);
     const tmpPath = `${finalPath}.${randomUUID()}.tmp`;
-    try {
-      await fs.writeFile(tmpPath, bytes);
-      await fs.rename(tmpPath, finalPath);
-    } catch (err) {
-      // Leave nothing that reads as a thumbnail on its way: it would stop the next try.
+    const rollBack = async (): Promise<void> => {
       await fs.rm(tmpPath, { force: true });
+      await fs.rm(finalPath, { force: true });
       await fs.rm(path.join(dir, artifactId), { force: true });
       await withSidecarLock(artifactId, () => fs.rm(sidecarPath(artifactId), { force: true }));
+      metaCache.delete(artifactId);
+    };
+    try {
+      await fs.mkdir(dir, { recursive: true, mode: 0o750 });
+      await fs.writeFile(path.join(dir, artifactId), '', { flag: 'w' });
+      await fs.writeFile(tmpPath, bytes);
+      await fs.rename(tmpPath, finalPath);
+      // Under the video's lock, so it can't be deleted or reserved again in between.
+      const stored = await withSidecarLock(relatedTo, async () => {
+        const parent = await readSidecar(relatedTo);
+        if (parent?.status !== 'ready' || parent.generation !== relatedGeneration) return false;
+        await withSidecarLock(artifactId, () =>
+          writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() }),
+        );
+        return true;
+      });
+      if (!stored) {
+        await rollBack();
+        return false;
+      }
+    } catch (err) {
+      await rollBack();
       throw err;
     }
-    await withSidecarLock(artifactId, () =>
-      writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() }),
-    );
     cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+    return true;
   };
 
   // Under the sidecar lock, from the sidecar itself: in this process, a conversion switching the

@@ -16,7 +16,10 @@ breaking changes, called out explicitly below.
   before this gets its poster the first time it's asked for, in the background.
 - `extractPosterFrame(path, { ffmpegPath })`: one frame of a video as a JPEG, at most 640 px.
 - `storeArtifact` on the storage contract (and the local adapter): stores a finished artifact
-  PulseVault made itself, ready and acknowledged, under `relatedTo`.
+  PulseVault made itself, ready and acknowledged, under `relatedTo`, only while that artifact is
+  still the ready one of `relatedGeneration`. Resolves whether it stored it.
+- `generated` on artifact metadata, `true` for one PulseVault made. `getPulse` (and so the poster
+  route) prefers a thumbnail the client sent over a generated one, whichever finished last.
 
 ### Changed
 

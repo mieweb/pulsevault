@@ -1020,11 +1020,17 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
               : null;
       if (!slot) continue;
       // One per kind: a pulse uploads each once, and a retry that re-sent one is the newer —
-      // by when it finished (`readyAt`), which later bookkeeping never moves.
+      // by when it finished (`readyAt`), which later bookkeeping never moves. A thumbnail the
+      // client sent beats one PulseVault made (`generated`), however late it landed.
       const meta = await describe(record.artifactId);
       if (!meta) continue;
       const current = pulse[slot];
-      if (current && (current.readyAt ?? current.updatedAt) >= (meta.readyAt ?? meta.updatedAt)) continue;
+      if (current) {
+        const byClient = (m: PulseVaultArtifactMeta): number => (m.generated ? 0 : 1);
+        if (byClient(current) !== byClient(meta)) {
+          if (byClient(current) > byClient(meta)) continue;
+        } else if ((current.readyAt ?? current.updatedAt) >= (meta.readyAt ?? meta.updatedAt)) continue;
+      }
       pulse[slot] = meta;
     }
     return pulse;

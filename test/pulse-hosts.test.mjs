@@ -946,13 +946,27 @@ async function pollPoster(ctx, videoId, ms = 20_000) {
   }
 }
 
+/** `videoId`'s thumbnail in `getPulse`, waiting up to `ms` for one; never asks the poster route. */
+async function waitForThumbnail(ctx, videoId, ms = 20_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const { thumbnail } = await ctx.core.getPulse(videoId);
+    if (thumbnail || Date.now() > deadline) return thumbnail;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 test("poster: a video uploaded without a thumbnail gets one from its conform step", { skip: !FFMPEG }, async () => {
   const ctx = await startLocal({ pluginOptions: { webReady: true } });
   try {
     const videoId = randomUUID();
     await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, await clipBytes());
-    await waitForWebReady(ctx, videoId);
-    const res = await pollPoster(ctx, videoId);
+    // Made by the conform step itself: the poster route, which makes one on a miss, isn't asked
+    // until the thumbnail is there.
+    const thumbnail = await waitForThumbnail(ctx, videoId);
+    assert.ok(thumbnail, "a thumbnail before any poster request");
+    assert.equal(thumbnail.generated, true);
+    const res = await fetch(ctx.url(`/artifacts/${videoId}/poster`));
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "image/jpeg");
   } finally {
@@ -975,6 +989,45 @@ test("poster: a video whose client sent its cover keeps that cover", { skip: !FF
     const res = await pollPoster(ctx, videoId);
     assert.equal(res.status, 200);
     assert.deepEqual(Buffer.from(await res.arrayBuffer()), cover, "the client's cover, not a made one");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: a client's cover beats a made poster, whichever finished last", async () => {
+  const ctx = await startLocal();
+  try {
+    const videoId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, Buffer.from("not a real video"));
+    const coverId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: coverId, filename: "cover.jpg", kind: "thumbnail", relatedTo: videoId }, coverBytes());
+    // A poster stored after the cover, as when the cover lands while the frame is being made.
+    const { generation } = await ctx.storage.describeArtifact(videoId);
+    const stored = await ctx.storage.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: videoId, relatedGeneration: generation, bytes: Buffer.from("made"),
+    });
+    assert.equal(stored, true);
+    assert.equal((await ctx.core.getPulse(videoId)).thumbnail.artifactId, coverId);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("poster: a frame of a video that was replaced meanwhile isn't stored", async () => {
+  const ctx = await startLocal();
+  try {
+    const videoId = randomUUID();
+    await uploadArtifact(ctx, { artifactId: videoId, filename: "clip.mp4", kind: "video" }, Buffer.from("not a real video"));
+    const stored = await ctx.storage.storeArtifact({
+      artifactId: randomUUID(), kind: "thumbnail", ext: ".jpg", filename: "poster.jpg",
+      relatedTo: videoId, relatedGeneration: randomUUID(), bytes: Buffer.from("made"),
+    });
+    assert.equal(stored, false);
+    assert.equal((await ctx.core.getPulse(videoId)).thumbnail, undefined);
+    const related = [];
+    for await (const record of ctx.storage.listRelated(videoId)) related.push(record);
+    assert.deepEqual(related, [], "nothing left on its way, to stop a later try");
   } finally {
     await ctx.teardown();
   }
