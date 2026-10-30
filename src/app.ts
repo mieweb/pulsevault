@@ -273,6 +273,7 @@ export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  StoreArtifactParams,
   UploadKind,
 } from './storage/types.js';
 export type {
@@ -289,6 +290,7 @@ export { sniffMp4, createMp4Sniffer, createS3Mp4Sniffer, sniffVideo, createVideo
 export type { PulseVaultValidatePayload, VideoValidatorOptions } from './lib/magic.js';
 export {
   ensureWebReady,
+  extractPosterFrame,
   scanMoovPosition,
   probeVideo,
   webReadyAvailable,

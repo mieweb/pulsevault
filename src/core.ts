@@ -1078,9 +1078,12 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
     try {
       const prepared = await prepareArtifactRequest(req, res, artifactId, 'resolve', token);
       if (!prepared) return;
-      const { thumbnail } = await getPulse(artifactId);
+      const { video, thumbnail } = await getPulse(artifactId);
       const resolved = thumbnail ? await storage.resolve(thumbnail.artifactId) : null;
       if (!resolved) {
+        // A video stored before posters were made: one is made in the background, and the
+        // client's next look finds it. This answer doesn't wait on ffmpeg.
+        if (video && !thumbnail) completion.posterFor(artifactId);
         res.setHeader('cache-control', 'no-store');
         writeJson(res, 404, pulseVaultError('No poster for this artifact'));
         return;
@@ -1214,6 +1217,7 @@ export type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  StoreArtifactParams,
   UploadKind,
 } from './storage/types.js';
 export type {
@@ -1234,6 +1238,7 @@ export type { VideoValidatorOptions } from './lib/magic.js';
 export type { PulseVaultValidatePayload } from './lib/magic.js';
 export {
   ensureWebReady,
+  extractPosterFrame,
   scanMoovPosition,
   probeVideo,
   webReadyAvailable,

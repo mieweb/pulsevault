@@ -331,4 +331,24 @@ export interface PulseVaultStorage {
    * from an index the adapter keeps at reserve time, so it never scans every artifact.
    */
   listRelated?(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
+
+  /**
+   * Store a finished artifact PulseVault made itself, not one a client uploaded: a poster frame
+   * for a video that arrived without a thumbnail. Ready at once, listed under `relatedTo`, and
+   * already acknowledged, so no host hook runs for it. Optional — without it no poster is made.
+   */
+  storeArtifact?(params: StoreArtifactParams): Promise<void>;
 }
+
+/** What `storeArtifact` stores. */
+export type StoreArtifactParams = {
+  /** A new UUID: never an id a client could have reserved. */
+  artifactId: string;
+  kind: UploadKind;
+  /** Lowercase extension of the bytes, with the leading dot (e.g. `".jpg"`). */
+  ext: string;
+  filename: string;
+  /** The artifact this one belongs to. */
+  relatedTo: string;
+  bytes: Uint8Array;
+};

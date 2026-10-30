@@ -14,6 +14,7 @@ import type {
   PulseVaultResolution,
   PulseVaultStorage,
   ReserveUploadParams,
+  StoreArtifactParams,
   UploadKind,
 } from './types.js';
 import { parseUploadKind } from './types.js';
@@ -219,6 +220,8 @@ export type LocalStorage = PulseVaultStorage & {
   patchArtifact(artifactId: string, patch: PulseVaultArtifactPatch): Promise<boolean>;
   /** Satisfies the optional `PulseVaultStorage.listRelated` contract. */
   listRelated(artifactId: string): AsyncIterable<PulseVaultArtifactRecord>;
+  /** Satisfies the optional `PulseVaultStorage.storeArtifact` contract. */
+  storeArtifact(params: StoreArtifactParams): Promise<void>;
 };
 
 export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
@@ -637,6 +640,61 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
       cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
     });
 
+  /**
+   * The steps an upload takes, at once: claim the id (`wx`, as `reserveUpload`), index it under
+   * `relatedTo`, rename the bytes into place, then mark it ready. A crash part-way leaves an
+   * `"uploading"` artifact the retention sweep removes, never a ready one without its bytes.
+   */
+  const storeArtifact = async ({
+    artifactId,
+    kind,
+    ext,
+    filename,
+    relatedTo,
+    bytes,
+  }: StoreArtifactParams): Promise<void> => {
+    if (!isUuid(artifactId) || !isUuid(relatedTo)) throw new Error('storeArtifact needs UUID artifactIds');
+    if (!EXTENSION_REGEX.test(ext)) throw new Error(`storeArtifact: bad extension ${ext}`);
+    // Before any path is made from it: `kind` names a directory under the workspace.
+    if (parseUploadKind(kind) !== kind) throw new Error(`storeArtifact: bad kind ${String(kind)}`);
+    await fs.mkdir(path.join(workspaceRoot, kind), { recursive: true, mode: 0o750 });
+    await fs.mkdir(sidecarDir(), { recursive: true, mode: 0o750 });
+    const sidecar: Sidecar = {
+      version: SIDECAR_VERSION,
+      ext,
+      filename,
+      status: 'uploading',
+      kind,
+      relatedTo,
+      // Made here, not uploaded: no host hook to run, nothing to convert.
+      acknowledged: true,
+      converted: true,
+      generation: randomUUID(),
+    };
+    await withSidecarLock(artifactId, () =>
+      fs.writeFile(sidecarPath(artifactId), JSON.stringify(sidecar), { flag: 'wx' }),
+    );
+    const dir = relatedDir(relatedTo);
+    await fs.mkdir(dir, { recursive: true, mode: 0o750 });
+    await fs.writeFile(path.join(dir, artifactId), '', { flag: 'w' });
+    const finalPath = storedPath(artifactId, kind, ext);
+    const tmpPath = `${finalPath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmpPath, bytes);
+      await fs.rename(tmpPath, finalPath);
+    } catch (err) {
+      // Leave nothing that reads as a thumbnail on its way: it would stop the next try.
+      await fs.rm(tmpPath, { force: true });
+      await fs.rm(path.join(dir, artifactId), { force: true });
+      await withSidecarLock(artifactId, () => fs.rm(sidecarPath(artifactId), { force: true }));
+      throw err;
+    }
+    await withSidecarLock(artifactId, () =>
+      writeSidecar(artifactId, { ...sidecar, status: 'ready', readyAt: Date.now() }),
+    );
+    cacheSet(artifactId, sidecarToCachedMeta(sidecar, true));
+  };
+
   // Under the sidecar lock, from the sidecar itself: in this process, a conversion switching the
   // artifact to a new file (`patchArtifact` with `ext`) either finishes first — and this removes
   // the new file — or finds the sidecar gone and drops what it wrote.
@@ -857,5 +915,6 @@ export function createLocalStorage(opts: LocalStorageOptions): LocalStorage {
     describeArtifact,
     patchArtifact,
     listRelated,
+    storeArtifact,
   };
 }
