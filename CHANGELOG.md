@@ -7,6 +7,17 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Pulse recording held upright is no longer re-encoded.** A phone records portrait as its
+  camera's landscape frame plus a rotation tag, and the Pulse app's joins keep that tag, so every
+  portrait pulse from an iPhone failed "already conforms" and was transcoded in full before
+  `onUploadComplete` ran: with `completeAfter`, a 3-minute pulse reached its host minutes late.
+  A quarter-turn rotation tag now counts as conforming (every browser shows it upright), and the
+  `maxEdge` cap is checked against the size a player shows. A re-encode for another reason still
+  applies the rotation to the pixels, and a stream copy (a `moov` remux, a container change, an
+  audio-only re-encode) keeps the tag.
+
 ## [0.7.0] - 2026-10-30
 
 ### Added

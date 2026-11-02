@@ -187,7 +187,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Video | H.264, 8-bit `yuv420p` (limited range), even width and height |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
 | Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
-| Rotation | applied to the pixels, so every player shows it the way it was held |
+| Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
 | Audio | AAC; a video with no audio stays silent |
 
 `ensureWebReady` does the least work that gets a file there:
@@ -200,7 +200,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Another container (`.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp`, `.avi`) | one ffmpeg run into a new `<id>.mp4`: a stream copy when the streams already conform, otherwise only the off-target streams re-encoded | `conformed` |
 | No ffmpeg, unreadable, failed or timed out | nothing; the original serves | `skipped` |
 
-A re-encode scales by the longest edge, applies the rotation, tone-maps HDR
+A re-encode scales by the displayed longest edge, applies the rotation, tone-maps HDR
 (PQ or HLG) to SDR, and converts non-AAC audio (Opus, PCM, …) to AAC. After a
 container change the artifact's stored file, extension and served
 `Content-Type` (`video/mp4`) follow the new file; the artifact id, and so every
