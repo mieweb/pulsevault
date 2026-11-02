@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ensureWebReady, scanMoovPosition } from "../dist/lib/web-ready.js";
+import { ensureWebReady, extractPosterFrame, scanMoovPosition } from "../dist/lib/web-ready.js";
 
 function hasCmd(cmd) {
   try {
@@ -237,21 +237,149 @@ test("conform: landscape 4K is scaled to 1920×1080 and stays landscape", { skip
   assert.equal(audio, undefined, "no audio stays silent");
 });
 
-test("conform: a rotation tag is applied, so the file plays upright without it", { skip: !FFMPEG }, async () => {
-  const flat = await fixture("flat.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
-  const p = path.join(path.dirname(flat), "rot.mp4");
+// ---------- rotation: a phone's portrait is a rotation tag ----------
+
+/** Four coloured quadrants (red, green / blue, white), so a turn or a flip shows in the pixels. */
+const QUADRANTS = (size, duration = 1) => {
+  const [w, h] = size.split("x").map((n) => Number(n) / 2);
+  const q = (colour, label) => `color=${colour}:s=${w}x${h}:d=${duration}:r=30[${label}]`;
+  return ["-f", "lavfi", "-i", `${q("red", "a")};${q("lime", "b")};${q("blue", "c")};${q("white", "d")};[a][b]hstack[t];[c][d]hstack[u];[t][u]vstack,format=yuv420p`];
+};
+
+/**
+ * The colours of the first frame's quadrants, top-left to bottom-right (`RGBW` is upright), as a
+ * player shows it (the rotation tag applied) or, with `autorotate: false`, as the pixels are stored.
+ */
+function quadrants(p, { autorotate = true } = {}) {
+  const rgb = execFileSync("ffmpeg", [
+    "-v", "error", ...(autorotate ? [] : ["-noautorotate"]), "-i", p,
+    "-frames:v", "1", "-vf", "scale=8:8:flags=neighbor", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+  ]);
+  const at = (x, y) => {
+    const [r, g, b] = rgb.subarray((y * 8 + x) * 3, (y * 8 + x) * 3 + 3);
+    return r > 200 && g > 200 && b > 200 ? "W" : r > 150 ? "R" : g > 150 ? "G" : b > 150 ? "B" : "?";
+  };
+  return at(2, 2) + at(5, 2) + at(2, 5) + at(5, 5);
+}
+
+/** A copy of `src` tagged to show turned by `degrees`, the way a phone writes portrait: no re-encode. */
+function tagged(src, degrees, name, { faststart = true } = {}) {
+  const p = path.join(path.dirname(src), name);
+  const flags = faststart ? ["-movflags", "+faststart"] : [];
   try {
-    execFileSync("ffmpeg", ["-v", "error", "-display_rotation", "90", "-i", flat, "-c", "copy", "-movflags", "+faststart", "-y", p], { stdio: "ignore" });
+    execFileSync("ffmpeg", ["-v", "error", "-display_rotation", String(degrees), "-i", src, "-c", "copy", "-map", "0", ...flags, "-y", p], { stdio: "ignore" });
   } catch {
     // FFmpeg before 6.0 has no -display_rotation: the stream's `rotate` tag writes the same matrix.
-    execFileSync("ffmpeg", ["-v", "error", "-i", flat, "-c", "copy", "-metadata:s:v:0", "rotate=90", "-movflags", "+faststart", "-y", p]);
+    execFileSync("ffmpeg", ["-v", "error", "-i", src, "-c", "copy", "-map", "0", "-metadata:s:v:0", `rotate=${(degrees + 360) % 360}`, ...flags, "-y", p], { stdio: "ignore" });
   }
-  assert.equal(Math.abs(probe(p).rotation), 90, "fixture must carry a rotation tag");
+  assert.equal(turn(probe(p).rotation), turn(degrees), "fixture must carry its rotation tag");
+  return p;
+}
+
+/** Degrees as a turn in (-180, 180], as `ensureWebReady` reports it (270 → -90, -180 → 180). */
+const turn = (degrees) => {
+  const a = ((Number(degrees) % 360) + 360) % 360;
+  return a > 180 ? a - 360 : a;
+};
+
+/** What the Pulse app uploads: H.264 High 8-bit BT.709, mono 48 kHz AAC, faststart MP4. */
+const PULSE_ENCODE = ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "aac", "-ac", "1", "-ar", "48000"];
+
+test("conform: every way the Pulse app writes a recording keeps its bytes, rotation tag and all", { skip: !FFMPEG }, async () => {
+  // iOS joins keep the camera's coded 1920×1080 with its orientation tag (portrait is -90° or 90°,
+  // upside-down landscape 180°); a full render, and Android, write it upright.
+  const landscape = await fixture("coded.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  const upright = await fixture("upright.mp4", [...QUADRANTS("1080x1920"), ...TONE(), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  const shapes = [landscape, upright, ...[90, -90, 180, 270].map((d) => tagged(landscape, d, `rot${d}.mp4`))];
+  for (const p of shapes) {
+    const before = await fs.readFile(p);
+    const shown = quadrants(p);
+    const result = await ensureWebReady(p);
+    assert.deepEqual([result.action, result.reason], ["none", "already web-ready"], path.basename(p));
+    assert.equal(result.outputPath, undefined);
+    assert.deepEqual(await fs.readFile(p), before, `${path.basename(p)}: bytes untouched`);
+    assert.equal(quadrants(p), shown, `${path.basename(p)}: shown the same way`);
+  }
+});
+
+test("conform: a rotated video that is re-encoded anyway comes out upright, with no tag", { skip: !FFMPEG }, async () => {
+  const big = await fixture("big.mp4", [...QUADRANTS("3840x2160"), ...TONE(), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  for (const degrees of [90, -90, 180]) {
+    const p = tagged(big, degrees, `big${degrees}.mp4`);
+    const shown = quadrants(p);
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, "transcoded");
+    assert.match(result.reason, new RegExp(`rotation ${turn(degrees)}° applied`));
+    const { video, rotation } = probe(p);
+    const expected = degrees === 180 ? [1920, 1080] : [1080, 1920];
+    assert.deepEqual([video.width, video.height], expected, `${degrees}°: the size it was shown at, capped`);
+    assert.equal(rotation, 0, `${degrees}°: no tag left to apply`);
+    assert.equal(quadrants(p, { autorotate: false }), shown, `${degrees}°: the stored pixels are upright`);
+  }
+});
+
+test("conform: a rotated HEVC clip is transcoded to upright H.264", { skip: !FFMPEG }, async (t) => {
+  const flat = await fixture("hevc.mp4", [...QUADRANTS("640x360"), "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p", "-x265-params", "log-level=error", "-movflags", "+faststart"]);
+  if (!flat) return t.skip("ffmpeg build lacks libx265");
+  const p = tagged(flat, 90, "hevc90.mp4");
+  const shown = quadrants(p);
   const result = await ensureWebReady(p);
   assert.equal(result.action, "transcoded");
   const { video, rotation } = probe(p);
-  assert.deepEqual([video.width, video.height], [360, 640], "portrait, as it was held");
-  assert.equal(rotation, 0);
+  assert.equal(video.codec_name, "h264");
+  assert.deepEqual([video.width, video.height, rotation], [360, 640, 0]);
+  assert.equal(quadrants(p, { autorotate: false }), shown);
+});
+
+test("conform: stream copies keep the rotation tag (moov remux, container change, audio-only re-encode)", { skip: !FFMPEG }, async () => {
+  const mp4 = await fixture("src.mp4", [...QUADRANTS("640x360"), ...TONE(), ...PULSE_ENCODE]);
+  const cases = [
+    { p: tagged(mp4, -90, "end.mp4", { faststart: false }), action: "remuxed", file: (r, p) => p },
+    { p: tagged(mp4, -90, "phone.mov"), action: "conformed", file: (r) => r.outputPath },
+  ];
+  const pcm = await fixture("pcm-src.mov", [...QUADRANTS("640x360"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le"]);
+  cases.push({ p: tagged(pcm, 90, "pcm.mov"), action: "conformed", file: (r) => r.outputPath, audio: true });
+  for (const { p, action, file, audio } of cases) {
+    const before = probe(p);
+    const shown = quadrants(p);
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, action, path.basename(p));
+    assert.doesNotMatch(result.reason, /→ h264/, `${path.basename(p)}: the video is copied`);
+    if (audio) assert.match(result.reason, /audio pcm_s16le → aac/);
+    const out = file(result, p);
+    const after = probe(out);
+    assert.deepEqual([after.video.width, after.video.height], [before.video.width, before.video.height]);
+    assert.equal(after.rotation, before.rotation, `${path.basename(p)}: the tag is kept`);
+    assert.equal(quadrants(out), shown, `${path.basename(p)}: shown the same way`);
+    assert.equal(await scanMoovPosition(out), "front");
+    assert.equal((await ensureWebReady(out)).action, "none", `${path.basename(p)}: conforms once done`);
+  }
+});
+
+test("conform: the size cap is the size a player shows, not the coded one", { skip: !FFMPEG }, async () => {
+  // Coded 1920×1080, shown 1080×1920: within the default cap, over a 1280 one.
+  const coded = await fixture("cap.mp4", [...QUADRANTS("1920x1080"), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  const p = tagged(coded, 90, "cap90.mp4");
+  assert.equal((await ensureWebReady(p)).action, "none");
+  const shown = quadrants(p);
+  const result = await ensureWebReady(p, { maxEdge: 1280 });
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /size 1080×1920/);
+  const { video, rotation } = probe(p);
+  assert.deepEqual([video.width, video.height, rotation], [720, 1280, 0]);
+  assert.equal(quadrants(p, { autorotate: false }), shown);
+});
+
+test("extractPosterFrame: a rotated video's poster is upright", { skip: !FFMPEG }, async () => {
+  const flat = await fixture("poster-src.mp4", [...QUADRANTS("640x360", 2), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  const p = tagged(flat, -90, "poster90.mp4");
+  const jpeg = await extractPosterFrame(p);
+  assert.ok(jpeg, "a poster was made");
+  const out = path.join(path.dirname(p), "poster.jpg");
+  await fs.writeFile(out, jpeg);
+  const { video } = probe(out);
+  assert.deepEqual([video.width, video.height], [360, 640]);
+  assert.equal(quadrants(out), quadrants(p));
 });
 
 test("conform: 10-bit HLG HEVC is tone-mapped to 8-bit BT.709 H.264", { skip: !FFMPEG }, async (t) => {

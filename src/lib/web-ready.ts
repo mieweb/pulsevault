@@ -33,9 +33,10 @@ export const CONFORM_TARGET = {
   container: 'mp4',
   extension: '.mp4',
   /**
-   * H.264, 8-bit 4:2:0 in limited range, even width and height, SDR, no rotation tag. HDR (PQ,
-   * HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601),
-   * which browsers honour — so a Pulse upload from any phone keeps its bytes.
+   * H.264, 8-bit 4:2:0 in limited range, even width and height, SDR. HDR (PQ, HLG) is
+   * tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601) and its
+   * quarter-turn rotation tag, which browsers honour — so a Pulse upload from any phone, held
+   * any way, keeps its bytes. A re-encode applies the rotation to the pixels.
    */
   videoCodec: 'h264',
   pixelFormat: 'yuv420p',
@@ -451,11 +452,15 @@ function toneMapperOf(ffmpegPath: string): Promise<ToneMapper> {
  */
 const even = (n: number): number => Math.max(2, 2 * Math.floor(Math.round(n) / 2));
 
-/** The displayed size (after rotation) scaled so the longest edge is at most `maxEdge`. */
-function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
+/** The size a player shows: the coded size, turned by the rotation tag. */
+function displayedSize(video: VideoProbe['video']): { width: number; height: number } {
   const sideways = Math.abs(video.rotation) === 90;
-  const width = sideways ? video.height : video.width;
-  const height = sideways ? video.width : video.height;
+  return sideways ? { width: video.height, height: video.width } : { width: video.width, height: video.height };
+}
+
+/** The displayed size scaled so the longest edge is at most `maxEdge`. */
+function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
+  const { width, height } = displayedSize(video);
   const scale = Math.min(1, maxEdge / Math.max(width, height));
   return { width: even(width * scale), height: even(height * scale) };
 }
@@ -599,9 +604,10 @@ export function validateWebReadyOptions(options: WebReadyOptions): void {
  * - any other container with conforming streams → lossless remux into a new `.mp4` beside it
  *   (`conformed`);
  * - otherwise one ffmpeg run: the video re-encoded to H.264 when its codec, pixel format, bit
- *   depth, size, rotation or dynamic range is off (scaled by the longest edge, rotation
+ *   depth, displayed size or dynamic range is off (scaled by the longest edge, rotation
  *   applied, HDR tone-mapped), the audio re-encoded to AAC unless it already is — in place for
- *   an MP4 (`transcoded`), into a new `.mp4` otherwise (`conformed`);
+ *   an MP4 (`transcoded`), into a new `.mp4` otherwise (`conformed`). A copied video stream
+ *   keeps its rotation tag;
  * - no ffmpeg/ffprobe, a file ffprobe can't read, a failed or timed-out run → `skipped` with
  *   the reason; the original is untouched.
  *
@@ -663,14 +669,16 @@ export async function ensureWebReady(
   // What's off-target, stream by stream.
   const hdr = video.transfer !== undefined && HDR_TRANSFERS.has(video.transfer);
   const size = targetSize(video, maxEdge);
+  const shown = displayedSize(video);
   const videoOff: string[] = [];
   if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
   if (video.pixelFormat !== CONFORM_TARGET.pixelFormat) videoOff.push(`pixel format ${video.pixelFormat}`);
   else if (video.range === 'pc') videoOff.push('full range');
   if (hdr) videoOff.push(`HDR (${video.transfer})`);
-  if (video.rotation !== 0) videoOff.push(`rotation ${video.rotation}°`);
-  if (video.rotation === 0 && (size.width !== video.width || size.height !== video.height)) {
-    videoOff.push(`size ${video.width}×${video.height}`);
+  // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
+  // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.
+  if (size.width !== shown.width || size.height !== shown.height) {
+    videoOff.push(`size ${shown.width}×${shown.height}`);
   }
   const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
 
@@ -718,7 +726,9 @@ export async function ensureWebReady(
     // An 8-bit SDR output must not keep the source's HDR colour tags.
     if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
     const toneMapped = hdr ? ', tone-mapped' : '';
-    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}`);
+    // ffmpeg's autorotate turns the pixels upright on decode and writes no rotation tag.
+    const rotated = video.rotation !== 0 ? `, rotation ${video.rotation}° applied` : '';
+    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rotated}`);
   } else {
     args.push('-c:v', 'copy');
   }
