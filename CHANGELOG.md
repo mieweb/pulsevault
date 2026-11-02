@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-02
+
 ### Fixed
 
 - **A Pulse recording held upright is no longer re-encoded.** A phone records portrait as its
@@ -659,7 +661,8 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/mieweb/pulsevault/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/mieweb/pulsevault/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mieweb/pulsevault/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mieweb/pulsevault/compare/v0.4.2...v0.5.0
