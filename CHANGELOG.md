@@ -18,7 +18,9 @@ breaking changes, called out explicitly below.
   limited range. Where they disagree (an MP4 `colr` box saying one range, the H.264 stream the
   other), iOS Safari follows the container and every other browser the stream, so that video is
   still re-encoded. ffprobe before FFmpeg 9 doesn't report the `colr` box's range, so it is read
-  from the file. A re-encode for any reason writes limited range.
+  from the file; a box structure that can't be read far enough counts as disagreeing, and a
+  first-frame probe that times out leaves the file as uploaded (`skipped`). A re-encode for any
+  reason writes limited range.
 
 ## [0.7.1] - 2026-11-02
 

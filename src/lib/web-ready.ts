@@ -182,80 +182,96 @@ export async function scanMoovPosition(filePath: string): Promise<MoovPosition> 
 const MAX_BOXES = 10_000;
 
 /**
- * The colour range an ISO-BMFF file's video track declares in its `colr` (`nclx`) box: `pc` for
- * full, `tv` for limited, or `null` when it declares none (no box, a QuickTime `nclc` box with no
- * range in it, or not ISO-BMFF at all). iOS Safari shows this range ahead of the codec's own, and
- * ffprobe before FFmpeg 9 doesn't report it. Pure Node: reads box headers and the 11 bytes of
- * `nclx`, wherever `moov` is.
+ * What a file's container says about its video's colour range:
+ * - `pc` (full) or `tv` (limited): the video track's `colr` (`nclx`) box;
+ * - `none`: no range declared, read to the end (no `colr` box, a QuickTime `nclc` one, which has
+ *   no range in it, or a file that isn't ISO-BMFF);
+ * - `unknown`: the boxes couldn't be read far enough to tell (malformed, or more than
+ *   `MAX_BOXES` of them on the way).
  */
-export async function readContainerRange(filePath: string): Promise<'pc' | 'tv' | null> {
+export type ContainerRange = 'pc' | 'tv' | 'none' | 'unknown';
+
+/**
+ * The colour range an ISO-BMFF file's container declares for its video (`ContainerRange`). iOS
+ * Safari shows this range ahead of the codec's own, and ffprobe before FFmpeg 9 doesn't report it.
+ * Pure Node: walks box headers, stopping at each box it needs, and reads the 11 bytes of `nclx`,
+ * wherever `moov` is.
+ */
+export async function readContainerRange(filePath: string): Promise<ContainerRange> {
   let fd: fs.FileHandle;
   try {
     fd = await fs.open(filePath, 'r');
   } catch {
-    return null;
+    return 'unknown';
   }
   try {
     const { size: fileSize } = await fd.stat();
     let budget = MAX_BOXES;
+    // Set when a walk stops before its end: a malformed box, or the budget ran out.
+    let incomplete = false;
     type Box = { type: string; start: number; end: number };
-    /** The boxes in [start, end): their type and payload span. Stops at the first malformed one. */
-    const children = async (start: number, end: number): Promise<Box[]> => {
-      const boxes: Box[] = [];
-      const header = Buffer.alloc(16);
-      for (let at = start; at + 8 <= end && budget-- > 0; ) {
+    const header = Buffer.alloc(16);
+    /** The boxes in [start, end), one header read at a time. */
+    async function* boxes(start: number, end: number): AsyncGenerator<Box> {
+      for (let at = start; at + 8 <= end; ) {
+        if (budget-- <= 0) return void (incomplete = true);
         const { bytesRead } = await fd.read(header, 0, 16, at);
-        if (bytesRead < 8) break;
+        if (bytesRead < 8) return void (incomplete = true);
         let boxSize = header.readUInt32BE(0);
         let headerSize = 8;
         if (boxSize === 1) {
-          if (bytesRead < 16) break;
-          const large = header.readBigUInt64BE(8);
-          if (large > BigInt(Number.MAX_SAFE_INTEGER)) break;
+          const large = bytesRead < 16 ? null : header.readBigUInt64BE(8);
+          if (large === null || large > BigInt(Number.MAX_SAFE_INTEGER)) return void (incomplete = true);
           boxSize = Number(large);
           headerSize = 16;
         } else if (boxSize === 0) {
           boxSize = end - at;
         }
-        if (boxSize < headerSize || at + boxSize > end) break;
-        boxes.push({ type: header.toString('latin1', 4, 8), start: at + headerSize, end: at + boxSize });
+        if (boxSize < headerSize || at + boxSize > end) return void (incomplete = true);
+        const box = { type: header.toString('latin1', 4, 8), start: at + headerSize, end: at + boxSize };
         at += boxSize;
+        yield box;
       }
-      return boxes;
+    }
+    /** The first box of `type` inside `box`; stops walking once it is found. */
+    const child = async (box: Box | undefined, type: string): Promise<Box | undefined> => {
+      if (!box) return undefined;
+      for await (const b of boxes(box.start, box.end)) if (b.type === type) return b;
+      return undefined;
     };
-    const child = async (box: Box | undefined, type: string) =>
-      box ? (await children(box.start, box.end)).find((b) => b.type === type) : undefined;
     const bytes = async (at: number, length: number) => {
       const buf = Buffer.alloc(length);
       const { bytesRead } = await fd.read(buf, 0, length, at);
       return bytesRead === length ? buf : null;
     };
 
-    const moov = (await children(0, fileSize)).find((b) => b.type === 'moov');
-    if (!moov) return null;
-    for (const trak of await children(moov.start, moov.end)) {
+    // Not ISO-BMFF (a WebM, an MKV): there is no colr box to declare a range.
+    if ((await bytes(4, 4))?.toString('latin1') !== 'ftyp') return 'none';
+    const moov = await child({ type: '', start: 0, end: fileSize }, 'moov');
+    if (!moov) return 'unknown';
+    for await (const trak of boxes(moov.start, moov.end)) {
       if (trak.type !== 'trak') continue;
       const mdia = await child(trak, 'mdia');
       const hdlr = await child(mdia, 'hdlr');
       // hdlr: version and flags, pre_defined, then the handler type.
       if (!hdlr || (await bytes(hdlr.start + 8, 4))?.toString('latin1') !== 'vide') continue;
       const stsd = await child(await child(await child(mdia, 'minf'), 'stbl'), 'stsd');
-      if (!stsd) return null;
       // stsd: version and flags, entry count, then the sample entries. A visual sample entry's own
       // fields take 78 bytes, then its boxes (avcC, colr, pasp, …); a colr box may also hold an
       // ICC profile (`prof`, `rICC`), so every one is looked at.
-      const entry = (await children(stsd.start + 8, stsd.end))[0];
-      if (!entry) return null;
-      for (const colr of (await children(entry.start + 78, entry.end)).filter((b) => b.type === 'colr')) {
-        const nclx = colr.end - colr.start >= 11 ? await bytes(colr.start, 11) : null;
+      const entry = stsd ? (await boxes(stsd.start + 8, stsd.end).next()).value as Box | undefined : undefined;
+      if (!entry) return 'unknown';
+      for await (const b of boxes(entry.start + 78, entry.end)) {
+        if (b.type !== 'colr' || b.end - b.start < 11) continue;
+        const nclx = await bytes(b.start, 11);
         // nclx: primaries, transfer, matrix (2 bytes each), then the full-range bit.
         if (nclx?.toString('latin1', 0, 4) === 'nclx') return (nclx[10]! & 0x80) !== 0 ? 'pc' : 'tv';
       }
-      return null;
+      return incomplete ? 'unknown' : 'none';
     }
-    return null;
+    return 'unknown';
   } catch {
-    return null;
+    return 'unknown';
   } finally {
     await fd.close();
   }
@@ -782,16 +798,20 @@ export async function ensureWebReady(
     // codec's in its place), and the codec's from one decoded frame, only when either says full.
     const containerRange = await readContainerRange(filePath);
     if (video.range === 'pc' || video.pixelFormat === FULL_RANGE_420 || containerRange === 'pc') {
-      let codedRange: string | null = null;
+      let codedRange: string | null;
       try {
         const timeoutMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
         codedRange = await firstFrameRange(filePath, ffprobePath, video.index, timeoutMs);
       } catch (err) {
         if (!(err instanceof ProbeTimeoutError)) throw err;
+        options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
+        return { action: 'skipped', reason: err.message };
       }
-      // No colr box: every browser, iOS Safari too, shows the codec's range.
-      if (codedRange !== 'pc' || (containerRange ?? 'pc') !== 'pc') {
-        videoOff.push(`range tagged ${containerRange ?? 'none'} in the container, ${codedRange ?? 'unknown'} in the video`);
+      // No range in the container: every browser, iOS Safari too, shows the codec's. A container
+      // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
+      const shownByIos = containerRange === 'none' ? codedRange : containerRange;
+      if (codedRange !== 'pc' || shownByIos !== 'pc') {
+        videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
       }
     }
   }

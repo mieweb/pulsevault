@@ -391,7 +391,7 @@ async function setColrFullRange(p, full) {
   await fs.writeFile(p, bytes);
 }
 
-/** The range the MP4 colr box declares (`container`, null without one) and the first decoded frame's (`frame`). */
+/** The range the container declares (`container`, `none` without a colr box) and the first decoded frame's (`frame`). */
 async function ranges(p) {
   const frame = execFileSync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_entries", "frame=color_range", "-of", "csv=p=0", p]).toString().trim().split("\n")[0].replace(/,+$/, "");
   return { container: await readContainerRange(p), frame };
@@ -404,7 +404,7 @@ test("conform: a full-range recording keeps its bytes when the container and the
   const upright = await fixture("full-upright.mp4", [...QUADRANTS("1080x1920"), ...TONE(), ...FULL_RANGE_ENCODE, "-movflags", "+faststart+write_colr"]);
   const shapes = [
     [upright, "pc"], [taggedWithColr(coded, -90, "full-90.mp4"), "pc"], [taggedWithColr(coded, 90, "full+90.mp4"), "pc"],
-    [await dropColr(taggedWithColr(coded, -90, "full-nocolr.mp4")), null],
+    [await dropColr(taggedWithColr(coded, -90, "full-nocolr.mp4")), "none"],
   ];
   for (const [p, container] of shapes) {
     assert.deepEqual(await ranges(p), { container, frame: "pc" }, `${path.basename(p)}: fixture is full range`);
@@ -452,6 +452,59 @@ test("conform: stream copies of a full-range video keep it full range in both pl
     assert.notEqual(after.container, "tv", `${path.basename(p)}: the container doesn't say otherwise`);
     assert.equal((await ensureWebReady(out)).action, "none", `${path.basename(p)}: conforms once done`);
   }
+});
+
+/** Insert `count` empty `free` boxes before the top-level box `before`, or at the end of the file without one. */
+async function insertFreeBoxes(p, count, before = null) {
+  const bytes = await fs.readFile(p);
+  let at = bytes.length;
+  for (let o = 0; before && o + 8 <= bytes.length; o += bytes.readUInt32BE(o)) {
+    if (bytes.toString("latin1", o + 4, o + 8) === before) { at = o; break; }
+  }
+  const free = Buffer.alloc(8 * count);
+  for (let i = 0; i < count; i++) { free.writeUInt32BE(8, i * 8); free.write("free", i * 8 + 4, "latin1"); }
+  await fs.writeFile(p, Buffer.concat([bytes.subarray(0, at), free, bytes.subarray(at)]));
+  return p;
+}
+
+test("readContainerRange: stops at the boxes it needs, and says unknown when it can't read far enough", { skip: !FFMPEG }, async () => {
+  const full = await fixture("range-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  // 10,001 boxes after a front moov: the walk stops at moov, so they are never read.
+  const trailing = await insertFreeBoxes(taggedWithColr(full, -90, "trailing.mp4"), 10_001);
+  assert.equal(await readContainerRange(trailing), "pc");
+  const saysLimited = await insertFreeBoxes(taggedWithColr(full, -90, "trailing-limited.mp4"), 10_001);
+  await setColrFullRange(saysLimited, false);
+  assert.equal(await readContainerRange(saysLimited), "tv");
+  const result = await ensureWebReady(saysLimited);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /range tagged tv in the container, pc in the video/);
+  // The same boxes before a moov at the end: the budget runs out first, so the range is unknown,
+  // not absent, and a full-range video is re-encoded rather than trusted.
+  const leading = await insertFreeBoxes(taggedWithColr(full, -90, "leading.mp4", { faststart: false }), 10_001, "moov");
+  assert.equal(await readContainerRange(leading), "unknown");
+  const unknown = await ensureWebReady(leading);
+  assert.equal(unknown.action, "transcoded");
+  assert.match(unknown.reason, /range tagged unknown in the container, pc in the video/);
+  // Cut inside moov: unknown. Not ISO-BMFF: nothing declared.
+  const cut = path.join(path.dirname(full), "cut.mp4");
+  const whole = await fs.readFile(taggedWithColr(full, -90, "whole.mp4"));
+  await fs.writeFile(cut, whole.subarray(0, whole.indexOf("moov", 0, "latin1") + 64));
+  assert.equal(await readContainerRange(cut), "unknown");
+  assert.equal(await readContainerRange(await tmpFile("text.mp4", Buffer.from("not a video at all"))), "none");
+});
+
+test("conform: a frame probe past probeTimeoutSeconds keeps the original", { skip: !FFMPEG }, async () => {
+  const full = await fixture("frame-hang-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  const p = taggedWithColr(full, -90, "frame-hang.mp4");
+  const before = await fs.readFile(p);
+  // The metadata probe answers; the one-frame range probe hangs.
+  const ffprobePath = await fakeBinary("ffprobe", 'case "$*" in *frame=color_range*) sleep 10;; *) exec ffprobe "$@";; esac');
+  const started = Date.now();
+  const result = await ensureWebReady(p, { ffprobePath, probeTimeoutSeconds: 1 });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /ffprobe timed out/);
+  assert.ok(Date.now() - started < 8000, "the probe was killed, not waited out");
+  assert.deepEqual(await fs.readFile(p), before, "bytes untouched");
 });
 
 test("conform: the size cap is the size a player shows, not the coded one", { skip: !FFMPEG }, async () => {
