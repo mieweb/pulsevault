@@ -184,7 +184,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Property | Target |
 |---|---|
 | Container | MP4, `moov` at the front (faststart) |
-| Video | H.264, 8-bit `yuv420p` (limited range), even width and height |
+| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range), even width and height. A re-encode writes limited range |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
 | Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
 | Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
