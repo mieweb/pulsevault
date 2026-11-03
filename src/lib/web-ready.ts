@@ -213,7 +213,8 @@ export async function readContainerRange(filePath: string): Promise<ContainerRan
     const header = Buffer.alloc(16);
     /** The boxes in [start, end), one header read at a time. */
     async function* boxes(start: number, end: number): AsyncGenerator<Box> {
-      for (let at = start; at + 8 <= end; ) {
+      let at = start;
+      while (at + 8 <= end) {
         if (budget-- <= 0) return void (incomplete = true);
         const { bytesRead } = await fd.read(header, 0, 16, at);
         if (bytesRead < 8) return void (incomplete = true);
@@ -232,12 +233,32 @@ export async function readContainerRange(filePath: string): Promise<ContainerRan
         at += boxSize;
         yield box;
       }
+      // 1–7 bytes left over: a box header cut short, unless they are zeros (QuickTime ends a list
+      // of boxes with a 32-bit 0, as an iPhone's sample entries do).
+      if (at < end && !(await bytes(at, end - at))?.every((b) => b === 0)) incomplete = true;
     }
     /** The first box of `type` inside `box`; stops walking once it is found. */
     const child = async (box: Box | undefined, type: string): Promise<Box | undefined> => {
       if (!box) return undefined;
       for await (const b of boxes(box.start, box.end)) if (b.type === type) return b;
       return undefined;
+    };
+    /**
+     * The range a visual sample entry declares. Its own fields take 78 bytes, then its boxes
+     * (avcC, colr, pasp, …); a colr box may also hold an ICC profile (`prof`, `rICC`), so every one
+     * is looked at.
+     */
+    const entryRange = async (entry: Box): Promise<ContainerRange> => {
+      // Walked to its end (an entry holds a handful of boxes), so a header cut short after the
+      // colr box still marks the read incomplete.
+      let range: ContainerRange = 'none';
+      for await (const b of boxes(entry.start + 78, entry.end)) {
+        if (range !== 'none' || b.type !== 'colr' || b.end - b.start < 11) continue;
+        const nclx = await bytes(b.start, 11);
+        // nclx: primaries, transfer, matrix (2 bytes each), then the full-range bit.
+        if (nclx?.toString('latin1', 0, 4) === 'nclx') range = (nclx[10]! & 0x80) !== 0 ? 'pc' : 'tv';
+      }
+      return range;
     };
     const bytes = async (at: number, length: number) => {
       const buf = Buffer.alloc(length);
@@ -256,18 +277,13 @@ export async function readContainerRange(filePath: string): Promise<ContainerRan
       // hdlr: version and flags, pre_defined, then the handler type.
       if (!hdlr || (await bytes(hdlr.start + 8, 4))?.toString('latin1') !== 'vide') continue;
       const stsd = await child(await child(await child(mdia, 'minf'), 'stbl'), 'stsd');
-      // stsd: version and flags, entry count, then the sample entries. A visual sample entry's own
-      // fields take 78 bytes, then its boxes (avcC, colr, pasp, …); a colr box may also hold an
-      // ICC profile (`prof`, `rICC`), so every one is looked at.
-      const entry = stsd ? (await boxes(stsd.start + 8, stsd.end).next()).value as Box | undefined : undefined;
-      if (!entry) return 'unknown';
-      for await (const b of boxes(entry.start + 78, entry.end)) {
-        if (b.type !== 'colr' || b.end - b.start < 11) continue;
-        const nclx = await bytes(b.start, 11);
-        // nclx: primaries, transfer, matrix (2 bytes each), then the full-range bit.
-        if (nclx?.toString('latin1', 0, 4) === 'nclx') return (nclx[10]! & 0x80) !== 0 ? 'pc' : 'tv';
-      }
-      return incomplete ? 'unknown' : 'none';
+      if (!stsd) return 'unknown';
+      // stsd: version and flags, entry count, then the sample entries. Each chunk picks one, so
+      // every entry is read, and a range counts only when they all declare the same one.
+      const ranges = new Set<ContainerRange>();
+      for await (const entry of boxes(stsd.start + 8, stsd.end)) ranges.add(await entryRange(entry));
+      if (incomplete || ranges.size !== 1) return 'unknown';
+      return [...ranges][0]!;
     }
     return 'unknown';
   } catch {

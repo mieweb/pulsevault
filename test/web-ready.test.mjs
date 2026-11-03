@@ -493,6 +493,31 @@ test("readContainerRange: stops at the boxes it needs, and says unknown when it 
   assert.equal(await readContainerRange(await tmpFile("text.mp4", Buffer.from("not a video at all"))), "none");
 });
 
+test("readContainerRange: every sample description must agree, and a header cut short is unknown", async () => {
+  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
+  const mk = (type, ...parts) => { const payload = Buffer.concat(parts); return Buffer.concat([u32(8 + payload.length), Buffer.from(type, "latin1"), payload]); };
+  /** nclx: primaries, transfer, matrix (BT.709), then the full-range bit. */
+  const colr = (full) => mk("colr", Buffer.from("nclx", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1, full ? 0x80 : 0]));
+  /** A visual sample entry: its 78 bytes of fields, its boxes, then whatever ends it. */
+  const avc1 = (boxes, tail = Buffer.alloc(0)) => mk("avc1", Buffer.alloc(78), ...boxes, tail);
+  const file = (...entries) => Buffer.concat([
+    mk("ftyp", Buffer.from("isom", "latin1"), u32(0)),
+    mk("moov", mk("trak", mk("mdia",
+      mk("hdlr", Buffer.alloc(8), Buffer.from("vide", "latin1"), Buffer.alloc(12)),
+      mk("minf", mk("stbl", mk("stsd", u32(0), u32(entries.length), ...entries)))))),
+  ]);
+  const read = async (name, bytes) => readContainerRange(await tmpFile(name, bytes));
+  assert.equal(await read("one.mp4", file(avc1([colr(true)]))), "pc");
+  // QuickTime ends a sample entry's boxes with a 32-bit 0, as an iPhone does: not a cut header.
+  assert.equal(await read("terminated.mp4", file(avc1([colr(true)], Buffer.alloc(4)))), "pc");
+  assert.equal(await read("terminated-none.mp4", file(avc1([], Buffer.alloc(4)))), "none");
+  assert.equal(await read("cut.mp4", file(avc1([colr(true)], Buffer.from([0, 0, 1])))), "unknown");
+  // Each chunk picks its sample description: one range is declared only when they all agree.
+  assert.equal(await read("two-same.mp4", file(avc1([colr(true)]), avc1([colr(true)]))), "pc");
+  assert.equal(await read("two-differ.mp4", file(avc1([colr(true)]), avc1([colr(false)]))), "unknown");
+  assert.equal(await read("one-untagged.mp4", file(avc1([colr(true)]), avc1([]))), "unknown");
+});
+
 test("conform: a frame probe past probeTimeoutSeconds keeps the original", { skip: !FFMPEG }, async () => {
   const full = await fixture("frame-hang-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
   const p = taggedWithColr(full, -90, "frame-hang.mp4");
