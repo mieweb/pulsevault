@@ -234,6 +234,15 @@ packages) on older builds. A build with neither leaves an HDR video as
 uploaded and records `skipped` with what's missing: converting it without tone
 mapping would give wrong colours.
 
+**Recommended for production:** a pinned static FFmpeg 9 instead of the distro
+package, whose version follows the OS (Debian 12 ships 5.1). CI tests both the
+distro package and this build: [BtbN](https://github.com/BtbN/FFmpeg-Builds)'s
+`ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0` from the month-end release
+`autobuild-2026-10-31-12-59` (sha256
+`73e29a56974ae5a651133a04584c7483b21afe941e17dc91d79814a758b608d3`; month-end
+releases are kept, daily ones pruned). Unpack it anywhere and put its `bin/`
+first on `PATH`, or pass `ffmpegPath`/`ffprobePath`.
+
 ```js
 await app.register(pulseVault, {
   storage: createLocalStorage({ workspaceDir: dataDir }),

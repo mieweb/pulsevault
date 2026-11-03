@@ -27,7 +27,18 @@ jobs:
       fail-fast: false
       matrix:
         node: ["22", "24"]
-    name: test (node ${{ matrix.node }})
+        ffmpeg: ["distro"]
+        include:
+          # The pinned static build the recommended production setup runs (OPERATIONS.md).
+          - node: "24"
+            ffmpeg: "9.0"
+    name: test (node ${{ matrix.node }}${{ matrix.ffmpeg != 'distro' && format(', ffmpeg {0}', matrix.ffmpeg) || '' }})
+    env:
+      # BtbN month-end autobuild (kept; daily ones are pruned). Bump the three together, and the
+      # same pins in OPERATIONS.md.
+      FFMPEG_RELEASE: autobuild-2026-10-31-12-59
+      FFMPEG_BUILD: ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0
+      FFMPEG_SHA256: 73e29a56974ae5a651133a04584c7483b21afe941e17dc91d79814a758b608d3
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -36,8 +47,18 @@ jobs:
           cache: npm
       # The web-ready/conform tests skip without ffmpeg. Ubuntu's package (FFmpeg 6.x with
       # zscale) is also what a Debian/Ubuntu server runs, so its HDR path is the one tested here.
-      - name: Install ffmpeg
+      - name: Install ffmpeg (distro)
+        if: matrix.ffmpeg == 'distro'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install ffmpeg (pinned static build)
+        if: matrix.ffmpeg != 'distro'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ffmpeg.tar.xz" \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  $RUNNER_TEMP/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/${FFMPEG_BUILD}/bin" >> "$GITHUB_PATH"
+      - run: ffmpeg -hide_banner -version | head -1
       - run: npm ci
       - run: npm test
 
