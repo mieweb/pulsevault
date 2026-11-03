@@ -516,6 +516,26 @@ test("readContainerRange: every sample description must agree, and a header cut 
   assert.equal(await read("two-same.mp4", file(avc1([colr(true)]), avc1([colr(true)]))), "pc");
   assert.equal(await read("two-differ.mp4", file(avc1([colr(true)]), avc1([colr(false)]))), "unknown");
   assert.equal(await read("one-untagged.mp4", file(avc1([colr(true)]), avc1([]))), "unknown");
+  // A colr box too short to say: unknown. QuickTime's nclc (an iPhone's) has no range: none.
+  const nclxCut = mk("colr", Buffer.from("nclx", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1]));
+  assert.equal(await read("nclx-cut.mp4", file(avc1([nclxCut]))), "unknown");
+  assert.equal(await read("colr-empty.mp4", file(avc1([mk("colr")]))), "unknown");
+  const nclc = mk("colr", Buffer.from("nclc", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1]));
+  assert.equal(await read("nclc.mp4", file(avc1([nclc], Buffer.alloc(4)))), "none");
+});
+
+test("conform: a limited-range video whose container range can't be read is re-encoded", { skip: !FFMPEG }, async () => {
+  // Behind 10,001 boxes the colr box is out of reach: it might say full range, so a limited
+  // stream isn't trusted either (ffprobe before FFmpeg 9 wouldn't say).
+  const limited = await fixture("unknown-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-color_range", "tv"]);
+  const p = await insertFreeBoxes(taggedWithColr(limited, -90, "unknown-limited.mp4", { faststart: false }), 10_001, "moov");
+  assert.equal(await readContainerRange(p), "unknown");
+  const shown = quadrants(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /range tagged unknown in the container, tv in the video/);
+  assert.equal(quadrants(p), shown);
+  assert.equal((await ensureWebReady(p)).action, "none", "conforms once done");
 });
 
 test("conform: a frame probe past probeTimeoutSeconds keeps the original", { skip: !FFMPEG }, async () => {

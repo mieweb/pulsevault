@@ -253,10 +253,13 @@ export async function readContainerRange(filePath: string): Promise<ContainerRan
       // colr box still marks the read incomplete.
       let range: ContainerRange = 'none';
       for await (const b of boxes(entry.start + 78, entry.end)) {
-        if (range !== 'none' || b.type !== 'colr' || b.end - b.start < 11) continue;
-        const nclx = await bytes(b.start, 11);
-        // nclx: primaries, transfer, matrix (2 bytes each), then the full-range bit.
-        if (nclx?.toString('latin1', 0, 4) === 'nclx') range = (nclx[10]! & 0x80) !== 0 ? 'pc' : 'tv';
+        if (range !== 'none' || b.type !== 'colr') continue;
+        // The colour type, then for nclx: primaries, transfer, matrix (2 bytes each) and the
+        // full-range bit. One too short to say is unreadable; nclc, prof and rICC carry no range.
+        const colr = await bytes(b.start, Math.min(11, b.end - b.start));
+        const kind = colr && colr.length >= 4 ? colr.toString('latin1', 0, 4) : null;
+        if (kind === null || (kind === 'nclx' && colr!.length < 11)) incomplete = true;
+        else if (kind === 'nclx') range = (colr![10]! & 0x80) !== 0 ? 'pc' : 'tv';
       }
       return range;
     };
@@ -812,8 +815,10 @@ export async function ensureWebReady(
   } else {
     // The container's range is read from its colr box (ffprobe before FFmpeg 9 reports the
     // codec's in its place), and the codec's from one decoded frame, only when either says full.
+    // A container range that can't be read (`unknown`) might be either, so it is checked too.
     const containerRange = await readContainerRange(filePath);
-    if (video.range === 'pc' || video.pixelFormat === FULL_RANGE_420 || containerRange === 'pc') {
+    const claimsFull = video.range === 'pc' || video.pixelFormat === FULL_RANGE_420;
+    if (claimsFull || containerRange === 'pc' || containerRange === 'unknown') {
       let codedRange: string | null;
       try {
         const timeoutMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
