@@ -33,10 +33,11 @@ export const CONFORM_TARGET = {
   container: 'mp4',
   extension: '.mp4',
   /**
-   * H.264, 8-bit 4:2:0 in limited range, even width and height, SDR. HDR (PQ, HLG) is
-   * tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601) and its
+   * H.264, 8-bit 4:2:0, even width and height, SDR. HDR (PQ, HLG) is tone-mapped to BT.709; an
+   * SDR source keeps its own colour tags (BT.709 or BT.601, limited or full range) and its
    * quarter-turn rotation tag, which browsers honour — so a Pulse upload from any phone, held
-   * any way, keeps its bytes. A re-encode applies the rotation to the pixels.
+   * any way, keeps its bytes. A re-encode writes limited range and applies the rotation to the
+   * pixels.
    */
   videoCodec: 'h264',
   pixelFormat: 'yuv420p',
@@ -59,6 +60,9 @@ export const CONFORM_VIDEO_EXTENSIONS: readonly string[] = [
 
 /** ffprobe demuxers that read still or animated images, not video. */
 const IMAGE_FORMATS = /^(image2|[a-z0-9]+_pipe|gif|apng|webp)$/;
+
+/** ffprobe's name for 8-bit 4:2:0 in full range: kept as it is, like `yuv420p`. */
+const FULL_RANGE_420 = 'yuvj420p';
 
 /** Transfer functions of HDR video (PQ and HLG): tone-mapped to SDR on the way in. */
 const HDR_TRANSFERS = new Set(['smpte2084', 'arib-std-b67']);
@@ -165,6 +169,124 @@ export async function scanMoovPosition(filePath: string): Promise<MoovPosition> 
       if (boxType === 'moov') return sawMdat ? 'end' : 'front';
       if (boxType === 'mdat') sawMdat = true;
       offset += boxSize;
+    }
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  } finally {
+    await fd.close();
+  }
+}
+
+/** Boxes `readContainerRange` visits at most: a crafted file can't keep it walking. */
+const MAX_BOXES = 10_000;
+
+/**
+ * What a file's container says about its video's colour range:
+ * - `pc` (full) or `tv` (limited): the video track's `colr` (`nclx`) box;
+ * - `none`: no range declared, read to the end (no `colr` box, a QuickTime `nclc` one, which has
+ *   no range in it, or a file that isn't ISO-BMFF);
+ * - `unknown`: the boxes couldn't be read far enough to tell (malformed, or more than
+ *   `MAX_BOXES` of them on the way).
+ */
+export type ContainerRange = 'pc' | 'tv' | 'none' | 'unknown';
+
+/**
+ * The colour range an ISO-BMFF file's container declares for its video (`ContainerRange`). iOS
+ * Safari shows this range ahead of the codec's own, and ffprobe before FFmpeg 9 doesn't report it.
+ * Pure Node: walks box headers, stopping at each box it needs, and reads the 11 bytes of `nclx`,
+ * wherever `moov` is.
+ */
+export async function readContainerRange(filePath: string): Promise<ContainerRange> {
+  let fd: fs.FileHandle;
+  try {
+    fd = await fs.open(filePath, 'r');
+  } catch {
+    return 'unknown';
+  }
+  try {
+    const { size: fileSize } = await fd.stat();
+    let budget = MAX_BOXES;
+    // Set when a walk stops before its end: a malformed box, or the budget ran out.
+    let incomplete = false;
+    type Box = { type: string; start: number; end: number };
+    const header = Buffer.alloc(16);
+    /** The boxes in [start, end), one header read at a time. */
+    async function* boxes(start: number, end: number): AsyncGenerator<Box> {
+      let at = start;
+      while (at + 8 <= end) {
+        if (budget-- <= 0) return void (incomplete = true);
+        const { bytesRead } = await fd.read(header, 0, 16, at);
+        if (bytesRead < 8) return void (incomplete = true);
+        let boxSize = header.readUInt32BE(0);
+        let headerSize = 8;
+        if (boxSize === 1) {
+          const large = bytesRead < 16 ? null : header.readBigUInt64BE(8);
+          if (large === null || large > BigInt(Number.MAX_SAFE_INTEGER)) return void (incomplete = true);
+          boxSize = Number(large);
+          headerSize = 16;
+        } else if (boxSize === 0) {
+          boxSize = end - at;
+        }
+        if (boxSize < headerSize || at + boxSize > end) return void (incomplete = true);
+        const box = { type: header.toString('latin1', 4, 8), start: at + headerSize, end: at + boxSize };
+        at += boxSize;
+        yield box;
+      }
+      // 1–7 bytes left over: a box header cut short, unless they are zeros (QuickTime ends a list
+      // of boxes with a 32-bit 0, as an iPhone's sample entries do).
+      if (at < end && !(await bytes(at, end - at))?.every((b) => b === 0)) incomplete = true;
+    }
+    /** The first box of `type` inside `box`; stops walking once it is found. */
+    const child = async (box: Box | undefined, type: string): Promise<Box | undefined> => {
+      if (!box) return undefined;
+      for await (const b of boxes(box.start, box.end)) if (b.type === type) return b;
+      return undefined;
+    };
+    /**
+     * The range a visual sample entry declares. Its own fields take 78 bytes, then its boxes
+     * (avcC, colr, pasp, …); a colr box may also hold an ICC profile (`prof`, `rICC`), so every one
+     * is looked at.
+     */
+    const entryRange = async (entry: Box): Promise<ContainerRange> => {
+      // Walked to its end (an entry holds a handful of boxes), so a header cut short after the
+      // colr box still marks the read incomplete.
+      let range: ContainerRange = 'none';
+      for await (const b of boxes(entry.start + 78, entry.end)) {
+        if (range !== 'none' || b.type !== 'colr') continue;
+        // The colour type, then for nclx: primaries, transfer, matrix (2 bytes each) and the
+        // full-range bit. One too short to say is unreadable; nclc, prof and rICC carry no range.
+        const colr = await bytes(b.start, Math.min(11, b.end - b.start));
+        const kind = colr && colr.length >= 4 ? colr.toString('latin1', 0, 4) : null;
+        if (kind === null || (kind === 'nclx' && colr!.length < 11)) incomplete = true;
+        else if (kind === 'nclx') range = (colr![10]! & 0x80) !== 0 ? 'pc' : 'tv';
+      }
+      return range;
+    };
+    const bytes = async (at: number, length: number) => {
+      const buf = Buffer.alloc(length);
+      const { bytesRead } = await fd.read(buf, 0, length, at);
+      return bytesRead === length ? buf : null;
+    };
+
+    // Not ISO-BMFF (a WebM, an MKV): there is no colr box to declare a range.
+    if ((await bytes(4, 4))?.toString('latin1') !== 'ftyp') return 'none';
+    const moov = await child({ type: '', start: 0, end: fileSize }, 'moov');
+    if (!moov) return 'unknown';
+    for await (const trak of boxes(moov.start, moov.end)) {
+      if (trak.type !== 'trak') continue;
+      const mdia = await child(trak, 'mdia');
+      const hdlr = await child(mdia, 'hdlr');
+      // hdlr: version and flags, pre_defined, then the handler type.
+      if (!hdlr || (await bytes(hdlr.start + 8, 4))?.toString('latin1') !== 'vide') continue;
+      const stsd = await child(await child(await child(mdia, 'minf'), 'stbl'), 'stsd');
+      if (!stsd) return 'unknown';
+      // stsd: version and flags, entry count, then the sample entries. Each chunk picks one, so
+      // every entry is read, and a range counts only when they all declare the same one.
+      const ranges = new Set<ContainerRange>();
+      for await (const entry of boxes(stsd.start + 8, stsd.end)) ranges.add(await entryRange(entry));
+      if (incomplete || ranges.size !== 1) return 'unknown';
+      return [...ranges][0]!;
     }
     return 'unknown';
   } catch {
@@ -313,6 +435,17 @@ async function packetDuration(filePath: string, ffprobePath: string, index: numb
   }
   const span = end - start;
   return Number.isFinite(span) && span > 0 ? span : null;
+}
+
+/** The range the first decoded frame carries: the codec's own flag (H.264's VUI). */
+async function firstFrameRange(filePath: string, ffprobePath: string, index: number, timeoutMs: number): Promise<string | null> {
+  const stdout = await runProbe(
+    ffprobePath,
+    ['-select_streams', String(index), '-read_intervals', '%+#1', '-show_entries', 'frame=color_range', '-of', 'csv=p=0', filePath],
+    timeoutMs,
+  );
+  const range = (stdout ?? '').split('\n')[0]?.replace(/,+$/, '').trim();
+  return range ? range : null;
 }
 
 /** Whether a stream has at least two packets: reads only the first two. */
@@ -672,8 +805,37 @@ export async function ensureWebReady(
   const shown = displayedSize(video);
   const videoOff: string[] = [];
   if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
-  if (video.pixelFormat !== CONFORM_TARGET.pixelFormat) videoOff.push(`pixel format ${video.pixelFormat}`);
-  else if (video.range === 'pc') videoOff.push('full range');
+  // Full range is not off-target either, when the container and the codec both say so: every
+  // browser then shows it in the right colours, and it is how some Android phones record (a
+  // Pixel 6a's Pulse recordings are `yuvj420p`, and the app's joins keep it). Where the two disagree,
+  // iOS Safari follows the container and every other browser the codec, so one of them shows it
+  // wrong: re-encoded. A re-encode writes limited range.
+  if (video.pixelFormat !== CONFORM_TARGET.pixelFormat && video.pixelFormat !== FULL_RANGE_420) {
+    videoOff.push(`pixel format ${video.pixelFormat}`);
+  } else {
+    // The container's range is read from its colr box (ffprobe before FFmpeg 9 reports the
+    // codec's in its place), and the codec's from one decoded frame, only when either says full.
+    // A container range that can't be read (`unknown`) might be either, so it is checked too.
+    const containerRange = await readContainerRange(filePath);
+    const claimsFull = video.range === 'pc' || video.pixelFormat === FULL_RANGE_420;
+    if (claimsFull || containerRange === 'pc' || containerRange === 'unknown') {
+      let codedRange: string | null;
+      try {
+        const timeoutMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+        codedRange = await firstFrameRange(filePath, ffprobePath, video.index, timeoutMs);
+      } catch (err) {
+        if (!(err instanceof ProbeTimeoutError)) throw err;
+        options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
+        return { action: 'skipped', reason: err.message };
+      }
+      // No range in the container: every browser, iOS Safari too, shows the codec's. A container
+      // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
+      const shownByIos = containerRange === 'none' ? codedRange : containerRange;
+      if (codedRange !== 'pc' || shownByIos !== 'pc') {
+        videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
+      }
+    }
+  }
   if (hdr) videoOff.push(`HDR (${video.transfer})`);
   // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
   // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.

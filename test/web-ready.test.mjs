@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ensureWebReady, extractPosterFrame, scanMoovPosition } from "../dist/lib/web-ready.js";
+import { ensureWebReady, extractPosterFrame, readContainerRange, scanMoovPosition } from "../dist/lib/web-ready.js";
 
 function hasCmd(cmd) {
   try {
@@ -354,6 +354,202 @@ test("conform: stream copies keep the rotation tag (moov remux, container change
     assert.equal(await scanMoovPosition(out), "front");
     assert.equal((await ensureWebReady(out)).action, "none", `${path.basename(p)}: conforms once done`);
   }
+});
+
+/** H.264 in full range, as a Pixel's Pulse recordings are, with the MP4 `colr` box written. */
+const FULL_RANGE_ENCODE = ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuvj420p", "-color_range", "pc", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "aac", "-ac", "1", "-ar", "48000"];
+
+/** A stream copy of `src` tagged `degrees`, with the `colr` box (`faststart: false` leaves `moov` at the end). */
+function taggedWithColr(src, degrees, name, { faststart = true } = {}) {
+  const p = path.join(path.dirname(src), name);
+  const flags = faststart ? "+faststart+write_colr" : "+write_colr";
+  try {
+    execFileSync("ffmpeg", ["-v", "error", "-display_rotation", String(degrees), "-i", src, "-c", "copy", "-map", "0", "-movflags", flags, "-y", p], { stdio: "ignore" });
+  } catch {
+    execFileSync("ffmpeg", ["-v", "error", "-i", src, "-c", "copy", "-map", "0", "-metadata:s:v:0", `rotate=${(degrees + 360) % 360}`, "-movflags", flags, "-y", p], { stdio: "ignore" });
+  }
+  return p;
+}
+
+/** Turn the file's `colr` box into a `free` one (skipped by every reader): the container then says no range. */
+async function dropColr(p) {
+  const bytes = await fs.readFile(p);
+  const at = bytes.indexOf("colrnclx", 0, "latin1");
+  assert.ok(at > 0, `${path.basename(p)} has an nclx colr box`);
+  bytes.write("free", at, "latin1");
+  await fs.writeFile(p, bytes);
+  return p;
+}
+
+/** Rewrite the full-range bit of the file's MP4 `colr` (nclx) box, so the container says `full`. */
+async function setColrFullRange(p, full) {
+  const bytes = await fs.readFile(p);
+  const at = bytes.indexOf("colrnclx", 0, "latin1");
+  assert.ok(at > 0, `${path.basename(p)} has an nclx colr box`);
+  // type + nclx + primaries, transfer, matrix (2 bytes each), then the full-range bit.
+  bytes[at + 14] = (bytes[at + 14] & 0x7f) | (full ? 0x80 : 0);
+  await fs.writeFile(p, bytes);
+}
+
+/** The range the container declares (`container`, `none` without a colr box) and the first decoded frame's (`frame`). */
+async function ranges(p) {
+  const frame = execFileSync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_entries", "frame=color_range", "-of", "csv=p=0", p]).toString().trim().split("\n")[0].replace(/,+$/, "");
+  return { container: await readContainerRange(p), frame };
+}
+
+test("conform: a full-range recording keeps its bytes when the container and the video agree", { skip: !FFMPEG }, async () => {
+  // A Pixel's Pulse recordings are full range (`yuvj420p`, the colr box saying so too), coded
+  // 1920×1080 tagged ±90° or 1080×1920 upright; the app's joins keep them as they are.
+  const coded = await fixture("full.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  const upright = await fixture("full-upright.mp4", [...QUADRANTS("1080x1920"), ...TONE(), ...FULL_RANGE_ENCODE, "-movflags", "+faststart+write_colr"]);
+  const shapes = [
+    [upright, "pc"], [taggedWithColr(coded, -90, "full-90.mp4"), "pc"], [taggedWithColr(coded, 90, "full+90.mp4"), "pc"],
+    [await dropColr(taggedWithColr(coded, -90, "full-nocolr.mp4")), "none"],
+  ];
+  for (const [p, container] of shapes) {
+    assert.deepEqual(await ranges(p), { container, frame: "pc" }, `${path.basename(p)}: fixture is full range`);
+    const before = await fs.readFile(p);
+    const result = await ensureWebReady(p);
+    assert.deepEqual([result.action, result.reason], ["none", "already web-ready"], path.basename(p));
+    assert.deepEqual(await fs.readFile(p), before, `${path.basename(p)}: bytes untouched`);
+  }
+});
+
+test("conform: a range tagged two ways is re-encoded, and comes out limited range", { skip: !FFMPEG }, async () => {
+  // iOS Safari shows the container's range, every other browser the video's: one of them is wrong.
+  const full = await fixture("full-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  const limited = await fixture("limited-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-color_range", "tv"]);
+  const saysLimited = taggedWithColr(full, -90, "colr-limited.mp4");
+  await setColrFullRange(saysLimited, false);
+  const saysFull = taggedWithColr(limited, -90, "colr-full.mp4");
+  await setColrFullRange(saysFull, true);
+  for (const [p, container, frame] of [[saysLimited, "tv", "pc"], [saysFull, "pc", "tv"]]) {
+    assert.deepEqual(await ranges(p), { container, frame }, `${path.basename(p)}: fixture disagrees with itself`);
+    const shown = quadrants(p);
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, "transcoded", path.basename(p));
+    assert.match(result.reason, new RegExp(`range tagged ${container} in the container, ${frame} in the video`));
+    const after = await ranges(p);
+    assert.notEqual(after.container, "pc", `${path.basename(p)}: limited range out`);
+    assert.notEqual(after.frame, "pc", `${path.basename(p)}: limited range out`);
+    assert.equal(quadrants(p), shown, `${path.basename(p)}: shown the same way`);
+    assert.equal((await ensureWebReady(p)).action, "none", `${path.basename(p)}: conforms once done`);
+  }
+});
+
+test("conform: stream copies of a full-range video keep it full range in both places", { skip: !FFMPEG }, async () => {
+  const full = await fixture("full-copy-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  const cases = [
+    { p: taggedWithColr(full, -90, "full-end.mp4", { faststart: false }), action: "remuxed", file: (r, p) => p },
+    { p: taggedWithColr(full, -90, "full.mov"), action: "conformed", file: (r) => r.outputPath },
+  ];
+  for (const { p, action, file } of cases) {
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, action, path.basename(p));
+    const out = file(result, p);
+    const after = await ranges(out);
+    assert.equal(after.frame, "pc", `${path.basename(p)}: full range in the video`);
+    assert.notEqual(after.container, "tv", `${path.basename(p)}: the container doesn't say otherwise`);
+    assert.equal((await ensureWebReady(out)).action, "none", `${path.basename(p)}: conforms once done`);
+  }
+});
+
+/** Insert `count` empty `free` boxes before the top-level box `before`, or at the end of the file without one. */
+async function insertFreeBoxes(p, count, before = null) {
+  const bytes = await fs.readFile(p);
+  let at = bytes.length;
+  for (let o = 0; before && o + 8 <= bytes.length; o += bytes.readUInt32BE(o)) {
+    if (bytes.toString("latin1", o + 4, o + 8) === before) { at = o; break; }
+  }
+  const free = Buffer.alloc(8 * count);
+  for (let i = 0; i < count; i++) { free.writeUInt32BE(8, i * 8); free.write("free", i * 8 + 4, "latin1"); }
+  await fs.writeFile(p, Buffer.concat([bytes.subarray(0, at), free, bytes.subarray(at)]));
+  return p;
+}
+
+test("readContainerRange: stops at the boxes it needs, and says unknown when it can't read far enough", { skip: !FFMPEG }, async () => {
+  const full = await fixture("range-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  // 10,001 boxes after a front moov: the walk stops at moov, so they are never read.
+  const trailing = await insertFreeBoxes(taggedWithColr(full, -90, "trailing.mp4"), 10_001);
+  assert.equal(await readContainerRange(trailing), "pc");
+  const saysLimited = await insertFreeBoxes(taggedWithColr(full, -90, "trailing-limited.mp4"), 10_001);
+  await setColrFullRange(saysLimited, false);
+  assert.equal(await readContainerRange(saysLimited), "tv");
+  const result = await ensureWebReady(saysLimited);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /range tagged tv in the container, pc in the video/);
+  // The same boxes before a moov at the end: the budget runs out first, so the range is unknown,
+  // not absent, and a full-range video is re-encoded rather than trusted.
+  const leading = await insertFreeBoxes(taggedWithColr(full, -90, "leading.mp4", { faststart: false }), 10_001, "moov");
+  assert.equal(await readContainerRange(leading), "unknown");
+  const unknown = await ensureWebReady(leading);
+  assert.equal(unknown.action, "transcoded");
+  assert.match(unknown.reason, /range tagged unknown in the container, pc in the video/);
+  // Cut inside moov: unknown. Not ISO-BMFF: nothing declared.
+  const cut = path.join(path.dirname(full), "cut.mp4");
+  const whole = await fs.readFile(taggedWithColr(full, -90, "whole.mp4"));
+  await fs.writeFile(cut, whole.subarray(0, whole.indexOf("moov", 0, "latin1") + 64));
+  assert.equal(await readContainerRange(cut), "unknown");
+  assert.equal(await readContainerRange(await tmpFile("text.mp4", Buffer.from("not a video at all"))), "none");
+});
+
+test("readContainerRange: every sample description must agree, and a header cut short is unknown", async () => {
+  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
+  const mk = (type, ...parts) => { const payload = Buffer.concat(parts); return Buffer.concat([u32(8 + payload.length), Buffer.from(type, "latin1"), payload]); };
+  /** nclx: primaries, transfer, matrix (BT.709), then the full-range bit. */
+  const colr = (full) => mk("colr", Buffer.from("nclx", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1, full ? 0x80 : 0]));
+  /** A visual sample entry: its 78 bytes of fields, its boxes, then whatever ends it. */
+  const avc1 = (boxes, tail = Buffer.alloc(0)) => mk("avc1", Buffer.alloc(78), ...boxes, tail);
+  const file = (...entries) => Buffer.concat([
+    mk("ftyp", Buffer.from("isom", "latin1"), u32(0)),
+    mk("moov", mk("trak", mk("mdia",
+      mk("hdlr", Buffer.alloc(8), Buffer.from("vide", "latin1"), Buffer.alloc(12)),
+      mk("minf", mk("stbl", mk("stsd", u32(0), u32(entries.length), ...entries)))))),
+  ]);
+  const read = async (name, bytes) => readContainerRange(await tmpFile(name, bytes));
+  assert.equal(await read("one.mp4", file(avc1([colr(true)]))), "pc");
+  // QuickTime ends a sample entry's boxes with a 32-bit 0, as an iPhone does: not a cut header.
+  assert.equal(await read("terminated.mp4", file(avc1([colr(true)], Buffer.alloc(4)))), "pc");
+  assert.equal(await read("terminated-none.mp4", file(avc1([], Buffer.alloc(4)))), "none");
+  assert.equal(await read("cut.mp4", file(avc1([colr(true)], Buffer.from([0, 0, 1])))), "unknown");
+  // Each chunk picks its sample description: one range is declared only when they all agree.
+  assert.equal(await read("two-same.mp4", file(avc1([colr(true)]), avc1([colr(true)]))), "pc");
+  assert.equal(await read("two-differ.mp4", file(avc1([colr(true)]), avc1([colr(false)]))), "unknown");
+  assert.equal(await read("one-untagged.mp4", file(avc1([colr(true)]), avc1([]))), "unknown");
+  // A colr box too short to say: unknown. QuickTime's nclc (an iPhone's) has no range: none.
+  const nclxCut = mk("colr", Buffer.from("nclx", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1]));
+  assert.equal(await read("nclx-cut.mp4", file(avc1([nclxCut]))), "unknown");
+  assert.equal(await read("colr-empty.mp4", file(avc1([mk("colr")]))), "unknown");
+  const nclc = mk("colr", Buffer.from("nclc", "latin1"), Buffer.from([0, 1, 0, 1, 0, 1]));
+  assert.equal(await read("nclc.mp4", file(avc1([nclc], Buffer.alloc(4)))), "none");
+});
+
+test("conform: a limited-range video whose container range can't be read is re-encoded", { skip: !FFMPEG }, async () => {
+  // Behind 10,001 boxes the colr box is out of reach: it might say full range, so a limited
+  // stream isn't trusted either (ffprobe before FFmpeg 9 wouldn't say).
+  const limited = await fixture("unknown-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-color_range", "tv"]);
+  const p = await insertFreeBoxes(taggedWithColr(limited, -90, "unknown-limited.mp4", { faststart: false }), 10_001, "moov");
+  assert.equal(await readContainerRange(p), "unknown");
+  const shown = quadrants(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /range tagged unknown in the container, tv in the video/);
+  assert.equal(quadrants(p), shown);
+  assert.equal((await ensureWebReady(p)).action, "none", "conforms once done");
+});
+
+test("conform: a frame probe past probeTimeoutSeconds keeps the original", { skip: !FFMPEG }, async () => {
+  const full = await fixture("frame-hang-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
+  const p = taggedWithColr(full, -90, "frame-hang.mp4");
+  const before = await fs.readFile(p);
+  // The metadata probe answers; the one-frame range probe hangs.
+  const ffprobePath = await fakeBinary("ffprobe", 'case "$*" in *frame=color_range*) sleep 10;; *) exec ffprobe "$@";; esac');
+  const started = Date.now();
+  const result = await ensureWebReady(p, { ffprobePath, probeTimeoutSeconds: 1 });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /ffprobe timed out/);
+  assert.ok(Date.now() - started < 8000, "the probe was killed, not waited out");
+  assert.deepEqual(await fs.readFile(p), before, "bytes untouched");
 });
 
 test("conform: the size cap is the size a player shows, not the coded one", { skip: !FFMPEG }, async () => {

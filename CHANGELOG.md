@@ -7,6 +7,21 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A full-range recording is no longer re-encoded.** Some Android phones record full-range
+  H.264 (`yuvj420p`): a Pixel 6a's Pulse recordings are, from both cameras. The Pulse app joins a
+  draft of such clips without re-encoding, so a plain back-camera pulse from that phone failed
+  "already conforms" and was transcoded in full before `onUploadComplete` ran. Full range now
+  counts as conforming when the container and the video agree on it: Chrome, Firefox and Safari
+  on macOS, Safari in the iOS Simulator and Chrome on Android then show it in the same colours as
+  limited range. Where they disagree (an MP4 `colr` box saying one range, the H.264 stream the
+  other), iOS Safari follows the container and every other browser the stream, so that video is
+  still re-encoded. ffprobe before FFmpeg 9 doesn't report the `colr` box's range, so it is read
+  from the file; a box structure that can't be read far enough counts as disagreeing, and a
+  first-frame probe that times out leaves the file as uploaded (`skipped`). A re-encode for any
+  reason writes limited range.
+
 ## [0.7.1] - 2026-11-02
 
 ### Fixed
