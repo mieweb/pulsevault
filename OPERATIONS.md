@@ -187,6 +187,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range), even width and height. A re-encode writes limited range |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
 | Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
+| Frame rate | a re-encode writes at most 30 fps (`maxFrameRate`), the rate the Pulse app records; a 60 fps or slow-motion clip keeps its duration. Never a reason to re-encode on its own: a video that conforms otherwise keeps its rate |
 | Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
 | Audio | AAC; a video with no audio stays silent |
 
@@ -266,6 +267,14 @@ Settings:
 - `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
   over the upload, so a malformed file can't hold the queue.
 - `maxEdge` (default `1920`): the longest edge of the served video.
+- `maxFrameRate` (default `30`): the frame rate of a re-encoded video, at most.
+  Frames are dropped before anything else runs, and HDR is tone-mapped after
+  the scale, so a 4K60 HDR clip costs a fraction of what it did. An HEVC clip
+  recorded in temporal layers (an iPhone's 60 and 120 fps: a 30 fps base layer
+  with layers of extra frames on top) is decoded from its base layer alone,
+  the upper layers dropped before decoding. Those frames are bit for bit the
+  ones a full decode gives; if that decode fails, the run is repeated over
+  every frame.
 - `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
   moved to the front, or another container whose streams already conform copied
   into an `.mp4`), so no CPU cost beyond a file rewrite. A file that would need

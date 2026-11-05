@@ -593,6 +593,108 @@ test("conform: 10-bit HLG HEVC is tone-mapped to 8-bit BT.709 H.264", { skip: !F
   assert.equal(video.color_transfer, "bt709");
 });
 
+// ---------- frame rate: a re-encode comes out at most maxFrameRate ----------
+
+/** Frame rate, frame count and duration of a file's video stream (frames counted by decoding). */
+function videoTiming(p) {
+  const out = JSON.parse(execFileSync("ffprobe", [
+    "-v", "error", "-select_streams", "v:0", "-count_frames",
+    "-show_entries", "stream=avg_frame_rate,nb_read_frames:format=duration", "-of", "json", p,
+  ]).toString());
+  const [num, den] = out.streams[0].avg_frame_rate.split("/").map(Number);
+  return { fps: num / den, frames: Number(out.streams[0].nb_read_frames), duration: Number(out.format.duration) };
+}
+const VIDEO_AT = (size, rate, duration = 2) => ["-f", "lavfi", "-i", `testsrc2=size=${size}:rate=${rate}:duration=${duration}`];
+
+test("conform: a 60 fps video that is re-encoded anyway comes out at 30 fps, as long as before", { skip: !FFMPEG }, async () => {
+  const p = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), ...TONE(2), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]);
+  const before = videoTiming(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /60 → 30 fps/);
+  const after = videoTiming(p);
+  assert.equal(after.fps, 30);
+  assert.equal(after.frames, before.frames / 2);
+  assert.ok(Math.abs(after.duration - before.duration) < 0.1, `duration ${before.duration} → ${after.duration}`);
+});
+
+test("conform: maxFrameRate sets the cap, and a video at the cap keeps every frame", { skip: !FFMPEG }, async () => {
+  const fast = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  assert.equal((await ensureWebReady(fast, { maxFrameRate: 60 })).action, "transcoded");
+  assert.equal(videoTiming(fast).fps, 60, "a cap of 60 keeps a 60 fps video's rate");
+
+  // 30000/1001 (29.97) and 30 are at the cap: never given duplicate frames.
+  for (const rate of ["30000/1001", "30"]) {
+    const p = await fixture(`land4k-${rate.replace("/", "_")}.mp4`, [...VIDEO_AT("3840x2160", rate), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+    const before = videoTiming(p);
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, "transcoded");
+    assert.doesNotMatch(result.reason, /fps/);
+    assert.equal(videoTiming(p).frames, before.frames, `${rate} fps keeps its frames`);
+  }
+});
+
+test("conform: a 60 fps video that conforms otherwise keeps its rate and its bytes", { skip: !FFMPEG }, async () => {
+  const p = await fixture("hd60.mp4", [...VIDEO_AT("1920x1080", 60), ...TONE(2), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]);
+  const bytes = await fs.readFile(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "none");
+  assert.ok(bytes.equals(await fs.readFile(p)), "bytes untouched");
+});
+
+/** A 60 fps HEVC clip; `layers: 2` gives it a 30 fps base layer under sub-layer access pictures, as an iPhone records. */
+const HEVC60 = (layers) => [...VIDEO_AT("640x360", 60), ...TONE(2), "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+  "-pix_fmt", "yuv420p", "-x265-params", `temporal-layers=${layers}:log-level=error`, "-c:a", "aac"];
+
+test("conform: a layered 60 fps HEVC clip is decoded from its 30 fps base layer", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("layered60.mov", HEVC60(2));
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const before = videoTiming(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /60 → 30 fps.*decoded from its base layer/);
+  const after = videoTiming(result.outputPath);
+  assert.equal(after.fps, 30);
+  assert.equal(after.frames, before.frames / 2);
+  assert.ok(Math.abs(after.duration - before.duration) < 0.1, `duration ${before.duration} → ${after.duration}`);
+});
+
+test("conform: a base-layer decode that fails falls back to decoding every frame", { skip: !FFMPEG || process.platform === "win32" }, async (t) => {
+  const p = await fixture("layered60.mov", HEVC60(2));
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  // An ffmpeg that refuses to drop layers on input, as one that can't would.
+  const dir = await scratchDir("ffmpeg-shim-");
+  const shim = path.join(dir, "ffmpeg");
+  await fs.writeFile(shim, `#!/bin/sh\ncase "$*" in *filter_units*) echo "unsupported" >&2; exit 1;; esac\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+  const result = await ensureWebReady(p, { ffmpegPath: shim });
+  assert.equal(result.action, "conformed");
+  assert.doesNotMatch(result.reason, /base layer/);
+  assert.equal(videoTiming(result.outputPath).fps, 30);
+});
+
+test("conform: a 60 fps HEVC clip without sub-layers decodes every frame", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("flat60.mov", HEVC60(0));
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /60 → 30 fps/);
+  assert.doesNotMatch(result.reason, /base layer/);
+  assert.equal(videoTiming(result.outputPath).fps, 30);
+});
+
+test("conform: 4K HLG is scaled, then tone-mapped, to 1080p BT.709", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("hlg4k.mov", [...VIDEO_AT("3840x2160", 60, 1),
+    "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1", "-pix_fmt", "yuv420p10le",
+    "-x265-params", "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:log-level=error"]);
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /HDR \(arib-std-b67\).*1920×1080, tone-mapped, 60 → 30 fps/);
+  const { video } = probe(result.outputPath);
+  assert.deepEqual([video.codec_name, video.pix_fmt, video.color_transfer, video.width, video.height], ["h264", "yuv420p", "bt709", 1920, 1080]);
+  assert.equal(videoTiming(result.outputPath).fps, 30);
+});
+
 test("conform: non-AAC audio in an MP4-family file is converted to AAC", { skip: !FFMPEG }, async () => {
   const p = await fixture("pcm.mov", [...VIDEO("320x240"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le"]);
   const result = await ensureWebReady(p);
@@ -645,6 +747,8 @@ test("conform: a one-frame MKV (no frame count in the container) isn't a video",
 
 test("conform: options that can't work are refused", async () => {
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxEdge: 1 }), /maxEdge/);
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxFrameRate: 0 }), /maxFrameRate/);
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxFrameRate: 29.97 }), /maxFrameRate/);
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { timeoutSeconds: 0 }), /timeoutSeconds/);
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { probeTimeoutSeconds: -1 }), /probeTimeoutSeconds/);
 });

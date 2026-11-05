@@ -7,6 +7,20 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **web-ready:** re-encodes are much faster for the videos that need them most. A re-encoded
+  video now comes out at most 30 fps (`maxFrameRate`, the rate the Pulse app records), its
+  frames dropped before anything else runs, and HDR is tone-mapped after it is scaled down
+  rather than at its full size. An HEVC clip recorded in temporal layers (an iPhone's 60 and
+  120 fps) is decoded from its 30 fps base layer alone, the frames past the cap never decoded;
+  if that fails, the run is repeated over every frame. A video that conforms otherwise (every Pulse upload) keeps its
+  bytes and its own frame rate, as before.
+
+### Added
+
+- **web-ready:** `maxFrameRate` option (default `30`).
+
 ## [0.7.2] - 2026-11-02
 
 ### Fixed

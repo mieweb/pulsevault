@@ -43,6 +43,11 @@ export const CONFORM_TARGET = {
   pixelFormat: 'yuv420p',
   /** Default cap on the longest edge, in pixels (`webReady.maxEdge`). */
   maxEdge: 1920,
+  /**
+   * Default cap on the frame rate of a re-encoded video (`webReady.maxFrameRate`): the rate the
+   * Pulse app records. A video that conforms otherwise keeps its own rate and bytes.
+   */
+  maxFrameRate: 30,
   /** AAC; a video without audio stays silent. */
   audioCodec: 'aac',
 } as const;
@@ -96,6 +101,12 @@ export type WebReadyOptions = {
   transcode?: boolean;
   /** Longest edge of the served video, in pixels; larger videos are scaled down. Default `1920`. */
   maxEdge?: number;
+  /**
+   * Frames per second of a re-encoded video, at most; a faster one (60 fps, a 120 or 240 fps
+   * slow-motion clip) is re-encoded at this rate, its duration unchanged. Default `30`. Never a
+   * reason to re-encode on its own: a video that conforms otherwise keeps its rate.
+   */
+  maxFrameRate?: number;
   /** x264 CRF for the transcode path (lower = better/larger). Default `23`. */
   crf?: number;
   /** x264 preset for the transcode path. Default `"veryfast"`. */
@@ -598,31 +609,101 @@ function targetSize(video: VideoProbe['video'], maxEdge: number): { width: numbe
   return { width: even(width * scale), height: even(height * scale) };
 }
 
-/** The `-vf` chain for a re-encode: tone map (HDR), scale to the target size, 8-bit 4:2:0. */
+/**
+ * The `-vf` chain for a re-encode: drop frames past the frame-rate cap, scale to the target size,
+ * tone map (HDR), 8-bit 4:2:0. Each step runs on as little as it can: frames are dropped first, and
+ * HDR is tone-mapped after the scale — the tone map runs at the size it is given, so a 4K
+ * source tone-mapped before it is scaled to 1080p costs four times as much.
+ */
 function videoFilter(
   size: { width: number; height: number },
   hdr: boolean,
   toneMapper: ToneMapper,
+  frameRate: number | null,
 ): string {
   const { width, height } = size;
+  const fps = frameRate !== null ? `fps=${frameRate},` : '';
   if (hdr && toneMapper === 'scale') {
+    // Scaled in its own colours first (10-bit, still HDR), then tone-mapped at the target size.
     return (
-      `scale=w=${width}:h=${height}:out_transfer=bt709:out_primaries=bt709` +
+      `${fps}scale=w=${width}:h=${height},scale=out_transfer=bt709:out_primaries=bt709` +
       ':out_color_matrix=bt709:out_range=tv:intent=perceptual,format=yuv420p'
     );
   }
   if (hdr && toneMapper === 'zscale') {
     return (
+      `${fps}scale=${width}:${height},` +
       'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,' +
-      `zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=${width}:${height}`
+      'zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
     );
   }
   // `out_range=tv`: a full-range source (`yuvj420p`, as iPhone screen recordings are) is
   // converted to the limited range of `yuv420p`; `format` alone keeps the source's range.
-  return `scale=${width}:${height}:out_range=tv,format=yuv420p`;
+  return `${fps}scale=${width}:${height}:out_range=tv,format=yuv420p`;
+}
+
+/**
+ * The rate a re-encode drops `video` to, or `null` to keep its own: only a rate clearly past the
+ * cap (half a frame a second, so a 30.03 fps phone clip isn't given duplicate frames at 30).
+ */
+function cappedFrameRate(video: VideoProbe['video'], maxFrameRate: number): number | null {
+  return video.frameRate !== undefined && video.frameRate > maxFrameRate + 0.5 ? maxFrameRate : null;
 }
 
 class TimeoutError extends Error {}
+
+/**
+ * HEVC NAL unit types of the pictures that start a higher temporal sub-layer (TSA_N, TSA_R,
+ * STSA_N, STSA_R): what `filter_units` drops to leave the base layer.
+ */
+const SUB_LAYER_TYPES = [2, 3, 4, 5];
+/** Input option that drops them before decoding. */
+const BASE_LAYER_ONLY = ['-bsf:v', `filter_units=remove_types=${SUB_LAYER_TYPES.join('|')}`];
+/** What FFmpeg's HEVC decoder logs when a picture it needs is gone. */
+const MISSING_REFERENCE = /Could not find ref with POC|Error constructing the frame RPS/;
+/** Packets read to learn a stream's layer structure: a second of 120 fps. */
+const LAYER_SCAN_PACKETS = 120;
+
+/**
+ * Whether a high-frame-rate HEVC stream decodes at a lower rate from its base layer alone: every
+ * picture above temporal layer 0 is a sub-layer access picture (`SUB_LAYER_TYPES`), which by the
+ * standard no lower layer refers to — how an iPhone records 60 and 120 fps (a 30 fps base and
+ * one or two layers on top). Dropping them leaves exactly the base layer's frames, bit for bit
+ * those of a full decode, for a fraction of the decoding. Reads the NAL headers of the first
+ * `LAYER_SCAN_PACKETS` packets with ffmpeg's `trace_headers`; `false` on anything unexpected.
+ */
+async function decodesFromBaseLayer(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<boolean> {
+  let stderr: string;
+  try {
+    ({ stderr } = await execFileAsync(
+      ffmpegPath,
+      ['-hide_banner', '-v', 'info', '-i', filePath, '-map', `0:${index}`, '-c', 'copy', '-bsf:v', 'trace_headers',
+        '-frames:v', String(LAYER_SCAN_PACKETS), '-f', 'null', '-'],
+      { maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+    ));
+  } catch {
+    return false;
+  }
+  // Each NAL unit header traces its type, then its temporal id + 1.
+  let type: number | null = null;
+  let upper = 0;
+  for (const line of stderr.split('\n')) {
+    const field = /\b(nal_unit_type|nuh_temporal_id_plus1)\b.*=\s*(\d+)\s*$/.exec(line);
+    if (!field) continue;
+    const value = Number(field[2]);
+    if (field[1] === 'nal_unit_type') {
+      type = value;
+      continue;
+    }
+    // Only coded pictures (types 0–31) count; parameter sets and SEI carry no picture.
+    if (type !== null && type < 32 && value > 1) {
+      if (!SUB_LAYER_TYPES.includes(type)) return false;
+      upper++;
+    }
+    type = null;
+  }
+  return upper > 0;
+}
 
 /**
  * Run ffmpeg into a sibling tmp file, then rename it onto `outputPath` (the input itself, or a
@@ -634,6 +715,7 @@ async function rewrite(
   ffmpegPath: string,
   args: string[],
   timeoutMs: number,
+  inputArgs: string[] = [],
 ): Promise<string> {
   // randomUUID in the name: every video artifact shares one kind directory, so
   // a pid+timestamp tmp name collides when two uploads finish in the same
@@ -642,12 +724,15 @@ async function rewrite(
   const tmp = path.join(path.dirname(inputPath), `.webready-${randomUUID()}${CONFORM_TARGET.extension}`);
   try {
     try {
-      await execFileAsync(ffmpegPath, ['-y', '-v', 'error', '-i', inputPath, ...args, tmp], {
+      const { stderr } = await execFileAsync(ffmpegPath, ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp], {
         // Cap the buffered stderr; the wall clock is capped by the timeout.
         maxBuffer: 16 * 1024 * 1024,
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
       });
+      // A decode of the base layer alone that found a picture missing: the decoder made one up
+      // and carried on, so the output may show it. Not a file to keep.
+      if (inputArgs.length > 0 && MISSING_REFERENCE.test(stderr)) throw new Error('a dropped picture was referenced');
     } catch (err) {
       if ((err as { killed?: boolean }).killed) {
         throw new TimeoutError(`timed out after ${Math.round(timeoutMs / 100) / 10} s`);
@@ -717,9 +802,12 @@ export async function extractPosterFrame(
 
 /** Fail at once on an option that can't work, for `ensureWebReady` and the core's `webReady`. */
 export function validateWebReadyOptions(options: WebReadyOptions): void {
-  const { maxEdge, timeoutSeconds, probeTimeoutSeconds } = options;
+  const { maxEdge, maxFrameRate, timeoutSeconds, probeTimeoutSeconds } = options;
   if (maxEdge !== undefined && !(Number.isInteger(maxEdge) && maxEdge >= 2)) {
     throw new TypeError('`webReady.maxEdge` must be an integer of at least 2 (pixels)');
+  }
+  if (maxFrameRate !== undefined && !(Number.isInteger(maxFrameRate) && maxFrameRate >= 1)) {
+    throw new TypeError('`webReady.maxFrameRate` must be a whole number of frames per second, at least 1');
   }
   for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
     if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
@@ -766,6 +854,7 @@ export async function ensureWebReady(
   const transcode = options.transcode ?? true;
   const install = options.install ?? true;
   const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
+  const maxFrameRate = options.maxFrameRate ?? CONFORM_TARGET.maxFrameRate;
   const crf = options.crf ?? 23;
   const preset = options.preset ?? 'veryfast';
 
@@ -880,17 +969,28 @@ export async function ensureWebReady(
 
   const args = ['-map', `0:${video.index}`, ...(audio ? ['-map', `0:${audio.index}`] : []), '-sn', '-dn'];
   const done: string[] = [];
+  // Set when frames past the cap can be dropped before they're decoded (`decodesFromBaseLayer`).
+  let inputArgs: string[] = [];
   if (videoOff.length > 0) {
+    const frameRate = cappedFrameRate(video, maxFrameRate);
+    if (
+      frameRate !== null &&
+      video.codec === 'hevc' &&
+      (await decodesFromBaseLayer(filePath, ffmpegPath, video.index, Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000))))
+    ) {
+      inputArgs = BASE_LAYER_ONLY;
+    }
     args.push(
-      '-vf', videoFilter(size, hdr, toneMapper),
+      '-vf', videoFilter(size, hdr, toneMapper, frameRate),
       '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
     );
     // An 8-bit SDR output must not keep the source's HDR colour tags.
     if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
     const toneMapped = hdr ? ', tone-mapped' : '';
+    const rate = frameRate !== null ? `, ${Math.round(video.frameRate!)} → ${frameRate} fps` : '';
     // ffmpeg's autorotate turns the pixels upright on decode and writes no rotation tag.
     const rotated = video.rotation !== 0 ? `, rotation ${video.rotation}° applied` : '';
-    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rotated}`);
+    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rate}${rotated}`);
   } else {
     args.push('-c:v', 'copy');
   }
@@ -913,11 +1013,21 @@ export async function ensureWebReady(
   if (isMp4 && moov === 'end') done.push('moov moved to the front');
   let written: string;
   try {
-    written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe));
+    try {
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe), inputArgs);
+    } catch (err) {
+      // The base layer alone didn't decode cleanly (or this ffmpeg can't drop layers on input):
+      // the same run over every frame. A run that timed out would only time out again.
+      if (inputArgs.length === 0 || err instanceof TimeoutError) throw err;
+      options.logger?.error({ err, filePath }, 'pulsevault web-ready: base-layer decode failed; decoding every frame');
+      inputArgs = [];
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe));
+    }
   } catch (err) {
     options.logger?.error({ err, filePath }, `pulsevault web-ready: ${action === 'remuxed' ? 'remux' : 'conversion'} failed; serving original bytes`);
     return { action: 'skipped', reason: `${action === 'remuxed' ? 'remux' : 'conversion'} failed: ${failureOf(err)}` };
   }
+  if (inputArgs.length > 0) done.push('decoded from its base layer');
   const reason = action === 'remuxed' ? 'moov was at end of file; remuxed to faststart' : `${done.join('; ')} (+faststart)`;
   return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
