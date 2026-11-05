@@ -184,10 +184,9 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Property | Target |
 |---|---|
 | Container | MP4, `moov` at the front (faststart) |
-| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range), even width and height. A re-encode writes limited range |
+| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range). The format every browser plays: such a video keeps its bytes. HEVC, AV1, VP8/VP9, ProRes, 10-bit and the like are re-encoded. A re-encode writes limited range |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
-| Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
-| Frame rate | a re-encode writes at most 30 fps (`maxFrameRate`), the rate the Pulse app records; a 60 fps or slow-motion clip keeps its duration. Never a reason to re-encode on its own: a video that conforms otherwise keeps its rate |
+| Size and frame rate | kept, within H.264 level 5.2 — the highest phones and laptops decode in hardware: up to 4096×2304, and 4K at 60 fps. Past it (8K, 4K at 120 fps) the video is re-encoded. A re-encode, for any reason, writes a longest edge of at most 1920 (`maxEdge`) and at most 30 fps (`maxFrameRate`, the rate the Pulse app records), keeping the duration; aspect ratio and orientation are kept — no crop, pad or stretch |
 | Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
 | Audio | AAC; a video with no audio stays silent |
 
@@ -201,7 +200,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Another container (`.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp`, `.avi`) | one ffmpeg run into a new `<id>.mp4`: a stream copy when the streams already conform, otherwise only the off-target streams re-encoded | `conformed` |
 | No ffmpeg, unreadable, failed or timed out | nothing; the original serves | `skipped` |
 
-A re-encode scales by the displayed longest edge, applies the rotation, tone-maps HDR
+A re-encode scales by the displayed longest edge, caps the frame rate, applies the rotation, tone-maps HDR
 (PQ or HLG) to SDR, and converts non-AAC audio (Opus, PCM, …) to AAC. After a
 container change the artifact's stored file, extension and served
 `Content-Type` (`video/mp4`) follow the new file; the artifact id, and so every
@@ -262,13 +261,13 @@ Settings:
   a higher `concurrency` converts several uploads at once (one re-encode uses
   up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
-  until its result is recorded. A process manager that stops the whole process
-  tree (pm2's default) stops its ffmpeg too. A process that dies on its own (a
-  crash, an out-of-memory kill) leaves its ffmpeg running to the end: the replay
-  converts the video again meanwhile, and the old run's output is left as a
-  `.webready-*.mp4` file in the video directory, never served. Such files older
-  than an hour are safe to delete
-  (`find <videos dir> -name '.webready-*' -mmin +60 -delete`).
+  until its result is recorded. A process stopped mid-conversion leaves that
+  run's partial output behind as a `.webready-*.mp4` file in the video
+  directory, never served. A process manager that stops the whole process tree
+  (pm2's default) stops its ffmpeg too; a process that dies on its own (a crash,
+  an out-of-memory kill) leaves its ffmpeg running to the end, while the replay
+  converts the video again. `.webready-*` files older than an hour are safe to
+  delete (`find <videos dir> -name '.webready-*' -mmin +60 -delete`).
 - `stallSeconds` (default `120`): ffmpeg reports how far through the video it
   is about twice a second; a run that hasn't moved forward for this long is
   killed, the original kept, and `skipped` recorded with the reason
@@ -281,7 +280,8 @@ Settings:
   (`progress`, 0–1) and `onProgress` is called with the same fraction.
 - `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
   over the upload, so a malformed file can't hold the queue.
-- `maxEdge` (default `1920`): the longest edge of the served video.
+- `maxEdge` (default `1920`): the longest edge of a re-encoded video. A video
+  that isn't re-encoded keeps its size.
 - `maxFrameRate` (default `30`): the frame rate of a re-encoded video, at most.
   Frames are dropped before anything else runs, and HDR is tone-mapped after
   the scale, so a 4K60 HDR clip costs a fraction of what it did. An HEVC clip

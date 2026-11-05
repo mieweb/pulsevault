@@ -9,6 +9,10 @@ breaking changes, called out explicitly below.
 
 ### Changed
 
+- **web-ready:** an H.264 8-bit SDR video keeps its size, frame rate and bytes up to H.264 level
+  5.2 (4096×2304, 4K at 60 fps), the format every browser plays: a 4K or 60 fps H.264 upload is
+  only remuxed, no longer re-encoded down to 1920. `maxEdge` and `maxFrameRate` now apply to a
+  video that is re-encoded for another reason (HEVC, HDR, AV1, VP9, …), and to H.264 past level 5.2.
 - **web-ready:** re-encodes are much faster for the videos that need them most. A re-encoded
   video now comes out at most 30 fps (`maxFrameRate`, the rate the Pulse app records), its
   frames dropped before anything else runs, and HDR is tone-mapped after it is scaled down

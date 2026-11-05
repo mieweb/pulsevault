@@ -33,15 +33,16 @@ export const CONFORM_TARGET = {
   container: 'mp4',
   extension: '.mp4',
   /**
-   * H.264, 8-bit 4:2:0, even width and height, SDR. HDR (PQ, HLG) is tone-mapped to BT.709; an
-   * SDR source keeps its own colour tags (BT.709 or BT.601, limited or full range) and its
-   * quarter-turn rotation tag, which browsers honour — so a Pulse upload from any phone, held
-   * any way, keeps its bytes. A re-encode writes limited range and applies the rotation to the
-   * pixels.
+   * H.264, 8-bit 4:2:0, SDR, within level 5.2 (up to 4096×2304, 4K at 60 fps): the format every
+   * browser plays. Such a video keeps its size, frame rate, bitrate and bytes, and its own colour
+   * tags (BT.709 or BT.601, limited or full range) and quarter-turn rotation tag, which browsers
+   * honour — so a Pulse upload from any phone, held any way, keeps its bytes. Anything else is
+   * re-encoded: HDR (PQ, HLG) tone-mapped to BT.709, at most `maxEdge` and `maxFrameRate`,
+   * limited range, rotation applied to the pixels.
    */
   videoCodec: 'h264',
   pixelFormat: 'yuv420p',
-  /** Default cap on the longest edge, in pixels (`webReady.maxEdge`). */
+  /** Default cap on the longest edge of a re-encoded video, in pixels (`webReady.maxEdge`). */
   maxEdge: 1920,
   /**
    * Default cap on the frame rate of a re-encoded video (`webReady.maxFrameRate`): the rate the
@@ -99,7 +100,11 @@ export type WebReadyOptions = {
    * host is a concern.
    */
   transcode?: boolean;
-  /** Longest edge of the served video, in pixels; larger videos are scaled down. Default `1920`. */
+  /**
+   * Longest edge of a re-encoded video, in pixels; a larger one is scaled down. Default `1920`. A
+   * video that isn't re-encoded keeps its size: H.264 up to level 5.2 (4096×2304, 4K at 60 fps)
+   * plays everywhere.
+   */
   maxEdge?: number;
   /**
    * Frames per second of a re-encoded video, at most; a faster one (60 fps, a 120 or 240 fps
@@ -611,6 +616,19 @@ function displayedSize(video: VideoProbe['video']): { width: number; height: num
   return sideways ? { width: video.height, height: video.width } : { width: video.width, height: video.height };
 }
 
+/**
+ * H.264 level 5.2, the highest that phones, tablets and laptops decode in hardware: frames up to
+ * 36 864 macroblocks (4096×2304) at up to 2 073 600 macroblocks a second (4K at 60 fps). A video
+ * within it is served at its own size and rate; past it (8K, 4K at 120 fps), it is re-encoded.
+ */
+const LEVEL_52 = { frameMacroblocks: 36_864, macroblocksPerSecond: 2_073_600 };
+
+/** Whether a video's size and frame rate are within `LEVEL_52`; an unknown rate counts as 30. */
+function withinDecodeLimits(video: VideoProbe['video']): boolean {
+  const macroblocks = Math.ceil(video.width / 16) * Math.ceil(video.height / 16);
+  return macroblocks <= LEVEL_52.frameMacroblocks && macroblocks * (video.frameRate ?? 30) <= LEVEL_52.macroblocksPerSecond;
+}
+
 /** The displayed size scaled so the longest edge is at most `maxEdge`. */
 function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
   const { width, height } = displayedSize(video);
@@ -979,8 +997,11 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
   if (hdr) videoOff.push(`HDR (${video.transfer})`);
   // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
   // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.
-  if (size.width !== shown.width || size.height !== shown.height) {
-    videoOff.push(`size ${shown.width}×${shown.height}`);
+  // Size and frame rate aren't either, within what every device decodes (`withinDecodeLimits`): a
+  // 4K or 60 fps H.264 upload keeps its bytes. A re-encode for any other reason scales to `maxEdge`.
+  if (!withinDecodeLimits(video)) {
+    const fps = video.frameRate !== undefined ? ` at ${Math.round(video.frameRate)} fps` : '';
+    videoOff.push(`size ${shown.width}×${shown.height}${fps} past H.264 level 5.2`);
   }
   const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
   return { probe, moov, isMp4, hdr, size, videoOff, audioOff };

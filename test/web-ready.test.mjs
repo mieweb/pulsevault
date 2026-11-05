@@ -228,8 +228,25 @@ test("conform: an MKV with H.264/AAC is remuxed into an MP4 without re-encoding"
   assert.equal(probe(result.outputPath).video.codec_name, "h264");
 });
 
-test("conform: landscape 4K is scaled to 1920×1080 and stays landscape", { skip: !FFMPEG }, async () => {
-  const p = await fixture("land4k.mp4", [...VIDEO("3840x2160"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+test("conform: 4K H.264 keeps its size and its bytes (within level 5.2)", { skip: !FFMPEG }, async () => {
+  const p = await fixture("land4k-h264.mp4", [...VIDEO("3840x2160"), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const before = await fs.readFile(p);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "none");
+  assert.ok(before.equals(await fs.readFile(p)), "bytes untouched");
+});
+
+test("conform: H.264 past level 5.2 is re-encoded at most maxEdge and maxFrameRate", { skip: !FFMPEG }, async () => {
+  // 1080p at 300 fps: 8 160 macroblocks a frame, 2.4 million a second, over level 5.2's 2 073 600.
+  const p = await fixture("hd300.mp4", [...VIDEO_AT("1920x1080", 300, 1), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const result = await ensureWebReady(p);
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /past H\.264 level 5\.2/);
+  assert.equal(videoTiming(p).fps, 30);
+});
+
+test("conform: landscape 4K re-encoded for another reason is scaled to 1920×1080 and stays landscape", { skip: !FFMPEG }, async () => {
+  const p = await fixture("land4k.mp4", [...VIDEO("3840x2160"), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
   const result = await ensureWebReady(p);
   assert.equal(result.action, "transcoded");
   const { video, audio } = probe(p);
@@ -284,6 +301,8 @@ const turn = (degrees) => {
 
 /** What the Pulse app uploads: H.264 High 8-bit BT.709, mono 48 kHz AAC, faststart MP4. */
 const PULSE_ENCODE = ["-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "aac", "-ac", "1", "-ar", "48000"];
+/** The same in 4:4:4, which no browser plays in hardware: re-encoded whatever its size. */
+const OFF_ENCODE = PULSE_ENCODE.map((a) => (a === "high" ? "high444" : a === "yuv420p" ? "yuv444p" : a));
 
 test("conform: every way the Pulse app writes a recording keeps its bytes, rotation tag and all", { skip: !FFMPEG }, async () => {
   // iOS joins keep the camera's coded 1920×1080 with its orientation tag (portrait is -90° or 90°,
@@ -303,7 +322,7 @@ test("conform: every way the Pulse app writes a recording keeps its bytes, rotat
 });
 
 test("conform: a rotated video that is re-encoded anyway comes out upright, with no tag", { skip: !FFMPEG }, async () => {
-  const big = await fixture("big.mp4", [...QUADRANTS("3840x2160"), ...TONE(), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  const big = await fixture("big.mp4", [...QUADRANTS("3840x2160"), ...TONE(), ...OFF_ENCODE, "-movflags", "+faststart"]);
   for (const degrees of [90, -90, 180]) {
     const p = tagged(big, degrees, `big${degrees}.mp4`);
     const shown = quadrants(p);
@@ -553,14 +572,13 @@ test("conform: a frame probe past probeTimeoutSeconds keeps the original", { ski
 });
 
 test("conform: the size cap is the size a player shows, not the coded one", { skip: !FFMPEG }, async () => {
-  // Coded 1920×1080, shown 1080×1920: within the default cap, over a 1280 one.
-  const coded = await fixture("cap.mp4", [...QUADRANTS("1920x1080"), ...PULSE_ENCODE, "-movflags", "+faststart"]);
+  // Coded 1920×1080, shown 1080×1920, re-encoded (4:4:4) with a cap of 1280: scaled by its shown size.
+  const coded = await fixture("cap.mp4", [...QUADRANTS("1920x1080"), ...OFF_ENCODE, "-movflags", "+faststart"]);
   const p = tagged(coded, 90, "cap90.mp4");
-  assert.equal((await ensureWebReady(p)).action, "none");
   const shown = quadrants(p);
   const result = await ensureWebReady(p, { maxEdge: 1280 });
   assert.equal(result.action, "transcoded");
-  assert.match(result.reason, /size 1080×1920/);
+  assert.match(result.reason, /→ h264 720×1280/);
   const { video, rotation } = probe(p);
   assert.deepEqual([video.width, video.height, rotation], [720, 1280, 0]);
   assert.equal(quadrants(p, { autorotate: false }), shown);
@@ -607,7 +625,7 @@ function videoTiming(p) {
 const VIDEO_AT = (size, rate, duration = 2) => ["-f", "lavfi", "-i", `testsrc2=size=${size}:rate=${rate}:duration=${duration}`];
 
 test("conform: a 60 fps video that is re-encoded anyway comes out at 30 fps, as long as before", { skip: !FFMPEG }, async () => {
-  const p = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), ...TONE(2), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]);
+  const p = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), ...TONE(2), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-c:a", "aac", "-movflags", "+faststart"]);
   const before = videoTiming(p);
   const result = await ensureWebReady(p);
   assert.equal(result.action, "transcoded");
@@ -619,13 +637,13 @@ test("conform: a 60 fps video that is re-encoded anyway comes out at 30 fps, as 
 });
 
 test("conform: maxFrameRate sets the cap, and a video at the cap keeps every frame", { skip: !FFMPEG }, async () => {
-  const fast = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const fast = await fixture("land4k60.mp4", [...VIDEO_AT("3840x2160", 60), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
   assert.equal((await ensureWebReady(fast, { maxFrameRate: 60 })).action, "transcoded");
   assert.equal(videoTiming(fast).fps, 60, "a cap of 60 keeps a 60 fps video's rate");
 
   // 30000/1001 (29.97) and 30 are at the cap: never given duplicate frames.
   for (const rate of ["30000/1001", "30"]) {
-    const p = await fixture(`land4k-${rate.replace("/", "_")}.mp4`, [...VIDEO_AT("3840x2160", rate), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+    const p = await fixture(`land4k-${rate.replace("/", "_")}.mp4`, [...VIDEO_AT("3840x2160", rate), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
     const before = videoTiming(p);
     const result = await ensureWebReady(p);
     assert.equal(result.action, "transcoded");
@@ -704,7 +722,7 @@ test("conform: non-AAC audio in an MP4-family file is converted to AAC", { skip:
 });
 
 test("conform: a run past timeoutSeconds is killed, the original kept and the reason given", { skip: !FFMPEG }, async () => {
-  const p = await fixture("slow.mp4", [...VIDEO("3840x2160", 3), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const p = await fixture("slow.mp4", [...VIDEO("3840x2160", 3), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const before = await fs.readFile(p);
   const result = await ensureWebReady(p, { timeoutSeconds: 0.05 });
   assert.equal(result.action, "skipped");
@@ -714,7 +732,7 @@ test("conform: a run past timeoutSeconds is killed, the original kept and the re
 });
 
 test("conform: a run that stops making progress is killed after stallSeconds, the original kept", { skip: !FFMPEG || process.platform === "win32" }, async () => {
-  const p = await fixture("hung.mp4", [...VIDEO("3840x2160", 1), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const p = await fixture("hung.mp4", [...VIDEO("3840x2160", 1), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const before = await fs.readFile(p);
   // An ffmpeg that hangs on the re-encode: never reports progress, never exits.
   const dir = await scratchDir("ffmpeg-hang-");
@@ -731,7 +749,7 @@ test("conform: a run that stops making progress is killed after stallSeconds, th
 
 test("conform: a run that keeps making progress outlasts stallSeconds, and reports it", { skip: !FFMPEG }, async () => {
   // A re-encode of several seconds, with a stall limit of one: progress keeps it alive.
-  const p = await fixture("long.mp4", [...VIDEO("3840x2160", 10), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const p = await fixture("long.mp4", [...VIDEO("3840x2160", 10), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const fractions = [];
   const started = Date.now();
   const result = await ensureWebReady(p, { stallSeconds: 1, onProgress: (f) => fractions.push(f) });
@@ -743,7 +761,7 @@ test("conform: a run that keeps making progress outlasts stallSeconds, and repor
 });
 
 test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {
-  const p = await fixture("odd-cap.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  const p = await fixture("odd-cap.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
   const result = await ensureWebReady(p, { maxEdge: 321 });
   assert.equal(result.action, "transcoded");
   const { video } = probe(p);

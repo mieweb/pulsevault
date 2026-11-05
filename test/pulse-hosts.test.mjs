@@ -916,7 +916,7 @@ test("webReady: the final PATCH is answered before the conversion; completeAfter
 
 test("webReady: a video that needs no re-encode is settled while another upload's re-encode runs", { skip: !FFMPEG }, async () => {
   // A re-encode that takes seconds (4K, scaled to 1080p) and a Pulse-like upload that needs nothing.
-  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p"]);
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p"]);
   const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=1080x1920:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
   const processed = [];
   const ctx = await startLocal({
@@ -943,7 +943,7 @@ test("webReady: a video that needs no re-encode is settled while another upload'
 });
 
 test("webReady: the status route says how far a running conversion has got", { skip: !FFMPEG }, async () => {
-  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p"]);
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p"]);
   const ctx = await startLocal({ pluginOptions: { webReady: true } });
   try {
     const id = randomUUID();
@@ -969,7 +969,7 @@ test("webReady: the status route says how far a running conversion has got", { s
 });
 
 test("webReady: re-encodes run `concurrency` at a time, and every upload in a burst is settled", { skip: !FFMPEG }, async () => {
-  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
   let running = 0;
   let most = 0;
@@ -1343,7 +1343,7 @@ test("webReady: a video still being converted is revalidated instead of the conf
 test("webReady: a conversion that times out keeps serving the original and the status says why", { skip: !FFMPEG }, async () => {
   const body = await encodeMp4([
     "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=1",
-    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p",
   ]);
   const ctx = await startLocal({ pluginOptions: { webReady: { timeoutSeconds: 0.05 } } });
   try {
