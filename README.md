@@ -543,7 +543,7 @@ Off by default. `true`, or `ensureWebReady`'s options plus:
 
 ```ts
 webReady: {
-  concurrency: 1,        // conversions at once; a transcode is CPU-bound
+  concurrency: 1,        // video re-encodes at once (CPU-bound); checks, remuxes and posters run in their own lane
   completeAfter: false,  // true: run onUploadComplete only once the conversion has finished
   poster: true,          // a video that arrived without a thumbnail gets one frame as its poster
   maxEdge: 1920,         // longest edge of the served video

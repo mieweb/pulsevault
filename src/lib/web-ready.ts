@@ -816,47 +816,25 @@ export function validateWebReadyOptions(options: WebReadyOptions): void {
   }
 }
 
+/** What `ensureWebReady` finds off-target in a file, stream by stream. */
+type Assessment = {
+  probe: VideoProbe;
+  moov: MoovPosition;
+  isMp4: boolean;
+  hdr: boolean;
+  size: { width: number; height: number };
+  videoOff: string[];
+  audioOff: boolean;
+};
+
 /**
- * Bring the video at `filePath` to `CONFORM_TARGET`:
- *
- * - already conforming → `none`, bytes untouched;
- * - an MP4 with conforming streams but the `moov` at the end → lossless faststart remux in
- *   place (`remuxed`);
- * - any other container with conforming streams → lossless remux into a new `.mp4` beside it
- *   (`conformed`);
- * - otherwise one ffmpeg run: the video re-encoded to H.264 when its codec, pixel format, bit
- *   depth, displayed size or dynamic range is off (scaled by the longest edge, rotation
- *   applied, HDR tone-mapped), the audio re-encoded to AAC unless it already is — in place for
- *   an MP4 (`transcoded`), into a new `.mp4` otherwise (`conformed`). A copied video stream
- *   keeps its rotation tag;
- * - no ffmpeg/ffprobe, a file ffprobe can't read, a failed or timed-out run → `skipped` with
- *   the reason; the original is untouched.
- *
- * When the result carries `outputPath`, the conformed file was written there (`<name>.mp4`)
- * and the original is left in place: the caller switches the artifact over, then removes it.
- * With `install: false` nothing is renamed: every rewrite is left at a temporary path beside
- * the input, returned as `outputPath`, for the caller to install (or remove).
- * Never throws for pipeline reasons.
- *
- * NOTE: a rewrite changes the artifact's bytes, so any upload-time checksum
- * recorded for it (e.g. the local adapter's sidecar `checksum` from
- * `Upload-Metadata`) describes the ORIGINAL bytes, not the rewritten file.
- * Consumers verifying bytes against `getChecksum` must treat it as
- * upload-time provenance, not current-file integrity.
+ * Look at a file the way `ensureWebReady` does, without writing anything: what's off-target, or
+ * the `skipped` result when it can't be looked at (no ffmpeg, unreadable, not a video).
  */
-export async function ensureWebReady(
-  filePath: string,
-  options: WebReadyOptions = {},
-): Promise<WebReadyResult & { outputPath?: string }> {
-  validateWebReadyOptions(options);
+async function assess(filePath: string, options: WebReadyOptions): Promise<Assessment | WebReadyResult> {
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
-  const transcode = options.transcode ?? true;
-  const install = options.install ?? true;
   const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
-  const maxFrameRate = options.maxFrameRate ?? CONFORM_TARGET.maxFrameRate;
-  const crf = options.crf ?? 23;
-  const preset = options.preset ?? 'veryfast';
 
   if (!(await webReadyAvailable({ ffmpegPath, ffprobePath }))) {
     const key = `${ffmpegPath}|${ffprobePath}`;
@@ -932,6 +910,66 @@ export async function ensureWebReady(
     videoOff.push(`size ${shown.width}×${shown.height}`);
   }
   const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
+  return { probe, moov, isMp4, hdr, size, videoOff, audioOff };
+}
+
+/**
+ * Whether `ensureWebReady` would re-encode this file's video: the slow, CPU-bound work, as
+ * against nothing, a lossless remux or an audio-only conversion. For scheduling: it probes the
+ * file and writes nothing. `false` when the file can't be looked at (`ensureWebReady` then skips
+ * it at once).
+ */
+export async function needsVideoReencode(filePath: string, options: WebReadyOptions = {}): Promise<boolean> {
+  validateWebReadyOptions(options);
+  if (options.transcode === false) return false;
+  const assessed = await assess(filePath, options);
+  return !('action' in assessed) && assessed.videoOff.length > 0;
+}
+
+/**
+ * Bring the video at `filePath` to `CONFORM_TARGET`:
+ *
+ * - already conforming → `none`, bytes untouched;
+ * - an MP4 with conforming streams but the `moov` at the end → lossless faststart remux in
+ *   place (`remuxed`);
+ * - any other container with conforming streams → lossless remux into a new `.mp4` beside it
+ *   (`conformed`);
+ * - otherwise one ffmpeg run: the video re-encoded to H.264 when its codec, pixel format, bit
+ *   depth, displayed size or dynamic range is off (scaled by the longest edge, rotation
+ *   applied, HDR tone-mapped), the audio re-encoded to AAC unless it already is — in place for
+ *   an MP4 (`transcoded`), into a new `.mp4` otherwise (`conformed`). A copied video stream
+ *   keeps its rotation tag;
+ * - no ffmpeg/ffprobe, a file ffprobe can't read, a failed or timed-out run → `skipped` with
+ *   the reason; the original is untouched.
+ *
+ * When the result carries `outputPath`, the conformed file was written there (`<name>.mp4`)
+ * and the original is left in place: the caller switches the artifact over, then removes it.
+ * With `install: false` nothing is renamed: every rewrite is left at a temporary path beside
+ * the input, returned as `outputPath`, for the caller to install (or remove).
+ * Never throws for pipeline reasons.
+ *
+ * NOTE: a rewrite changes the artifact's bytes, so any upload-time checksum
+ * recorded for it (e.g. the local adapter's sidecar `checksum` from
+ * `Upload-Metadata`) describes the ORIGINAL bytes, not the rewritten file.
+ * Consumers verifying bytes against `getChecksum` must treat it as
+ * upload-time provenance, not current-file integrity.
+ */
+export async function ensureWebReady(
+  filePath: string,
+  options: WebReadyOptions = {},
+): Promise<WebReadyResult & { outputPath?: string }> {
+  validateWebReadyOptions(options);
+  const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
+  const transcode = options.transcode ?? true;
+  const install = options.install ?? true;
+  const maxFrameRate = options.maxFrameRate ?? CONFORM_TARGET.maxFrameRate;
+  const crf = options.crf ?? 23;
+  const preset = options.preset ?? 'veryfast';
+
+  const assessed = await assess(filePath, options);
+  if ('action' in assessed) return assessed;
+  const { probe, moov, isMp4, hdr, size, videoOff, audioOff } = assessed;
+  const { video, audio } = probe;
 
   if (videoOff.length === 0 && !audioOff && isMp4 && moov === 'front') {
     return { action: 'none', reason: 'already web-ready' };

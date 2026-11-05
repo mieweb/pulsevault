@@ -17,9 +17,16 @@ breaking changes, called out explicitly below.
   if that fails, the run is repeated over every frame. A video that conforms otherwise (every Pulse upload) keeps its
   bytes and its own frame rate, as before.
 
+- **web-ready:** a video that needs no re-encode — every Pulse upload, a lossless remux, an
+  audio-only conversion — and a poster frame no longer wait behind another upload's re-encode.
+  Conversions run in two lanes: video re-encodes, `concurrency` at a time (default 1), and
+  everything else, two at a time.
+
 ### Added
 
 - **web-ready:** `maxFrameRate` option (default `30`).
+- **web-ready:** `needsVideoReencode(filePath, options)`: whether `ensureWebReady` would re-encode
+  a file's video, for a host scheduling conversions itself. Writes nothing.
 
 ## [0.7.2] - 2026-11-02
 

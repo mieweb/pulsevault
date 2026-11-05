@@ -254,8 +254,13 @@ await app.register(pulseVault, {
 
 Settings:
 
-- `concurrency` (default `1`): conversions run one at a time per process; the
-  rest wait in a queue. A conversion a restart interrupted is resumed by the
+- `concurrency` (default `1`): video re-encodes run one at a time per process;
+  the rest wait in a queue. Everything else — a file that's already web-ready
+  (every Pulse upload), a lossless remux, an audio-only conversion, a poster
+  frame — runs in a lane of its own, two at a time, so it is settled in a
+  second or two even while a long re-encode runs. On a machine with many cores,
+  a higher `concurrency` converts several uploads at once (one re-encode uses
+  up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
   until its result is recorded.
 - `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
