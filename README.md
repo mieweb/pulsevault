@@ -548,7 +548,9 @@ webReady: {
   poster: true,          // a video that arrived without a thumbnail gets one frame as its poster
   maxEdge: 1920,         // longest edge of the served video
   maxFrameRate: 30,      // frames per second of a re-encoded video, at most
-  timeoutSeconds: undefined, // default 60 + 10 × duration in 1080p30 seconds (4K120 counts 16×), at most 1 h: a hang guard
+  stallSeconds: 120,     // a run that stops moving forward through the video for this long is killed
+  timeoutSeconds: 3600,  // a backstop on any one run; a slow run that keeps making progress is never cut short before it
+  onProgress: undefined, // (fraction) => …, about twice a second; the status route reports it as `progress` too
   probeTimeoutSeconds: 60,   // the same guard for each ffprobe run over the upload
   transcode: true, crf: 23, preset: "veryfast", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe",
 },

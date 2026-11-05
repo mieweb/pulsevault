@@ -263,12 +263,16 @@ Settings:
   up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
   until its result is recorded.
-- `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
-  1080p30 seconds — a second of 4K at 120 fps counts 16 — at most an hour,
-  and an hour when the duration is unknown; the default comes from the
-  upload's own metadata, so set this for longer runs): a run past it is
-  killed, the original kept, and
-  `skipped` recorded with the reason.
+- `stallSeconds` (default `120`): ffmpeg reports how far through the video it
+  is about twice a second; a run that hasn't moved forward for this long is
+  killed, the original kept, and `skipped` recorded with the reason
+  (`stalled: no progress for …`). A slow run on a busy or small server is never
+  stopped while it keeps making progress.
+- `timeoutSeconds` (default `3600`): a backstop on any one run, whatever its
+  progress; set it higher for longer runs. A run past it is killed, the
+  original kept, and `skipped` recorded with the reason.
+- While a conversion runs, the status route reports how far it has got
+  (`progress`, 0–1) and `onProgress` is called with the same fraction.
 - `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
   over the upload, so a malformed file can't hold the queue.
 - `maxEdge` (default `1920`): the longest edge of the served video.

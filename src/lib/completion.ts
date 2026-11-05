@@ -144,6 +144,11 @@ export type CompletionRunner = {
   /** Whether a web-ready conversion applies to an artifact of this kind: `webReady` is on and it's a video. */
   converts(kind: UploadKind): boolean;
   /**
+   * How far this process's conversion of an artifact has got (0–1), while one runs; `undefined`
+   * while it waits for a slot, before it starts, or when it isn't this process converting it.
+   */
+  progressOf(artifactId: string): number | undefined;
+  /**
    * Make a poster for a finished video stored before posters were made (or whose first try
    * failed), in the light lane of the conversion queue: once per video per process, a no-op when it has a
    * thumbnail or `webReady.poster` is off. Never rejects. For the poster route's miss.
@@ -290,6 +295,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     opts.replay === false ? null : (opts.replay?.intervalSeconds ?? DEFAULT_REPLAY_INTERVAL_SECONDS) * 1000;
 
   const converts = (kind: UploadKind): boolean => webReady !== undefined && kind === 'video';
+
+  /** How far each running conversion has got, for the status route. Display only, never state. */
+  const progress = new Map<string, number>();
 
   const postersOn =
     webReady !== undefined &&
@@ -480,7 +488,22 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
               ? { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined }
               : !fresh.generation
                 ? { action: 'skipped' as const, reason: 'the storage adapter keeps no generation for this upload', outputPath: undefined }
-                : await ensureWebReady(localPath, { ...webReady, logger, install: false });
+                : await (async () => {
+                    progress.set(ctx.artifactId, 0);
+                    try {
+                      return await ensureWebReady(localPath, {
+                        ...webReady,
+                        logger,
+                        install: false,
+                        onProgress: (fraction) => {
+                          progress.set(ctx.artifactId, fraction);
+                          webReady?.onProgress?.(fraction);
+                        },
+                      });
+                    } finally {
+                      progress.delete(ctx.artifactId);
+                    }
+                  })();
           const expected = generation !== undefined ? generation : (fresh.generation ?? null);
           const localExt = typeof localPath === 'string' ? path.extname(localPath).toLowerCase() : '';
           const storedExt = localExt && localExt !== fresh.ext ? localExt : undefined;
@@ -681,6 +704,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     complete,
     replay,
     converts,
+    progressOf: (artifactId: string) => progress.get(artifactId),
     posterFor,
     start: () => {
       if (timer || stopped) return;

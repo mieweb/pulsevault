@@ -232,6 +232,11 @@ export type PulseVaultArtifactStatus = {
   /** Whether the host's `onUploadComplete` has finished for this artifact. */
   acknowledged?: boolean;
   /**
+   * How far the web-ready conversion has got (0–1) while `processing`, when this process is
+   * running it; absent while it waits for its turn.
+   */
+  progress?: number;
+  /**
    * What the web-ready conversion did, once it ran: `none`, `remuxed`, `transcoded`, `conformed`,
    * or `skipped` with the reason (the original bytes serve).
    */
@@ -998,6 +1003,9 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       ...(meta.name ? { name: meta.name } : {}),
       ...(await uploadProgress(meta)),
       acknowledged: meta.acknowledged,
+      ...(state === 'processing' && completion.progressOf(artifactId) !== undefined
+        ? { progress: Math.round(completion.progressOf(artifactId)! * 1000) / 1000 }
+        : {}),
       ...(meta.webReady ? { webReady: meta.webReady } : {}),
       ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),
       ...(meta.context !== undefined ? { context: meta.context } : {}),

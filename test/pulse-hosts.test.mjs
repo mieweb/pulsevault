@@ -942,6 +942,32 @@ test("webReady: a video that needs no re-encode is settled while another upload'
   }
 });
 
+test("webReady: the status route says how far a running conversion has got", { skip: !FFMPEG }, async () => {
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p"]);
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "imported.mp4", kind: "video", body: slow });
+    const seen = [];
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const res = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}/status`);
+      const status = await res.json();
+      if (status.state === "ready" || Date.now() > deadline) {
+        assert.equal(status.state, "ready");
+        assert.equal(status.progress, undefined, "no progress once ready");
+        break;
+      }
+      if (typeof status.progress === "number") seen.push(status.progress);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(seen.length >= 2, `progress seen ${seen.length} times`);
+    assert.ok(seen.every((f, i) => f >= 0 && f <= 1 && (i === 0 || f >= seen[i - 1])), `climbing within 0–1: ${seen}`);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("webReady: re-encodes run `concurrency` at a time, and every upload in a burst is settled", { skip: !FFMPEG }, async () => {
   const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
   const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);

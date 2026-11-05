@@ -113,12 +113,21 @@ export type WebReadyOptions = {
   preset?: string;
   /**
    * Wall-clock limit for one ffmpeg run, in seconds; the run is killed and the original kept.
-   * A guard against a run that hangs, not a speed limit. Default `60 + 10 ×` the video's
-   * duration counted in 1080p30 seconds (a second of 4K at 120 fps counts 16), at most an hour,
-   * and an hour when the duration is unknown. The default comes from the upload's own metadata,
-   * so it's capped: a file can't claim its way to a days-long run. Set this for longer runs.
+   * A backstop, not a speed limit: a run that stops working is caught by `stallSeconds` long
+   * before. Default `3600` (an hour). Set this for longer runs.
    */
   timeoutSeconds?: number;
+  /**
+   * Seconds an ffmpeg run may go without moving forward through the video before it is killed
+   * and the original kept. A slow run is never stopped while it makes progress; a hung one is
+   * stopped this long after it last did. Default `120`.
+   */
+  stallSeconds?: number;
+  /**
+   * Called as a re-encode or remux moves through the video, with the fraction done (0–1), about
+   * twice a second. Only when the video's duration is known.
+   */
+  onProgress?: (fraction: number) => void;
   /**
    * `false`: leave every rewrite at a temporary `.mp4` path beside the input (the result's
    * `outputPath`) instead of renaming it into place, so the caller can install it under its own
@@ -705,6 +714,82 @@ async function decodesFromBaseLayer(filePath: string, ffmpegPath: string, index:
   return upper > 0;
 }
 
+/** What one ffmpeg run may take, and whom to tell how far it has got. */
+type RunLimits = {
+  timeoutMs: number;
+  stallMs: number;
+  durationSeconds: number | null;
+  onProgress?: (fraction: number) => void;
+};
+
+/** A run that stopped moving forward through the video for `stallSeconds`. */
+class StallError extends TimeoutError {}
+
+/** Most of ffmpeg's stderr kept per run: its last lines say why it failed. */
+const STDERR_KEEP = 256 * 1024;
+
+/**
+ * Run ffmpeg, watching its `-progress` report: killed when it hasn't moved forward through the
+ * video for `stallMs` (`StallError`), or past `timeoutMs` in all (`TimeoutError`). Resolves its
+ * stderr; rejects with the exit `code` when it fails.
+ */
+function runFfmpeg(ffmpegPath: string, args: string[], limits: RunLimits): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, ['-nostats', '-progress', 'pipe:1', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr = (stderr + chunk).slice(-STDERR_KEEP);
+    });
+    // The furthest point reached in the output, in microseconds, and when it last moved.
+    let reached = -1;
+    let movedAt = Date.now();
+    const lines = createInterface({ input: child.stdout });
+    lines.on('line', (line) => {
+      const field = /^out_time_us=(\d+)$/.exec(line);
+      if (!field) return;
+      const us = Number(field[1]);
+      if (us <= reached) return;
+      reached = us;
+      movedAt = Date.now();
+      if (limits.onProgress && limits.durationSeconds) {
+        try {
+          limits.onProgress(Math.min(1, us / 1e6 / limits.durationSeconds));
+        } catch {
+          // An observer's failure isn't the run's.
+        }
+      }
+    });
+    let killedFor: TimeoutError | null = null;
+    const kill = (why: TimeoutError) => {
+      if (killedFor) return;
+      killedFor = why;
+      child.kill('SIGKILL');
+    };
+    const deadline = setTimeout(() => kill(new TimeoutError(`timed out after ${Math.round(limits.timeoutMs / 100) / 10} s`)), limits.timeoutMs);
+    const watchdog = setInterval(() => {
+      if (Date.now() - movedAt > limits.stallMs) {
+        kill(new StallError(`stalled: no progress for ${Math.round(limits.stallMs / 100) / 10} s`));
+      }
+    }, Math.min(1000, limits.stallMs));
+    const done = () => {
+      clearTimeout(deadline);
+      clearInterval(watchdog);
+      lines.close();
+    };
+    child.once('error', (err) => {
+      done();
+      reject(err);
+    });
+    child.once('close', (code) => {
+      done();
+      if (killedFor) return reject(killedFor);
+      if (code === 0) return resolve(stderr);
+      reject(Object.assign(new Error(`ffmpeg exited with code ${code}`), { code, stderr }));
+    });
+  });
+}
+
 /**
  * Run ffmpeg into a sibling tmp file, then rename it onto `outputPath` (the input itself, or a
  * new `.mp4` beside it). The rename is atomic, so a crash never leaves a half-written artifact.
@@ -714,7 +799,7 @@ async function rewrite(
   outputPath: string | null,
   ffmpegPath: string,
   args: string[],
-  timeoutMs: number,
+  limits: RunLimits,
   inputArgs: string[] = [],
 ): Promise<string> {
   // randomUUID in the name: every video artifact shares one kind directory, so
@@ -723,22 +808,10 @@ async function rewrite(
   // winner's rename would install garbage bytes over a real artifact.
   const tmp = path.join(path.dirname(inputPath), `.webready-${randomUUID()}${CONFORM_TARGET.extension}`);
   try {
-    try {
-      const { stderr } = await execFileAsync(ffmpegPath, ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp], {
-        // Cap the buffered stderr; the wall clock is capped by the timeout.
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
-      });
-      // A decode of the base layer alone that found a picture missing: the decoder made one up
-      // and carried on, so the output may show it. Not a file to keep.
-      if (inputArgs.length > 0 && MISSING_REFERENCE.test(stderr)) throw new Error('a dropped picture was referenced');
-    } catch (err) {
-      if ((err as { killed?: boolean }).killed) {
-        throw new TimeoutError(`timed out after ${Math.round(timeoutMs / 100) / 10} s`);
-      }
-      throw err;
-    }
+    const stderr = await runFfmpeg(ffmpegPath, ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp], limits);
+    // A decode of the base layer alone that found a picture missing: the decoder made one up
+    // and carried on, so the output may show it. Not a file to keep.
+    if (inputArgs.length > 0 && MISSING_REFERENCE.test(stderr)) throw new Error('a dropped picture was referenced');
     // ffmpeg exiting 0 with an empty/absent output would still be a corrupt
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
@@ -809,7 +882,7 @@ export function validateWebReadyOptions(options: WebReadyOptions): void {
   if (maxFrameRate !== undefined && !(Number.isInteger(maxFrameRate) && maxFrameRate >= 1)) {
     throw new TypeError('`webReady.maxFrameRate` must be a whole number of frames per second, at least 1');
   }
-  for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
+  for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['stallSeconds', options.stallSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
     if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
       throw new TypeError(`\`webReady.${name}\` must be a positive number of seconds`);
     }
@@ -979,7 +1052,7 @@ export async function ensureWebReady(
     const off = [...videoOff, ...(audioOff ? [`audio ${audio?.codec}`] : [])].join(', ');
     if (isMp4 && moov === 'end') {
       try {
-        const written = await rewrite(filePath, install ? filePath : null, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], timeoutOf(options, probe));
+        const written = await rewrite(filePath, install ? filePath : null, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], limitsOf(options, probe));
         return {
           action: 'remuxed',
           reason: `moov was at end of file; remuxed to faststart (${off} left as-is: transcode disabled)`,
@@ -1052,14 +1125,14 @@ export async function ensureWebReady(
   let written: string;
   try {
     try {
-      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe), inputArgs);
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, limitsOf(options, probe), inputArgs);
     } catch (err) {
       // The base layer alone didn't decode cleanly (or this ffmpeg can't drop layers on input):
       // the same run over every frame. A run that timed out would only time out again.
       if (inputArgs.length === 0 || err instanceof TimeoutError) throw err;
       options.logger?.error({ err, filePath }, 'pulsevault web-ready: base-layer decode failed; decoding every frame');
       inputArgs = [];
-      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe));
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, limitsOf(options, probe));
     }
   } catch (err) {
     options.logger?.error({ err, filePath }, `pulsevault web-ready: ${action === 'remuxed' ? 'remux' : 'conversion'} failed; serving original bytes`);
@@ -1070,24 +1143,16 @@ export async function ensureWebReady(
   return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
 
-/** The longest default run: the default is computed from the upload's own (untrusted) metadata. */
-const MAX_DEFAULT_TIMEOUT_SECONDS = 3600;
+/** The longest a run may take by default: a backstop; `stallSeconds` catches a hung run sooner. */
+const DEFAULT_TIMEOUT_SECONDS = 3600;
+const DEFAULT_STALL_SECONDS = 120;
 
-/** The wall-clock limit for one run over this video, in ms. */
-function timeoutOf(options: WebReadyOptions, probe: VideoProbe): number {
-  const computed = probe.durationSeconds !== null ? 60 + 10 * workSeconds(probe) : MAX_DEFAULT_TIMEOUT_SECONDS;
-  const seconds =
-    options.timeoutSeconds ??
-    (Number.isFinite(computed) ? Math.min(computed, MAX_DEFAULT_TIMEOUT_SECONDS) : MAX_DEFAULT_TIMEOUT_SECONDS);
-  return Math.max(1, Math.round(seconds * 1000));
-}
-
-/**
- * The video's duration in seconds of 1080p30, the work of a conversion: a second of 4K at
- * 120 fps (an iPhone recording) decodes and scales 16 times the pixels of a 1080p30 second.
- */
-function workSeconds(probe: VideoProbe): number {
-  const { width, height, frameRate } = probe.video;
-  const pixelRate = width * height * (frameRate ?? 30);
-  return (probe.durationSeconds ?? 0) * Math.max(1, pixelRate / (1920 * 1080 * 30));
+/** What one run over this video may take. */
+function limitsOf(options: WebReadyOptions, probe: VideoProbe): RunLimits {
+  return {
+    timeoutMs: Math.max(1, Math.round((options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS) * 1000)),
+    stallMs: Math.max(1, Math.round((options.stallSeconds ?? DEFAULT_STALL_SECONDS) * 1000)),
+    durationSeconds: probe.durationSeconds,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+  };
 }

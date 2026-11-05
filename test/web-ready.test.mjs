@@ -713,6 +713,35 @@ test("conform: a run past timeoutSeconds is killed, the original kept and the re
   assert.deepEqual((await fs.readdir(path.dirname(p))).filter((f) => f.startsWith(".webready-")), [], "no tmp file left");
 });
 
+test("conform: a run that stops making progress is killed after stallSeconds, the original kept", { skip: !FFMPEG || process.platform === "win32" }, async () => {
+  const p = await fixture("hung.mp4", [...VIDEO("3840x2160", 1), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const before = await fs.readFile(p);
+  // An ffmpeg that hangs on the re-encode: never reports progress, never exits.
+  const dir = await scratchDir("ffmpeg-hang-");
+  const shim = path.join(dir, "ffmpeg");
+  await fs.writeFile(shim, `#!/bin/sh\ncase "$*" in *libx264*) exec sleep 60;; esac\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+  const started = Date.now();
+  const result = await ensureWebReady(p, { ffmpegPath: shim, stallSeconds: 1 });
+  assert.equal(result.action, "skipped");
+  assert.match(result.reason, /stalled: no progress for 1 s/);
+  assert.ok(Date.now() - started < 10_000, `killed after ${Date.now() - started} ms`);
+  assert.deepEqual(await fs.readFile(p), before);
+  assert.deepEqual((await fs.readdir(path.dirname(p))).filter((f) => f.startsWith(".webready-")), [], "no tmp file left");
+});
+
+test("conform: a run that keeps making progress outlasts stallSeconds, and reports it", { skip: !FFMPEG }, async () => {
+  // A re-encode of several seconds, with a stall limit of one: progress keeps it alive.
+  const p = await fixture("long.mp4", [...VIDEO("3840x2160", 10), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+  const fractions = [];
+  const started = Date.now();
+  const result = await ensureWebReady(p, { stallSeconds: 1, onProgress: (f) => fractions.push(f) });
+  assert.equal(result.action, "transcoded", result.reason);
+  assert.ok(Date.now() - started > 1000, "the run took longer than stallSeconds");
+  assert.ok(fractions.length >= 2, `progress reported ${fractions.length} times`);
+  assert.ok(fractions.every((f, i) => f >= 0 && f <= 1 && (i === 0 || f >= fractions[i - 1])), "climbing, within 0–1");
+  assert.ok(fractions.at(-1) > 0.9, `ended at ${fractions.at(-1)}`);
+});
+
 test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {
   const p = await fixture("odd-cap.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
   const result = await ensureWebReady(p, { maxEdge: 321 });
@@ -750,6 +779,7 @@ test("conform: options that can't work are refused", async () => {
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxFrameRate: 0 }), /maxFrameRate/);
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { maxFrameRate: 29.97 }), /maxFrameRate/);
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { timeoutSeconds: 0 }), /timeoutSeconds/);
+  await assert.rejects(ensureWebReady("/nonexistent.mp4", { stallSeconds: -1 }), /stallSeconds/);
   await assert.rejects(ensureWebReady("/nonexistent.mp4", { probeTimeoutSeconds: -1 }), /probeTimeoutSeconds/);
 });
 

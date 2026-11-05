@@ -22,9 +22,16 @@ breaking changes, called out explicitly below.
   Conversions run in two lanes: video re-encodes, `concurrency` at a time (default 1), and
   everything else, two at a time.
 
+- **web-ready:** a run is no longer cut short by a limit worked out from the video's length: a
+  run that stops moving forward through the video for `stallSeconds` (default 120) is killed,
+  and `timeoutSeconds` defaults to an hour, as a backstop. A long conversion on a small or busy
+  server is never killed while it makes progress.
+
 ### Added
 
 - **web-ready:** `maxFrameRate` option (default `30`).
+- **web-ready:** `stallSeconds` and `onProgress` options; the status route reports `progress`
+  (0–1) while a conversion runs (protocol 2.6).
 - **web-ready:** `needsVideoReencode(filePath, options)`: whether `ensureWebReady` would re-encode
   a file's video, for a host scheduling conversions itself. Writes nothing.
 
