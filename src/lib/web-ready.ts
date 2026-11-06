@@ -49,7 +49,7 @@ export const CONFORM_TARGET = {
    * Pulse app records. A video that conforms otherwise keeps its own rate and bytes.
    */
   maxFrameRate: 30,
-  /** AAC; a video without audio stays silent. */
+  /** AAC (an MP3 is kept too: every browser plays it in an MP4); a video without audio stays silent. */
   audioCodec: 'aac',
 } as const;
 
@@ -949,7 +949,12 @@ type Assessment = {
   size: { width: number; height: number };
   videoOff: string[];
   audioOff: boolean;
+  /** The container's colour range to rewrite to the codec's, in a lossless remux. */
+  retag: { container: ContainerRange; range: 'pc' | 'tv' } | null;
 };
+
+/** Audio codecs served as uploaded: every browser plays them in an MP4. */
+const KEPT_AUDIO = new Set(['aac', 'mp3']);
 
 /**
  * Look at a file the way `ensureWebReady` does, without writing anything: what's off-target, or
@@ -995,12 +1000,15 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
   const size = targetSize(video, maxEdge);
   const shown = displayedSize(video);
   const videoOff: string[] = [];
+  // Set when the container's colour range disagrees with the codec's: fixed without re-encoding.
+  let retag: { container: ContainerRange; range: 'pc' | 'tv' } | null = null;
   if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
   // Full range is not off-target either, when the container and the codec both say so: every
   // browser then shows it in the right colours, and it is how some Android phones record (a
   // Pixel 6a's Pulse recordings are `yuvj420p`, and the app's joins keep it). Where the two disagree,
   // iOS Safari follows the container and every other browser the codec, so one of them shows it
-  // wrong: re-encoded. A re-encode writes limited range.
+  // wrong: the container is retagged with the codec's range in a lossless remux (`retagRange`), the
+  // range every decoder uses. Re-encoded only when the codec's range can't be read.
   if (video.pixelFormat !== CONFORM_TARGET.pixelFormat && video.pixelFormat !== FULL_RANGE_420) {
     videoOff.push(`pixel format ${video.pixelFormat}`);
   } else {
@@ -1023,7 +1031,11 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
       // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
       const shownByIos = containerRange === 'none' ? codedRange : containerRange;
       if (codedRange !== 'pc' || shownByIos !== 'pc') {
-        videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
+        if (codedRange === 'pc' || codedRange === 'tv') {
+          if (shownByIos !== codedRange) retag = { container: containerRange, range: codedRange };
+        } else {
+          videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
+        }
       }
     }
   }
@@ -1036,8 +1048,9 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
     const fps = video.frameRate !== undefined ? ` at ${Math.round(video.frameRate)} fps` : '';
     videoOff.push(`size ${shown.width}×${shown.height}${fps} past H.264 level 5.2`);
   }
-  const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
-  return { probe, moov, isMp4, hdr, size, videoOff, audioOff };
+  // AAC, or MP3, which every browser also plays in an MP4: copied. Anything else becomes AAC.
+  const audioOff = audio !== null && !KEPT_AUDIO.has(audio.codec);
+  return { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag };
 }
 
 /**
@@ -1095,10 +1108,10 @@ export async function ensureWebReady(
 
   const assessed = await assess(filePath, options);
   if ('action' in assessed) return assessed;
-  const { probe, moov, isMp4, hdr, size, videoOff, audioOff } = assessed;
+  const { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag } = assessed;
   const { video, audio } = probe;
 
-  if (videoOff.length === 0 && !audioOff && isMp4 && moov === 'front') {
+  if (videoOff.length === 0 && !audioOff && !retag && isMp4 && moov === 'front') {
     return { action: 'none', reason: 'already web-ready' };
   }
 
@@ -1158,6 +1171,12 @@ export async function ensureWebReady(
     done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rate}${rotated}`);
   } else {
     args.push('-c:v', 'copy');
+    // The copied stream's range, written into the container's colr box: the same bytes, tagged
+    // the same way in both places.
+    if (retag) {
+      args.push('-color_range', retag.range);
+      done.push(`range tagged ${retag.container} in the container, ${retag.range} in the video → container retagged ${retag.range}`);
+    }
   }
   if (audioOff) {
     args.push('-c:a', 'aac', '-b:a', '160k');
@@ -1170,7 +1189,8 @@ export async function ensureWebReady(
   const outputPath = isMp4
     ? filePath
     : path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}${CONFORM_TARGET.extension}`);
-  const action: WebReadyAction = !isMp4 ? 'conformed' : done.length > 0 ? 'transcoded' : 'remuxed';
+  const reencoded = videoOff.length > 0 || audioOff;
+  const action: WebReadyAction = !isMp4 ? 'conformed' : reencoded ? 'transcoded' : 'remuxed';
   if (!isMp4) {
     const ext = path.extname(filePath).toLowerCase();
     done.unshift(`container ${ext && ext !== CONFORM_TARGET.extension ? ext : 'not MP4'} → mp4`);
@@ -1193,7 +1213,10 @@ export async function ensureWebReady(
     return { action: 'skipped', reason: `${action === 'remuxed' ? 'remux' : 'conversion'} failed: ${failureOf(err)}` };
   }
   if (inputArgs.length > 0) done.push('decoded from its base layer');
-  const reason = action === 'remuxed' ? 'moov was at end of file; remuxed to faststart' : `${done.join('; ')} (+faststart)`;
+  const reason =
+    action === 'remuxed' && !retag
+      ? 'moov was at end of file; remuxed to faststart'
+      : `${done.join('; ')}${action === 'remuxed' ? '; remuxed, nothing re-encoded' : ''} (+faststart)`;
   return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
 

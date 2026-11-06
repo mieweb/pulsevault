@@ -184,11 +184,11 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Property | Target |
 |---|---|
 | Container | MP4, `moov` at the front (faststart) |
-| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range). The format every browser plays: such a video keeps its bytes. HEVC, AV1, VP8/VP9, ProRes, 10-bit and the like are re-encoded. A re-encode writes limited range |
+| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p`). Where the container's colour range disagrees with the stream's, the container is retagged with the stream's range, losslessly. The format every browser plays: such a video keeps its bytes. HEVC, AV1, VP8/VP9, ProRes, 10-bit and the like are re-encoded. A re-encode writes limited range |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
 | Size and frame rate | kept, within H.264 level 5.2 — the highest phones and laptops decode in hardware: up to 4096×2304, and 4K at 60 fps. Past it (8K, 4K at 120 fps) the video is re-encoded. A re-encode, for any reason, writes a longest edge of at most 1920 (`maxEdge`) and at most 30 fps (`maxFrameRate`, the rate the Pulse app records), keeping the duration; aspect ratio and orientation are kept — no crop, pad or stretch |
 | Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
-| Audio | AAC; a video with no audio stays silent |
+| Audio | AAC, or MP3 kept as it is (every browser plays both in an MP4); anything else becomes AAC. A video with no audio stays silent |
 
 `ensureWebReady` does the least work that gets a file there:
 

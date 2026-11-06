@@ -434,7 +434,7 @@ test("conform: a full-range recording keeps its bytes when the container and the
   }
 });
 
-test("conform: a range tagged two ways is re-encoded, and comes out limited range", { skip: !FFMPEG }, async () => {
+test("conform: a range tagged two ways is retagged with the video's own range, nothing re-encoded", { skip: !FFMPEG }, async () => {
   // iOS Safari shows the container's range, every other browser the video's: one of them is wrong.
   const full = await fixture("full-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...FULL_RANGE_ENCODE]);
   const limited = await fixture("limited-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-color_range", "tv"]);
@@ -445,15 +445,30 @@ test("conform: a range tagged two ways is re-encoded, and comes out limited rang
   for (const [p, container, frame] of [[saysLimited, "tv", "pc"], [saysFull, "pc", "tv"]]) {
     assert.deepEqual(await ranges(p), { container, frame }, `${path.basename(p)}: fixture disagrees with itself`);
     const shown = quadrants(p);
+    const packets = videoPacketsMd5(p);
     const result = await ensureWebReady(p);
-    assert.equal(result.action, "transcoded", path.basename(p));
-    assert.match(result.reason, new RegExp(`range tagged ${container} in the container, ${frame} in the video`));
+    assert.equal(result.action, "remuxed", path.basename(p));
+    assert.match(result.reason, new RegExp(`range tagged ${container} in the container, ${frame} in the video → container retagged ${frame}`));
+    // The container says the video's range, or nothing (no colr box): then every browser shows the video's.
     const after = await ranges(p);
-    assert.notEqual(after.container, "pc", `${path.basename(p)}: limited range out`);
-    assert.notEqual(after.frame, "pc", `${path.basename(p)}: limited range out`);
+    assert.equal(after.frame, frame, `${path.basename(p)}: the video's range kept`);
+    assert.ok([frame, "none"].includes(after.container), `${path.basename(p)}: container says ${after.container}`);
+    assert.equal(videoPacketsMd5(p), packets, `${path.basename(p)}: the same video bytes`);
     assert.equal(quadrants(p), shown, `${path.basename(p)}: shown the same way`);
     assert.equal((await ensureWebReady(p)).action, "none", `${path.basename(p)}: conforms once done`);
   }
+});
+
+/** An md5 of a file's video packets: equal when its video wasn't re-encoded. */
+function videoPacketsMd5(p) {
+  return execFileSync("ffmpeg", ["-v", "error", "-i", p, "-map", "0:v:0", "-c", "copy", "-f", "md5", "-"]).toString().trim();
+}
+
+test("conform: MP3 audio in an MP4 is kept as it is", { skip: !FFMPEG }, async () => {
+  const p = await fixture("mp3.mp4", [...VIDEO("320x240"), ...TONE(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "libmp3lame", "-movflags", "+faststart"]);
+  const before = await fs.readFile(p);
+  assert.equal((await ensureWebReady(p)).action, "none");
+  assert.ok(before.equals(await fs.readFile(p)), "bytes untouched");
 });
 
 test("conform: stream copies of a full-range video keep it full range in both places", { skip: !FFMPEG }, async () => {
@@ -495,14 +510,14 @@ test("readContainerRange: stops at the boxes it needs, and says unknown when it 
   await setColrFullRange(saysLimited, false);
   assert.equal(await readContainerRange(saysLimited), "tv");
   const result = await ensureWebReady(saysLimited);
-  assert.equal(result.action, "transcoded");
-  assert.match(result.reason, /range tagged tv in the container, pc in the video/);
+  assert.equal(result.action, "remuxed");
+  assert.match(result.reason, /range tagged tv in the container, pc in the video → container retagged pc/);
   // The same boxes before a moov at the end: the budget runs out first, so the range is unknown,
-  // not absent, and a full-range video is re-encoded rather than trusted.
+  // not absent, and the container is retagged with the video's range rather than trusted.
   const leading = await insertFreeBoxes(taggedWithColr(full, -90, "leading.mp4", { faststart: false }), 10_001, "moov");
   assert.equal(await readContainerRange(leading), "unknown");
   const unknown = await ensureWebReady(leading);
-  assert.equal(unknown.action, "transcoded");
+  assert.equal(unknown.action, "remuxed");
   assert.match(unknown.reason, /range tagged unknown in the container, pc in the video/);
   // Cut inside moov: unknown. Not ISO-BMFF: nothing declared.
   const cut = path.join(path.dirname(full), "cut.mp4");
@@ -543,16 +558,19 @@ test("readContainerRange: every sample description must agree, and a header cut 
   assert.equal(await read("nclc.mp4", file(avc1([nclc], Buffer.alloc(4)))), "none");
 });
 
-test("conform: a limited-range video whose container range can't be read is re-encoded", { skip: !FFMPEG }, async () => {
-  // Behind 10,001 boxes the colr box is out of reach: it might say full range, so a limited
-  // stream isn't trusted either (ffprobe before FFmpeg 9 wouldn't say).
+test("conform: a limited-range video whose container range can't be read is retagged, nothing re-encoded", { skip: !FFMPEG }, async () => {
+  // Behind 10,001 boxes the colr box is out of reach: it might say full range. The remux writes a
+  // fresh one with the video's range (ffprobe before FFmpeg 9 wouldn't say).
   const limited = await fixture("unknown-src.mp4", [...QUADRANTS("1920x1080"), ...TONE(), ...PULSE_ENCODE, "-color_range", "tv"]);
   const p = await insertFreeBoxes(taggedWithColr(limited, -90, "unknown-limited.mp4", { faststart: false }), 10_001, "moov");
   assert.equal(await readContainerRange(p), "unknown");
   const shown = quadrants(p);
+  const packets = videoPacketsMd5(p);
   const result = await ensureWebReady(p);
-  assert.equal(result.action, "transcoded");
-  assert.match(result.reason, /range tagged unknown in the container, tv in the video/);
+  assert.equal(result.action, "remuxed");
+  assert.match(result.reason, /range tagged unknown in the container, tv in the video → container retagged tv/);
+  assert.ok(["tv", "none"].includes(await readContainerRange(p)), "the container agrees with the video, or says nothing");
+  assert.equal(videoPacketsMd5(p), packets, "the same video bytes");
   assert.equal(quadrants(p), shown);
   assert.equal((await ensureWebReady(p)).action, "none", "conforms once done");
 });

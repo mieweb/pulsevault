@@ -34,6 +34,9 @@ breaking changes, called out explicitly below.
 ### Added
 
 - **web-ready:** `maxFrameRate` option (default `30`).
+- **web-ready:** a video whose container and stream disagree about its colour range is fixed
+  losslessly: the container is retagged with the stream's range in a remux (the same video
+  bytes), instead of being re-encoded. MP3 audio is kept as it is, like AAC.
 - **web-ready:** the partial output a run stopped part-way leaves behind (a restart mid-conversion)
   is removed by the next run over the same video.
 - **web-ready:** `stallSeconds` and `onProgress` options; the status route reports `progress`
