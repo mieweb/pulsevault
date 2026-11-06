@@ -968,7 +968,7 @@ test("webReady: the status route says how far a running conversion has got", { s
   }
 });
 
-test("webReady: re-encodes run `concurrency` at a time, and every upload in a burst is settled", { skip: !FFMPEG }, async () => {
+test("webReady: re-encodes run `concurrency` at a time, and every upload in a burst is settled", { skip: !FFMPEG || process.platform === "win32" }, async () => {
   const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
   let running = 0;

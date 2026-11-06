@@ -621,12 +621,54 @@ function displayedSize(video: VideoProbe['video']): { width: number; height: num
  * 36 864 macroblocks (4096×2304) at up to 2 073 600 macroblocks a second (4K at 60 fps). A video
  * within it is served at its own size and rate; past it (8K, 4K at 120 fps), it is re-encoded.
  */
-const LEVEL_52 = { frameMacroblocks: 36_864, macroblocksPerSecond: 2_073_600 };
+const LEVEL_52 = { frameMacroblocks: 36_864, macroblocksPerSecond: 2_073_600, dpbMacroblocks: 184_320 };
 
-/** Whether a video's size and frame rate are within `LEVEL_52`; an unknown rate counts as 30. */
-function withinDecodeLimits(video: VideoProbe['video']): boolean {
+/** Most reference frames H.264 allows: a frame within `dpbMacroblocks / MAX_REFS` always fits the DPB. */
+const MAX_REFS = 16;
+
+/**
+ * Why a video's size, frame rate or decoded-picture buffer is past `LEVEL_52`, or `null` when it is
+ * within it; an unknown rate counts as 30. The buffer comes from the stream's own SPS (`h264ReferenceFrames`), read only
+ * for a frame large enough to overflow it: the level an encoder writes isn't trusted, since some
+ * phones label ordinary 1080p as level 6.0.
+ */
+async function pastDecodeLimits(
+  video: VideoProbe['video'],
+  referenceFrames: () => Promise<number | null>,
+): Promise<string | null> {
   const macroblocks = Math.ceil(video.width / 16) * Math.ceil(video.height / 16);
-  return macroblocks <= LEVEL_52.frameMacroblocks && macroblocks * (video.frameRate ?? 30) <= LEVEL_52.macroblocksPerSecond;
+  const { width, height } = displayedSize(video);
+  if (macroblocks > LEVEL_52.frameMacroblocks || macroblocks * (video.frameRate ?? 30) > LEVEL_52.macroblocksPerSecond) {
+    const fps = video.frameRate !== undefined ? ` at ${Math.round(video.frameRate)} fps` : '';
+    return `size ${width}×${height}${fps} past H.264 level 5.2`;
+  }
+  if (video.codec !== CONFORM_TARGET.videoCodec || macroblocks * MAX_REFS <= LEVEL_52.dpbMacroblocks) return null;
+  const refs = await referenceFrames();
+  return refs !== null && macroblocks * refs > LEVEL_52.dpbMacroblocks
+    ? `${refs} reference frames at ${width}×${height} past H.264 level 5.2`
+    : null;
+}
+
+/**
+ * How many frames an H.264 stream keeps for reference: its first SPS's `max_dec_frame_buffering`
+ * when the VUI declares it, else `max_num_ref_frames`. `null` when it can't be read.
+ */
+async function h264ReferenceFrames(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<number | null> {
+  let stderr: string;
+  try {
+    ({ stderr } = await execFileAsync(
+      ffmpegPath,
+      ['-hide_banner', '-v', 'info', '-i', filePath, '-map', `0:${index}`, '-c', 'copy', '-bsf:v', 'trace_headers', '-frames:v', '1', '-f', 'null', '-'],
+      { maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+    ));
+  } catch {
+    return null;
+  }
+  const field = (name: string) => {
+    const m = new RegExp(`\\b${name}\\b.*=\\s*(\\d+)\\s*$`, 'm').exec(stderr);
+    return m ? Number(m[1]) : null;
+  };
+  return field('max_dec_frame_buffering') ?? field('max_num_ref_frames');
 }
 
 /** The displayed size scaled so the longest edge is at most `maxEdge`. */
@@ -692,14 +734,15 @@ const MISSING_REFERENCE = /Could not find ref with POC|Error constructing the fr
 const LAYER_SCAN_PACKETS = 120;
 
 /**
- * Whether a high-frame-rate HEVC stream decodes at a lower rate from its base layer alone: every
- * picture above temporal layer 0 is a sub-layer access picture (`SUB_LAYER_TYPES`), which by the
- * standard no lower layer refers to — how an iPhone records 60 and 120 fps (a 30 fps base and
- * one or two layers on top). Dropping them leaves exactly the base layer's frames, bit for bit
- * those of a full decode, for a fraction of the decoding. Reads the NAL headers of the first
- * `LAYER_SCAN_PACKETS` packets with ffmpeg's `trace_headers`; `false` on anything unexpected.
+ * The share of a high-frame-rate HEVC stream's pictures in its base layer, when it can be decoded
+ * from that layer alone: every picture above temporal layer 0 is a sub-layer access picture
+ * (`SUB_LAYER_TYPES`), which by the standard no lower layer refers to — how an iPhone records 60
+ * and 120 fps (a 30 fps base and one or two layers on top). Dropping them leaves exactly the base
+ * layer's frames, bit for bit those of a full decode, for a fraction of the decoding. Reads the
+ * NAL headers of the first `LAYER_SCAN_PACKETS` packets with ffmpeg's `trace_headers`; `null` when
+ * there are no such layers, or on anything unexpected.
  */
-async function decodesFromBaseLayer(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<boolean> {
+async function baseLayerShare(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<number | null> {
   let stderr: string;
   try {
     ({ stderr } = await execFileAsync(
@@ -709,11 +752,12 @@ async function decodesFromBaseLayer(filePath: string, ffmpegPath: string, index:
       { maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
     ));
   } catch {
-    return false;
+    return null;
   }
   // Each NAL unit header traces its type, then its temporal id + 1.
   let type: number | null = null;
   let upper = 0;
+  let base = 0;
   for (const line of stderr.split('\n')) {
     const field = /\b(nal_unit_type|nuh_temporal_id_plus1)\b.*=\s*(\d+)\s*$/.exec(line);
     if (!field) continue;
@@ -723,13 +767,14 @@ async function decodesFromBaseLayer(filePath: string, ffmpegPath: string, index:
       continue;
     }
     // Only coded pictures (types 0–31) count; parameter sets and SEI carry no picture.
-    if (type !== null && type < 32 && value > 1) {
-      if (!SUB_LAYER_TYPES.includes(type)) return false;
-      upper++;
+    if (type !== null && type < 32) {
+      if (value === 1) base++;
+      else if (SUB_LAYER_TYPES.includes(type)) upper++;
+      else return null;
     }
     type = null;
   }
-  return upper > 0;
+  return upper > 0 && base > 0 ? base / (base + upper) : null;
 }
 
 /** What one ffmpeg run may take, and whom to tell how far it has got. */
@@ -748,15 +793,19 @@ const STDERR_KEEP = 256 * 1024;
 
 /**
  * Run ffmpeg, watching its `-progress` report: killed when it hasn't moved forward through the
- * video for `stallMs` (`StallError`), or past `timeoutMs` in all (`TimeoutError`). Resolves its
- * stderr; rejects with the exit `code` when it fails.
+ * video for `stallMs` (`StallError`), or past `timeoutMs` in all (`TimeoutError`). Resolves whether
+ * `watch` appeared anywhere in its stderr (checked as it streams, so a long log can't hide it);
+ * rejects with the exit `code` when it fails.
  */
-function runFfmpeg(ffmpegPath: string, args: string[], limits: RunLimits): Promise<string> {
+function runFfmpeg(ffmpegPath: string, args: string[], limits: RunLimits, watch?: RegExp): Promise<{ seen: boolean }> {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, ['-nostats', '-progress', 'pipe:1', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let seen = false;
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
+      // The end of the previous chunk too: a message split across two chunks is still found.
+      if (watch && !seen && watch.test(stderr.slice(-1024) + chunk)) seen = true;
       stderr = (stderr + chunk).slice(-STDERR_KEEP);
     });
     // The furthest point reached in the output, in microseconds, and when it last moved.
@@ -802,7 +851,7 @@ function runFfmpeg(ffmpegPath: string, args: string[], limits: RunLimits): Promi
     child.once('close', (code) => {
       done();
       if (killedFor) return reject(killedFor);
-      if (code === 0) return resolve(stderr);
+      if (code === 0) return resolve({ seen });
       reject(Object.assign(new Error(`ffmpeg exited with code ${code}`), { code, stderr }));
     });
   });
@@ -827,18 +876,24 @@ async function rewrite(
   // The input's own name in it too: a run that was stopped part-way (a restart) leaves its file
   // behind, and the next run over the same input removes it (`removeStaleOutputs`).
   const dir = path.dirname(inputPath);
-  const prefix = `.webready-${path.basename(inputPath, path.extname(inputPath))}-`;
-  const tmp = path.join(dir, `${prefix}${randomUUID()}${CONFORM_TARGET.extension}`);
+  const name = path.basename(inputPath, path.extname(inputPath));
+  const tmp = path.join(dir, `.webready-${name}-${randomUUID()}${CONFORM_TARGET.extension}`);
+  const startedAt = Date.now();
   try {
-    const stderr = await runFfmpeg(ffmpegPath, ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp], limits);
+    const { seen } = await runFfmpeg(
+      ffmpegPath,
+      ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp],
+      limits,
+      inputArgs.length > 0 ? MISSING_REFERENCE : undefined,
+    );
     // A decode of the base layer alone that found a picture missing: the decoder made one up
     // and carried on, so the output may show it. Not a file to keep.
-    if (inputArgs.length > 0 && MISSING_REFERENCE.test(stderr)) throw new Error('a dropped picture was referenced');
+    if (seen) throw new Error('a dropped picture was referenced');
     // ffmpeg exiting 0 with an empty/absent output would still be a corrupt
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
     if (stat.size === 0) throw new Error('ffmpeg produced an empty output');
-    await removeStaleOutputs(dir, prefix, tmp);
+    await removeStaleOutputs(dir, name, tmp, startedAt);
     // `null`: the caller installs the file itself (`install: false`).
     if (outputPath === null) return tmp;
     await fs.rename(tmp, outputPath);
@@ -849,28 +904,29 @@ async function rewrite(
   }
 }
 
-/** How long an earlier run's output must have gone unwritten before it counts as abandoned. */
-const STALE_OUTPUT_MS = 60_000;
+/** `.webready-<name>-<uuid>.mp4`: a run's temporary output for the input named `<name>`. */
+const outputNameOf = (name: string) =>
+  new RegExp(`^\\.webready-${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$`);
 
 /**
- * Remove what earlier runs over the same input left behind (`<prefix>*`, other than `keep`): a
- * process stopped mid-conversion never got to delete its partial output. Only files nothing has
- * written to for `STALE_OUTPUT_MS`, so a run still going (another process's) keeps its file.
- * Best effort: a file that can't be listed or removed is left.
+ * Remove what earlier runs over the same input left behind (exactly `.webready-<name>-<uuid>.mp4`,
+ * other than `keep`): a process stopped mid-conversion never got to delete its partial output.
+ * Only files nothing has written to since this run began (`since`), so a run still going (another
+ * process's) keeps its file. Best effort: a file that can't be listed or removed is left.
  */
-async function removeStaleOutputs(dir: string, prefix: string, keep: string): Promise<void> {
+async function removeStaleOutputs(dir: string, name: string, keep: string, since: number): Promise<void> {
   let names: string[];
   try {
     names = await fs.readdir(dir);
   } catch {
     return;
   }
-  const cutoff = Date.now() - STALE_OUTPUT_MS;
-  for (const name of names) {
-    const file = path.join(dir, name);
-    if (!name.startsWith(prefix) || file === keep) continue;
+  const ours = outputNameOf(name);
+  for (const entry of names) {
+    const file = path.join(dir, entry);
+    if (!ours.test(entry) || file === keep) continue;
     try {
-      if ((await fs.stat(file)).mtimeMs < cutoff) await fs.rm(file, { force: true });
+      if ((await fs.stat(file)).mtimeMs < since) await fs.rm(file, { force: true });
     } catch {
       // Gone already, or not ours to remove.
     }
@@ -1042,12 +1098,11 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
   if (hdr) videoOff.push(`HDR (${video.transfer})`);
   // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
   // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.
-  // Size and frame rate aren't either, within what every device decodes (`withinDecodeLimits`): a
+  // Size and frame rate aren't either, within what every device decodes (`pastDecodeLimits`): a
   // 4K or 60 fps H.264 upload keeps its bytes. A re-encode for any other reason scales to `maxEdge`.
-  if (!withinDecodeLimits(video)) {
-    const fps = video.frameRate !== undefined ? ` at ${Math.round(video.frameRate)} fps` : '';
-    videoOff.push(`size ${shown.width}×${shown.height}${fps} past H.264 level 5.2`);
-  }
+  const probeMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+  const pastLimits = await pastDecodeLimits(video, () => h264ReferenceFrames(filePath, ffmpegPath, video.index, probeMs));
+  if (pastLimits) videoOff.push(pastLimits);
   // AAC, or MP3, which every browser also plays in an MP4: copied. Anything else becomes AAC.
   const audioOff = audio !== null && !KEPT_AUDIO.has(audio.codec);
   return { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag };
@@ -1147,16 +1202,16 @@ export async function ensureWebReady(
 
   const args = ['-map', `0:${video.index}`, ...(audio ? ['-map', `0:${audio.index}`] : []), '-sn', '-dn'];
   const done: string[] = [];
-  // Set when frames past the cap can be dropped before they're decoded (`decodesFromBaseLayer`).
+  // Set when frames past the cap can be dropped before they're decoded (`baseLayerShare`).
   let inputArgs: string[] = [];
   if (videoOff.length > 0) {
     const frameRate = cappedFrameRate(video, maxFrameRate);
-    if (
-      frameRate !== null &&
-      video.codec === 'hevc' &&
-      (await decodesFromBaseLayer(filePath, ffmpegPath, video.index, Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000))))
-    ) {
-      inputArgs = BASE_LAYER_ONLY;
+    if (frameRate !== null && video.codec === 'hevc') {
+      // Only a base layer with at least the frames the cap keeps: a 30 fps base under a 60 fps cap
+      // would come out as repeated frames, so that clip is decoded in full.
+      const probeMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+      const share = await baseLayerShare(filePath, ffmpegPath, video.index, probeMs);
+      if (share !== null && share * video.frameRate! >= frameRate - 0.5) inputArgs = BASE_LAYER_ONLY;
     }
     args.push(
       '-vf', videoFilter(size, hdr, toneMapper, frameRate),

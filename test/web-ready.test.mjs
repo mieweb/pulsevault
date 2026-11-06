@@ -7,6 +7,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -243,6 +244,20 @@ test("conform: H.264 past level 5.2 is re-encoded at most maxEdge and maxFrameRa
   assert.equal(result.action, "transcoded");
   assert.match(result.reason, /past H\.264 level 5\.2/);
   assert.equal(videoTiming(p).fps, 30);
+});
+
+test("conform: the level an encoder writes isn't trusted; the stream's reference frames are", { skip: !FFMPEG }, async () => {
+  // Some phones label ordinary 1080p as level 6.0: still within level 5.2, so it keeps its bytes.
+  const labelled = await fixture("hd-l60.mp4", [...VIDEO("1920x1080"), "-c:v", "libx264", "-preset", "ultrafast", "-level", "6.0", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+  assert.match(execFileSync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=level", "-of", "csv=p=0", labelled]).toString(), /^60/);
+  assert.equal((await ensureWebReady(labelled)).action, "none");
+  // 4K with 4 reference frames fits level 5.2's picture buffer; with 8 it doesn't.
+  for (const [refs, action] of [[4, "none"], [8, "transcoded"]]) {
+    const p = await fixture(`uhd-ref${refs}.mp4`, [...VIDEO("3840x2160"), "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", `ref=${refs}`, "-pix_fmt", "yuv420p", "-movflags", "+faststart"]);
+    const result = await ensureWebReady(p);
+    assert.equal(result.action, action, `${refs} reference frames`);
+    if (action === "transcoded") assert.match(result.reason, /8 reference frames at 3840×2160 past H\.264 level 5\.2/);
+  }
 });
 
 test("conform: landscape 4K re-encoded for another reason is scaled to 1920×1080 and stays landscape", { skip: !FFMPEG }, async () => {
@@ -695,6 +710,34 @@ test("conform: a layered 60 fps HEVC clip is decoded from its 30 fps base layer"
   assert.ok(Math.abs(after.duration - before.duration) < 0.1, `duration ${before.duration} → ${after.duration}`);
 });
 
+test("conform: a base layer with fewer frames than the cap isn't used", { skip: !FFMPEG }, async (t) => {
+  // A 30 fps base layer under a 50 fps cap would repeat frames: every frame is decoded instead.
+  const p = await fixture("layered60-cap50.mov", HEVC60(2));
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const result = await ensureWebReady(p, { maxFrameRate: 50 });
+  assert.equal(result.action, "conformed");
+  assert.match(result.reason, /60 → 50 fps/);
+  assert.doesNotMatch(result.reason, /base layer/);
+  const { fps, frames } = videoTiming(result.outputPath);
+  assert.equal(fps, 50);
+  assert.equal(frames, 100, "every output frame its own picture, 2 s at 50 fps");
+});
+
+test("conform: a missing picture reported early in a long log still falls back", { skip: !FFMPEG || process.platform === "win32" }, async (t) => {
+  const p = await fixture("layered60-log.mov", HEVC60(2));
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  // An ffmpeg whose base-layer run succeeds, but reports a missing picture and then 400 KiB more.
+  const dir = await scratchDir("ffmpeg-log-");
+  const shim = path.join(dir, "ffmpeg");
+  await fs.writeFile(shim, `#!/bin/sh
+case "$*" in *filter_units*) ffmpeg "$@" || exit $?; echo "[hevc] Could not find ref with POC 7" >&2; head -c 409600 /dev/zero | tr '\\0' 'x' >&2; exit 0;; esac
+exec ffmpeg "$@"
+`, { mode: 0o755 });
+  const result = await ensureWebReady(p, { ffmpegPath: shim });
+  assert.equal(result.action, "conformed");
+  assert.doesNotMatch(result.reason, /base layer/, "the base-layer output wasn't kept");
+});
+
 test("conform: a base-layer decode that fails falls back to decoding every frame", { skip: !FFMPEG || process.platform === "win32" }, async (t) => {
   const p = await fixture("layered60.mov", HEVC60(2));
   if (!p) return t.skip("ffmpeg build lacks libx265");
@@ -766,13 +809,14 @@ test("conform: a run that stops making progress is killed after stallSeconds, th
 });
 
 test("conform: a run that keeps making progress outlasts stallSeconds, and reports it", { skip: !FFMPEG }, async () => {
-  // A re-encode of several seconds, with a stall limit of one: progress keeps it alive.
-  const p = await fixture("long.mp4", [...VIDEO("3840x2160", 10), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
+  // A re-encode of several seconds with a stall limit of three: progress (twice a second) keeps it
+  // alive, with room for a slow machine's start-up before the first report.
+  const p = await fixture("long.mp4", [...VIDEO("1920x1080", 40), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
   const fractions = [];
   const started = Date.now();
-  const result = await ensureWebReady(p, { stallSeconds: 1, onProgress: (f) => fractions.push(f) });
+  const result = await ensureWebReady(p, { stallSeconds: 3, onProgress: (f) => fractions.push(f) });
   assert.equal(result.action, "transcoded", result.reason);
-  assert.ok(Date.now() - started > 1000, "the run took longer than stallSeconds");
+  assert.ok(Date.now() - started > 3000, "the run took longer than stallSeconds");
   assert.ok(fractions.length >= 2, `progress reported ${fractions.length} times`);
   assert.ok(fractions.every((f, i) => f >= 0 && f <= 1 && (i === 0 || f >= fractions[i - 1])), "climbing, within 0–1");
   assert.ok(fractions.at(-1) > 0.9, `ended at ${fractions.at(-1)}`);
@@ -785,13 +829,24 @@ test("conform: a run removes what an interrupted earlier run over the same video
     const file = path.join(dir, name);
     return fs.writeFile(file, "partial").then(() => fs.utimes(file, new Date(Date.now() - ageMs), new Date(Date.now() - ageMs))).then(() => file);
   };
-  const stale = await leftover(".webready-clip-0a1b.mp4", 5 * 60_000);
-  const fresh = await leftover(".webready-clip-2c3d.mp4", 0); // another run may still be writing it
-  const other = await leftover(".webready-other-4e5f.mp4", 5 * 60_000); // another video's
-  assert.equal((await ensureWebReady(p)).action, "transcoded");
+  const uuid = () => crypto.randomUUID();
+  const stale = await leftover(`.webready-clip-${uuid()}.mp4`, 0); // an interrupted run: written before this one began
+  const live = await leftover(`.webready-clip-${uuid()}.mp4`, 0); // another process still writing it
+  const sibling = await leftover(`.webready-clip-other-${uuid()}.mp4`, 5 * 60_000); // clip-other.mp4's, not clip.mp4's
+  const other = await leftover(`.webready-other-${uuid()}.mp4`, 5 * 60_000); // another video's
+  const notOurs = await leftover(".webready-clip-partial.mp4", 5 * 60_000); // not a name a run writes
+  await new Promise((r) => setTimeout(r, 20));
+  const writing = setInterval(() => fs.appendFile(live, "x").catch(() => {}), 5);
+  try {
+    assert.equal((await ensureWebReady(p)).action, "transcoded");
+  } finally {
+    clearInterval(writing);
+  }
   await assert.rejects(fs.stat(stale), "the abandoned output is removed");
-  assert.ok(await fs.stat(fresh), "a recent one is left");
+  assert.ok(await fs.stat(live), "one written during the run is left");
+  assert.ok(await fs.stat(sibling), "a video whose name starts the same keeps its output");
   assert.ok(await fs.stat(other), "another video's is left");
+  assert.ok(await fs.stat(notOurs), "a file that isn't a run's output is left");
 });
 
 test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {
