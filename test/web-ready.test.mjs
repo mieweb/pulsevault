@@ -760,6 +760,22 @@ test("conform: a run that keeps making progress outlasts stallSeconds, and repor
   assert.ok(fractions.at(-1) > 0.9, `ended at ${fractions.at(-1)}`);
 });
 
+test("conform: a run removes what an interrupted earlier run over the same video left behind", { skip: !FFMPEG }, async () => {
+  const p = await fixture("clip.mp4", [...VIDEO("320x240"), "-c:v", "libx264", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
+  const dir = path.dirname(p);
+  const leftover = (name, ageMs) => {
+    const file = path.join(dir, name);
+    return fs.writeFile(file, "partial").then(() => fs.utimes(file, new Date(Date.now() - ageMs), new Date(Date.now() - ageMs))).then(() => file);
+  };
+  const stale = await leftover(".webready-clip-0a1b.mp4", 5 * 60_000);
+  const fresh = await leftover(".webready-clip-2c3d.mp4", 0); // another run may still be writing it
+  const other = await leftover(".webready-other-4e5f.mp4", 5 * 60_000); // another video's
+  assert.equal((await ensureWebReady(p)).action, "transcoded");
+  await assert.rejects(fs.stat(stale), "the abandoned output is removed");
+  assert.ok(await fs.stat(fresh), "a recent one is left");
+  assert.ok(await fs.stat(other), "another video's is left");
+});
+
 test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {
   const p = await fixture("odd-cap.mp4", [...VIDEO("640x360"), "-c:v", "libx264", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
   const result = await ensureWebReady(p, { maxEdge: 321 });

@@ -824,7 +824,11 @@ async function rewrite(
   // a pid+timestamp tmp name collides when two uploads finish in the same
   // millisecond — both ffmpegs would interleave writes into one file and the
   // winner's rename would install garbage bytes over a real artifact.
-  const tmp = path.join(path.dirname(inputPath), `.webready-${randomUUID()}${CONFORM_TARGET.extension}`);
+  // The input's own name in it too: a run that was stopped part-way (a restart) leaves its file
+  // behind, and the next run over the same input removes it (`removeStaleOutputs`).
+  const dir = path.dirname(inputPath);
+  const prefix = `.webready-${path.basename(inputPath, path.extname(inputPath))}-`;
+  const tmp = path.join(dir, `${prefix}${randomUUID()}${CONFORM_TARGET.extension}`);
   try {
     const stderr = await runFfmpeg(ffmpegPath, ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp], limits);
     // A decode of the base layer alone that found a picture missing: the decoder made one up
@@ -834,6 +838,7 @@ async function rewrite(
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
     if (stat.size === 0) throw new Error('ffmpeg produced an empty output');
+    await removeStaleOutputs(dir, prefix, tmp);
     // `null`: the caller installs the file itself (`install: false`).
     if (outputPath === null) return tmp;
     await fs.rename(tmp, outputPath);
@@ -841,6 +846,34 @@ async function rewrite(
   } catch (err) {
     await fs.rm(tmp, { force: true });
     throw err;
+  }
+}
+
+/** How long an earlier run's output must have gone unwritten before it counts as abandoned. */
+const STALE_OUTPUT_MS = 60_000;
+
+/**
+ * Remove what earlier runs over the same input left behind (`<prefix>*`, other than `keep`): a
+ * process stopped mid-conversion never got to delete its partial output. Only files nothing has
+ * written to for `STALE_OUTPUT_MS`, so a run still going (another process's) keeps its file.
+ * Best effort: a file that can't be listed or removed is left.
+ */
+async function removeStaleOutputs(dir: string, prefix: string, keep: string): Promise<void> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - STALE_OUTPUT_MS;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    if (!name.startsWith(prefix) || file === keep) continue;
+    try {
+      if ((await fs.stat(file)).mtimeMs < cutoff) await fs.rm(file, { force: true });
+    } catch {
+      // Gone already, or not ours to remove.
+    }
   }
 }
 

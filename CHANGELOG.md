@@ -34,6 +34,8 @@ breaking changes, called out explicitly below.
 ### Added
 
 - **web-ready:** `maxFrameRate` option (default `30`).
+- **web-ready:** the partial output a run stopped part-way leaves behind (a restart mid-conversion)
+  is removed by the next run over the same video.
 - **web-ready:** `stallSeconds` and `onProgress` options; the status route reports `progress`
   (0–1) while a conversion runs (protocol 2.6).
 - **web-ready:** `needsVideoReencode(filePath, options)`: whether `ensureWebReady` would re-encode

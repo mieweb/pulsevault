@@ -261,13 +261,12 @@ Settings:
   a higher `concurrency` converts several uploads at once (one re-encode uses
   up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
-  until its result is recorded. A process stopped mid-conversion leaves that
-  run's partial output behind as a `.webready-*.mp4` file in the video
-  directory, never served. A process manager that stops the whole process tree
-  (pm2's default) stops its ffmpeg too; a process that dies on its own (a crash,
-  an out-of-memory kill) leaves its ffmpeg running to the end, while the replay
-  converts the video again. `.webready-*` files older than an hour are safe to
-  delete (`find <videos dir> -name '.webready-*' -mmin +60 -delete`).
+  until its result is recorded. A run stopped part-way leaves its partial
+  output (`.webready-<name>-*.mp4`, never served); the replay's run over the
+  same video removes it once nothing has written to it for a minute. A process
+  manager that stops the whole process tree (pm2's default) stops its ffmpeg
+  too; a process that dies on its own (a crash, an out-of-memory kill) leaves
+  its ffmpeg running to the end, while the replay converts the video again.
 - `stallSeconds` (default `120`): ffmpeg reports how far through the video it
   is about twice a second; a run that hasn't moved forward for this long is
   killed, the original kept, and `skipped` recorded with the reason
