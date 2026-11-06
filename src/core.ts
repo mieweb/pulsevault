@@ -1003,8 +1003,8 @@ export function createPulseVaultCore(options: PulseVaultCoreOptions): PulseVault
       ...(meta.name ? { name: meta.name } : {}),
       ...(await uploadProgress(meta)),
       acknowledged: meta.acknowledged,
-      ...(state === 'processing' && completion.progressOf(artifactId) !== undefined
-        ? { progress: Math.round(completion.progressOf(artifactId)! * 1000) / 1000 }
+      ...(state === 'processing' && completion.progressOf(artifactId, meta.generation) !== undefined
+        ? { progress: Math.round(completion.progressOf(artifactId, meta.generation)! * 1000) / 1000 }
         : {}),
       ...(meta.webReady ? { webReady: meta.webReady } : {}),
       ...(meta.outcome !== undefined ? { outcome: meta.outcome } : {}),

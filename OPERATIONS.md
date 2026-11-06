@@ -262,7 +262,8 @@ Settings:
   up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
   until its result is recorded. A run stopped part-way leaves its partial
-  output (`.webready-<name>-<uuid>.mp4`, never served); the replay's run over
+  output (`.webready-<tag>-<uuid>.mp4`, the tag a hash of the input's filename,
+  never served); the replay's run over
   the same video removes it, unless something has written to it since that run
   began (another process still converting it). A process
   manager that stops the whole process tree (pm2's default) stops its ffmpeg

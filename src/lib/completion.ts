@@ -144,10 +144,11 @@ export type CompletionRunner = {
   /** Whether a web-ready conversion applies to an artifact of this kind: `webReady` is on and it's a video. */
   converts(kind: UploadKind): boolean;
   /**
-   * How far this process's conversion of an artifact has got (0–1), while one runs; `undefined`
-   * while it waits for a slot, before it starts, or when it isn't this process converting it.
+   * How far this process's conversion of an artifact's upload (its `generation`) has got (0–1),
+   * while one runs; `undefined` while it waits for a slot, before it starts, or when it isn't this
+   * process converting it — or the conversion is of an earlier upload of the same id.
    */
-  progressOf(artifactId: string): number | undefined;
+  progressOf(artifactId: string, generation: string | null | undefined): number | undefined;
   /**
    * Make a poster for a finished video stored before posters were made (or whose first try
    * failed), in the light lane of the conversion queue: once per video per process, a no-op when it has a
@@ -296,8 +297,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
 
   const converts = (kind: UploadKind): boolean => webReady !== undefined && kind === 'video';
 
-  /** How far each running conversion has got, for the status route. Display only, never state. */
+  /** How far each running conversion has got, by artifact and upload, for the status route. Display only, never state. */
   const progress = new Map<string, number>();
+  const progressKey = (artifactId: string, generation: string | null | undefined) => `${artifactId}:${generation ?? ''}`;
 
   const postersOn =
     webReady !== undefined &&
@@ -489,19 +491,20 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
               : !fresh.generation
                 ? { action: 'skipped' as const, reason: 'the storage adapter keeps no generation for this upload', outputPath: undefined }
                 : await (async () => {
-                    progress.set(ctx.artifactId, 0);
+                    const key = progressKey(ctx.artifactId, fresh.generation);
+                    progress.set(key, 0);
                     try {
                       return await ensureWebReady(localPath, {
                         ...webReady,
                         logger,
                         install: false,
                         onProgress: (fraction) => {
-                          progress.set(ctx.artifactId, fraction);
+                          progress.set(key, fraction);
                           webReady?.onProgress?.(fraction);
                         },
                       });
                     } finally {
-                      progress.delete(ctx.artifactId);
+                      progress.delete(key);
                     }
                   })();
           const expected = generation !== undefined ? generation : (fresh.generation ?? null);
@@ -543,7 +546,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       // Routed in the light lane: a video re-encode moves to the heavy lane, anything else runs
       // here. A file that can't be looked at runs here too, and the job skips it at once.
       void light.run(async () => {
-        let reencode = false;
+        // A check that can't finish counts as a re-encode: the job's own look might find one, and
+        // a re-encode never runs outside the `concurrency` slots.
+        let reencode = true;
         try {
           const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
           reencode = typeof localPath === 'string' && (await needsVideoReencode(localPath, { ...webReady, logger }));
@@ -704,7 +709,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     complete,
     replay,
     converts,
-    progressOf: (artifactId: string) => progress.get(artifactId),
+    progressOf: (artifactId: string, generation: string | null | undefined) => progress.get(progressKey(artifactId, generation)),
     posterFor,
     start: () => {
       if (timer || stopped) return;

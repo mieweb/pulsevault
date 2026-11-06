@@ -710,6 +710,38 @@ test("conform: a layered 60 fps HEVC clip is decoded from its 30 fps base layer"
   assert.ok(Math.abs(after.duration - before.duration) < 0.1, `duration ${before.duration} → ${after.duration}`);
 });
 
+test("conform: a base layer is measured in pictures, however many slices each is cut into", { skip: !FFMPEG }, async (t) => {
+  const p = await fixture("layered60-slices.mov", [...VIDEO_AT("640x360", 60), ...TONE(2), "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+    "-pix_fmt", "yuv420p", "-x265-params", "temporal-layers=2:slices=4:log-level=error", "-c:a", "aac"]);
+  if (!p) return t.skip("ffmpeg build lacks libx265");
+  const result = await ensureWebReady(p);
+  assert.match(result.reason, /60 → 30 fps.*decoded from its base layer/);
+  const { fps, frames } = videoTiming(result.outputPath);
+  assert.deepEqual([fps, frames], [30, 60]);
+  // A 30 fps base layer under a 40 fps cap: decoded in full, never repeated.
+  const capped = await ensureWebReady(await fixture("layered60-slices-cap40.mov", [...VIDEO_AT("640x360", 60), ...TONE(2), "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+    "-pix_fmt", "yuv420p", "-x265-params", "temporal-layers=2:slices=4:log-level=error", "-c:a", "aac"]), { maxFrameRate: 40 });
+  assert.doesNotMatch(capped.reason, /base layer/);
+  assert.deepEqual(Object.values(videoTiming(capped.outputPath)).slice(0, 2), [40, 80]);
+});
+
+test("conform: a video whose frame rate can't be read is capped without repeating frames", { skip: !FFMPEG || process.platform === "win32" }, async () => {
+  // An ffprobe that reports the frame rate as unknown (0/0), as for some browser recordings.
+  const dir = await scratchDir("ffprobe-norate-");
+  const shim = path.join(dir, "ffprobe");
+  await fs.writeFile(shim, `#!/bin/sh\nffprobe "$@" | sed -e 's#"avg_frame_rate": "[^"]*"#"avg_frame_rate": "0/0"#'\n`, { mode: 0o755 });
+  const fast = await fixture("norate60.mp4", [...VIDEO_AT("640x360", 60), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
+  const result = await ensureWebReady(fast, { ffprobePath: shim });
+  assert.equal(result.action, "transcoded");
+  assert.match(result.reason, /frame rate unknown: frames past 30 fps dropped/);
+  const { frames } = videoTiming(fast);
+  assert.ok(frames >= 59 && frames <= 61, `60 fps for 2 s kept every other frame: ${frames}`);
+  // A slower recording keeps every frame: the cap drops, never repeats.
+  const slow = await fixture("norate24.mp4", [...VIDEO_AT("640x360", 24), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
+  assert.equal((await ensureWebReady(slow, { ffprobePath: shim })).action, "transcoded");
+  assert.equal(videoTiming(slow).frames, 48);
+});
+
 test("conform: a base layer with fewer frames than the cap isn't used", { skip: !FFMPEG }, async (t) => {
   // A 30 fps base layer under a 50 fps cap would repeat frames: every frame is decoded instead.
   const p = await fixture("layered60-cap50.mov", HEVC60(2));
@@ -830,11 +862,11 @@ test("conform: a run removes what an interrupted earlier run over the same video
     return fs.writeFile(file, "partial").then(() => fs.utimes(file, new Date(Date.now() - ageMs), new Date(Date.now() - ageMs))).then(() => file);
   };
   const uuid = () => crypto.randomUUID();
-  const stale = await leftover(`.webready-clip-${uuid()}.mp4`, 0); // an interrupted run: written before this one began
-  const live = await leftover(`.webready-clip-${uuid()}.mp4`, 0); // another process still writing it
-  const sibling = await leftover(`.webready-clip-other-${uuid()}.mp4`, 5 * 60_000); // clip-other.mp4's, not clip.mp4's
-  const other = await leftover(`.webready-other-${uuid()}.mp4`, 5 * 60_000); // another video's
-  const notOurs = await leftover(".webready-clip-partial.mp4", 5 * 60_000); // not a name a run writes
+  const stale = await leftover(`.webready-${outputTag("clip.mp4")}-${uuid()}.mp4`, 0); // an interrupted run: written before this one began
+  const live = await leftover(`.webready-${outputTag("clip.mp4")}-${uuid()}.mp4`, 0); // another process still writing it
+  const sameStem = await leftover(`.webready-${outputTag("clip.webm")}-${uuid()}.mp4`, 5 * 60_000); // clip.webm's, not clip.mp4's
+  const sibling = await leftover(`.webready-${outputTag("clip-other.mp4")}-${uuid()}.mp4`, 5 * 60_000); // clip-other.mp4's
+  const notOurs = await leftover(`.webready-${outputTag("clip.mp4")}-partial.mp4`, 5 * 60_000); // not a name a run writes
   await new Promise((r) => setTimeout(r, 20));
   const writing = setInterval(() => fs.appendFile(live, "x").catch(() => {}), 5);
   try {
@@ -844,9 +876,17 @@ test("conform: a run removes what an interrupted earlier run over the same video
   }
   await assert.rejects(fs.stat(stale), "the abandoned output is removed");
   assert.ok(await fs.stat(live), "one written during the run is left");
+  assert.ok(await fs.stat(sameStem), "an input with the same stem keeps its output");
   assert.ok(await fs.stat(sibling), "a video whose name starts the same keeps its output");
-  assert.ok(await fs.stat(other), "another video's is left");
   assert.ok(await fs.stat(notOurs), "a file that isn't a run's output is left");
+});
+
+/** The tag a run's temporary output carries for the input named `name` (a hash of the whole filename). */
+const outputTag = (name) => crypto.createHash("sha256").update(name).digest("hex").slice(0, 16);
+
+test("conform: an input with a very long filename converts (its temporary name stays short)", { skip: !FFMPEG }, async () => {
+  const p = await fixture(`${"v".repeat(240)}.mp4`, [...VIDEO("320x240"), "-c:v", "libx264", "-pix_fmt", "yuv444p", "-movflags", "+faststart"]);
+  assert.equal((await ensureWebReady(p)).action, "transcoded");
 });
 
 test("conform: an odd maxEdge stays a cap (sizes round down to even)", { skip: !FFMPEG }, async () => {

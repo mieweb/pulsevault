@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -689,9 +689,10 @@ function videoFilter(
   hdr: boolean,
   toneMapper: ToneMapper,
   frameRate: number | null,
+  unknownRateCap: number | null = null,
 ): string {
   const { width, height } = size;
-  const fps = frameRate !== null ? `fps=${frameRate},` : '';
+  const fps = frameRate !== null ? `fps=${frameRate},` : unknownRateCap !== null ? dropPast(unknownRateCap) : '';
   if (hdr && toneMapper === 'scale') {
     // Scaled in its own colours first (10-bit, still HDR), then tone-mapped at the target size.
     return (
@@ -718,6 +719,14 @@ function videoFilter(
 function cappedFrameRate(video: VideoProbe['video'], maxFrameRate: number): number | null {
   return video.frameRate !== undefined && video.frameRate > maxFrameRate + 0.5 ? maxFrameRate : null;
 }
+
+/**
+ * For a video whose frame rate ffprobe can't tell: keep a frame only when it comes at least a
+ * frame of `maxFrameRate` after the last one kept. Drops frames past the cap, never repeats one,
+ * so a slower recording keeps all of its frames. Runs first in the chain, like `fps`.
+ */
+const dropPast = (maxFrameRate: number) =>
+  `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,${(1 / maxFrameRate - 0.001).toFixed(4)})',`;
 
 class TimeoutError extends Error {}
 
@@ -754,25 +763,28 @@ async function baseLayerShare(filePath: string, ffmpegPath: string, index: numbe
   } catch {
     return null;
   }
-  // Each NAL unit header traces its type, then its temporal id + 1.
+  // Each NAL unit header traces its type, then its temporal id + 1; a slice's header then says
+  // whether it starts a picture. Every slice above layer 0 is checked; pictures are counted once,
+  // by their first slice, however many slices they are cut into.
   let type: number | null = null;
+  let layer: number | null = null;
   let upper = 0;
   let base = 0;
   for (const line of stderr.split('\n')) {
-    const field = /\b(nal_unit_type|nuh_temporal_id_plus1)\b.*=\s*(\d+)\s*$/.exec(line);
+    const field = /\b(nal_unit_type|nuh_temporal_id_plus1|first_slice_segment_in_pic_flag)\b.*=\s*(\d+)\s*$/.exec(line);
     if (!field) continue;
     const value = Number(field[2]);
     if (field[1] === 'nal_unit_type') {
       type = value;
-      continue;
+      layer = null;
+    } else if (field[1] === 'nuh_temporal_id_plus1') {
+      layer = value;
+      // Only coded slices (types 0–31) are pictures; parameter sets and SEI carry none.
+      if (type !== null && type < 32 && value > 1 && !SUB_LAYER_TYPES.includes(type)) return null;
+    } else if (value === 1 && type !== null && type < 32 && layer !== null) {
+      if (layer === 1) base++;
+      else upper++;
     }
-    // Only coded pictures (types 0–31) count; parameter sets and SEI carry no picture.
-    if (type !== null && type < 32) {
-      if (value === 1) base++;
-      else if (SUB_LAYER_TYPES.includes(type)) upper++;
-      else return null;
-    }
-    type = null;
   }
   return upper > 0 && base > 0 ? base / (base + upper) : null;
 }
@@ -873,10 +885,10 @@ async function rewrite(
   // a pid+timestamp tmp name collides when two uploads finish in the same
   // millisecond — both ffmpegs would interleave writes into one file and the
   // winner's rename would install garbage bytes over a real artifact.
-  // The input's own name in it too: a run that was stopped part-way (a restart) leaves its file
-  // behind, and the next run over the same input removes it (`removeStaleOutputs`).
+  // The input's own tag in it too (`outputTagOf`): a run that was stopped part-way (a restart)
+  // leaves its file behind, and the next run over the same input removes it (`removeStaleOutputs`).
   const dir = path.dirname(inputPath);
-  const name = path.basename(inputPath, path.extname(inputPath));
+  const name = outputTagOf(inputPath);
   const tmp = path.join(dir, `.webready-${name}-${randomUUID()}${CONFORM_TARGET.extension}`);
   const startedAt = Date.now();
   try {
@@ -904,12 +916,19 @@ async function rewrite(
   }
 }
 
-/** `.webready-<name>-<uuid>.mp4`: a run's temporary output for the input named `<name>`. */
-const outputNameOf = (name: string) =>
-  new RegExp(`^\\.webready-${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$`);
+/**
+ * The tag a run's temporary output carries for its input: 16 hex digits of the SHA-256 of the
+ * input's whole filename. Bounded, whatever the name's length, and distinct for `clip.mov` and
+ * `clip.webm`.
+ */
+const outputTagOf = (inputPath: string) => createHash('sha256').update(path.basename(inputPath)).digest('hex').slice(0, 16);
+
+/** `.webready-<tag>-<uuid>.mp4`: a run's temporary output for the input tagged `<tag>`. */
+const outputNameOf = (tag: string) =>
+  new RegExp(`^\\.webready-${tag}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$`);
 
 /**
- * Remove what earlier runs over the same input left behind (exactly `.webready-<name>-<uuid>.mp4`,
+ * Remove what earlier runs over the same input left behind (exactly `.webready-<tag>-<uuid>.mp4`,
  * other than `keep`): a process stopped mid-conversion never got to delete its partial output.
  * Only files nothing has written to since this run began (`since`), so a run still going (another
  * process's) keeps its file. Best effort: a file that can't be listed or removed is left.
@@ -1016,7 +1035,7 @@ const KEPT_AUDIO = new Set(['aac', 'mp3']);
  * Look at a file the way `ensureWebReady` does, without writing anything: what's off-target, or
  * the `skipped` result when it can't be looked at (no ffmpeg, unreadable, not a video).
  */
-async function assess(filePath: string, options: WebReadyOptions): Promise<Assessment | WebReadyResult> {
+async function assess(filePath: string, options: WebReadyOptions): Promise<Assessment | (WebReadyResult & { timedOut?: true })> {
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
   const ffprobePath = options.ffprobePath ?? 'ffprobe';
   const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
@@ -1040,7 +1059,7 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
   } catch (err) {
     if (!(err instanceof ProbeTimeoutError)) throw err;
     options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
-    return { action: 'skipped', reason: err.message };
+    return { action: 'skipped', reason: err.message, timedOut: true };
   }
   if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
   // Phones only record quarter turns; any other angle would need its own geometry.
@@ -1081,7 +1100,7 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
       } catch (err) {
         if (!(err instanceof ProbeTimeoutError)) throw err;
         options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
-        return { action: 'skipped', reason: err.message };
+        return { action: 'skipped', reason: err.message, timedOut: true };
       }
       // No range in the container: every browser, iOS Safari too, shows the codec's. A container
       // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
@@ -1109,16 +1128,16 @@ async function assess(filePath: string, options: WebReadyOptions): Promise<Asses
 }
 
 /**
- * Whether `ensureWebReady` would re-encode this file's video: the slow, CPU-bound work, as
- * against nothing, a lossless remux or an audio-only conversion. For scheduling: it probes the
- * file and writes nothing. `false` when the file can't be looked at (`ensureWebReady` then skips
- * it at once).
+ * Whether `ensureWebReady` may re-encode this file's video: the slow, CPU-bound work, as against
+ * nothing, a lossless remux or an audio-only conversion. For scheduling: it probes the file and
+ * writes nothing. `false` when the file isn't a video it can convert (`ensureWebReady` skips it at
+ * once); `true` when a probe ran out of time, since a later look might find a re-encode.
  */
 export async function needsVideoReencode(filePath: string, options: WebReadyOptions = {}): Promise<boolean> {
   validateWebReadyOptions(options);
   if (options.transcode === false) return false;
   const assessed = await assess(filePath, options);
-  return !('action' in assessed) && assessed.videoOff.length > 0;
+  return 'action' in assessed ? assessed.timedOut === true : assessed.videoOff.length > 0;
 }
 
 /**
@@ -1162,7 +1181,7 @@ export async function ensureWebReady(
   const preset = options.preset ?? 'veryfast';
 
   const assessed = await assess(filePath, options);
-  if ('action' in assessed) return assessed;
+  if ('action' in assessed) return { action: assessed.action, reason: assessed.reason };
   const { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag } = assessed;
   const { video, audio } = probe;
 
@@ -1214,13 +1233,18 @@ export async function ensureWebReady(
       if (share !== null && share * video.frameRate! >= frameRate - 0.5) inputArgs = BASE_LAYER_ONLY;
     }
     args.push(
-      '-vf', videoFilter(size, hdr, toneMapper, frameRate),
+      '-vf', videoFilter(size, hdr, toneMapper, frameRate, video.frameRate === undefined ? maxFrameRate : null),
       '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
     );
     // An 8-bit SDR output must not keep the source's HDR colour tags.
     if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
     const toneMapped = hdr ? ', tone-mapped' : '';
-    const rate = frameRate !== null ? `, ${Math.round(video.frameRate!)} → ${frameRate} fps` : '';
+    const rate =
+      frameRate !== null
+        ? `, ${Math.round(video.frameRate!)} → ${frameRate} fps`
+        : video.frameRate === undefined
+          ? `, frame rate unknown: frames past ${maxFrameRate} fps dropped`
+          : '';
     // ffmpeg's autorotate turns the pixels upright on decode and writes no rotation tag.
     const rotated = video.rotation !== 0 ? `, rotation ${video.rotation}° applied` : '';
     done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rate}${rotated}`);
