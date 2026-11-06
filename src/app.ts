@@ -291,6 +291,7 @@ export type { PulseVaultValidatePayload, VideoValidatorOptions } from './lib/mag
 export {
   ensureWebReady,
   extractPosterFrame,
+  needsVideoReencode,
   scanMoovPosition,
   probeVideo,
   webReadyAvailable,

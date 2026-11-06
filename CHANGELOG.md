@@ -7,6 +7,44 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **web-ready:** an H.264 8-bit SDR video keeps its size, frame rate and bytes up to H.264 level
+  5.2 (4096×2304, 4K at 60 fps), the format every browser plays: a 4K or 60 fps H.264 upload is
+  only remuxed, no longer re-encoded down to 1920. `maxEdge` and `maxFrameRate` now apply to a
+  video that is re-encoded for another reason (HEVC, HDR, AV1, VP9, …), and to H.264 past level 5.2.
+- **web-ready:** re-encodes are much faster for the videos that need them most. A re-encoded
+  video now comes out at most 30 fps (`maxFrameRate`, the rate the Pulse app records), its
+  frames dropped before anything else runs (one whose rate can't be read keeps only frames at
+  least a frame of the cap apart, never repeating one), and HDR is tone-mapped after it is scaled down
+  rather than at its full size. An HEVC clip recorded in temporal layers (an iPhone's 60 and
+  120 fps) is decoded from its 30 fps base layer alone, the frames past the cap never decoded;
+  if that fails, the run is repeated over every frame. A video that conforms otherwise (every Pulse upload) keeps its
+  bytes and its own frame rate, as before.
+
+- **web-ready:** a video that needs no re-encode — every Pulse upload, a lossless remux, an
+  audio-only conversion — and a poster frame no longer wait behind another upload's re-encode.
+  Conversions run in two lanes: video re-encodes, `concurrency` at a time (default 1), and
+  everything else, two at a time.
+
+- **web-ready:** a run is no longer cut short by a limit worked out from the video's length: a
+  run that stops moving forward through the video for `stallSeconds` (default 120) is killed,
+  and `timeoutSeconds` defaults to an hour, as a backstop. A long conversion on a small or busy
+  server is never killed while it makes progress.
+
+### Added
+
+- **web-ready:** `maxFrameRate` option (default `30`).
+- **web-ready:** a video whose container and stream disagree about its colour range is fixed
+  losslessly: the container is retagged with the stream's range in a remux (the same video
+  bytes), instead of being re-encoded. MP3 audio is kept as it is, like AAC.
+- **web-ready:** the partial output a run stopped part-way leaves behind (a restart mid-conversion)
+  is removed by the next run over the same video.
+- **web-ready:** `stallSeconds` and `onProgress` options; the status route reports `progress`
+  (0–1) while a conversion runs (protocol 2.6).
+- **web-ready:** `needsVideoReencode(filePath, options)`: whether `ensureWebReady` would re-encode
+  a file's video, for a host scheduling conversions itself. Writes nothing.
+
 ## [0.7.2] - 2026-11-02
 
 ### Fixed

@@ -914,6 +914,113 @@ test("webReady: the final PATCH is answered before the conversion; completeAfter
   }
 });
 
+test("webReady: a video that needs no re-encode is settled while another upload's re-encode runs", { skip: !FFMPEG }, async () => {
+  // A re-encode that takes seconds (4K, scaled to 1080p) and a Pulse-like upload that needs nothing.
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p"]);
+  const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=1080x1920:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  const processed = [];
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: { completeAfter: true },
+      onArtifactEvent: (e) => { if (e.phase === "processed") processed.push({ id: e.artifactId, action: e.webReady.action, at: Date.now() }); },
+    },
+  });
+  try {
+    const slowId = randomUUID();
+    const pulseId = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: slowId, filename: "imported.mp4", kind: "video", body: slow });
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: pulseId, filename: "draft.mp4", kind: "video", body: pulse });
+    const pulseDone = await waitForWebReady(ctx, pulseId);
+    assert.equal(pulseDone.webReady?.action, "none");
+    // The Pulse upload was settled while the re-encode was still running: one lane didn't hold the other.
+    assert.equal((await ctx.core.getStatus(slowId)).state, "processing", "the re-encode is still running");
+    const slowDone = await waitForWebReady(ctx, slowId);
+    assert.equal(slowDone.webReady?.action, "transcoded");
+    assert.deepEqual(processed.map((p) => p.id), [pulseId, slowId]);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: the status route says how far a running conversion has got", { skip: !FFMPEG }, async () => {
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=5", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p"]);
+  const ctx = await startLocal({ pluginOptions: { webReady: true } });
+  try {
+    const id = randomUUID();
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: id, filename: "imported.mp4", kind: "video", body: slow });
+    const seen = [];
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const res = await fetch(`${ctx.baseUrl}${PREFIX}/artifacts/${id}/status`);
+      const status = await res.json();
+      if (status.state === "ready" || Date.now() > deadline) {
+        assert.equal(status.state, "ready");
+        assert.equal(status.progress, undefined, "no progress once ready");
+        break;
+      }
+      if (typeof status.progress === "number") seen.push(status.progress);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(seen.length >= 2, `progress seen ${seen.length} times`);
+    assert.ok(seen.every((f, i) => f >= 0 && f <= 1 && (i === 0 || f >= seen[i - 1])), `climbing within 0–1: ${seen}`);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("webReady: re-encodes run `concurrency` at a time, and every upload in a burst is settled", { skip: !FFMPEG || process.platform === "win32" }, async () => {
+  const slow = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=30:duration=2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]);
+  const pulse = await encodeMp4(["-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=30:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+  let running = 0;
+  let most = 0;
+  const ctx = await startLocal({
+    pluginOptions: {
+      webReady: {
+        concurrency: 1,
+        // Counts the ffmpeg runs that encode video at once (posters and probes don't).
+        ffmpegPath: await countingFfmpeg((delta) => { running += delta; most = Math.max(most, running); }),
+      },
+    },
+  });
+  try {
+    const uploads = [
+      ...Array.from({ length: 3 }, () => ({ id: randomUUID(), body: slow, expect: "transcoded" })),
+      ...Array.from({ length: 4 }, () => ({ id: randomUUID(), body: pulse, expect: "none" })),
+    ];
+    await Promise.all(uploads.map((u) => uploadFull(ctx.baseUrl, PREFIX, { artifactId: u.id, filename: "v.mp4", kind: "video", body: u.body })));
+    for (const u of uploads) {
+      const status = await waitForWebReady(ctx, u.id);
+      assert.equal(status.webReady?.action, u.expect, u.id);
+      assert.equal(status.state, "ready");
+    }
+    assert.equal(most, 1, "one re-encode at a time");
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+/**
+ * An ffmpeg wrapper that reports each video re-encode (a run with `libx264`) starting (+1) and
+ * ending (-1) through a file the test watches.
+ */
+async function countingFfmpeg(onChange) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-ffmpeg-count-"));
+  const log = path.join(dir, "log");
+  await fs.writeFile(log, "");
+  const shim = path.join(dir, "ffmpeg");
+  await fs.writeFile(shim, `#!/bin/sh
+case "$*" in *libx264*) echo + >> "${log}"; ffmpeg "$@"; code=$?; echo - >> "${log}"; exit $code;; esac
+exec ffmpeg "$@"
+`, { mode: 0o755 });
+  let seen = 0;
+  const watcher = setInterval(async () => {
+    const lines = (await fs.readFile(log, "utf8")).split("\n").filter(Boolean);
+    for (; seen < lines.length; seen++) onChange(lines[seen] === "+" ? 1 : -1);
+  }, 20);
+  watcher.unref();
+  return shim;
+}
+
 /** An MP4 made by ffmpeg from lavfi sources (MP4 needs a seekable output, so via a tmp file). */
 async function encodeMp4(args) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-fixture-"));
@@ -1236,7 +1343,7 @@ test("webReady: a video still being converted is revalidated instead of the conf
 test("webReady: a conversion that times out keeps serving the original and the status says why", { skip: !FFMPEG }, async () => {
   const body = await encodeMp4([
     "-f", "lavfi", "-i", "testsrc2=size=3840x2160:rate=30:duration=1",
-    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40", "-pix_fmt", "yuv444p",
   ]);
   const ctx = await startLocal({ pluginOptions: { webReady: { timeoutSeconds: 0.05 } } });
   try {

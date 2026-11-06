@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.5` |
+| Spec revision | `2.6` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -354,7 +354,9 @@ bytes for the web) or `ready`, with the bytes received against the declared
 length while uploading, and whatever outcome the host recorded once finished.
 A server that converts videos for the web also reports what the conversion did
 (`webReady`, protocol 2.5): nothing, a remux, a transcode, a new container, or
-why it was skipped (the original then serves). The response MUST NOT be cached.
+why it was skipped (the original then serves). While a conversion runs it may
+report how far it has got (`progress`, 0–1, protocol 2.6); a conversion still
+waiting for its turn has none. The response MUST NOT be cached.
 
 A server MAY also expose `GET {prefix}/artifacts/<videoId>/poster`: the finished
 thumbnail `relatedTo` the video (§8), served exactly as §6.2 serves an artifact
@@ -447,6 +449,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.3 | Added `GET {prefix}/artifacts/<id>/status` and `GET {prefix}/artifacts/<id>/poster` (§6.5), the capability token's `ctx` claim (§5.4), and the pulse-shape rule for creates (§5.4). |
 | 2.4 | Added the `https://mieweb.github.io/pulse/open#…` pairing link form (§3), with the parameters in the fragment. |
 | 2.5 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
+| 2.6 | Added `progress` to the status response (§6.5): how far a running conversion has got. |
 
 ## 8. Artifact relationships (`relatedTo`)
 

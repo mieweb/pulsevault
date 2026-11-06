@@ -184,11 +184,11 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Property | Target |
 |---|---|
 | Container | MP4, `moov` at the front (faststart) |
-| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p` when the container and the stream both say full range), even width and height. A re-encode writes limited range |
+| Video | H.264, 8-bit 4:2:0 (`yuv420p`, or full-range `yuvj420p`). Where the container's colour range disagrees with the stream's, the container is retagged with the stream's range, losslessly. The format every browser plays: such a video keeps its bytes. HEVC, AV1, VP8/VP9, ProRes, 10-bit and the like are re-encoded. A re-encode writes limited range |
 | Colour | SDR: HDR (PQ or HLG) is tone-mapped to BT.709; an SDR source keeps its own colour tags (BT.709 or BT.601), which browsers honour |
-| Size | longest edge at most 1920 (`maxEdge`); aspect ratio and orientation kept — no crop, pad or stretch |
+| Size and frame rate | kept, within H.264 level 5.2 — the highest phones and laptops decode in hardware: up to 4096×2304, and 4K at 60 fps. Past it (8K, 4K at 120 fps) the video is re-encoded. A re-encode, for any reason, writes a longest edge of at most 1920 (`maxEdge`) and at most 30 fps (`maxFrameRate`, the rate the Pulse app records), keeping the duration; aspect ratio and orientation are kept — no crop, pad or stretch |
 | Rotation | a quarter-turn rotation tag is kept: it is how a phone records portrait, and every browser shows it the way it was held. A re-encode applies it to the pixels |
-| Audio | AAC; a video with no audio stays silent |
+| Audio | AAC, or MP3 kept as it is (every browser plays both in an MP4); anything else becomes AAC. A video with no audio stays silent |
 
 `ensureWebReady` does the least work that gets a file there:
 
@@ -200,7 +200,7 @@ target (`CONFORM_TARGET`, exported from the package root):
 | Another container (`.mov`, `.m4v`, `.webm`, `.mkv`, `.3gp`, `.avi`) | one ffmpeg run into a new `<id>.mp4`: a stream copy when the streams already conform, otherwise only the off-target streams re-encoded | `conformed` |
 | No ffmpeg, unreadable, failed or timed out | nothing; the original serves | `skipped` |
 
-A re-encode scales by the displayed longest edge, applies the rotation, tone-maps HDR
+A re-encode scales by the displayed longest edge, caps the frame rate, applies the rotation, tone-maps HDR
 (PQ or HLG) to SDR, and converts non-AAC audio (Opus, PCM, …) to AAC. After a
 container change the artifact's stored file, extension and served
 `Content-Type` (`video/mp4`) follow the new file; the artifact id, and so every
@@ -253,19 +253,44 @@ await app.register(pulseVault, {
 
 Settings:
 
-- `concurrency` (default `1`): conversions run one at a time per process; the
-  rest wait in a queue. A conversion a restart interrupted is resumed by the
+- `concurrency` (default `1`): video re-encodes run one at a time per process;
+  the rest wait in a queue. Everything else — a file that's already web-ready
+  (every Pulse upload), a lossless remux, an audio-only conversion, a poster
+  frame — runs in a lane of its own, two at a time, so it is settled in a
+  second or two even while a long re-encode runs. On a machine with many cores,
+  a higher `concurrency` converts several uploads at once (one re-encode uses
+  up to about 8 cores well). A conversion a restart interrupted is resumed by the
   completion replay (`replayCompletions`): an artifact isn't marked converted
-  until its result is recorded.
-- `timeoutSeconds` (default `60 + 10 ×` the video's duration counted in
-  1080p30 seconds — a second of 4K at 120 fps counts 16 — at most an hour,
-  and an hour when the duration is unknown; the default comes from the
-  upload's own metadata, so set this for longer runs): a run past it is
-  killed, the original kept, and
-  `skipped` recorded with the reason.
+  until its result is recorded. A run stopped part-way leaves its partial
+  output (`.webready-<tag>-<uuid>.mp4`, the tag a hash of the input's filename,
+  never served); the replay's run over
+  the same video removes it, unless something has written to it since that run
+  began (another process still converting it). A process
+  manager that stops the whole process tree (pm2's default) stops its ffmpeg
+  too; a process that dies on its own (a crash, an out-of-memory kill) leaves
+  its ffmpeg running to the end, while the replay converts the video again.
+- `stallSeconds` (default `120`): ffmpeg reports how far through the video it
+  is about twice a second; a run that hasn't moved forward for this long is
+  killed, the original kept, and `skipped` recorded with the reason
+  (`stalled: no progress for …`). A slow run on a busy or small server is never
+  stopped while it keeps making progress.
+- `timeoutSeconds` (default `3600`): a backstop on any one run, whatever its
+  progress; set it higher for longer runs. A run past it is killed, the
+  original kept, and `skipped` recorded with the reason.
+- While a conversion runs, the status route reports how far it has got
+  (`progress`, 0–1) and `onProgress` is called with the same fraction.
 - `probeTimeoutSeconds` (default `60`): the same guard for each ffprobe run
   over the upload, so a malformed file can't hold the queue.
-- `maxEdge` (default `1920`): the longest edge of the served video.
+- `maxEdge` (default `1920`): the longest edge of a re-encoded video. A video
+  that isn't re-encoded keeps its size.
+- `maxFrameRate` (default `30`): the frame rate of a re-encoded video, at most.
+  Frames are dropped before anything else runs, and HDR is tone-mapped after
+  the scale, so a 4K60 HDR clip costs a fraction of what it did. An HEVC clip
+  recorded in temporal layers (an iPhone's 60 and 120 fps: a 30 fps base layer
+  with layers of extra frames on top) is decoded from its base layer alone,
+  the upper layers dropped before decoding. Those frames are bit for bit the
+  ones a full decode gives; if that decode fails, the run is repeated over
+  every frame.
 - `transcode: false`: never re-encode; only lossless remuxes run (a `moov`
   moved to the front, or another container whose streams already conform copied
   into an `.mp4`), so no CPU cost beyond a file rewrite. A file that would need

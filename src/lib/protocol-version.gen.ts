@@ -2,7 +2,7 @@
 // Do not edit: change package.json, then run `npm run build`.
 
 export const PULSE_PROTOCOL: { version: string; min: number; max: number } = {
-  version: '2.5',
+  version: '2.6',
   min: 2,
   max: 2,
 };

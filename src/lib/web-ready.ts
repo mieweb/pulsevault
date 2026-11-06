@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -33,17 +33,23 @@ export const CONFORM_TARGET = {
   container: 'mp4',
   extension: '.mp4',
   /**
-   * H.264, 8-bit 4:2:0, even width and height, SDR. HDR (PQ, HLG) is tone-mapped to BT.709; an
-   * SDR source keeps its own colour tags (BT.709 or BT.601, limited or full range) and its
-   * quarter-turn rotation tag, which browsers honour — so a Pulse upload from any phone, held
-   * any way, keeps its bytes. A re-encode writes limited range and applies the rotation to the
-   * pixels.
+   * H.264, 8-bit 4:2:0, SDR, within level 5.2 (up to 4096×2304, 4K at 60 fps): the format every
+   * browser plays. Such a video keeps its size, frame rate, bitrate and bytes, and its own colour
+   * tags (BT.709 or BT.601, limited or full range) and quarter-turn rotation tag, which browsers
+   * honour — so a Pulse upload from any phone, held any way, keeps its bytes. Anything else is
+   * re-encoded: HDR (PQ, HLG) tone-mapped to BT.709, at most `maxEdge` and `maxFrameRate`,
+   * limited range, rotation applied to the pixels.
    */
   videoCodec: 'h264',
   pixelFormat: 'yuv420p',
-  /** Default cap on the longest edge, in pixels (`webReady.maxEdge`). */
+  /** Default cap on the longest edge of a re-encoded video, in pixels (`webReady.maxEdge`). */
   maxEdge: 1920,
-  /** AAC; a video without audio stays silent. */
+  /**
+   * Default cap on the frame rate of a re-encoded video (`webReady.maxFrameRate`): the rate the
+   * Pulse app records. A video that conforms otherwise keeps its own rate and bytes.
+   */
+  maxFrameRate: 30,
+  /** AAC (an MP3 is kept too: every browser plays it in an MP4); a video without audio stays silent. */
   audioCodec: 'aac',
 } as const;
 
@@ -94,20 +100,39 @@ export type WebReadyOptions = {
    * host is a concern.
    */
   transcode?: boolean;
-  /** Longest edge of the served video, in pixels; larger videos are scaled down. Default `1920`. */
+  /**
+   * Longest edge of a re-encoded video, in pixels; a larger one is scaled down. Default `1920`. A
+   * video that isn't re-encoded keeps its size: H.264 up to level 5.2 (4096×2304, 4K at 60 fps)
+   * plays everywhere.
+   */
   maxEdge?: number;
+  /**
+   * Frames per second of a re-encoded video, at most; a faster one (60 fps, a 120 or 240 fps
+   * slow-motion clip) is re-encoded at this rate, its duration unchanged. Default `30`. Never a
+   * reason to re-encode on its own: a video that conforms otherwise keeps its rate.
+   */
+  maxFrameRate?: number;
   /** x264 CRF for the transcode path (lower = better/larger). Default `23`. */
   crf?: number;
   /** x264 preset for the transcode path. Default `"veryfast"`. */
   preset?: string;
   /**
    * Wall-clock limit for one ffmpeg run, in seconds; the run is killed and the original kept.
-   * A guard against a run that hangs, not a speed limit. Default `60 + 10 ×` the video's
-   * duration counted in 1080p30 seconds (a second of 4K at 120 fps counts 16), at most an hour,
-   * and an hour when the duration is unknown. The default comes from the upload's own metadata,
-   * so it's capped: a file can't claim its way to a days-long run. Set this for longer runs.
+   * A backstop, not a speed limit: a run that stops working is caught by `stallSeconds` long
+   * before. Default `3600` (an hour). Set this for longer runs.
    */
   timeoutSeconds?: number;
+  /**
+   * Seconds an ffmpeg run may go without moving forward through the video before it is killed
+   * and the original kept. A slow run is never stopped while it makes progress; a hung one is
+   * stopped this long after it last did. Default `120`.
+   */
+  stallSeconds?: number;
+  /**
+   * Called as a re-encode or remux moves through the video, with the fraction done (0–1), about
+   * twice a second. Only when the video's duration is known.
+   */
+  onProgress?: (fraction: number) => void;
   /**
    * `false`: leave every rewrite at a temporary `.mp4` path beside the input (the result's
    * `outputPath`) instead of renaming it into place, so the caller can install it under its own
@@ -591,6 +616,61 @@ function displayedSize(video: VideoProbe['video']): { width: number; height: num
   return sideways ? { width: video.height, height: video.width } : { width: video.width, height: video.height };
 }
 
+/**
+ * H.264 level 5.2, the highest that phones, tablets and laptops decode in hardware: frames up to
+ * 36 864 macroblocks (4096×2304) at up to 2 073 600 macroblocks a second (4K at 60 fps). A video
+ * within it is served at its own size and rate; past it (8K, 4K at 120 fps), it is re-encoded.
+ */
+const LEVEL_52 = { frameMacroblocks: 36_864, macroblocksPerSecond: 2_073_600, dpbMacroblocks: 184_320 };
+
+/** Most reference frames H.264 allows: a frame within `dpbMacroblocks / MAX_REFS` always fits the DPB. */
+const MAX_REFS = 16;
+
+/**
+ * Why a video's size, frame rate or decoded-picture buffer is past `LEVEL_52`, or `null` when it is
+ * within it; an unknown rate counts as 30. The buffer comes from the stream's own SPS (`h264ReferenceFrames`), read only
+ * for a frame large enough to overflow it: the level an encoder writes isn't trusted, since some
+ * phones label ordinary 1080p as level 6.0.
+ */
+async function pastDecodeLimits(
+  video: VideoProbe['video'],
+  referenceFrames: () => Promise<number | null>,
+): Promise<string | null> {
+  const macroblocks = Math.ceil(video.width / 16) * Math.ceil(video.height / 16);
+  const { width, height } = displayedSize(video);
+  if (macroblocks > LEVEL_52.frameMacroblocks || macroblocks * (video.frameRate ?? 30) > LEVEL_52.macroblocksPerSecond) {
+    const fps = video.frameRate !== undefined ? ` at ${Math.round(video.frameRate)} fps` : '';
+    return `size ${width}×${height}${fps} past H.264 level 5.2`;
+  }
+  if (video.codec !== CONFORM_TARGET.videoCodec || macroblocks * MAX_REFS <= LEVEL_52.dpbMacroblocks) return null;
+  const refs = await referenceFrames();
+  return refs !== null && macroblocks * refs > LEVEL_52.dpbMacroblocks
+    ? `${refs} reference frames at ${width}×${height} past H.264 level 5.2`
+    : null;
+}
+
+/**
+ * How many frames an H.264 stream keeps for reference: its first SPS's `max_dec_frame_buffering`
+ * when the VUI declares it, else `max_num_ref_frames`. `null` when it can't be read.
+ */
+async function h264ReferenceFrames(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<number | null> {
+  let stderr: string;
+  try {
+    ({ stderr } = await execFileAsync(
+      ffmpegPath,
+      ['-hide_banner', '-v', 'info', '-i', filePath, '-map', `0:${index}`, '-c', 'copy', '-bsf:v', 'trace_headers', '-frames:v', '1', '-f', 'null', '-'],
+      { maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+    ));
+  } catch {
+    return null;
+  }
+  const field = (name: string) => {
+    const m = new RegExp(`\\b${name}\\b.*=\\s*(\\d+)\\s*$`, 'm').exec(stderr);
+    return m ? Number(m[1]) : null;
+  };
+  return field('max_dec_frame_buffering') ?? field('max_num_ref_frames');
+}
+
 /** The displayed size scaled so the longest edge is at most `maxEdge`. */
 function targetSize(video: VideoProbe['video'], maxEdge: number): { width: number; height: number } {
   const { width, height } = displayedSize(video);
@@ -598,31 +678,196 @@ function targetSize(video: VideoProbe['video'], maxEdge: number): { width: numbe
   return { width: even(width * scale), height: even(height * scale) };
 }
 
-/** The `-vf` chain for a re-encode: tone map (HDR), scale to the target size, 8-bit 4:2:0. */
+/**
+ * The `-vf` chain for a re-encode: drop frames past the frame-rate cap, scale to the target size,
+ * tone map (HDR), 8-bit 4:2:0. Each step runs on as little as it can: frames are dropped first, and
+ * HDR is tone-mapped after the scale — the tone map runs at the size it is given, so a 4K
+ * source tone-mapped before it is scaled to 1080p costs four times as much.
+ */
 function videoFilter(
   size: { width: number; height: number },
   hdr: boolean,
   toneMapper: ToneMapper,
+  frameRate: number | null,
+  unknownRateCap: number | null = null,
 ): string {
   const { width, height } = size;
+  const fps = frameRate !== null ? `fps=${frameRate},` : unknownRateCap !== null ? dropPast(unknownRateCap) : '';
   if (hdr && toneMapper === 'scale') {
+    // Scaled in its own colours first (10-bit, still HDR), then tone-mapped at the target size.
     return (
-      `scale=w=${width}:h=${height}:out_transfer=bt709:out_primaries=bt709` +
+      `${fps}scale=w=${width}:h=${height},scale=out_transfer=bt709:out_primaries=bt709` +
       ':out_color_matrix=bt709:out_range=tv:intent=perceptual,format=yuv420p'
     );
   }
   if (hdr && toneMapper === 'zscale') {
     return (
+      `${fps}scale=${width}:${height},` +
       'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,' +
-      `zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=${width}:${height}`
+      'zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
     );
   }
   // `out_range=tv`: a full-range source (`yuvj420p`, as iPhone screen recordings are) is
   // converted to the limited range of `yuv420p`; `format` alone keeps the source's range.
-  return `scale=${width}:${height}:out_range=tv,format=yuv420p`;
+  return `${fps}scale=${width}:${height}:out_range=tv,format=yuv420p`;
 }
 
+/**
+ * The rate a re-encode drops `video` to, or `null` to keep its own: only a rate clearly past the
+ * cap (half a frame a second, so a 30.03 fps phone clip isn't given duplicate frames at 30).
+ */
+function cappedFrameRate(video: VideoProbe['video'], maxFrameRate: number): number | null {
+  return video.frameRate !== undefined && video.frameRate > maxFrameRate + 0.5 ? maxFrameRate : null;
+}
+
+/**
+ * For a video whose frame rate ffprobe can't tell: keep a frame only when it comes at least a
+ * frame of `maxFrameRate` after the last one kept. Drops frames past the cap, never repeats one,
+ * so a slower recording keeps all of its frames. Runs first in the chain, like `fps`.
+ */
+const dropPast = (maxFrameRate: number) =>
+  `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,${(1 / maxFrameRate - 0.001).toFixed(4)})',`;
+
 class TimeoutError extends Error {}
+
+/**
+ * HEVC NAL unit types of the pictures that start a higher temporal sub-layer (TSA_N, TSA_R,
+ * STSA_N, STSA_R): what `filter_units` drops to leave the base layer.
+ */
+const SUB_LAYER_TYPES = [2, 3, 4, 5];
+/** Input option that drops them before decoding. */
+const BASE_LAYER_ONLY = ['-bsf:v', `filter_units=remove_types=${SUB_LAYER_TYPES.join('|')}`];
+/** What FFmpeg's HEVC decoder logs when a picture it needs is gone. */
+const MISSING_REFERENCE = /Could not find ref with POC|Error constructing the frame RPS/;
+/** Packets read to learn a stream's layer structure: a second of 120 fps. */
+const LAYER_SCAN_PACKETS = 120;
+
+/**
+ * The share of a high-frame-rate HEVC stream's pictures in its base layer, when it can be decoded
+ * from that layer alone: every picture above temporal layer 0 is a sub-layer access picture
+ * (`SUB_LAYER_TYPES`), which by the standard no lower layer refers to — how an iPhone records 60
+ * and 120 fps (a 30 fps base and one or two layers on top). Dropping them leaves exactly the base
+ * layer's frames, bit for bit those of a full decode, for a fraction of the decoding. Reads the
+ * NAL headers of the first `LAYER_SCAN_PACKETS` packets with ffmpeg's `trace_headers`; `null` when
+ * there are no such layers, or on anything unexpected.
+ */
+async function baseLayerShare(filePath: string, ffmpegPath: string, index: number, timeoutMs: number): Promise<number | null> {
+  let stderr: string;
+  try {
+    ({ stderr } = await execFileAsync(
+      ffmpegPath,
+      ['-hide_banner', '-v', 'info', '-i', filePath, '-map', `0:${index}`, '-c', 'copy', '-bsf:v', 'trace_headers',
+        '-frames:v', String(LAYER_SCAN_PACKETS), '-f', 'null', '-'],
+      { maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs, killSignal: 'SIGKILL' },
+    ));
+  } catch {
+    return null;
+  }
+  // Each NAL unit header traces its type, then its temporal id + 1; a slice's header then says
+  // whether it starts a picture. Every slice above layer 0 is checked; pictures are counted once,
+  // by their first slice, however many slices they are cut into.
+  let type: number | null = null;
+  let layer: number | null = null;
+  let upper = 0;
+  let base = 0;
+  for (const line of stderr.split('\n')) {
+    const field = /\b(nal_unit_type|nuh_temporal_id_plus1|first_slice_segment_in_pic_flag)\b.*=\s*(\d+)\s*$/.exec(line);
+    if (!field) continue;
+    const value = Number(field[2]);
+    if (field[1] === 'nal_unit_type') {
+      type = value;
+      layer = null;
+    } else if (field[1] === 'nuh_temporal_id_plus1') {
+      layer = value;
+      // Only coded slices (types 0–31) are pictures; parameter sets and SEI carry none.
+      if (type !== null && type < 32 && value > 1 && !SUB_LAYER_TYPES.includes(type)) return null;
+    } else if (value === 1 && type !== null && type < 32 && layer !== null) {
+      if (layer === 1) base++;
+      else upper++;
+    }
+  }
+  return upper > 0 && base > 0 ? base / (base + upper) : null;
+}
+
+/** What one ffmpeg run may take, and whom to tell how far it has got. */
+type RunLimits = {
+  timeoutMs: number;
+  stallMs: number;
+  durationSeconds: number | null;
+  onProgress?: (fraction: number) => void;
+};
+
+/** A run that stopped moving forward through the video for `stallSeconds`. */
+class StallError extends TimeoutError {}
+
+/** Most of ffmpeg's stderr kept per run: its last lines say why it failed. */
+const STDERR_KEEP = 256 * 1024;
+
+/**
+ * Run ffmpeg, watching its `-progress` report: killed when it hasn't moved forward through the
+ * video for `stallMs` (`StallError`), or past `timeoutMs` in all (`TimeoutError`). Resolves whether
+ * `watch` appeared anywhere in its stderr (checked as it streams, so a long log can't hide it);
+ * rejects with the exit `code` when it fails.
+ */
+function runFfmpeg(ffmpegPath: string, args: string[], limits: RunLimits, watch?: RegExp): Promise<{ seen: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, ['-nostats', '-progress', 'pipe:1', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    let seen = false;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      // The end of the previous chunk too: a message split across two chunks is still found.
+      if (watch && !seen && watch.test(stderr.slice(-1024) + chunk)) seen = true;
+      stderr = (stderr + chunk).slice(-STDERR_KEEP);
+    });
+    // The furthest point reached in the output, in microseconds, and when it last moved.
+    let reached = -1;
+    let movedAt = Date.now();
+    const lines = createInterface({ input: child.stdout });
+    lines.on('line', (line) => {
+      const field = /^out_time_us=(\d+)$/.exec(line);
+      if (!field) return;
+      const us = Number(field[1]);
+      if (us <= reached) return;
+      reached = us;
+      movedAt = Date.now();
+      if (limits.onProgress && limits.durationSeconds) {
+        try {
+          limits.onProgress(Math.min(1, us / 1e6 / limits.durationSeconds));
+        } catch {
+          // An observer's failure isn't the run's.
+        }
+      }
+    });
+    let killedFor: TimeoutError | null = null;
+    const kill = (why: TimeoutError) => {
+      if (killedFor) return;
+      killedFor = why;
+      child.kill('SIGKILL');
+    };
+    const deadline = setTimeout(() => kill(new TimeoutError(`timed out after ${Math.round(limits.timeoutMs / 100) / 10} s`)), limits.timeoutMs);
+    const watchdog = setInterval(() => {
+      if (Date.now() - movedAt > limits.stallMs) {
+        kill(new StallError(`stalled: no progress for ${Math.round(limits.stallMs / 100) / 10} s`));
+      }
+    }, Math.min(1000, limits.stallMs));
+    const done = () => {
+      clearTimeout(deadline);
+      clearInterval(watchdog);
+      lines.close();
+    };
+    child.once('error', (err) => {
+      done();
+      reject(err);
+    });
+    child.once('close', (code) => {
+      done();
+      if (killedFor) return reject(killedFor);
+      if (code === 0) return resolve({ seen });
+      reject(Object.assign(new Error(`ffmpeg exited with code ${code}`), { code, stderr }));
+    });
+  });
+}
 
 /**
  * Run ffmpeg into a sibling tmp file, then rename it onto `outputPath` (the input itself, or a
@@ -633,31 +878,34 @@ async function rewrite(
   outputPath: string | null,
   ffmpegPath: string,
   args: string[],
-  timeoutMs: number,
+  limits: RunLimits,
+  inputArgs: string[] = [],
 ): Promise<string> {
   // randomUUID in the name: every video artifact shares one kind directory, so
   // a pid+timestamp tmp name collides when two uploads finish in the same
   // millisecond — both ffmpegs would interleave writes into one file and the
   // winner's rename would install garbage bytes over a real artifact.
-  const tmp = path.join(path.dirname(inputPath), `.webready-${randomUUID()}${CONFORM_TARGET.extension}`);
+  // The input's own tag in it too (`outputTagOf`): a run that was stopped part-way (a restart)
+  // leaves its file behind, and the next run over the same input removes it (`removeStaleOutputs`).
+  const dir = path.dirname(inputPath);
+  const name = outputTagOf(inputPath);
+  const tmp = path.join(dir, `.webready-${name}-${randomUUID()}${CONFORM_TARGET.extension}`);
+  const startedAt = Date.now();
   try {
-    try {
-      await execFileAsync(ffmpegPath, ['-y', '-v', 'error', '-i', inputPath, ...args, tmp], {
-        // Cap the buffered stderr; the wall clock is capped by the timeout.
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: timeoutMs,
-        killSignal: 'SIGKILL',
-      });
-    } catch (err) {
-      if ((err as { killed?: boolean }).killed) {
-        throw new TimeoutError(`timed out after ${Math.round(timeoutMs / 100) / 10} s`);
-      }
-      throw err;
-    }
+    const { seen } = await runFfmpeg(
+      ffmpegPath,
+      ['-y', '-v', 'error', ...inputArgs, '-i', inputPath, ...args, tmp],
+      limits,
+      inputArgs.length > 0 ? MISSING_REFERENCE : undefined,
+    );
+    // A decode of the base layer alone that found a picture missing: the decoder made one up
+    // and carried on, so the output may show it. Not a file to keep.
+    if (seen) throw new Error('a dropped picture was referenced');
     // ffmpeg exiting 0 with an empty/absent output would still be a corrupt
     // swap — verify there are real bytes before replacing the original.
     const stat = await fs.stat(tmp);
     if (stat.size === 0) throw new Error('ffmpeg produced an empty output');
+    await removeStaleOutputs(dir, name, tmp, startedAt);
     // `null`: the caller installs the file itself (`install: false`).
     if (outputPath === null) return tmp;
     await fs.rename(tmp, outputPath);
@@ -665,6 +913,42 @@ async function rewrite(
   } catch (err) {
     await fs.rm(tmp, { force: true });
     throw err;
+  }
+}
+
+/**
+ * The tag a run's temporary output carries for its input: 16 hex digits of the SHA-256 of the
+ * input's whole filename. Bounded, whatever the name's length, and distinct for `clip.mov` and
+ * `clip.webm`.
+ */
+const outputTagOf = (inputPath: string) => createHash('sha256').update(path.basename(inputPath)).digest('hex').slice(0, 16);
+
+/** `.webready-<tag>-<uuid>.mp4`: a run's temporary output for the input tagged `<tag>`. */
+const outputNameOf = (tag: string) =>
+  new RegExp(`^\\.webready-${tag}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.mp4$`);
+
+/**
+ * Remove what earlier runs over the same input left behind (exactly `.webready-<tag>-<uuid>.mp4`,
+ * other than `keep`): a process stopped mid-conversion never got to delete its partial output.
+ * Only files nothing has written to since this run began (`since`), so a run still going (another
+ * process's) keeps its file. Best effort: a file that can't be listed or removed is left.
+ */
+async function removeStaleOutputs(dir: string, name: string, keep: string, since: number): Promise<void> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  const ours = outputNameOf(name);
+  for (const entry of names) {
+    const file = path.join(dir, entry);
+    if (!ours.test(entry) || file === keep) continue;
+    try {
+      if ((await fs.stat(file)).mtimeMs < since) await fs.rm(file, { force: true });
+    } catch {
+      // Gone already, or not ours to remove.
+    }
   }
 }
 
@@ -717,15 +1001,143 @@ export async function extractPosterFrame(
 
 /** Fail at once on an option that can't work, for `ensureWebReady` and the core's `webReady`. */
 export function validateWebReadyOptions(options: WebReadyOptions): void {
-  const { maxEdge, timeoutSeconds, probeTimeoutSeconds } = options;
+  const { maxEdge, maxFrameRate, timeoutSeconds, probeTimeoutSeconds } = options;
   if (maxEdge !== undefined && !(Number.isInteger(maxEdge) && maxEdge >= 2)) {
     throw new TypeError('`webReady.maxEdge` must be an integer of at least 2 (pixels)');
   }
-  for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
+  if (maxFrameRate !== undefined && !(Number.isInteger(maxFrameRate) && maxFrameRate >= 1)) {
+    throw new TypeError('`webReady.maxFrameRate` must be a whole number of frames per second, at least 1');
+  }
+  for (const [name, value] of [['timeoutSeconds', timeoutSeconds], ['stallSeconds', options.stallSeconds], ['probeTimeoutSeconds', probeTimeoutSeconds]] as const) {
     if (value !== undefined && !(value > 0 && Number.isFinite(value))) {
       throw new TypeError(`\`webReady.${name}\` must be a positive number of seconds`);
     }
   }
+}
+
+/** What `ensureWebReady` finds off-target in a file, stream by stream. */
+type Assessment = {
+  probe: VideoProbe;
+  moov: MoovPosition;
+  isMp4: boolean;
+  hdr: boolean;
+  size: { width: number; height: number };
+  videoOff: string[];
+  audioOff: boolean;
+  /** The container's colour range to rewrite to the codec's, in a lossless remux. */
+  retag: { container: ContainerRange; range: 'pc' | 'tv' } | null;
+};
+
+/** Audio codecs served as uploaded: every browser plays them in an MP4. */
+const KEPT_AUDIO = new Set(['aac', 'mp3']);
+
+/**
+ * Look at a file the way `ensureWebReady` does, without writing anything: what's off-target, or
+ * the `skipped` result when it can't be looked at (no ffmpeg, unreadable, not a video).
+ */
+async function assess(filePath: string, options: WebReadyOptions): Promise<Assessment | (WebReadyResult & { timedOut?: true })> {
+  const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
+  const ffprobePath = options.ffprobePath ?? 'ffprobe';
+  const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
+
+  if (!(await webReadyAvailable({ ffmpegPath, ffprobePath }))) {
+    const key = `${ffmpegPath}|${ffprobePath}`;
+    if (!warnedMissing.has(key)) {
+      warnedMissing.add(key);
+      options.logger?.error(
+        { filePath },
+        'pulsevault web-ready: ffmpeg/ffprobe not found — uploads are served as-is. ' +
+          'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to conform videos for the web.',
+      );
+    }
+    return { action: 'skipped', reason: 'ffmpeg/ffprobe not available' };
+  }
+
+  let probe: VideoProbe | null;
+  try {
+    probe = await probeVideo(filePath, { ffprobePath, timeoutSeconds: options.probeTimeoutSeconds });
+  } catch (err) {
+    if (!(err instanceof ProbeTimeoutError)) throw err;
+    options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
+    return { action: 'skipped', reason: err.message, timedOut: true };
+  }
+  if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
+  // Phones only record quarter turns; any other angle would need its own geometry.
+  if (probe.video.rotation % 90 !== 0) {
+    return { action: 'skipped', reason: `rotation ${probe.video.rotation}° isn't a quarter turn` };
+  }
+  const { video, audio } = probe;
+  const moov = await scanMoovPosition(filePath);
+  const isMp4 = path.extname(filePath).toLowerCase() === CONFORM_TARGET.extension && moov !== 'unknown';
+
+  // What's off-target, stream by stream.
+  const hdr = video.transfer !== undefined && HDR_TRANSFERS.has(video.transfer);
+  const size = targetSize(video, maxEdge);
+  const shown = displayedSize(video);
+  const videoOff: string[] = [];
+  // Set when the container's colour range disagrees with the codec's: fixed without re-encoding.
+  let retag: { container: ContainerRange; range: 'pc' | 'tv' } | null = null;
+  if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
+  // Full range is not off-target either, when the container and the codec both say so: every
+  // browser then shows it in the right colours, and it is how some Android phones record (a
+  // Pixel 6a's Pulse recordings are `yuvj420p`, and the app's joins keep it). Where the two disagree,
+  // iOS Safari follows the container and every other browser the codec, so one of them shows it
+  // wrong: the container is retagged with the codec's range in a lossless remux (`retagRange`), the
+  // range every decoder uses. Re-encoded only when the codec's range can't be read.
+  if (video.pixelFormat !== CONFORM_TARGET.pixelFormat && video.pixelFormat !== FULL_RANGE_420) {
+    videoOff.push(`pixel format ${video.pixelFormat}`);
+  } else {
+    // The container's range is read from its colr box (ffprobe before FFmpeg 9 reports the
+    // codec's in its place), and the codec's from one decoded frame, only when either says full.
+    // A container range that can't be read (`unknown`) might be either, so it is checked too.
+    const containerRange = await readContainerRange(filePath);
+    const claimsFull = video.range === 'pc' || video.pixelFormat === FULL_RANGE_420;
+    if (claimsFull || containerRange === 'pc' || containerRange === 'unknown') {
+      let codedRange: string | null;
+      try {
+        const timeoutMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+        codedRange = await firstFrameRange(filePath, ffprobePath, video.index, timeoutMs);
+      } catch (err) {
+        if (!(err instanceof ProbeTimeoutError)) throw err;
+        options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
+        return { action: 'skipped', reason: err.message, timedOut: true };
+      }
+      // No range in the container: every browser, iOS Safari too, shows the codec's. A container
+      // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
+      const shownByIos = containerRange === 'none' ? codedRange : containerRange;
+      if (codedRange !== 'pc' || shownByIos !== 'pc') {
+        if (codedRange === 'pc' || codedRange === 'tv') {
+          if (shownByIos !== codedRange) retag = { container: containerRange, range: codedRange };
+        } else {
+          videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
+        }
+      }
+    }
+  }
+  if (hdr) videoOff.push(`HDR (${video.transfer})`);
+  // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
+  // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.
+  // Size and frame rate aren't either, within what every device decodes (`pastDecodeLimits`): a
+  // 4K or 60 fps H.264 upload keeps its bytes. A re-encode for any other reason scales to `maxEdge`.
+  const probeMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+  const pastLimits = await pastDecodeLimits(video, () => h264ReferenceFrames(filePath, ffmpegPath, video.index, probeMs));
+  if (pastLimits) videoOff.push(pastLimits);
+  // AAC, or MP3, which every browser also plays in an MP4: copied. Anything else becomes AAC.
+  const audioOff = audio !== null && !KEPT_AUDIO.has(audio.codec);
+  return { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag };
+}
+
+/**
+ * Whether `ensureWebReady` may re-encode this file's video: the slow, CPU-bound work, as against
+ * nothing, a lossless remux or an audio-only conversion. For scheduling: it probes the file and
+ * writes nothing. `false` when the file isn't a video it can convert (`ensureWebReady` skips it at
+ * once); `true` when a probe ran out of time, since a later look might find a re-encode.
+ */
+export async function needsVideoReencode(filePath: string, options: WebReadyOptions = {}): Promise<boolean> {
+  validateWebReadyOptions(options);
+  if (options.transcode === false) return false;
+  const assessed = await assess(filePath, options);
+  return 'action' in assessed ? assessed.timedOut === true : assessed.videoOff.length > 0;
 }
 
 /**
@@ -762,89 +1174,18 @@ export async function ensureWebReady(
 ): Promise<WebReadyResult & { outputPath?: string }> {
   validateWebReadyOptions(options);
   const ffmpegPath = options.ffmpegPath ?? 'ffmpeg';
-  const ffprobePath = options.ffprobePath ?? 'ffprobe';
   const transcode = options.transcode ?? true;
   const install = options.install ?? true;
-  const maxEdge = options.maxEdge ?? CONFORM_TARGET.maxEdge;
+  const maxFrameRate = options.maxFrameRate ?? CONFORM_TARGET.maxFrameRate;
   const crf = options.crf ?? 23;
   const preset = options.preset ?? 'veryfast';
 
-  if (!(await webReadyAvailable({ ffmpegPath, ffprobePath }))) {
-    const key = `${ffmpegPath}|${ffprobePath}`;
-    if (!warnedMissing.has(key)) {
-      warnedMissing.add(key);
-      options.logger?.error(
-        { filePath },
-        'pulsevault web-ready: ffmpeg/ffprobe not found — uploads are served as-is. ' +
-          'Install ffmpeg (apt install ffmpeg / brew install ffmpeg) to conform videos for the web.',
-      );
-    }
-    return { action: 'skipped', reason: 'ffmpeg/ffprobe not available' };
-  }
-
-  let probe: VideoProbe | null;
-  try {
-    probe = await probeVideo(filePath, { ffprobePath, timeoutSeconds: options.probeTimeoutSeconds });
-  } catch (err) {
-    if (!(err instanceof ProbeTimeoutError)) throw err;
-    options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
-    return { action: 'skipped', reason: err.message };
-  }
-  if (!probe) return { action: 'skipped', reason: 'not a video ffprobe can read' };
-  // Phones only record quarter turns; any other angle would need its own geometry.
-  if (probe.video.rotation % 90 !== 0) {
-    return { action: 'skipped', reason: `rotation ${probe.video.rotation}° isn't a quarter turn` };
-  }
+  const assessed = await assess(filePath, options);
+  if ('action' in assessed) return { action: assessed.action, reason: assessed.reason };
+  const { probe, moov, isMp4, hdr, size, videoOff, audioOff, retag } = assessed;
   const { video, audio } = probe;
-  const moov = await scanMoovPosition(filePath);
-  const isMp4 = path.extname(filePath).toLowerCase() === CONFORM_TARGET.extension && moov !== 'unknown';
 
-  // What's off-target, stream by stream.
-  const hdr = video.transfer !== undefined && HDR_TRANSFERS.has(video.transfer);
-  const size = targetSize(video, maxEdge);
-  const shown = displayedSize(video);
-  const videoOff: string[] = [];
-  if (video.codec !== CONFORM_TARGET.videoCodec) videoOff.push(`codec ${video.codec}`);
-  // Full range is not off-target either, when the container and the codec both say so: every
-  // browser then shows it in the right colours, and it is how some Android phones record (a
-  // Pixel 6a's Pulse recordings are `yuvj420p`, and the app's joins keep it). Where the two disagree,
-  // iOS Safari follows the container and every other browser the codec, so one of them shows it
-  // wrong: re-encoded. A re-encode writes limited range.
-  if (video.pixelFormat !== CONFORM_TARGET.pixelFormat && video.pixelFormat !== FULL_RANGE_420) {
-    videoOff.push(`pixel format ${video.pixelFormat}`);
-  } else {
-    // The container's range is read from its colr box (ffprobe before FFmpeg 9 reports the
-    // codec's in its place), and the codec's from one decoded frame, only when either says full.
-    // A container range that can't be read (`unknown`) might be either, so it is checked too.
-    const containerRange = await readContainerRange(filePath);
-    const claimsFull = video.range === 'pc' || video.pixelFormat === FULL_RANGE_420;
-    if (claimsFull || containerRange === 'pc' || containerRange === 'unknown') {
-      let codedRange: string | null;
-      try {
-        const timeoutMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
-        codedRange = await firstFrameRange(filePath, ffprobePath, video.index, timeoutMs);
-      } catch (err) {
-        if (!(err instanceof ProbeTimeoutError)) throw err;
-        options.logger?.error({ err, filePath }, 'pulsevault web-ready: ffprobe timed out; serving original bytes');
-        return { action: 'skipped', reason: err.message };
-      }
-      // No range in the container: every browser, iOS Safari too, shows the codec's. A container
-      // whose boxes can't be read far enough to tell (`unknown`) counts as disagreeing.
-      const shownByIos = containerRange === 'none' ? codedRange : containerRange;
-      if (codedRange !== 'pc' || shownByIos !== 'pc') {
-        videoOff.push(`range tagged ${containerRange} in the container, ${codedRange ?? 'unknown'} in the video`);
-      }
-    }
-  }
-  if (hdr) videoOff.push(`HDR (${video.transfer})`);
-  // A quarter-turn rotation tag is not off-target: every browser shows it upright, and it is how
-  // a phone records portrait (the Pulse app's joins keep it). A re-encode applies it.
-  if (size.width !== shown.width || size.height !== shown.height) {
-    videoOff.push(`size ${shown.width}×${shown.height}`);
-  }
-  const audioOff = audio !== null && audio.codec !== CONFORM_TARGET.audioCodec;
-
-  if (videoOff.length === 0 && !audioOff && isMp4 && moov === 'front') {
+  if (videoOff.length === 0 && !audioOff && !retag && isMp4 && moov === 'front') {
     return { action: 'none', reason: 'already web-ready' };
   }
 
@@ -852,7 +1193,7 @@ export async function ensureWebReady(
     const off = [...videoOff, ...(audioOff ? [`audio ${audio?.codec}`] : [])].join(', ');
     if (isMp4 && moov === 'end') {
       try {
-        const written = await rewrite(filePath, install ? filePath : null, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], timeoutOf(options, probe));
+        const written = await rewrite(filePath, install ? filePath : null, ffmpegPath, ['-c', 'copy', '-map', '0', '-movflags', '+faststart'], limitsOf(options, probe));
         return {
           action: 'remuxed',
           reason: `moov was at end of file; remuxed to faststart (${off} left as-is: transcode disabled)`,
@@ -880,19 +1221,41 @@ export async function ensureWebReady(
 
   const args = ['-map', `0:${video.index}`, ...(audio ? ['-map', `0:${audio.index}`] : []), '-sn', '-dn'];
   const done: string[] = [];
+  // Set when frames past the cap can be dropped before they're decoded (`baseLayerShare`).
+  let inputArgs: string[] = [];
   if (videoOff.length > 0) {
+    const frameRate = cappedFrameRate(video, maxFrameRate);
+    if (frameRate !== null && video.codec === 'hevc') {
+      // Only a base layer with at least the frames the cap keeps: a 30 fps base under a 60 fps cap
+      // would come out as repeated frames, so that clip is decoded in full.
+      const probeMs = Math.max(1, Math.round((options.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000));
+      const share = await baseLayerShare(filePath, ffmpegPath, video.index, probeMs);
+      if (share !== null && share * video.frameRate! >= frameRate - 0.5) inputArgs = BASE_LAYER_ONLY;
+    }
     args.push(
-      '-vf', videoFilter(size, hdr, toneMapper),
+      '-vf', videoFilter(size, hdr, toneMapper, frameRate, video.frameRate === undefined ? maxFrameRate : null),
       '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
     );
     // An 8-bit SDR output must not keep the source's HDR colour tags.
     if (hdr) args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
     const toneMapped = hdr ? ', tone-mapped' : '';
+    const rate =
+      frameRate !== null
+        ? `, ${Math.round(video.frameRate!)} → ${frameRate} fps`
+        : video.frameRate === undefined
+          ? `, frame rate unknown: frames past ${maxFrameRate} fps dropped`
+          : '';
     // ffmpeg's autorotate turns the pixels upright on decode and writes no rotation tag.
     const rotated = video.rotation !== 0 ? `, rotation ${video.rotation}° applied` : '';
-    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rotated}`);
+    done.push(`video ${videoOff.join(', ')} → h264 ${size.width}×${size.height}${toneMapped}${rate}${rotated}`);
   } else {
     args.push('-c:v', 'copy');
+    // The copied stream's range, written into the container's colr box: the same bytes, tagged
+    // the same way in both places.
+    if (retag) {
+      args.push('-color_range', retag.range);
+      done.push(`range tagged ${retag.container} in the container, ${retag.range} in the video → container retagged ${retag.range}`);
+    }
   }
   if (audioOff) {
     args.push('-c:a', 'aac', '-b:a', '160k');
@@ -905,7 +1268,8 @@ export async function ensureWebReady(
   const outputPath = isMp4
     ? filePath
     : path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}${CONFORM_TARGET.extension}`);
-  const action: WebReadyAction = !isMp4 ? 'conformed' : done.length > 0 ? 'transcoded' : 'remuxed';
+  const reencoded = videoOff.length > 0 || audioOff;
+  const action: WebReadyAction = !isMp4 ? 'conformed' : reencoded ? 'transcoded' : 'remuxed';
   if (!isMp4) {
     const ext = path.extname(filePath).toLowerCase();
     done.unshift(`container ${ext && ext !== CONFORM_TARGET.extension ? ext : 'not MP4'} → mp4`);
@@ -913,33 +1277,38 @@ export async function ensureWebReady(
   if (isMp4 && moov === 'end') done.push('moov moved to the front');
   let written: string;
   try {
-    written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, timeoutOf(options, probe));
+    try {
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, limitsOf(options, probe), inputArgs);
+    } catch (err) {
+      // The base layer alone didn't decode cleanly (or this ffmpeg can't drop layers on input):
+      // the same run over every frame. A run that timed out would only time out again.
+      if (inputArgs.length === 0 || err instanceof TimeoutError) throw err;
+      options.logger?.error({ err, filePath }, 'pulsevault web-ready: base-layer decode failed; decoding every frame');
+      inputArgs = [];
+      written = await rewrite(filePath, install ? outputPath : null, ffmpegPath, args, limitsOf(options, probe));
+    }
   } catch (err) {
     options.logger?.error({ err, filePath }, `pulsevault web-ready: ${action === 'remuxed' ? 'remux' : 'conversion'} failed; serving original bytes`);
     return { action: 'skipped', reason: `${action === 'remuxed' ? 'remux' : 'conversion'} failed: ${failureOf(err)}` };
   }
-  const reason = action === 'remuxed' ? 'moov was at end of file; remuxed to faststart' : `${done.join('; ')} (+faststart)`;
+  if (inputArgs.length > 0) done.push('decoded from its base layer');
+  const reason =
+    action === 'remuxed' && !retag
+      ? 'moov was at end of file; remuxed to faststart'
+      : `${done.join('; ')}${action === 'remuxed' ? '; remuxed, nothing re-encoded' : ''} (+faststart)`;
   return { action, reason, ...(written !== filePath ? { outputPath: written } : {}) };
 }
 
-/** The longest default run: the default is computed from the upload's own (untrusted) metadata. */
-const MAX_DEFAULT_TIMEOUT_SECONDS = 3600;
+/** The longest a run may take by default: a backstop; `stallSeconds` catches a hung run sooner. */
+const DEFAULT_TIMEOUT_SECONDS = 3600;
+const DEFAULT_STALL_SECONDS = 120;
 
-/** The wall-clock limit for one run over this video, in ms. */
-function timeoutOf(options: WebReadyOptions, probe: VideoProbe): number {
-  const computed = probe.durationSeconds !== null ? 60 + 10 * workSeconds(probe) : MAX_DEFAULT_TIMEOUT_SECONDS;
-  const seconds =
-    options.timeoutSeconds ??
-    (Number.isFinite(computed) ? Math.min(computed, MAX_DEFAULT_TIMEOUT_SECONDS) : MAX_DEFAULT_TIMEOUT_SECONDS);
-  return Math.max(1, Math.round(seconds * 1000));
-}
-
-/**
- * The video's duration in seconds of 1080p30, the work of a conversion: a second of 4K at
- * 120 fps (an iPhone recording) decodes and scales 16 times the pixels of a 1080p30 second.
- */
-function workSeconds(probe: VideoProbe): number {
-  const { width, height, frameRate } = probe.video;
-  const pixelRate = width * height * (frameRate ?? 30);
-  return (probe.durationSeconds ?? 0) * Math.max(1, pixelRate / (1920 * 1080 * 30));
+/** What one run over this video may take. */
+function limitsOf(options: WebReadyOptions, probe: VideoProbe): RunLimits {
+  return {
+    timeoutMs: Math.max(1, Math.round((options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS) * 1000)),
+    stallMs: Math.max(1, Math.round((options.stallSeconds ?? DEFAULT_STALL_SECONDS) * 1000)),
+    durationSeconds: probe.durationSeconds,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+  };
 }

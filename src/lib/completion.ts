@@ -5,6 +5,7 @@ import {
   CONFORM_TARGET,
   ensureWebReady,
   extractPosterFrame,
+  needsVideoReencode,
   validateWebReadyOptions,
   type WebReadyOptions,
   type WebReadyResult,
@@ -85,7 +86,11 @@ export type PulseVaultOnArtifactEvent = (event: PulseVaultArtifactEvent) => void
  * adapter without `getLocalPath` the option is refused at boot.
  */
 export type PulseVaultWebReadyOptions = WebReadyOptions & {
-  /** How many conversions run at once. A transcode is CPU-bound; defaults to 1. */
+  /**
+   * How many video re-encodes run at once; defaults to 1. A re-encode is CPU-bound. Everything
+   * else (a file that's already web-ready, a lossless remux, an audio-only conversion, a poster
+   * frame) runs in its own lane, `LIGHT_CONCURRENCY` at a time, so it never waits behind one.
+   */
   concurrency?: number;
   /**
    * Call `onUploadComplete` only once the conversion has finished, with `ctx.webReady` saying
@@ -139,8 +144,14 @@ export type CompletionRunner = {
   /** Whether a web-ready conversion applies to an artifact of this kind: `webReady` is on and it's a video. */
   converts(kind: UploadKind): boolean;
   /**
+   * How far this process's conversion of an artifact's upload (its `generation`) has got (0–1),
+   * while one runs; `undefined` while it waits for a slot, before it starts, or when it isn't this
+   * process converting it — or the conversion is of an earlier upload of the same id.
+   */
+  progressOf(artifactId: string, generation: string | null | undefined): number | undefined;
+  /**
    * Make a poster for a finished video stored before posters were made (or whose first try
-   * failed), in the conversion queue: once per video per process, a no-op when it has a
+   * failed), in the light lane of the conversion queue: once per video per process, a no-op when it has a
    * thumbnail or `webReady.poster` is off. Never rejects. For the poster route's miss.
    */
   posterFor(artifactId: string): void;
@@ -222,6 +233,13 @@ function contextFor(
   };
 }
 
+/**
+ * Jobs that never re-encode video run in a lane of their own, this many at once: checking a file,
+ * a lossless remux, an audio-only conversion, a poster frame. Each takes a second or two, so a
+ * Pulse upload is settled while a long re-encode runs in the other lane.
+ */
+const LIGHT_CONCURRENCY = 2;
+
 /** A bounded set of concurrent jobs: `run` waits for a slot, `drain` waits for every job. */
 function createQueue(concurrency: number) {
   let active = 0;
@@ -271,11 +289,17 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       : {}
     : undefined;
   const completeAfter = webReady?.completeAfter === true;
-  const queue = createQueue(webReady?.concurrency ?? 1);
+  // Two lanes: video re-encodes (`concurrency` at once) and everything else.
+  const heavy = createQueue(webReady?.concurrency ?? 1);
+  const light = createQueue(LIGHT_CONCURRENCY);
   const replayEvery =
     opts.replay === false ? null : (opts.replay?.intervalSeconds ?? DEFAULT_REPLAY_INTERVAL_SECONDS) * 1000;
 
   const converts = (kind: UploadKind): boolean => webReady !== undefined && kind === 'video';
+
+  /** How far each running conversion has got, by artifact and upload, for the status route. Display only, never state. */
+  const progress = new Map<string, number>();
+  const progressKey = (artifactId: string, generation: string | null | undefined) => `${artifactId}:${generation ?? ''}`;
 
   const postersOn =
     webReady !== undefined &&
@@ -366,7 +390,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     if (!postersOn || posterTried.has(artifactId)) return;
     if (posterTried.size >= POSTER_TRIED_LIMIT) posterTried.clear();
     posterTried.add(artifactId);
-    void queue.run(async () => {
+    void light.run(async () => {
       let outcome: 'done' | 'retry' = 'retry';
       try {
         const meta = await describe(artifactId);
@@ -442,7 +466,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     generation: string | null | undefined,
   ): Promise<WebReadyResult | undefined> =>
     new Promise((resolve) => {
-      void queue.run(async () => {
+      const job = async (): Promise<void> => {
         try {
           // What was read before this job waited for its slot may be stale: the artifact may
           // have been removed — and its id reserved again by another upload, which isn't this
@@ -466,7 +490,23 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
               ? { action: 'skipped' as const, reason: 'no local path for this artifact', outputPath: undefined }
               : !fresh.generation
                 ? { action: 'skipped' as const, reason: 'the storage adapter keeps no generation for this upload', outputPath: undefined }
-                : await ensureWebReady(localPath, { ...webReady, logger, install: false });
+                : await (async () => {
+                    const key = progressKey(ctx.artifactId, fresh.generation);
+                    progress.set(key, 0);
+                    try {
+                      return await ensureWebReady(localPath, {
+                        ...webReady,
+                        logger,
+                        install: false,
+                        onProgress: (fraction) => {
+                          progress.set(key, fraction);
+                          webReady?.onProgress?.(fraction);
+                        },
+                      });
+                    } finally {
+                      progress.delete(key);
+                    }
+                  })();
           const expected = generation !== undefined ? generation : (fresh.generation ?? null);
           const localExt = typeof localPath === 'string' ? path.extname(localPath).toLowerCase() : '';
           const storedExt = localExt && localExt !== fresh.ext ? localExt : undefined;
@@ -502,6 +542,21 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
           logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault web-ready conversion failed');
           resolve(undefined);
         }
+      };
+      // Routed in the light lane: a video re-encode moves to the heavy lane, anything else runs
+      // here. A file that can't be looked at runs here too, and the job skips it at once.
+      void light.run(async () => {
+        // A check that can't finish counts as a re-encode: the job's own look might find one, and
+        // a re-encode never runs outside the `concurrency` slots.
+        let reencode = true;
+        try {
+          const localPath = await (storage as LocalPathStorage).getLocalPath?.(ctx.artifactId);
+          reencode = typeof localPath === 'string' && (await needsVideoReencode(localPath, { ...webReady, logger }));
+        } catch (err) {
+          logger.error({ err, artifactId: ctx.artifactId }, 'pulsevault could not check a video before converting it');
+        }
+        if (reencode) void heavy.run(job);
+        else await job();
       });
     });
 
@@ -654,6 +709,7 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
     complete,
     replay,
     converts,
+    progressOf: (artifactId: string, generation: string | null | undefined) => progress.get(progressKey(artifactId, generation)),
     posterFor,
     start: () => {
       if (timer || stopped) return;
@@ -664,7 +720,9 @@ export function createCompletionRunner(opts: CompletionRunnerOptions): Completio
       if (timer) clearTimeout(timer);
       timer = null;
       await replaying?.catch(() => []);
-      await queue.drain();
+      // A job routed from the light lane lands in the heavy one, so the light lane drains first.
+      await light.drain();
+      await heavy.drain();
       await Promise.allSettled([...settling.values(), ...posterRuns.values()]);
     },
   };
