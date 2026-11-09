@@ -8,6 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildUploadLink, PULSE_OPEN_URL } from "../dist/lib/deeplinks.js";
+import { issueCapabilityToken } from "../dist/lib/capability-token.js";
 
 const ARTIFACT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -120,4 +121,98 @@ test("rejects an unknown form", () => {
   for (const form of ["http", "HTTPS", "", null]) {
     assert.throws(() => buildUploadLink({ ...HTTPS_OPTS, form }), /`form` must be/, `expected ${form} to throw`);
   }
+});
+
+// ---------- link hints (protocol 2.7, PROTOCOL.md §3.1) ----------
+
+const SERVER = "https://vault.example.org/pulsevault";
+const paramsOf = (link) => Object.fromEntries(new URLSearchParams(link.slice(link.search(/[?#]/) + 1)));
+const tokenFor = (ref) => issueCapabilityToken(ARTIFACT_ID, "secret", { keyId: "k1", issuer: "vault", ...(ref ? { ref } : {}) });
+const T = tokenFor("u1:ticket:t1");
+const HINTED = { server: SERVER, artifactId: ARTIFACT_ID, token: T, ref: "u1:ticket:t1" };
+
+test("a link without hints is byte for byte the link it always was", () => {
+  assert.equal(
+    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t" }),
+    `pulsecam://?v=1&artifactId=${ARTIFACT_ID}&server=https%3A%2F%2Fvault.example.org%2Fpulsevault&token=t`,
+  );
+  assert.equal(
+    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, form: "https" }),
+    `${PULSE_OPEN_URL}#v=1&artifactId=${ARTIFACT_ID}&server=https%3A%2F%2Fvault.example.org%2Fpulsevault`,
+  );
+  // Hints that are undefined or blank add nothing either.
+  assert.equal(
+    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t", ref: undefined, label: "  ", name: "", app: undefined, returnUrl: undefined }),
+    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t" }),
+  );
+});
+
+test("hints follow the v1 params in a fixed order, in both forms", () => {
+  const opts = {
+    ...HINTED,
+    label: "Fix the login page",
+    name: "Login fix walkthrough",
+    app: "TimeHuddle",
+    returnUrl: "https://app.example.org/tickets/t1?tab=video",
+  };
+  const expected = [
+    ["v", "1"],
+    ["artifactId", ARTIFACT_ID],
+    ["server", SERVER],
+    ["token", T],
+    ["ref", "u1:ticket:t1"],
+    ["label", "Fix the login page"],
+    ["name", "Login fix walkthrough"],
+    ["app", "TimeHuddle"],
+    ["return", "https://app.example.org/tickets/t1?tab=video"],
+  ];
+  assert.deepEqual(Object.entries(paramsOf(buildUploadLink(opts))), expected);
+  assert.deepEqual(Object.entries(paramsOf(buildUploadLink({ ...opts, form: "https" }))), expected);
+});
+
+test("label, name and app are trimmed and capped at 60, 80 and 30 characters; blank ones are dropped", () => {
+  const params = paramsOf(
+    buildUploadLink({ ...HINTED, label: ` ${"L".repeat(80)} `, name: ` ${"N".repeat(100)} `, app: "A".repeat(40) }),
+  );
+  assert.equal(params.label, "L".repeat(60));
+  assert.equal(params.name, "N".repeat(80));
+  assert.equal(params.app, "A".repeat(30));
+  // Capped by code point: an emoji at the boundary is kept whole or not at all.
+  assert.equal(paramsOf(buildUploadLink({ ...HINTED, app: `${"A".repeat(29)}😀😀` })).app, `${"A".repeat(29)}😀`);
+  const blank = paramsOf(buildUploadLink({ ...HINTED, label: "   ", name: "", app: " " }));
+  assert.deepEqual(Object.keys(blank), ["v", "artifactId", "server", "token", "ref"]);
+});
+
+test("the display hints need no ref: they are unsigned and stand alone", () => {
+  const params = paramsOf(buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "opaque", name: "Huddle update", app: "TimeHuddle" }));
+  assert.equal(params.name, "Huddle update");
+  assert.equal(params.app, "TimeHuddle");
+  assert.equal("ref" in params, false);
+});
+
+test("the link's ref must be the ref signed into its token", () => {
+  const bound = /`ref` must be the `ref` signed into `token`/;
+  assert.ok(buildUploadLink(HINTED));
+  // Another place's token, a token with no ref, an opaque token, no token at all.
+  assert.throws(() => buildUploadLink({ ...HINTED, token: tokenFor("u2:ticket:t1") }), bound);
+  assert.throws(() => buildUploadLink({ ...HINTED, token: tokenFor() }), bound);
+  assert.throws(() => buildUploadLink({ ...HINTED, token: "opaque" }), bound);
+  assert.throws(() => buildUploadLink({ ...HINTED, token: "bnVsbA.sig" }), bound);
+  assert.throws(() => buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, ref: "u1:ticket:t1" }), bound);
+  // A token may carry a ref the link doesn't mention.
+  assert.equal("ref" in paramsOf(buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: T })), false);
+});
+
+test("ref is 1 to 200 characters", () => {
+  assert.throws(() => buildUploadLink({ ...HINTED, ref: "" }), /`ref` must be 1 to 200 characters/);
+  assert.throws(() => buildUploadLink({ ...HINTED, ref: "x".repeat(201) }), /`ref` must be 1 to 200 characters/);
+  const long = "x".repeat(200);
+  assert.equal(paramsOf(buildUploadLink({ ...HINTED, token: tokenFor(long), ref: long })).ref, long);
+});
+
+test("returnUrl is held to the server's rule: https, or http to localhost or a private IP", () => {
+  assert.throws(() => buildUploadLink({ ...HINTED, returnUrl: "http://evil.example.com/" }), /`returnUrl` must be https/);
+  assert.throws(() => buildUploadLink({ ...HINTED, returnUrl: "javascript:alert(1)" }), /`returnUrl` must be https/);
+  assert.throws(() => buildUploadLink({ ...HINTED, returnUrl: "not a url" }), /`returnUrl` is not a valid URL/);
+  assert.equal(paramsOf(buildUploadLink({ ...HINTED, returnUrl: "http://localhost:3000/x" })).return, "http://localhost:3000/x");
 });
