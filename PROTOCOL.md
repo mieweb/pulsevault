@@ -3,7 +3,7 @@
 <!-- BEGIN GENERATED: protocol-version (from package.json pulseProtocol — edit that, then run `npm run protocol`) -->
 | | |
 |---|---|
-| Spec revision | `2.6` |
+| Spec revision | `2.7` |
 | Protocol majors accepted | 2 |
 <!-- END GENERATED: protocol-version -->
 
@@ -121,6 +121,38 @@ A client SHOULD display the server's origin (and, where feasible, its TLS
 certificate fingerprint) to the user before uploading anything, rather than
 silently proceeding — this is a trust-on-first-use decision the user should
 be able to see and decline.
+
+### 3.1 Link hints (optional, protocol 2.7)
+
+A link is one upload. It MAY also say which place in the host that upload is
+for and what to call it, so the client can open its recorder on that place's
+draft instead of an empty one. All five parameters are optional, and a client
+that predates them ignores them:
+
+- `ref` (1–200 characters): the host's opaque key for the **place** this
+  upload goes to — a ticket, a team's update, a library. A host MUST use a
+  different `ref` for every owner and place. A client matches drafts and
+  destinations on `server` + `ref`, so a newer link to the same place replaces
+  the older one's.
+- `label` (≤ 60 characters): what to call the place, e.g. a ticket's title.
+- `name` (≤ 80 characters): what to name a new recording made from this link,
+  e.g. "Huddle update". Absent, the recording starts unnamed.
+- `app` (≤ 30 characters): the host app's name, shown with `label`.
+- `return`: a page in the host to go back to after the upload, held to the
+  same `https://` rule as `server`; a client MUST ignore one that isn't.
+
+**`ref` is bound to the token.** A client MUST act on a link's `ref` only when
+it equals the `ref` claim of the link's `token` (§5.4) — decoding the claims,
+since it can't verify the signature — and MUST refuse the link as invalid when
+they differ, or when the token has no readable `ref` claim. Otherwise anyone
+could build a link that points someone's place, and the draft recorded for it,
+at an upload of their own. The server doesn't check `ref`; it only signs it.
+
+`label`, `name`, `app` and `return` are **not signed**: they are display hints
+from whoever built the link, and a client MUST NOT treat them as coming from
+the server, nor let them change where anything is uploaded. A client SHOULD
+trim them and cap them at the lengths above. A link without `ref` is handled
+exactly as before these parameters existed.
 
 ## 4. Upload transport (TUS)
 
@@ -268,6 +300,12 @@ A token MAY also carry an opaque `ctx` claim (protocol 2.3): host data signed
 with the rest — who the upload is for, where it goes — that the server stores
 with the artifact the token creates and hands back to its own hooks, so the
 host needs no table keyed by artifactId. A client never reads it.
+
+A token MAY carry a `ref` claim (protocol 2.7): the host's key for the place
+the upload goes to, a string of 1–200 characters. It is the one claim a client
+reads: a link's `ref` counts only when it equals this one (§3.1). A server
+that issues links with a `ref` MUST sign the same value into the token, in a
+token of this `base64url(JSON claims).signature` form.
 
 When a token names a pulse's video, a server SHOULD hold the token to the
 shape of a pulse (§8): the video only under the token's own `artifactId`, with
@@ -450,6 +488,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.4 | Added the `https://mieweb.github.io/pulse/open#…` pairing link form (§3), with the parameters in the fragment. |
 | 2.5 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
 | 2.6 | Added `progress` to the status response (§6.5): how far a running conversion has got. |
+| 2.7 | Added link hints (§3.1): the optional pairing link parameters `ref`, `label`, `name`, `app` and `return`, and the capability token's `ref` claim (§5.4) that a link's `ref` is held to. |
 
 ## 8. Artifact relationships (`relatedTo`)
 
