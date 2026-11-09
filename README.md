@@ -674,7 +674,7 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. With [`pulseShape`](#pulseshape) (the default, on both the plugin and `createCapabilityAuthorize`), a create is held to that shape: the video only under the token's own `artifactId`, with no `relatedTo`; the rest only under other ids, `relatedTo` it. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`ctx`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. With [`pulseShape`](#pulseshape) (the default, on both the plugin and `createCapabilityAuthorize`), a create is held to that shape: the video only under the token's own `artifactId`, with no `relatedTo`; the rest only under other ids, `relatedTo` it. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`ref`/`ctx`) and rationale.
 
 **Context.** The token can carry the host's own data about the upload — who it's for, where it goes — signed with the rest, so whoever holds the token can't change it:
 
@@ -687,6 +687,8 @@ const token = issueCapabilityToken(artifactId, keys["2026-06"], {
 ```
 
 `createCapabilityAuthorize` returns it from the `create` phase, PulseVault stores it with the artifact (and with every file uploaded `relatedTo` it under the same token), and every later `authorize`, `onUploadComplete` (`ctx.context`, on replays too), `getStatus` and `getPulse` get it back. Most hosts then keep no table keyed by artifactId, and "is this the person who uploaded it?" is a comparison, not a lookup.
+
+**Ref.** `ref` signs your key for the *place* the upload goes to (1–200 characters, one per owner and place), for [link hints](#link-hints). PulseVault doesn't check it and `verifyCapabilityToken` returns it; unlike `context`, Pulse reads it, so keep it an opaque key.
 
 ## Upload-Metadata protocol
 
@@ -979,6 +981,28 @@ const httpsLink = buildUploadLink({
 ```
 
 The `https` form is what a phone camera opens: Pulse opens straight from it when installed, and its page sends the person to the store when not. The parameters are after `#`, which browsers never send, so the link host never sees the token. Pulse releases from before the link host was claimed land on the page instead and open Pulse from its button, so `pulsecam://` stays the default.
+
+### Link hints
+
+A link is one upload. It can also tell Pulse which place in your app that upload is for and what to call it (protocol 2.7, `PROTOCOL.md` §3.1), so Pulse opens the recorder on that place's draft — and a second link to the same place picks the same draft up again:
+
+```ts
+const ref = `${user.id}:ticket:${ticket.id}`; // your key for the place: one per owner and place
+const token = issueCapabilityToken(artifactId, secret, { keyId, issuer, ref, context });
+buildUploadLink({
+  server,
+  artifactId,
+  token,
+  ref, // must be the ref signed into the token
+  label: ticket.title, // the place's name in Pulse (trimmed to 60 characters)
+  name: "Login fix walkthrough", // names a new recording made from this link (80)
+  app: "TimeHuddle", // shown with the label (30)
+  returnUrl: "https://app.example.org/tickets/42", // "Back to TimeHuddle" after the upload
+});
+// pulsecam://?v=1&artifactId=…&server=…&token=…&ref=…&label=…&name=…&app=…&return=…
+```
+
+All five are optional, blank ones are left out, and a link without any is exactly the link above. `ref` is bound to the token: `buildUploadLink` throws unless it is the `ref` the token was issued with, and Pulse refuses a link where they differ, so nobody can point someone's place at an upload of their own. `label`, `name`, `app` and `returnUrl` are unsigned display hints; `returnUrl` follows `server`'s `https://` rule. An older Pulse ignores all of them and uploads as before.
 
 ## Pulse logo and store badges
 
