@@ -27,6 +27,68 @@ test("issue + verify round-trips the artifactId", () => {
   assert.deepEqual(result, { artifactId: ARTIFACT_ID });
 });
 
+const claimsOf = (token) => JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
+
+test("ref round-trips as a signed claim, beside context; a token without one is unchanged", (t) => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "u1:ticket:42", context: { userId: "u1" } });
+  assert.equal(claimsOf(token).ref, "u1:ticket:42");
+  assert.deepEqual(verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }), {
+    artifactId: ARTIFACT_ID,
+    ref: "u1:ticket:42",
+    context: { userId: "u1" },
+  });
+
+  // No `ref`, no claim: the token is byte for byte what it was before the option existed.
+  t.mock.timers.enable({ apis: ["Date"], now: 1_790_000_000_000 });
+  const plain = issueCapabilityToken(ARTIFACT_ID, SECRET, opts);
+  const payload = Buffer.from(
+    JSON.stringify({ artifactId: ARTIFACT_ID, iat: 1_790_000_000, exp: 1_790_001_800, kid: "k1", issuer: ISSUER }),
+  ).toString("base64url");
+  assert.equal(plain, `${payload}.${createHmac("sha256", SECRET).update(payload).digest("base64url")}`);
+  assert.equal("ref" in verifyCapabilityToken(plain, lookupSecret, { issuer: ISSUER }), false);
+});
+
+test("ref is signed: changing, adding or dropping it breaks the token", () => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  const withRef = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "u1:ticket:42" });
+  const without = issueCapabilityToken(ARTIFACT_ID, SECRET, opts);
+  const resigned = (token, change) => {
+    const payload = Buffer.from(JSON.stringify(change(claimsOf(token)))).toString("base64url");
+    return `${payload}.${token.split(".")[1]}`;
+  };
+  for (const forged of [
+    resigned(withRef, (c) => ({ ...c, ref: "u2:ticket:42" })),
+    resigned(withRef, ({ ref: _ref, ...rest }) => rest),
+    resigned(without, (c) => ({ ...c, ref: "u1:ticket:42" })),
+  ]) {
+    assert.equal(verifyCapabilityToken(forged, lookupSecret, { issuer: ISSUER }), null);
+  }
+});
+
+test("ref must be a string of 1 to 200 characters, at issue and at verify", () => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  for (const ref of ["", "x".repeat(201), 42, null, { place: "t1" }]) {
+    assert.throws(() => issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref }), /`ref` must be/, String(ref));
+    // The same claim in a correctly signed token (minted elsewhere with the secret) is malformed.
+    const claims = { ...claimsOf(issueCapabilityToken(ARTIFACT_ID, SECRET, opts)), ref };
+    const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+    const signed = `${payload}.${createHmac("sha256", SECRET).update(payload).digest("base64url")}`;
+    assert.equal(verifyCapabilityToken(signed, lookupSecret, { issuer: ISSUER }), null, String(ref));
+  }
+  assert.ok(issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "x".repeat(200) }));
+});
+
+test("createCapabilityAuthorize treats a token with a ref like any other: the server doesn't check it", async () => {
+  const authorize = createCapabilityAuthorize(lookupSecret, { issuer: ISSUER });
+  const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, ref: "u1:ticket:42", context: { userId: "u1" } });
+  const result = await authorize(
+    { headers: { authorization: `Bearer ${token}` } },
+    { artifactId: ARTIFACT_ID, kind: "video", phase: "create" },
+  );
+  assert.deepEqual(result, { context: { userId: "u1" } });
+});
+
 test("rejects a token with a tampered signature", () => {
   const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER });
   const [payload] = token.split(".");

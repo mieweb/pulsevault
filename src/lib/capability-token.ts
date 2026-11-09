@@ -28,6 +28,12 @@ export type CapabilityTokenClaims = {
    */
   use?: 'view';
   /**
+   * The host's key for the place this upload goes to (`issueCapabilityToken`'s `ref`), signed so
+   * the `ref` in a pairing link can be held to it (PROTOCOL.md §3.1). The server itself never
+   * checks it.
+   */
+  ref?: string;
+  /**
    * Opaque host data (`issueCapabilityToken`'s `context`): who the upload is for, where it goes.
    * Signed with the rest, so it can't be changed by whoever holds the token; stored with the
    * artifact at create and handed back to every hook. JSON, at most `MAX_CONTEXT_BYTES` encoded.
@@ -42,6 +48,11 @@ const DEFAULT_CLOCK_TOLERANCE_SECONDS = 30;
  * `Authorization` header, so a context is an owner and a destination, not a record.
  */
 export const MAX_CONTEXT_BYTES = 1024;
+/** Cap on the `ref` claim: it rides in the token and again in the link, and is a key, not a record. */
+export const MAX_REF_LENGTH = 200;
+
+const isRef = (value: unknown): value is string =>
+  typeof value === 'string' && value !== '' && value.length <= MAX_REF_LENGTH;
 
 /** `JSON.stringify` a context, refusing anything that isn't plain JSON or is too large. */
 function encodeContext(context: unknown): string {
@@ -103,6 +114,13 @@ export type IssueCapabilityTokenOptions = {
    * `getPulse`, so most hosts need no lookup table of their own. JSON, at most 1 KiB encoded.
    */
   context?: unknown;
+  /**
+   * The host's key for the place this upload goes to (`ref` claim), e.g. `"u1:ticket:42"` —
+   * one per owner and place, 1–200 characters. Pass the same value to `buildUploadLink`: a
+   * client acts on a link's `ref` only when it is the one signed here, so nobody can point
+   * someone's place at another upload. Readable by whoever holds the token; not a secret.
+   */
+  ref?: string;
 };
 
 /**
@@ -118,6 +136,11 @@ export function issueCapabilityToken(
   secret: string,
   opts: IssueCapabilityTokenOptions,
 ): string {
+  if (opts.ref !== undefined && !isRef(opts.ref)) {
+    throw new TypeError(
+      `issueCapabilityToken: \`ref\` must be a non-empty string of at most ${MAX_REF_LENGTH} characters`,
+    );
+  }
   const now = Math.floor(Date.now() / 1000);
   const claims: CapabilityTokenClaims = {
     artifactId,
@@ -125,6 +148,7 @@ export function issueCapabilityToken(
     exp: now + (opts.expirySeconds ?? DEFAULT_EXPIRY_SECONDS),
     kid: opts.keyId,
     issuer: opts.issuer,
+    ...(opts.ref !== undefined ? { ref: opts.ref } : {}),
     // Round-tripped through JSON so the claim is exactly what a verifier will read back.
     ...(opts.context !== undefined ? { ctx: JSON.parse(encodeContext(opts.context)) } : {}),
   };
@@ -192,7 +216,7 @@ function verifyToken(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
   use: 'upload' | 'view',
-): { artifactId: string; exp: number; context?: unknown } | null {
+): { artifactId: string; exp: number; ref?: string; context?: unknown } | null {
   const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
@@ -232,6 +256,7 @@ function verifyToken(
   if (claims.iat > now + tolerance) return null;
   if (claims.exp < now - tolerance) return null;
   if (claims.issuer !== opts.issuer) return null;
+  if (claims.ref !== undefined && !isRef(claims.ref)) return null;
   // The signature already covers `ctx`; the size cap is enforced on the way in, and checked
   // again here so a token minted elsewhere with the same secret can't carry a huge context.
   if (claims.ctx !== undefined) {
@@ -245,13 +270,14 @@ function verifyToken(
   return {
     artifactId: claims.artifactId,
     exp: claims.exp,
+    ...(claims.ref !== undefined ? { ref: claims.ref } : {}),
     ...(claims.ctx !== undefined ? { context: claims.ctx } : {}),
   };
 }
 
 /**
  * Verify a token minted by `issueCapabilityToken`. Returns the authorized
- * `artifactId` on success, or `null` for any failure (malformed token,
+ * `artifactId` (with the token's `ref` and `context`, when it has them) on success, or `null` for any failure (malformed token,
  * unknown `kid`, bad signature, expired, issued too far in the future,
  * issuer mismatch, or a view token) — deliberately collapsed to one failure
  * shape so callers can't accidentally branch on *why* a token failed and leak
@@ -261,11 +287,12 @@ export function verifyCapabilityToken(
   token: string,
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
-): { artifactId: string; context?: unknown } | null {
+): { artifactId: string; ref?: string; context?: unknown } | null {
   const verified = verifyToken(token, lookupSecret, opts, 'upload');
   if (!verified) return null;
   return {
     artifactId: verified.artifactId,
+    ...(verified.ref !== undefined ? { ref: verified.ref } : {}),
     ...(verified.context !== undefined ? { context: verified.context } : {}),
   };
 }
