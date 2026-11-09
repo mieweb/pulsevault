@@ -28,9 +28,9 @@ export type CapabilityTokenClaims = {
    */
   use?: 'view';
   /**
-   * The host's key for the place this upload goes to (`issueCapabilityToken`'s `ref`), signed so
-   * the `ref` in a pairing link can be held to it (PROTOCOL.md §3.1). The server itself never
-   * checks it.
+   * The host's key for the place this upload goes to (`issueCapabilityToken`'s `ref`). A client
+   * reads it from the token of a pairing link (PROTOCOL.md §3.1), so it is signed and nowhere
+   * else in the link. The server itself never checks it.
    */
   ref?: string;
   /**
@@ -48,8 +48,8 @@ const DEFAULT_CLOCK_TOLERANCE_SECONDS = 30;
  * `Authorization` header, so a context is an owner and a destination, not a record.
  */
 export const MAX_CONTEXT_BYTES = 1024;
-/** Cap on the `ref` claim: it rides in the token and again in the link, and is a key, not a record. */
-export const MAX_REF_LENGTH = 200;
+/** Cap on the `ref` claim: it rides in the token of every link, and is a key, not a record. */
+const MAX_REF_LENGTH = 200;
 
 const isRef = (value: unknown): value is string =>
   typeof value === 'string' && value !== '' && value.length <= MAX_REF_LENGTH;
@@ -116,8 +116,8 @@ export type IssueCapabilityTokenOptions = {
   context?: unknown;
   /**
    * The host's key for the place this upload goes to (`ref` claim), e.g. `"u1:ticket:42"` —
-   * one per owner and place, 1–200 characters. Pass the same value to `buildUploadLink`: a
-   * client acts on a link's `ref` only when it is the one signed here, so nobody can point
+   * one per owner and place, 1–200 characters. Pulse reads it from the token of a pairing link
+   * and opens the recorder on that place's draft; it travels nowhere else, so nobody can point
    * someone's place at another upload. Readable by whoever holds the token; not a secret.
    */
   ref?: string;

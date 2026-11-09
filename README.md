@@ -688,7 +688,7 @@ const token = issueCapabilityToken(artifactId, keys["2026-06"], {
 
 `createCapabilityAuthorize` returns it from the `create` phase, PulseVault stores it with the artifact (and with every file uploaded `relatedTo` it under the same token), and every later `authorize`, `onUploadComplete` (`ctx.context`, on replays too), `getStatus` and `getPulse` get it back. Most hosts then keep no table keyed by artifactId, and "is this the person who uploaded it?" is a comparison, not a lookup.
 
-**Ref.** `ref` signs your key for the *place* the upload goes to (1–200 characters, one per owner and place), for [link hints](#link-hints). PulseVault doesn't check it and `verifyCapabilityToken` returns it; unlike `context`, Pulse reads it, so keep it an opaque key.
+**Ref.** `ref` signs your key for the *place* the upload goes to (1–200 characters, one per owner and place), for [link hints](#link-hints). PulseVault doesn't check it and `verifyCapabilityToken` returns it; unlike `context`, Pulse reads it — straight from the token, so it isn't a link parameter — so keep it an opaque key.
 
 ## Upload-Metadata protocol
 
@@ -992,17 +992,16 @@ const token = issueCapabilityToken(artifactId, secret, { keyId, issuer, ref, con
 buildUploadLink({
   server,
   artifactId,
-  token,
-  ref, // must be the ref signed into the token
+  token, // carries the place: Pulse reads `ref` from its claims
   label: ticket.title, // the place's name in Pulse (trimmed to 60 characters)
   name: "Login fix walkthrough", // names a new recording made from this link (80)
   app: "TimeHuddle", // shown with the label (30)
   returnUrl: "https://app.example.org/tickets/42", // "Back to TimeHuddle" after the upload
 });
-// pulsecam://?v=1&artifactId=…&server=…&token=…&ref=…&label=…&name=…&app=…&return=…
+// pulsecam://?v=1&artifactId=…&server=…&token=…&label=…&name=…&app=…&return=…
 ```
 
-All five are optional, blank ones are left out, and a link without any is exactly the link above. `ref` is bound to the token: `buildUploadLink` throws unless it is the `ref` the token was issued with, and Pulse refuses a link where they differ, so nobody can point someone's place at an upload of their own. `label`, `name`, `app` and `returnUrl` are unsigned display hints; `returnUrl` follows `server`'s `https://` rule. An older Pulse ignores all of them and uploads as before.
+The place's key is only the `ref` signed into the token: there is no `ref` link parameter, so a link can't name one place and upload to another, and a token without the claim makes a plain link. `label`, `name`, `app` and `returnUrl` are optional, unsigned display hints; blank ones are left out, `returnUrl` follows `server`'s `https://` rule, and a link without any is exactly the link above. Leave `app` and `returnUrl` off a link shown as a QR code — it is scanned from another screen, so there is no page to go back to, and a shorter link is an easier code. An older Pulse ignores all of it and uploads as before.
 
 ## Pulse logo and store badges
 

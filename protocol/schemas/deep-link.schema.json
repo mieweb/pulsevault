@@ -25,16 +25,10 @@
       "type": "string",
       "description": "Optional credential the client sends as `Authorization: Bearer`. Typically a capability token (capability-token.schema.json)."
     },
-    "ref": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 200,
-      "description": "Optional (protocol 2.7, §3.1): the host's opaque key for the place this upload goes to, one per owner and place. A client matches drafts and destinations on `server` + `ref`, and acts on it only when it equals the `ref` claim of `token`; otherwise it refuses the link."
-    },
     "label": {
       "type": "string",
       "maxLength": 60,
-      "description": "Optional (protocol 2.7): what the client calls the place, e.g. a ticket's title. Unsigned: a display hint."
+      "description": "Optional (protocol 2.7, §3.1): what the client calls the place this upload goes to, e.g. a ticket's title. Unsigned: a display hint. The place's key is the `ref` claim of `token`."
     },
     "name": {
       "type": "string",

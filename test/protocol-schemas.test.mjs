@@ -79,23 +79,21 @@ test("buildUploadLink's params match deep-link.schema.json", () => {
 
 test("a link with hints matches deep-link.schema.json, and its token's ref claim the token schema", () => {
   const artifactId = randomUUID();
-  const ref = "u1:ticket:42";
-  const token = issueCapabilityToken(artifactId, "secret", { keyId: "k1", issuer: "vault", ref });
+  const token = issueCapabilityToken(artifactId, "secret", { keyId: "k1", issuer: "vault", ref: "u1:ticket:42" });
   const link = buildUploadLink({
     server: "https://vault.example.org/pulsevault",
     artifactId,
     token,
-    ref,
     label: "Fix the login page",
     name: "Login fix",
     app: "TimeHuddle",
     returnUrl: "https://app.example.org/tickets/42",
   });
   const params = Object.fromEntries(new URL(link.replace("pulsecam://", "http://x/")).searchParams);
-  assert.equal(Object.keys(params).length, 9);
+  assert.equal(Object.keys(params).length, 8);
   assertValid("deep-link", params);
-  const claims = JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
-  assert.equal(claims.ref, params.ref);
+  const claims = JSON.parse(Buffer.from(params.token.split(".")[0], "base64url").toString("utf8"));
+  assert.equal(claims.ref, "u1:ticket:42");
   assertValid("capability-token", claims);
 });
 

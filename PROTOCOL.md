@@ -126,14 +126,21 @@ be able to see and decline.
 
 A link is one upload. It MAY also say which place in the host that upload is
 for and what to call it, so the client can open its recorder on that place's
-draft instead of an empty one. All five parameters are optional, and a client
-that predates them ignores them:
+draft instead of an empty one. A client that predates this ignores all of it.
 
-- `ref` (1–200 characters): the host's opaque key for the **place** this
-  upload goes to — a ticket, a team's update, a library. A host MUST use a
-  different `ref` for every owner and place. A client matches drafts and
-  destinations on `server` + `ref`, so a newer link to the same place replaces
-  the older one's.
+**The place is in the token, not the link.** The host's opaque key for the
+place — a ticket, a team's update, a library — is the `ref` claim of the
+link's `token` (§5.4), and nowhere else: there is no `ref` parameter. A
+client reads it by decoding the token's claims, as it reads `exp`, and matches
+drafts and destinations on `server` + `ref`, so a newer link to the same place
+replaces the older one's. Because the key is signed with the token, nobody can
+build a link that points someone's place, and the draft recorded for it, at an
+upload of their own. A host MUST use a different `ref` for every owner and
+place. A link whose token has no readable `ref` claim — an older server, an
+opaque token, no token — is a plain link, handled exactly as before.
+
+Four optional parameters say what to call things:
+
 - `label` (≤ 60 characters): what to call the place, e.g. a ticket's title.
 - `name` (≤ 80 characters): what to name a new recording made from this link,
   e.g. "Huddle update". Absent, the recording starts unnamed.
@@ -141,18 +148,11 @@ that predates them ignores them:
 - `return`: a page in the host to go back to after the upload, held to the
   same `https://` rule as `server`; a client MUST ignore one that isn't.
 
-**`ref` is bound to the token.** A client MUST act on a link's `ref` only when
-it equals the `ref` claim of the link's `token` (§5.4) — decoding the claims,
-since it can't verify the signature — and MUST refuse the link as invalid when
-they differ, or when the token has no readable `ref` claim. Otherwise anyone
-could build a link that points someone's place, and the draft recorded for it,
-at an upload of their own. The server doesn't check `ref`; it only signs it.
-
-`label`, `name`, `app` and `return` are **not signed**: they are display hints
-from whoever built the link, and a client MUST NOT treat them as coming from
-the server, nor let them change where anything is uploaded. A client SHOULD
-trim them and cap them at the lengths above. A link without `ref` is handled
-exactly as before these parameters existed.
+They are **not signed**: display hints from whoever built the link. A client
+MUST NOT treat them as coming from the server, nor let them change where
+anything is uploaded, and SHOULD trim them and cap them at the lengths above.
+A link read from a QR code is opened on another device than the page that
+shows it, so a host SHOULD leave `app` and `return` off it and keep it short.
 
 ## 4. Upload transport (TUS)
 
@@ -302,10 +302,10 @@ with the artifact the token creates and hands back to its own hooks, so the
 host needs no table keyed by artifactId. A client never reads it.
 
 A token MAY carry a `ref` claim (protocol 2.7): the host's key for the place
-the upload goes to, a string of 1–200 characters. It is the one claim a client
-reads: a link's `ref` counts only when it equals this one (§3.1). A server
-that issues links with a `ref` MUST sign the same value into the token, in a
-token of this `base64url(JSON claims).signature` form.
+the upload goes to, a string of 1–200 characters. Besides `exp` it is the one
+claim a client reads (§3.1), so a server that wants its links to open on a
+place's draft MUST issue tokens of this `base64url(JSON claims).signature`
+form with the claims as JSON. The server itself doesn't check `ref`.
 
 When a token names a pulse's video, a server SHOULD hold the token to the
 shape of a pulse (§8): the video only under the token's own `artifactId`, with
@@ -488,7 +488,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.4 | Added the `https://mieweb.github.io/pulse/open#…` pairing link form (§3), with the parameters in the fragment. |
 | 2.5 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
 | 2.6 | Added `progress` to the status response (§6.5): how far a running conversion has got. |
-| 2.7 | Added link hints (§3.1): the optional pairing link parameters `ref`, `label`, `name`, `app` and `return`, and the capability token's `ref` claim (§5.4) that a link's `ref` is held to. |
+| 2.7 | Added link hints (§3.1): the capability token's `ref` claim (§5.4), which a client reads to know the place an upload is for, and the optional pairing link parameters `label`, `name`, `app` and `return`. |
 
 ## 8. Artifact relationships (`relatedTo`)
 

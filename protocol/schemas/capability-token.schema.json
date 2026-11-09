@@ -36,7 +36,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "description": "The host's key for the place this upload goes to (protocol 2.7), one per owner and place. A client acts on a pairing link's `ref` only when it equals this claim (§3.1). The server doesn't check it."
+      "description": "The host's key for the place this upload goes to (protocol 2.7), one per owner and place. The one claim a client reads besides `exp`: it matches drafts and destinations on the link's `server` and this (§3.1). The server doesn't check it."
     },
     "ctx": {
       "description": "Opaque host data signed into the token (protocol 2.3): who the upload is for, where it goes. The server stores it with the artifact the token creates and hands it back to its own hooks; a client never reads it. Any JSON, at most 1 KiB encoded."
