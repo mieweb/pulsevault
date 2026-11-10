@@ -73,8 +73,8 @@ A server presents a pairing link or QR code in one of two equivalent forms
 (since 2.4), carrying the same parameters:
 
 ```
-pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
-https://mieweb.github.io/pulse/open#v=1&artifactId=<uuid>&server=<origin>&token=<opaque>
+pulsecam://?v=1&artifactId=<uuid>&server=<origin>&token=<token>
+https://mieweb.github.io/pulse/open#v=1&artifactId=<uuid>&server=<origin>&token=<token>
 ```
 
 - **`pulsecam://`**: the parameters are the query string. Every Pulse release
@@ -87,6 +87,12 @@ https://mieweb.github.io/pulse/open#v=1&artifactId=<uuid>&server=<origin>&token=
   receives the token. The link host is fixed (an app can only claim domains it
   was built with); `server` still points at the deployment's own server, so
   uploads never touch the link host.
+
+In both forms the parameters are encoded as
+`application/x-www-form-urlencoded` in UTF-8: `name=value` pairs joined by
+`&`, a space written `+` or `%20`, and every other reserved character
+percent-encoded. A client MUST decode them that way, so a `+` in a value is a
+space.
 
 A client that accepts the `https://` form MUST treat it exactly like the
 `pulsecam://` form with the same parameters. A server that wants every Pulse
@@ -107,8 +113,10 @@ releases that claim the link host are installed.
   `server` value that is not `https://`, with the sole exception of
   `http://localhost` or a private IP literal for local development — this
   exception MUST NOT be silently extended to any other plaintext origin.
-- `token` (OPTIONAL): an opaque credential forwarded on every subsequent
-  request (§5). Servers SHOULD treat this as short-lived and scoped to the
+- `token` (OPTIONAL): a credential the client forwards unchanged on every
+  subsequent request (§5). It is the server's to define and a client needs to
+  understand none of it; the two things a client MAY read from it are in
+  §5.6. Servers SHOULD treat this as short-lived and scoped to the
   `artifactId` (or a session it anchors, §5.4), not a standing general
   credential — see §5.4 for the recommended (but not required) capability-
   token shape.
@@ -125,34 +133,60 @@ be able to see and decline.
 ### 3.1 Link hints (optional, protocol 2.7)
 
 A link is one upload. It MAY also say which place in the host that upload is
-for and what to call it, so the client can open its recorder on that place's
-draft instead of an empty one. A client that predates this ignores all of it.
+for and what to call it, so the client can open its recorder on what it
+already has for that place instead of starting empty. A client that predates
+this ignores all of it.
 
-**The place is in the token, not the link.** The host's opaque key for the
-place — a ticket, a team's update, a library — is the `ref` claim of the
-link's `token` (§5.4), and nowhere else: there is no `ref` parameter. A
-client reads it by decoding the token's claims, as it reads `exp`, and matches
-drafts and destinations on `server` + `ref`, so a newer link to the same place
-replaces the older one's. Because the key is signed with the token, nobody can
-build a link that points someone's place, and the draft recorded for it, at an
-upload of their own. A host MUST use a different `ref` for every owner and
-place. A link whose token has no readable `ref` claim — an older server, an
-opaque token, no token — is a plain link, handled exactly as before.
+**The place is in the token, not the link.** The host's key for the place — a
+ticket, a team's update, a library — is the `ref` claim of the link's `token`
+(§5.4), and nowhere else: there is no `ref` parameter. A client reads it from
+the token as §5.6 says, and keeps what it has for a place — the recording in
+progress, the link to upload it with — under `server` + `ref`. A newer link to
+the same place takes over from the older one: the next upload for the place
+uses the newer link's `artifactId` and `token`. A link whose token has no
+readable `ref` — an older server, a token of another shape, no token — is a
+plain link, handled exactly as before, and the parameters below are ignored on
+it.
 
-Four optional parameters say what to call things:
+The key is signed into the token, so a server that verifies its tokens refuses
+one whose `ref` was changed, and nobody can build a link that points someone's
+place, and the recording made for it, at an upload of their own. That holds
+only under the conditions of §5.6: the server verifies the token on every
+request, and the host uses a different `ref` for every owner and place. The
+client can't check the signature itself.
+
+Four optional parameters say what to call things. They act only on a link
+whose token carries a `ref`:
 
 - `label` (≤ 60 characters): what to call the place, e.g. a ticket's title.
-- `name` (≤ 80 characters): what to name a new recording made from this link,
+- `name` (≤ 80 characters): what to name a new recording made for the place,
   e.g. "Huddle update". Absent, the recording starts unnamed.
 - `app` (≤ 30 characters): the host app's name, shown with `label`.
-- `return`: a page in the host to go back to after the upload, held to the
-  same `https://` rule as `server`; a client MUST ignore one that isn't.
+- `return` (≤ 512 characters): a page in the host to go back to after the
+  upload, held to the same `https://` rule as `server`, with no username or
+  password. A client MUST ignore one that breaks any of this.
 
-They are **not signed**: display hints from whoever built the link. A client
-MUST NOT treat them as coming from the server, nor let them change where
-anything is uploaded, and SHOULD trim them and cap them at the lengths above.
-A link read from a QR code is opened on another device than the page that
-shows it, so a host SHOULD leave `app` and `return` off it and keep it short.
+A character, here and in §5.4, is a Unicode code point — not a byte, and not a
+UTF-16 code unit.
+
+They are **not signed**: text from whoever built the link, who may not be the
+server. A client:
+
+- MUST NOT treat them as coming from the server, nor let them change where
+  anything is uploaded or which place a link is for.
+- MUST show `label`, `name` and `app` as plain text on one line, never as
+  markup, and SHOULD first drop control characters (C0 and C1) and
+  bidirectional-formatting characters, trim them, and cut them at the lengths
+  above.
+- MUST open `return` only when the person asks for it (a tap), never by
+  itself, and MUST NOT add the token or anything else to it. It SHOULD show
+  the URL's host: an `app` beside it says nothing about where it leads.
+
+Every parameter travels in clear in the link, in its QR code, and wherever a
+link is logged or previewed, so a host SHOULD keep anything private out of
+`label` and `name`. A link read from a QR code is opened on another device
+than the page that shows it — there is no page to go back to, and a shorter
+link is an easier code — so a host SHOULD leave `app` and `return` off it.
 
 ## 4. Upload transport (TUS)
 
@@ -302,10 +336,9 @@ with the artifact the token creates and hands back to its own hooks, so the
 host needs no table keyed by artifactId. A client never reads it.
 
 A token MAY carry a `ref` claim (protocol 2.7): the host's key for the place
-the upload goes to, a string of 1–200 characters. Besides `exp` it is the one
-claim a client reads (§3.1), so a server that wants its links to open on a
-place's draft MUST issue tokens of this `base64url(JSON claims).signature`
-form with the claims as JSON. The server itself doesn't check `ref`.
+the upload goes to, a string of 1–200 characters, one per owner and place. A
+client reads it (§3.1, §5.6). The server doesn't act on it: a token is good or
+not whatever its `ref`, and a `ref` that isn't such a string is ignored.
 
 When a token names a pulse's video, a server SHOULD hold the token to the
 shape of a pulse (§8): the video only under the token's own `artifactId`, with
@@ -316,7 +349,8 @@ thumbnail so the video itself can never land.
 
 This shape is exactly what `@mieweb/pulsevault`'s `issueCapabilityToken`/
 `verifyCapabilityToken`/`createCapabilityAuthorize` implement, but any server
-is free to use its own scheme entirely — only §5.1–§5.3 are normative.
+is free to use its own scheme entirely — only §5.1–§5.3 and §5.6 are
+normative.
 
 ### 5.5 View tokens (non-normative)
 
@@ -331,6 +365,45 @@ treating it as an upload capability. `createCapabilityAuthorize` accepts it
 only for `GET {prefix}/artifacts/<id>` (the `resolve` phase); minting a view
 link (`share`) needs the pairing token itself, so a view link can't extend
 itself.
+
+### 5.6 What a client reads from a token (protocol 2.7)
+
+A token is the server's: a client forwards it unchanged (§5.1) and needs to
+understand none of it. From a token of the §5.4 form a client MAY read two
+claims, and MUST NOT act on anything else in it:
+
+- `exp`, to show when a link expires and to stop offering an upload the server
+  would refuse. The server decides whether a token is still good.
+- `ref`, the place the upload is for (§3.1).
+
+**Reading them.** The claims are the part of the token before its first `.`,
+decoded as base64url without padding
+([RFC 4648 §5](https://www.rfc-editor.org/rfc/rfc4648#section-5)) into the
+UTF-8 text of one JSON object. A token with no `.`, or whose first part isn't
+that, has no readable claims: a client MUST treat it as a credential it can't
+read — no known expiry, no `ref` — and not as expired or as a bad link. A
+client MAY also read nothing from a token whose claims lack any of
+`artifactId`, `iat`, `exp`, `kid` and `issuer` as
+[`capability-token.schema.json`](protocol/schemas/capability-token.schema.json)
+types them, so a server that wants its claims read issues all five. `exp` is a
+number of seconds since the Unix epoch. `ref` is a string of 1–200 characters;
+a client MUST read any other `ref` as none.
+
+**A client can't verify `ref`.** It has no key, so what it reads is what the
+link says, and only the server can tell whether the server signed it:
+
+- A server that issues tokens with a `ref` MUST verify the token's signature
+  on every request (§5.2), refusing one whose claims were changed. Where
+  requests are accepted unverified, anyone can write a token with any `ref`.
+- Its host MUST use a different `ref` for every owner and place: two people's
+  uploads to the same ticket carry different keys. A key shared between owners
+  would let one person's valid link take over another's place.
+- A client MUST send the server the token it read the `ref` from, unchanged.
+- A client MUST treat a `ref` as unconfirmed until the server has accepted
+  that token on a request — the status request (§6.5) or the upload's creation
+  (§4) will do. It SHOULD NOT discard the link it already holds for a place
+  until the newer link's token has been accepted: the server refuses a forged
+  link, and the place then still has its real one.
 
 ## 6. Storage and validation
 
@@ -488,7 +561,7 @@ a server it paired with earlier: a server can be upgraded in between.
 | 2.4 | Added the `https://mieweb.github.io/pulse/open#…` pairing link form (§3), with the parameters in the fragment. |
 | 2.5 | Added `webReady` to the status response (§6.5): what the server's conversion did. |
 | 2.6 | Added `progress` to the status response (§6.5): how far a running conversion has got. |
-| 2.7 | Added link hints (§3.1): the capability token's `ref` claim (§5.4), which a client reads to know the place an upload is for, and the optional pairing link parameters `label`, `name`, `app` and `return`. |
+| 2.7 | Added link hints (§3.1): the capability token's `ref` claim (§5.4), which a client reads to know the place an upload is for, and the optional pairing link parameters `label`, `name`, `app` and `return`. Wrote down what a client reads from a token and on what conditions (§5.6), and how a link's parameters are encoded (§3). |
 
 ## 8. Artifact relationships (`relatedTo`)
 

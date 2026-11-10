@@ -32,8 +32,10 @@ const schemas = Object.fromEntries(
   ),
 );
 
+const validatorOf = (name) => ajv.getSchema(schemas[name].$id) ?? ajv.compile(schemas[name]);
+
 function assertValid(name, value) {
-  const validate = ajv.getSchema(schemas[name].$id) ?? ajv.compile(schemas[name]);
+  const validate = validatorOf(name);
   assert.ok(validate(value), `${name}: ${ajv.errorsText(validate.errors)}\n${JSON.stringify(value)}`);
 }
 
@@ -95,6 +97,57 @@ test("a link with hints matches deep-link.schema.json, and its token's ref claim
   const claims = JSON.parse(Buffer.from(params.token.split(".")[0], "base64url").toString("utf8"));
   assert.equal(claims.ref, "u1:ticket:42");
   assertValid("capability-token", claims);
+});
+
+test("whatever hints buildUploadLink is given, what it writes matches deep-link.schema.json", () => {
+  const artifactId = randomUUID();
+  const paramsOf = (opts) => {
+    const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId, token: "t", ...opts });
+    return Object.fromEntries(new URLSearchParams(link.slice(link.indexOf("?") + 1)));
+  };
+  // Over-long, astral, padded and control-laden text is cut and cleaned to what the schema allows.
+  for (const text of ["L".repeat(500), "😀".repeat(500), `  ${"é".repeat(90)}  `, "a\nb\tc", "x"]) {
+    const params = paramsOf({ label: text, name: text, app: text });
+    assert.deepEqual(Object.keys(params), ["v", "artifactId", "server", "token", "label", "name", "app"]);
+    assertValid("deep-link", params);
+  }
+  // A return URL the parser accepts but a strict reader wouldn't goes out normalized.
+  const longest = `https://app.example.org/${"a".repeat(488)}`;
+  for (const returnUrl of [" https://app.example.org/x ", "https://exämple.org/a b", "https:\\\\app.example.org\\x", "http://localhost:3000/x", longest]) {
+    assertValid("deep-link", paramsOf({ returnUrl }));
+  }
+});
+
+test("deep-link.schema.json holds the hints to their caps, counted as code points, and `return` to http(s)", () => {
+  const validate = validatorOf("deep-link");
+  const base = { v: "1", artifactId: randomUUID(), server: "https://vault.example.org/pulsevault" };
+  for (const [key, max] of [["label", 60], ["name", 80], ["app", 30]]) {
+    assert.equal(validate({ ...base, [key]: "😀".repeat(max) }), true, `${key} at its cap`);
+    assert.equal(validate({ ...base, [key]: "x".repeat(max + 1) }), false, `${key} past its cap`);
+  }
+  assert.equal(validate({ ...base, return: `https://app.example.org/${"a".repeat(488)}` }), true);
+  assert.equal(validate({ ...base, return: `https://app.example.org/${"a".repeat(489)}` }), false);
+  for (const bad of ["javascript:alert(1)", "pulsecam://?v=1", "ftp://app.example.org/x", " https://app.example.org/"]) {
+    assert.equal(validate({ ...base, return: bad }), false, bad);
+  }
+  // Unknown parameters stay valid: a client ignores them.
+  assert.equal(validate({ ...base, zzz: "1" }), true);
+});
+
+test("capability-token.schema.json and issueCapabilityToken agree on a ref: 1 to 200 code points", () => {
+  const validate = validatorOf("capability-token");
+  const claims = JSON.parse(
+    Buffer.from(issueCapabilityToken(randomUUID(), "secret", { keyId: "k1", issuer: "vault" }).split(".")[0], "base64url").toString("utf8"),
+  );
+  for (const ref of ["x", "x".repeat(200), "😀".repeat(200), "", "x".repeat(201), "😀".repeat(201), 42]) {
+    let issued = true;
+    try {
+      issueCapabilityToken(randomUUID(), "secret", { keyId: "k1", issuer: "vault", ref });
+    } catch {
+      issued = false;
+    }
+    assert.equal(validate({ ...claims, ref }), issued, JSON.stringify(ref).slice(0, 20));
+  }
 });
 
 test("issued capability tokens carry claims matching capability-token.schema.json", () => {

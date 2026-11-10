@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mieweb/pulsevault/blob/main/protocol/schemas/deep-link.schema.json",
   "title": "Pairing link parameters",
-  "description": "The parameters of a pairing link (PROTOCOL.md §3), as built by `buildUploadLink`: the query string of `pulsecam://?…`, or the fragment of `https://mieweb.github.io/pulse/open#…`. Clients must ignore parameters they don't recognize.",
+  "description": "The parameters of a pairing link (PROTOCOL.md §3), as built by `buildUploadLink`: the query string of `pulsecam://?…`, or the fragment of `https://mieweb.github.io/pulse/open#…`, encoded as `application/x-www-form-urlencoded` in UTF-8. Clients must ignore parameters they don't recognize. Lengths are in characters: Unicode code points.",
   "type": "object",
   "required": ["v", "artifactId", "server"],
   "properties": {
@@ -23,27 +23,29 @@
     },
     "token": {
       "type": "string",
-      "description": "Optional credential the client sends as `Authorization: Bearer`. Typically a capability token (capability-token.schema.json)."
+      "description": "Optional credential the client sends as `Authorization: Bearer`, unchanged. Typically a capability token (capability-token.schema.json), from which a client may read `exp` and `ref` (§5.6)."
     },
     "label": {
       "type": "string",
       "maxLength": 60,
-      "description": "Optional (protocol 2.7, §3.1): what the client calls the place this upload goes to, e.g. a ticket's title. Unsigned: a display hint. The place's key is the `ref` claim of `token`."
+      "description": "Optional (protocol 2.7, §3.1): what the client calls the place this upload goes to, e.g. a ticket's title. An unsigned display hint, like `name`, `app` and `return`: it acts only on a link whose `token` carries a `ref` claim, the place's key, and is ignored on any other link."
     },
     "name": {
       "type": "string",
       "maxLength": 80,
-      "description": "Optional (protocol 2.7): what the client names a new recording made from this link, e.g. \"Huddle update\". Absent: the recording starts unnamed. Unsigned."
+      "description": "Optional (protocol 2.7): what the client names a new recording made for the place, e.g. \"Huddle update\". Absent: the recording starts unnamed. Unsigned; ignored unless `token` carries a `ref`."
     },
     "app": {
       "type": "string",
       "maxLength": 30,
-      "description": "Optional (protocol 2.7): the host app's name, shown with `label`. Unsigned."
+      "description": "Optional (protocol 2.7): the host app's name, shown with `label`. Unsigned; ignored unless `token` carries a `ref`."
     },
     "return": {
       "type": "string",
       "format": "uri",
-      "description": "Optional (protocol 2.7): a page in the host to go back to after the upload. `https://`, or `http://` to localhost or a private IP for development. Unsigned."
+      "pattern": "^https?://",
+      "maxLength": 512,
+      "description": "Optional (protocol 2.7): a page in the host to go back to after the upload. `https://`, or `http://` to localhost or a private IP for development, with no username or password. Unsigned; ignored unless `token` carries a `ref`."
     }
   }
 }
