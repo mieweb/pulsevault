@@ -99,11 +99,16 @@ test("a link with hints matches deep-link.schema.json, and its token's ref claim
   assertValid("capability-token", claims);
 });
 
-test("whatever hints buildUploadLink is given, what it writes matches deep-link.schema.json", () => {
+test("the hints buildUploadLink writes match deep-link.schema.json: cut and cleaned text, a normalized return URL", () => {
   const artifactId = randomUUID();
+  // The same parameters in both forms: after `?` in one, after `#` in the other.
   const paramsOf = (opts) => {
-    const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId, token: "t", ...opts });
-    return Object.fromEntries(new URLSearchParams(link.slice(link.indexOf("?") + 1)));
+    const [pulsecam, https] = [undefined, "https"].map((form) => {
+      const link = buildUploadLink({ server: "https://vault.example.org/pulsevault", artifactId, token: "t", ...opts, form });
+      return Object.fromEntries(new URLSearchParams(link.slice(link.search(/[?#]/) + 1)));
+    });
+    assert.deepEqual(https, pulsecam);
+    return pulsecam;
   };
   // Over-long, astral, padded and control-laden text is cut and cleaned to what the schema allows.
   for (const text of ["L".repeat(500), "😀".repeat(500), `  ${"é".repeat(90)}  `, "a\nb\tc", "x"]) {
@@ -111,10 +116,21 @@ test("whatever hints buildUploadLink is given, what it writes matches deep-link.
     assert.deepEqual(Object.keys(params), ["v", "artifactId", "server", "token", "label", "name", "app"]);
     assertValid("deep-link", params);
   }
-  // A return URL the parser accepts but a strict reader wouldn't goes out normalized.
+  // A return URL goes out as the URL parser writes it, at most 512 characters of http(s).
   const longest = `https://app.example.org/${"a".repeat(488)}`;
   for (const returnUrl of [" https://app.example.org/x ", "https://exämple.org/a b", "https:\\\\app.example.org\\x", "http://localhost:3000/x", longest]) {
     assertValid("deep-link", paramsOf({ returnUrl }));
+  }
+  // That writing leaves `[ ] { } |` as they are in a query, which a strict URI grammar refuses and
+  // every browser accepts: the schema holds `return` to its scheme and length, not to that grammar.
+  for (const [returnUrl, sent] of [
+    ["https://app.example.org/tickets?filter[status]=open", "https://app.example.org/tickets?filter[status]=open"],
+    ["https://app.example.org/search?q=a|b", "https://app.example.org/search?q=a|b"],
+    ['https://app.example.org/search?json={"a":1}', "https://app.example.org/search?json={%22a%22:1}"],
+  ]) {
+    const params = paramsOf({ returnUrl });
+    assert.equal(params.return, sent);
+    assertValid("deep-link", params);
   }
 });
 

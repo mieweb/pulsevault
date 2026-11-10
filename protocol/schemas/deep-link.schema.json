@@ -38,14 +38,13 @@
     "app": {
       "type": "string",
       "maxLength": 30,
-      "description": "Optional (protocol 2.7): the host app's name, shown with `label`. Unsigned; ignored unless `token` carries a `ref`."
+      "description": "Optional (protocol 2.7): the name of the operator's app, shown with `label`. Unsigned; ignored unless `token` carries a `ref`."
     },
     "return": {
       "type": "string",
-      "format": "uri",
       "pattern": "^https?://",
       "maxLength": 512,
-      "description": "Optional (protocol 2.7): a page in the host to go back to after the upload. `https://`, or `http://` to localhost or a private IP for development, with no username or password. Unsigned; ignored unless `token` carries a `ref`."
+      "description": "Optional (protocol 2.7): a page in the operator's app to go back to after the upload. `https://`, or `http://` to localhost or a private IP for development, with no username or password. Unsigned; ignored unless `token` carries a `ref`."
     }
   }
 }
