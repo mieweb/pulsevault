@@ -75,3 +75,17 @@ test("the icon is the logo's own drawing: its shape and its colours, placed in t
   }
   assert.equal(squeeze(/<linearGradient[^>]*>([\s\S]*?)<\/linearGradient>/.exec(read("pulse-icon.svg"))[1]), logoStops);
 });
+
+test("both logo files draw one shape, and its heartbeat is one even line", () => {
+  const shape = (file) => /<mask[^>]*>([\s\S]*?)<\/mask>/.exec(read(file))[1].replace(/\s+/g, " ").trim();
+  assert.equal(shape("pulse-logo.svg"), shape("pulse-logo-mono.svg"));
+  // A stroked centre line, not a traced outline: one width along its whole length, round ends
+  // and joins, and level at both ends.
+  const beat = /<path fill="none" stroke="#000" stroke-width="([\d.]+)" stroke-linecap="round" stroke-linejoin="round" d="([^"]+)"\/>/.exec(
+    read("pulse-logo.svg"),
+  );
+  assert.ok(beat, "the heartbeat isn't a single stroked path");
+  const points = [...beat[2].matchAll(/(-?[\d.]+) (-?[\d.]+)/g)].map(([, x, y]) => [Number(x), Number(y)]);
+  assert.equal(points.at(0)[1], points.at(-1)[1], "the two ends aren't level");
+  assert.ok(points.at(-1)[0] > points.at(0)[0]);
+});

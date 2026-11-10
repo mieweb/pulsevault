@@ -16,6 +16,14 @@ breaking changes, called out explicitly below.
   `@mieweb/pulsevault/assets/*` like the logo. The files are written from the logo by
   `npm run icons`. See `assets/README.md`.
 
+### Changed
+
+- **The logo's heartbeat is redrawn as one even line** (`assets/pulse-logo.svg`,
+  `assets/pulse-logo-mono.svg`). It was a traced outline: enlarged, it showed spikes at the peaks,
+  bumps where it met the level ends, and a width that varied along it. It is now a single stroked
+  line of one width with round ends, following the same path, and the files are a third the size.
+  The outline of the logo is unchanged.
+
 ## [0.8.0] - 2026-11-06
 
 ### Changed
