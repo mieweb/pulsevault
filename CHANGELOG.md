@@ -7,6 +7,15 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+
+- **A Pulse icon for buttons**: the logo itself, centred in a square 24 × 24 box at its full
+  height, so it is the logo at any size and lines up with the square icons beside it. In full
+  colour (`assets/pulse-icon.svg`), one colour (`assets/pulse-icon-mono.svg`, `currentColor`) and
+  white (`assets/pulse-icon-white.svg`, for an `<img>` on a filled button), exported as
+  `@mieweb/pulsevault/assets/*` like the logo. The files are written from the logo by
+  `npm run icons`. See `assets/README.md`.
+
 ## [0.8.0] - 2026-11-06
 
 ### Changed
