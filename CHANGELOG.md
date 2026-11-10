@@ -26,15 +26,18 @@ the server does nothing it didn't do before. `/capabilities` reports `protocolRe
   30) and `returnUrl` (a page to go back to after the upload; the link's `return`). They are
   unsigned display hints, and act only on a link whose token carries a `ref`: on any other link
   the app ignores them, as an older app ignores all of it. The text ones are cleaned for display —
-  control and bidirectional-formatting characters removed, trimmed, cut at a whole character —
-  and a blank, `null` or non-string one is left out. `returnUrl` follows `server`'s `https://`
+  control characters and line breaks become a space, bidirectional-formatting characters are
+  dropped, the text is trimmed and cut at a whole character — and a blank, `null` or non-string
+  one is left out. `returnUrl` follows `server`'s `https://`
   rule, carries no username or password, is at most 512 characters, and goes into the link
   normalized (`new URL(returnUrl).href`). Characters are Unicode code points throughout.
 - **`PROTOCOL.md` §5.6: what a client reads from a token.** `exp` and `ref`, how they are decoded,
   and on what conditions a `ref` can be trusted: a client can't verify it, so a server that issues
   one must verify its tokens on every request and use a different `ref` for every owner and
   place, and a client keeps the link it holds for a place until the server has accepted the
-  newer one's token. §3 now says how a link's parameters are encoded
+  newer one's token (a `200` from the status route). Two links are for the same place when
+  `server` and `ref` are exactly equal, and the newer is the one whose token expires later, so a
+  host gives a place's links an expiry that never goes down. §3 now says how a link's parameters are encoded
   (`application/x-www-form-urlencoded`, UTF-8), and §3.1 how a client shows hints it can't trust.
 
 ### Fixed

@@ -688,7 +688,7 @@ const token = issueCapabilityToken(artifactId, keys["2026-06"], {
 
 `createCapabilityAuthorize` returns it from the `create` phase, PulseVault stores it with the artifact (and with every file uploaded `relatedTo` it under the same token), and every later `authorize`, `onUploadComplete` (`ctx.context`, on replays too), `getStatus` and `getPulse` get it back. Most hosts then keep no table keyed by artifactId, and "is this the person who uploaded it?" is a comparison, not a lookup.
 
-**Ref.** `ref` signs your key for the *place* the upload goes to, for [link hints](#link-hints): a string of 1–200 characters, different for every owner and place (`` `${user.id}:ticket:${ticket.id}` ``). Unlike `context`, Pulse reads it, straight from the token, so keep it a plain key with nothing private in it. PulseVault never acts on it: a token is good or not whatever its `ref`, no hook receives it (what your hooks need goes in `context`), and `verifyCapabilityToken` returns it when it is such a string and leaves it out otherwise.
+**Ref.** `ref` signs your key for the *place* the upload goes to, for [link hints](#link-hints): a well-formed string of 1–200 characters, different for every owner and place (`` `${user.id}:ticket:${ticket.id}` ``) and written the same way every time. Unlike `context`, Pulse reads it, straight from the token, so keep it a plain key with nothing private in it. PulseVault never acts on it: a token is good or not whatever its `ref`, no hook receives it (what your hooks need goes in `context`), and `verifyCapabilityToken` returns it when it is such a string and leaves it out otherwise.
 
 ## Upload-Metadata protocol
 
@@ -1003,9 +1003,11 @@ buildUploadLink({
 
 **The place is the token's `ref`, and only that.** There is no `ref` link parameter, so a link can't name one place and upload to another. Pulse can't check the signature itself: what makes the key trustworthy is that your server verifies the token on every request (`createCapabilityAuthorize` does) and that no two owners share a `ref`.
 
+**Two links are for the same place when `server` and `ref` are the same, exactly.** Write both the same way every time: `Ticket:42` and `ticket:42` are two places, and so are two spellings of one server URL (only a trailing `/` is ignored). Of two links for a place, Pulse keeps the one whose token expires later, so give a place's links one lifetime (`expirySeconds`), or at least an expiry that never goes down: a link that expires sooner than the one Pulse holds doesn't take over. And Pulse takes a newer link over only once your server has accepted its token, which it asks the [status route](#status-outcome-and-pulses) (`PROTOCOL.md` §5.6).
+
 **The other four are unsigned display hints, and act only with a `ref`.** On a link whose token has no `ref` — an opaque token, no token — Pulse ignores them and handles the link as it always has. An older Pulse ignores all of it and uploads as before.
 
-- `label`, `name` and `app` are cleaned for display: control and bidirectional-formatting characters are removed, the text is trimmed and cut at a whole character (60, 80 and 30 characters, counted as Unicode code points), and a blank, `null` or non-string one is left out. So `label: ticket.title` is safe with a title that is missing or has line breaks in it.
+- `label`, `name` and `app` are cleaned for display: control characters and line breaks become a space, bidirectional-formatting characters are dropped, the text is trimmed and cut at a whole character (60, 80 and 30 characters, counted as Unicode code points), and a blank, `null` or non-string one is left out. So `label: ticket.title` is safe with a title that is missing or has line breaks in it.
 - `returnUrl` follows `server`'s `https://` rule, may not carry a username or password, and is at most 512 characters; the link carries it normalized (`new URL(returnUrl).href`). A blank or `null` one is left out; a bad one throws.
 - A link without any of them is exactly the link above, byte for byte.
 - Everything in a link travels in clear, in the URL and in its QR code: keep anything private out of `label` and `name`.
