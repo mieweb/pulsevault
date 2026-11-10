@@ -22,10 +22,10 @@ export type UploadLinkOptions = {
    *
    * This and the next three are unsigned display hints (PROTOCOL.md §3.1). They act only on a
    * link whose `token` carries a `ref` (`issueCapabilityToken`'s `ref`), the place's signed key,
-   * which Pulse reads from the token; on any other link Pulse ignores them. Control and
-   * bidirectional-formatting characters are removed, a hint that is blank (or not a string) is
-   * left out, and a longer one is cut at a whole character. They travel in clear in the link and
-   * its QR code, so nothing private belongs in them.
+   * which Pulse reads from the token; on any other link Pulse ignores them. Control characters
+   * and line breaks become a space, bidirectional-formatting characters are dropped, a hint that
+   * is blank (or not a string) is left out, and a longer one is cut at a whole character. They
+   * travel in clear in the link and its QR code, so nothing private belongs in them.
    */
   label?: string | null;
   /**
@@ -128,12 +128,17 @@ function returnParam(value: unknown): string {
   return url.href;
 }
 
+/** `text`, or nothing when all it holds is whitespace and format characters (category Cf). */
+const unlessBlank = (text: string): string => (/^[\s\p{Cf}]*$/u.test(text) ? '' : text);
+
 /**
  * A display hint as the link carries it: one line of plain text, at most `max` characters
  * (code points). Control characters and line breaks become a space, bidirectional-formatting
- * characters (which can reorder the text shown around them) are dropped, and a longer text is cut
- * at a whole user-perceived character, never through an emoji sequence or an accent. Blank,
- * invisible or not a string: none.
+ * characters (Unicode `Bidi_Control`, which can reorder the text shown around them) are dropped,
+ * and a longer text is cut at a whole user-perceived character, never through an emoji sequence
+ * or an accent. Not a string: none. Nothing but whitespace and format characters (zero-width
+ * spaces, joiners), as given or once cut: none. That is not every character that shows as
+ * nothing (a script's filler letters pass), so a client still decides what it displays.
  */
 function displayText(value: unknown, max: number): string {
   if (typeof value !== 'string') return '';
@@ -141,8 +146,7 @@ function displayText(value: unknown, max: number): string {
     .replace(/[\p{Cc}\u2028\u2029]+/gu, ' ')
     .replace(/\p{Bidi_Control}/gu, '')
     .trim();
-  if (/^[\s\p{Cf}]*$/u.test(text)) return '';
-  if (Array.from(text).length <= max) return text;
+  if (Array.from(text).length <= max) return unlessBlank(text);
   let cut = '';
   let length = 0;
   for (const { segment } of new Intl.Segmenter().segment(text)) {
@@ -150,7 +154,7 @@ function displayText(value: unknown, max: number): string {
     if (length > max) break;
     cut += segment;
   }
-  return cut.trim();
+  return unlessBlank(cut.trim());
 }
 
 /**

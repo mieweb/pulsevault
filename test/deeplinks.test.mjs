@@ -233,6 +233,25 @@ test("a hint is cut at a whole character: never through an emoji sequence, a fla
   assert.equal(hint({ app: `${"A".repeat(29)}\u{1F1FA}\u{1F1F8}` }, "app"), "A".repeat(29));
   assert.equal(hint({ app: `${"A".repeat(29)}e\u0301` }, "app"), "A".repeat(29));
   assert.equal(hint({ app: `${"A".repeat(28)}e\u0301` }, "app"), `${"A".repeat(28)}e\u0301`);
+  // One character that is longer than the cap by itself can't be cut: no hint.
+  const stacked = `e${"\u0301".repeat(40)}`;
+  assert.equal(hint({ app: stacked }, "app"), undefined);
+  assert.equal(hint({ app: `Hi ${stacked}` }, "app"), "Hi");
+});
+
+test("a hint that is blank once cut is left out, like one that is blank as given", () => {
+  // Sixty zero-width characters take the whole cap; the visible text after them is cut away.
+  for (const invisible of ["\u200B", "\u2060"]) {
+    const params = paramsOf(buildUploadLink({ ...BASE, label: `${invisible.repeat(60)}Fix the login page` }));
+    assert.deepEqual(Object.keys(params), ["v", "artifactId", "server", "token"]);
+  }
+  assert.equal(hint({ label: `${"\u200B".repeat(59)}Fix the login page` }, "label"), `${"\u200B".repeat(59)}F`);
+});
+
+test("an unpaired surrogate in a hint goes out as U+FFFD, the way every URL encoder writes it", () => {
+  const link = buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t", label: "a\uD83Db" });
+  assert.equal(rawParams(link).split("&").at(-1), "label=a%EF%BF%BDb");
+  assert.equal(paramsOf(link).label, "a\uFFFDb");
 });
 
 test("a hint is one line of plain text: control and bidi-formatting characters don't reach the link", () => {
@@ -265,6 +284,15 @@ test("returnUrl is held to the server's rule: https, or http to localhost or a p
   for (const dev of ["http://localhost:3000/x", "http://127.0.0.1:3000/x", "http://192.168.1.20:3000/x", "http://10.0.0.5/x"]) {
     assert.equal(hint({ returnUrl: dev }, "return"), dev);
   }
+  // The dev exception is the server's, no wider: not IPv6 loopback, not the rest of 127/8.
+  for (const bad of ["http://[::1]:3000/x", "http://127.0.0.2/x", "http://localhost./x"]) {
+    assert.throws(() => buildUploadLink({ ...BASE, returnUrl: bad }), /`returnUrl` must be https/, bad);
+  }
+  // An IPv4 address written as a number is judged, and sent, as the address it is.
+  assert.equal(hint({ returnUrl: "http://2130706433/x" }, "return"), "http://127.0.0.1/x");
+  assert.equal(hint({ returnUrl: "http://0x7f.1/x" }, "return"), "http://127.0.0.1/x");
+  assert.equal(hint({ returnUrl: "http://3232235796:3000/x" }, "return"), "http://192.168.1.20:3000/x");
+  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: "http://134744072/x" }), /`returnUrl` must be https/, "8.8.8.8");
 });
 
 test("returnUrl goes into the link as the URL parser reads it, so every client reads the same URL", () => {
