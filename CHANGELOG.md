@@ -7,6 +7,41 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+Protocol 2.7 (`PROTOCOL.md` §7.4): link hints. Additive only: a link built without hints and a
+token issued without a `ref` are byte for byte what 0.8.0 produced, there are no new routes, and
+the server does nothing it didn't do before. `/capabilities` reports `protocolRevision: "2.7"`.
+
+### Added
+
+- **A signed `ref` on upload tokens** (protocol 2.7): `issueCapabilityToken(…, { ref })` signs the
+  host's key for the *place* an upload goes to — a ticket, a team's update — a string of 1–200
+  characters, different for every owner and place. The Pulse app reads it from the token of a
+  pairing link and opens its recorder on what it already has for that place, so a second link to
+  the same place picks the same recording up. PulseVault never acts on it: authorization, storage
+  and every hook are as before (what a host's hooks need still goes in `context`).
+  `verifyCapabilityToken` returns it, and leaves out one that isn't such a string instead of
+  refusing the token.
+- **Link hints** (protocol 2.7, `PROTOCOL.md` §3.1): `buildUploadLink` takes `label` (the place's
+  name, 60 characters), `name` (what a new recording is called, 80), `app` (the host app's name,
+  30) and `returnUrl` (a page to go back to after the upload; the link's `return`). They are
+  unsigned display hints, and act only on a link whose token carries a `ref`: on any other link
+  the app ignores them, as an older app ignores all of it. The text ones are cleaned for display —
+  control and bidirectional-formatting characters removed, trimmed, cut at a whole character —
+  and a blank, `null` or non-string one is left out. `returnUrl` follows `server`'s `https://`
+  rule, carries no username or password, is at most 512 characters, and goes into the link
+  normalized (`new URL(returnUrl).href`). Characters are Unicode code points throughout.
+- **`PROTOCOL.md` §5.6: what a client reads from a token.** `exp` and `ref`, how they are decoded,
+  and on what conditions a `ref` can be trusted: a client can't verify it, so a server that issues
+  one must verify its tokens on every request and use a different `ref` for every owner and
+  place, and a client keeps the link it holds for a place until the server has accepted the
+  newer one's token. §3 now says how a link's parameters are encoded
+  (`application/x-www-form-urlencoded`, UTF-8), and §3.1 how a client shows hints it can't trust.
+
+### Fixed
+
+- `verifyViewToken` returns exactly `{ artifactId, exp }`, as its type says: a view token minted
+  outside this package with a `ctx` claim no longer has it passed through as `context`.
+
 ## [0.8.0] - 2026-11-06
 
 ### Changed
