@@ -71,9 +71,10 @@ const signedWith = (claims, key = SECRET) => {
   return `${payload}.${createHmac("sha256", key).update(payload).digest("base64url")}`;
 };
 
-test("ref is a string of 1 to 200 characters, counted as code points; anything else isn't issued", () => {
+test("ref is a well-formed string of 1 to 200 characters, counted as code points; anything else isn't issued", () => {
   const opts = { keyId: "k1", issuer: ISSUER };
-  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"]]) {
+  // The last two hold an unpaired surrogate, which no two decoders are sure to read alike.
+  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"], "\uD800", "a\uDC00b"]) {
     assert.throws(() => issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref }), /`ref` must be/, String(ref));
   }
   // At the cap, in ASCII and in characters that take two UTF-16 units each (400 units, 200 characters).
@@ -89,7 +90,7 @@ test("ref is a string of 1 to 200 characters, counted as code points; anything e
 test("a token is good or not whatever its ref: an unusable one is left out of the result, never refused", () => {
   const claims = claimsOf(issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, context: { userId: "u1" } }));
   // Correctly signed (minted elsewhere with the secret), carrying a `ref` this package wouldn't issue.
-  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"]]) {
+  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"], "a\uD800b"]) {
     const result = verifyCapabilityToken(signedWith({ ...claims, ref }), lookupSecret, { issuer: ISSUER });
     assert.deepEqual(result, { artifactId: ARTIFACT_ID, context: { userId: "u1" } }, JSON.stringify(ref));
   }

@@ -54,10 +54,14 @@ export const MAX_CONTEXT_BYTES = 1024;
  */
 const MAX_REF_LENGTH = 200;
 
-/** A usable `ref` claim: a string of 1 to `MAX_REF_LENGTH` characters. */
+/**
+ * A usable `ref` claim: a string of 1 to `MAX_REF_LENGTH` characters, well-formed (no unpaired
+ * surrogate), so every client decodes the same key from it.
+ */
 const isRef = (value: unknown): value is string =>
   typeof value === 'string' &&
   value !== '' &&
+  value.isWellFormed() &&
   // A code point is one or two UTF-16 units, so only a string between the two needs counting.
   (value.length <= MAX_REF_LENGTH ||
     (value.length <= 2 * MAX_REF_LENGTH && Array.from(value).length <= MAX_REF_LENGTH));
@@ -124,11 +128,13 @@ export type IssueCapabilityTokenOptions = {
   context?: unknown;
   /**
    * The host's key for the place this upload goes to (`ref` claim), e.g. `"u1:ticket:42"` —
-   * one per owner and place, 1–200 characters. Pulse reads it from the token of a pairing link
-   * and opens the recorder on that place's draft; it travels nowhere else, and a server that
-   * verifies its tokens refuses one whose `ref` was changed, so nobody can point someone's place
-   * at another upload. Readable by whoever holds the token, so not a secret; PulseVault never
-   * acts on it and hands it to no hook, so what the host's own hooks need goes in `context`.
+   * one per owner and place, 1–200 characters, compared exactly (no case folding). Pulse reads
+   * it from the token of a pairing link and opens the recorder on that place's draft; of two
+   * links for a place it keeps the one that expires later. The key travels nowhere else, and a
+   * server that verifies its tokens refuses one whose `ref` was changed, so nobody can point
+   * someone's place at another upload. Readable by whoever holds the token, so not a secret;
+   * PulseVault never acts on it and hands it to no hook, so what the host's own hooks need goes
+   * in `context`.
    */
   ref?: string;
 };
@@ -148,7 +154,7 @@ export function issueCapabilityToken(
 ): string {
   if (opts.ref !== undefined && !isRef(opts.ref)) {
     throw new TypeError(
-      `issueCapabilityToken: \`ref\` must be a non-empty string of at most ${MAX_REF_LENGTH} characters`,
+      `issueCapabilityToken: \`ref\` must be a non-empty, well-formed string of at most ${MAX_REF_LENGTH} characters`,
     );
   }
   const now = Math.floor(Date.now() / 1000);
