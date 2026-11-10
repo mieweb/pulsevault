@@ -39,6 +39,12 @@ the server does nothing it didn't do before. `/capabilities` reports `protocolRe
   `server` and `ref` are exactly equal, and the newer is the one whose token expires later, so a
   host gives a place's links an expiry that never goes down. §3 now says how a link's parameters are encoded
   (`application/x-www-form-urlencoded`, UTF-8), and §3.1 how a client shows hints it can't trust.
+- **A Pulse icon for buttons**: the logo itself, centred in a square 24 × 24 box at its full
+  height, so it is the logo at any size and lines up with the square icons beside it. In full
+  colour (`assets/pulse-icon.svg`), one colour (`assets/pulse-icon-mono.svg`, `currentColor`) and
+  white (`assets/pulse-icon-white.svg`, for an `<img>` on a filled button), exported as
+  `@mieweb/pulsevault/assets/*` like the logo. The files are written from the logo by
+  `npm run icons`. See `assets/README.md`.
 
 ### Fixed
 
