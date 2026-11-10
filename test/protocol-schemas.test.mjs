@@ -150,12 +150,12 @@ test("deep-link.schema.json holds the hints to their caps, counted as code point
   assert.equal(validate({ ...base, zzz: "1" }), true);
 });
 
-test("capability-token.schema.json and issueCapabilityToken agree on a ref: 1 to 200 code points", () => {
+test("capability-token.schema.json and issueCapabilityToken agree on a ref: 1 to 200 code points, no unpaired surrogate", () => {
   const validate = validatorOf("capability-token");
   const claims = JSON.parse(
     Buffer.from(issueCapabilityToken(randomUUID(), "secret", { keyId: "k1", issuer: "vault" }).split(".")[0], "base64url").toString("utf8"),
   );
-  for (const ref of ["x", "x".repeat(200), "😀".repeat(200), "", "x".repeat(201), "😀".repeat(201), 42]) {
+  for (const ref of ["x", "x".repeat(200), "😀".repeat(200), "", "x".repeat(201), "😀".repeat(201), 42, "\ud800", "a\udc00b", "😀\ud83d"]) {
     let issued = true;
     try {
       issueCapabilityToken(randomUUID(), "secret", { keyId: "k1", issuer: "vault", ref });
