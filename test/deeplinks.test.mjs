@@ -126,25 +126,38 @@ test("rejects an unknown form", () => {
 // ---------- link hints (protocol 2.7, PROTOCOL.md §3.1) ----------
 
 const SERVER = "https://vault.example.org/pulsevault";
-const paramsOf = (link) => Object.fromEntries(new URLSearchParams(link.slice(link.search(/[?#]/) + 1)));
+const ENCODED_SERVER = "https%3A%2F%2Fvault.example.org%2Fpulsevault";
+const rawParams = (link) => link.slice(link.search(/[?#]/) + 1);
+const paramsOf = (link) => Object.fromEntries(new URLSearchParams(rawParams(link)));
 // The place's key rides in the token's signed `ref` claim, never as a link param.
 const T = issueCapabilityToken(ARTIFACT_ID, "secret", { keyId: "k1", issuer: "vault", ref: "u1:ticket:t1" });
 const BASE = { server: SERVER, artifactId: ARTIFACT_ID, token: T };
+const hint = (opts, key) => paramsOf(buildUploadLink({ ...BASE, ...opts }))[key];
 
 test("a link without hints is byte for byte the link it always was", () => {
-  assert.equal(
-    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t" }),
-    `pulsecam://?v=1&artifactId=${ARTIFACT_ID}&server=https%3A%2F%2Fvault.example.org%2Fpulsevault&token=t`,
-  );
+  const plain = `pulsecam://?v=1&artifactId=${ARTIFACT_ID}&server=${ENCODED_SERVER}&token=t`;
+  assert.equal(buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t" }), plain);
   assert.equal(
     buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, form: "https" }),
-    `${PULSE_OPEN_URL}#v=1&artifactId=${ARTIFACT_ID}&server=https%3A%2F%2Fvault.example.org%2Fpulsevault`,
+    `${PULSE_OPEN_URL}#v=1&artifactId=${ARTIFACT_ID}&server=${ENCODED_SERVER}`,
   );
-  // Hints that are undefined or blank add nothing either.
-  assert.equal(
-    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t", label: "  ", name: "", app: undefined, returnUrl: undefined }),
-    buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t" }),
-  );
+  // Hints that are undefined, null, blank, invisible or not text add nothing either, so a
+  // nullable title is safe to pass.
+  for (const none of [undefined, null, "", "  ", "\t\n", "\u200B\u200E\u202E", "\uFEFF", 42, { a: 1 }, ["x"]]) {
+    assert.equal(
+      buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t", label: none, name: none, app: none }),
+      plain,
+      JSON.stringify(none),
+    );
+  }
+  // The same for a return URL that is absent, blank or not text; one that is wrong still throws.
+  for (const none of [undefined, null, "", "  ", "\t\n", 42, { a: 1 }]) {
+    assert.equal(
+      buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "t", returnUrl: none }),
+      plain,
+      JSON.stringify(none),
+    );
+  }
 });
 
 test("hints follow the v1 params in a fixed order, in both forms", () => {
@@ -169,6 +182,29 @@ test("hints follow the v1 params in a fixed order, in both forms", () => {
   assert.deepEqual(Object.entries(paramsOf(buildUploadLink({ ...opts, form: "https" }))), expected);
 });
 
+test("hints are form-urlencoded UTF-8 on the wire, the same in both forms", () => {
+  const opts = {
+    server: SERVER,
+    artifactId: ARTIFACT_ID,
+    token: "t",
+    label: "Q&A = 100% #1 + more",
+    name: "Café ☕",
+    app: "T&H",
+    returnUrl: "https://app.example.org/t?a=1&b=2#f",
+  };
+  const wire =
+    `v=1&artifactId=${ARTIFACT_ID}&server=${ENCODED_SERVER}&token=t` +
+    "&label=Q%26A+%3D+100%25+%231+%2B+more&name=Caf%C3%A9+%E2%98%95&app=T%26H" +
+    "&return=https%3A%2F%2Fapp.example.org%2Ft%3Fa%3D1%26b%3D2%23f";
+  assert.equal(buildUploadLink(opts), `pulsecam://?${wire}`);
+  // In the https form the hints, and a `#` inside one, stay inside the one fragment.
+  const https = buildUploadLink({ ...opts, form: "https" });
+  assert.equal(https, `${PULSE_OPEN_URL}#${wire}`);
+  assert.equal(new URL(https).hash, `#${wire}`);
+  assert.equal(paramsOf(https).label, opts.label);
+  assert.equal(paramsOf(https).return, opts.returnUrl);
+});
+
 test("the place's key is only in the token: a link never carries a ref param", () => {
   const params = paramsOf(buildUploadLink({ ...BASE, label: "Fix the login page", ref: "u1:ticket:t1" }));
   assert.equal("ref" in params, false);
@@ -176,20 +212,43 @@ test("the place's key is only in the token: a link never carries a ref param", (
   assert.equal(claims.ref, "u1:ticket:t1", "where a client reads it");
 });
 
-test("label, name and app are trimmed and capped at 60, 80 and 30 characters; blank ones are dropped", () => {
+test("label, name and app are trimmed and cut at 60, 80 and 30 characters", () => {
   const params = paramsOf(
     buildUploadLink({ ...BASE, label: ` ${"L".repeat(80)} `, name: ` ${"N".repeat(100)} `, app: "A".repeat(40) }),
   );
   assert.equal(params.label, "L".repeat(60));
   assert.equal(params.name, "N".repeat(80));
   assert.equal(params.app, "A".repeat(30));
-  // Capped by code point: an emoji at the boundary is kept whole or not at all.
-  assert.equal(paramsOf(buildUploadLink({ ...BASE, app: `${"A".repeat(29)}😀😀` })).app, `${"A".repeat(29)}😀`);
-  const blank = paramsOf(buildUploadLink({ ...BASE, label: "   ", name: "", app: " " }));
+  // A character is a code point: 30 emoji fit, though they are 60 UTF-16 units.
+  assert.equal(hint({ app: "😀".repeat(31) }, "app"), "😀".repeat(30));
+  assert.equal(hint({ app: `${"A".repeat(29)}😀😀` }, "app"), `${"A".repeat(29)}😀`);
+  // A space the cut would leave at the end is trimmed too.
+  assert.equal(hint({ app: `${"A".repeat(29)} B` }, "app"), "A".repeat(29));
+});
+
+test("a hint is cut at a whole character: never through an emoji sequence, a flag or an accent", () => {
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"; // one character on screen, five code points
+  assert.equal(hint({ app: `${"A".repeat(25)}${family}` }, "app"), `${"A".repeat(25)}${family}`);
+  assert.equal(hint({ app: `${"A".repeat(27)}${family}` }, "app"), "A".repeat(27));
+  assert.equal(hint({ app: `${"A".repeat(29)}\u{1F1FA}\u{1F1F8}` }, "app"), "A".repeat(29));
+  assert.equal(hint({ app: `${"A".repeat(29)}e\u0301` }, "app"), "A".repeat(29));
+  assert.equal(hint({ app: `${"A".repeat(28)}e\u0301` }, "app"), `${"A".repeat(28)}e\u0301`);
+});
+
+test("a hint is one line of plain text: control and bidi-formatting characters don't reach the link", () => {
+  // Line breaks, tabs and other controls (C0, DEL, C1, U+2028/9) become one space.
+  assert.equal(hint({ label: "Fix\r\nthe\tlogin\u0000page\u0085now\u2028ok\u007F" }, "label"), "Fix the login page now ok");
+  // Bidi overrides, isolates and marks are dropped, so a name can't be shown reversed.
+  assert.equal(hint({ label: "invoice\u202Egnp.exe" }, "label"), "invoicegnp.exe");
+  assert.equal(hint({ app: "\u2066Time\u200FHuddle\u2069\u061C" }, "app"), "TimeHuddle");
+  // What scripts and emoji need stays: joiners, variation selectors, right-to-left text itself.
+  for (const kept of ["می\u200Cخواهم", "❤\uFE0F", "שלום", "مرحبا"]) assert.equal(hint({ label: kept }, "label"), kept);
+  // Nothing left to show: no param.
+  const blank = paramsOf(buildUploadLink({ ...BASE, label: "\u202E\u200B", name: "\u0000\u0007", app: " \u2067 " }));
   assert.deepEqual(Object.keys(blank), ["v", "artifactId", "server", "token"]);
 });
 
-test("each hint stands alone, with any token or none", () => {
+test("the builder writes each hint it is given, though a client acts on them only with a ref", () => {
   const named = paramsOf(buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, token: "opaque", name: "Huddle update" }));
   assert.deepEqual(Object.keys(named), ["v", "artifactId", "server", "token", "name"]);
   const labelled = paramsOf(buildUploadLink({ server: SERVER, artifactId: ARTIFACT_ID, label: "Team · Huddle" }));
@@ -197,8 +256,40 @@ test("each hint stands alone, with any token or none", () => {
 });
 
 test("returnUrl is held to the server's rule: https, or http to localhost or a private IP", () => {
-  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: "http://evil.example.com/" }), /`returnUrl` must be https/);
-  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: "javascript:alert(1)" }), /`returnUrl` must be https/);
-  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: "not a url" }), /`returnUrl` is not a valid URL/);
-  assert.equal(paramsOf(buildUploadLink({ ...BASE, returnUrl: "http://localhost:3000/x" })).return, "http://localhost:3000/x");
+  for (const bad of ["http://evil.example.com/", "javascript:alert(1)", "data:text/html,x", "intent://x#Intent;end", "pulsecam://?v=1", "http://localhost.evil.example/", "http://8.8.8.8/"]) {
+    assert.throws(() => buildUploadLink({ ...BASE, returnUrl: bad }), /`returnUrl` must be https/, bad);
+  }
+  for (const bad of ["not a url", "//app.example.org/x", "https://"]) {
+    assert.throws(() => buildUploadLink({ ...BASE, returnUrl: bad }), /`returnUrl` is not a valid URL/, bad);
+  }
+  for (const dev of ["http://localhost:3000/x", "http://127.0.0.1:3000/x", "http://192.168.1.20:3000/x", "http://10.0.0.5/x"]) {
+    assert.equal(hint({ returnUrl: dev }, "return"), dev);
+  }
+});
+
+test("returnUrl goes into the link as the URL parser reads it, so every client reads the same URL", () => {
+  for (const [given, sent] of [
+    ["https://app.example.org", "https://app.example.org/"],
+    ["  https://app.example.org/x \n", "https://app.example.org/x"],
+    ["HTTPS://App.Example.ORG/Tickets/42", "https://app.example.org/Tickets/42"],
+    ["https://app.exa\nmple.org/x", "https://app.example.org/x"],
+    ["https:\\\\app.example.org\\x", "https://app.example.org/x"],
+    ["https:app.example.org", "https://app.example.org/"],
+    ["https://exämple.org/a b?q=ü", "https://xn--exmple-cua.org/a%20b?q=%C3%BC"],
+    ["https://app.example.org:443/x#top", "https://app.example.org/x#top"],
+  ]) {
+    assert.equal(hint({ returnUrl: given }, "return"), sent, given);
+  }
+});
+
+test("returnUrl carries no username or password, and is at most 512 characters", () => {
+  for (const bad of ["https://app.example.org@evil.example/x", "https://user:pass@app.example.org/", "https://:pass@app.example.org/"]) {
+    assert.throws(() => buildUploadLink({ ...BASE, returnUrl: bad }), /`returnUrl` must not carry a username or password/, bad);
+  }
+  const prefix = "https://app.example.org/";
+  const longest = prefix + "a".repeat(512 - prefix.length);
+  assert.equal(hint({ returnUrl: longest }, "return"), longest);
+  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: `${longest}a` }), /`returnUrl` must be at most 512 characters \(got 513\)/);
+  // Measured as sent: a short URL that grows past the cap when it is percent-encoded.
+  assert.throws(() => buildUploadLink({ ...BASE, returnUrl: prefix + "é".repeat(100) }), /at most 512 characters/);
 });
