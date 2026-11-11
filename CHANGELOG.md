@@ -7,6 +7,8 @@ breaking changes, called out explicitly below.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-10
+
 Protocol 2.7 (`PROTOCOL.md` §7.4): link hints. Additive only: a link built without hints and a
 token issued without a `ref` are byte for byte what 0.8.0 produced, there are no new routes, and
 the server does nothing it didn't do before. `/capabilities` reports `protocolRevision: "2.7"`.
@@ -771,7 +773,8 @@ if you've evaluated against an intermediate build.
   lock, so this is now at least surfaced: a one-time `console.warn` fires
   per process the first time a deployment falls into this degraded mode.
 
-[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/mieweb/pulsevault/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/mieweb/pulsevault/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mieweb/pulsevault/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/mieweb/pulsevault/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/mieweb/pulsevault/compare/v0.7.0...v0.7.1
