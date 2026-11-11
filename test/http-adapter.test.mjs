@@ -547,6 +547,46 @@ test("createCapabilityAuthorize: valid token authorizes its own artifact and a r
   }
 });
 
+test("a token with a ref through the bare core: accepted or refused on the status route, uploaded like any other", async () => {
+  const secret = "test-secret";
+  const issuer = "https://vault.example.test";
+  const completions = [];
+  const ctx = await startApp({
+    coreOptions: {
+      authorize: createCapabilityAuthorize((kid) => (kid === "k1" ? secret : null), { issuer }),
+      onUploadComplete: async (_req, c) => {
+        completions.push(c);
+      },
+    },
+  });
+  try {
+    const owner = { userId: "u1" };
+    const token = issueCapabilityToken(ID1, secret, { keyId: "k1", issuer, ref: "u1:ticket:42", context: owner });
+    const status = (bearer) =>
+      fetch(`${artifactUrl(ctx, ID1)}/status`, bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : {});
+
+    // What a client asks before it trusts a link's ref (PROTOCOL.md §5.6): nothing is uploaded yet.
+    const accepted = await status(token);
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), { artifactId: ID1, state: "unknown" });
+    // The same token with another place written into it: the signature no longer covers the claims.
+    const [payload, signature] = token.split(".");
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const forged = `${Buffer.from(JSON.stringify({ ...claims, ref: "u2:ticket:42" })).toString("base64url")}.${signature}`;
+    assert.equal((await status(forged)).status, 403);
+    assert.equal((await status()).status, 401);
+
+    await uploadFull(ctx.baseUrl, PREFIX, { artifactId: ID1, headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(completions.length, 1);
+    assert.deepEqual(completions[0].context, owner);
+    assert.equal(JSON.stringify(completions).includes("u1:ticket:42"), false, "the ref reaches no hook");
+    assert.equal((await status(token)).status, 200);
+    assert.equal(JSON.stringify(await ctx.storage.describeArtifact(ID1)).includes("u1:ticket:42"), false);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
 test("old root-level paths return 404", async () => {
   const ctx = await startApp();
   try {

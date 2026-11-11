@@ -106,7 +106,7 @@
     "@tus/s3-store": "^2.0.6"
   },
   "pulseProtocol": {
-    "version": "2.6",
+    "version": "2.7",
     "min": 2,
     "max": 2
   }

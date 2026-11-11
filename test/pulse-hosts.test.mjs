@@ -64,7 +64,8 @@ const authorize = (opts = {}) => createCapabilityAuthorize(lookupSecret, { issue
 async function startLocal({ pluginOptions = {} } = {}) {
   const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "pv-hosts-"));
   const storage = createLocalStorage({ workspaceDir });
-  return startApp(storage, pluginOptions, () => fs.rm(workspaceDir, { recursive: true, force: true }));
+  const ctx = await startApp(storage, pluginOptions, () => fs.rm(workspaceDir, { recursive: true, force: true }));
+  return { ...ctx, workspaceDir };
 }
 
 async function startS3({ pluginOptions = {} } = {}) {
@@ -252,6 +253,54 @@ test("onUploadComplete and authorize receive relatedTo, name, appVersion, filena
 
     // The context survives in the sidecar.
     assert.deepEqual((await ctx.storage.describeArtifact(videoId)).context, owner);
+  } finally {
+    await ctx.teardown();
+  }
+});
+
+test("a token's ref changes nothing on the server: the same hooks, the same stored artifact, no ref anywhere", async () => {
+  const completions = [];
+  const authorized = [];
+  const owner = { userId: "u1", destination: { kind: "ticket", ticketId: "42" } };
+  const ctx = await startLocal({
+    pluginOptions: {
+      authorize: async (request, c) => {
+        authorized.push(c);
+        return authorize()(request, c);
+      },
+      onUploadComplete: async (_req, c) => {
+        completions.push(c);
+      },
+    },
+  });
+  try {
+    // The same pulse twice: under a token with a ref, and under one without.
+    const seen = {};
+    for (const [which, extra] of [["withRef", { ref: "u1:ticket:42" }], ["plain", {}]]) {
+      const videoId = randomUUID();
+      const token = mint(videoId, { context: owner, ...extra });
+      await uploadPulse(ctx, videoId, token);
+      const status = await fetch(ctx.url(`/artifacts/${videoId}/status`), { headers: bearer(token) });
+      assert.equal(status.status, 200);
+      // Everything but what differs between any two uploads: their ids and their times.
+      const scrub = (value) =>
+        JSON.parse(JSON.stringify(value, (key, v) => (/^(artifactId|uploadId|generation)$|At$/.test(key) ? undefined : v)));
+      seen[which] = {
+        completion: scrub(completions.find((c) => c.artifactId === videoId)),
+        phases: authorized.filter((c) => c.artifactId === videoId).map((c) => c.phase),
+        stored: scrub(await ctx.storage.describeArtifact(videoId)),
+        status: scrub(await status.json()),
+      };
+      assert.deepEqual(seen[which].completion.context, owner);
+    }
+    assert.deepEqual(seen.withRef, seen.plain);
+    // Not in a hook's context, not in what authorize sees, not on disk.
+    assert.equal(JSON.stringify([completions, authorized]).includes("u1:ticket:42"), false);
+    const sidecars = (await fs.readdir(ctx.workspaceDir, { recursive: true })).filter((file) => file.endsWith(".json"));
+    assert.ok(sidecars.length >= 8, "a sidecar for each artifact of both pulses");
+    for (const file of sidecars) {
+      assert.equal((await fs.readFile(path.join(ctx.workspaceDir, file), "utf8")).includes("u1:ticket:42"), false, file);
+    }
   } finally {
     await ctx.teardown();
   }

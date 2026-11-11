@@ -674,7 +674,7 @@ app.post("/pair", async (_req, reply) => {
 });
 ```
 
-A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. With [`pulseShape`](#pulseshape) (the default, on both the plugin and `createCapabilityAuthorize`), a create is held to that shape: the video only under the token's own `artifactId`, with no `relatedTo`; the rest only under other ids, `relatedTo` it. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`ctx`) and rationale.
+A token authorizes either the artifact it names, or any artifact that declares that one as its `relatedTo` — so one token issued for a pulse's video also covers its captions, beat manifest and thumbnail in the same session, without minting a token per artifact. With [`pulseShape`](#pulseshape) (the default, on both the plugin and `createCapabilityAuthorize`), a create is held to that shape: the video only under the token's own `artifactId`, with no `relatedTo`; the rest only under other ids, `relatedTo` it. See `PROTOCOL.md` §5.4 for the full claim shape (`kid`/`iat`/`exp`/`issuer`/`artifactId`/`ref`/`ctx`) and rationale.
 
 **Context.** The token can carry the host's own data about the upload — who it's for, where it goes — signed with the rest, so whoever holds the token can't change it:
 
@@ -687,6 +687,8 @@ const token = issueCapabilityToken(artifactId, keys["2026-06"], {
 ```
 
 `createCapabilityAuthorize` returns it from the `create` phase, PulseVault stores it with the artifact (and with every file uploaded `relatedTo` it under the same token), and every later `authorize`, `onUploadComplete` (`ctx.context`, on replays too), `getStatus` and `getPulse` get it back. Most hosts then keep no table keyed by artifactId, and "is this the person who uploaded it?" is a comparison, not a lookup.
+
+**Ref.** `ref` signs your key for the *place* the upload goes to, for [link hints](#link-hints): a well-formed string of 1–200 characters, different for every owner and place (`` `${user.id}:ticket:${ticket.id}` ``) and written the same way every time. Unlike `context`, Pulse reads it, straight from the token, so keep it a plain key with nothing private in it. PulseVault never acts on it: a token is good or not whatever its `ref`, no hook receives it (what your hooks need goes in `context`), and `verifyCapabilityToken` returns it when it is such a string and leaves it out otherwise.
 
 ## Upload-Metadata protocol
 
@@ -980,6 +982,37 @@ const httpsLink = buildUploadLink({
 
 The `https` form is what a phone camera opens: Pulse opens straight from it when installed, and its page sends the person to the store when not. The parameters are after `#`, which browsers never send, so the link host never sees the token. Pulse releases from before the link host was claimed land on the page instead and open Pulse from its button, so `pulsecam://` stays the default.
 
+### Link hints
+
+A link is one upload. It can also tell Pulse which place in your app that upload is for and what to call it (protocol 2.7, `PROTOCOL.md` §3.1), so Pulse opens the recorder on the recording already in progress for that place — and a second link to the same place picks it up again:
+
+```ts
+const ref = `${user.id}:ticket:${ticket.id}`; // your key for the place: one per owner and place
+const token = issueCapabilityToken(artifactId, secret, { keyId, issuer, ref, context });
+buildUploadLink({
+  server,
+  artifactId,
+  token, // carries the place: Pulse reads `ref` from its claims
+  label: ticket.title, // the place's name in Pulse (cut to 60 characters)
+  name: "Login fix walkthrough", // names a new recording made for the place (80)
+  app: "TimeHuddle", // shown with the label (30)
+  returnUrl: "https://app.example.org/tickets/42", // "Back to TimeHuddle" after the upload
+});
+// pulsecam://?v=1&artifactId=…&server=…&token=…&label=…&name=…&app=…&return=…
+```
+
+**The place is the token's `ref`, and only that.** There is no `ref` link parameter, so a link can't name one place and upload to another. Pulse can't check the signature itself: what makes the key trustworthy is that your server verifies the token on every request (`createCapabilityAuthorize` does) and that no two owners share a `ref`.
+
+**Two links are for the same place when `server` and `ref` are the same, exactly.** Write both the same way every time: `Ticket:42` and `ticket:42` are two places, and so are two spellings of one server URL (only a trailing `/` is ignored). Of two links for a place, Pulse keeps the one whose token expires later, so give a place's links one lifetime (`expirySeconds`), or at least an expiry that never goes down: a link that expires sooner than the one Pulse holds doesn't take over. And Pulse takes a newer link over only once your server has accepted its token, which it asks the [status route](#status-outcome-and-pulses) (`PROTOCOL.md` §5.6).
+
+**The other four are unsigned display hints, and act only with a `ref`.** On a link whose token has no `ref` — an opaque token, no token — Pulse ignores them and handles the link as it always has. An older Pulse ignores all of it and uploads as before.
+
+- `label`, `name` and `app` are cleaned for display: control characters and line breaks become a space, bidirectional-formatting characters are dropped, the text is trimmed and cut at a whole character (60, 80 and 30 characters, counted as Unicode code points), and a blank, `null` or non-string one is left out. So `label: ticket.title` is safe with a title that is missing or has line breaks in it.
+- `returnUrl` follows `server`'s `https://` rule, may not carry a username or password, and is at most 512 characters; the link carries it normalized (`new URL(returnUrl).href`). A blank or `null` one is left out; a bad one throws.
+- A link without any of them is exactly the link above, byte for byte.
+- Everything in a link travels in clear, in the URL and in its QR code: keep anything private out of `label` and `name`.
+- Leave `app` and `returnUrl` off a link shown as a QR code — it is scanned from another screen, so there is no page to go back to, and a shorter link is an easier code.
+
 ## Pulse logo and store badges
 
 The package ships the Pulse logo for the button that opens Pulse
@@ -1012,6 +1045,8 @@ CI (`.github/workflows/ci.yml`) runs all of these, plus the Pulse app's contract
 - `allowedExtensions` object form
 - `createChecksumValidator`/`createS3ChecksumValidator`: matching digest accepted, mismatch rejected with cleanup
 - `issueCapabilityToken`/`verifyCapabilityToken`/`createCapabilityAuthorize`: round-trip, tampered signature/payload, expiry + clock tolerance, unknown `kid`, issuer mismatch, key-rotation overlap, `relatedTo`-based session authorization — both as fast unit tests (no server) and wired into real HTTP requests
+- The token's `ref` claim: signed, returned by `verifyCapabilityToken`, never acted on (the same authorization in every phase, nothing stored, nothing handed to a hook), and a token without one byte for byte what it was
+- `buildUploadLink`: both link forms, the `https://` rule, and link hints — a link without them byte for byte what it was, their wire encoding, cleaning and cutting of display text, and the `returnUrl` rules
 - TUS `DELETE` removing the whole artifact, in flight or finished (local and S3), authorized as `delete`
 - `retention` / `sweepAbandonedUploads` on both adapters: abandoned uploads and the related artifacts of a video that never finished are removed, finished pulses are kept, nothing newer than the cutoff is touched, the option's own timer, and boot-time validation
 - View links: `issueViewToken`/`verifyViewToken`/`createViewLinkIssuer`, a view token opening its artifact and related ones but never uploading, deleting or minting another link, per-link lifetimes, refusal, and only finished artifacts
