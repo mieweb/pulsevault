@@ -27,6 +27,121 @@ test("issue + verify round-trips the artifactId", () => {
   assert.deepEqual(result, { artifactId: ARTIFACT_ID });
 });
 
+const claimsOf = (token) => JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString("utf8"));
+
+test("ref round-trips as a signed claim, beside context; a token without one is unchanged", (t) => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "u1:ticket:42", context: { userId: "u1" } });
+  assert.equal(claimsOf(token).ref, "u1:ticket:42");
+  assert.deepEqual(verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }), {
+    artifactId: ARTIFACT_ID,
+    ref: "u1:ticket:42",
+    context: { userId: "u1" },
+  });
+
+  // No `ref`, no claim: the token is byte for byte what it was before the option existed.
+  t.mock.timers.enable({ apis: ["Date"], now: 1_790_000_000_000 });
+  const plain = issueCapabilityToken(ARTIFACT_ID, SECRET, opts);
+  const payload = Buffer.from(
+    JSON.stringify({ artifactId: ARTIFACT_ID, iat: 1_790_000_000, exp: 1_790_001_800, kid: "k1", issuer: ISSUER }),
+  ).toString("base64url");
+  assert.equal(plain, `${payload}.${createHmac("sha256", SECRET).update(payload).digest("base64url")}`);
+  assert.equal("ref" in verifyCapabilityToken(plain, lookupSecret, { issuer: ISSUER }), false);
+});
+
+test("ref is signed: changing, adding or dropping it breaks the token", () => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  const withRef = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "u1:ticket:42" });
+  const without = issueCapabilityToken(ARTIFACT_ID, SECRET, opts);
+  const resigned = (token, change) => {
+    const payload = Buffer.from(JSON.stringify(change(claimsOf(token)))).toString("base64url");
+    return `${payload}.${token.split(".")[1]}`;
+  };
+  for (const forged of [
+    resigned(withRef, (c) => ({ ...c, ref: "u2:ticket:42" })),
+    resigned(withRef, ({ ref: _ref, ...rest }) => rest),
+    resigned(without, (c) => ({ ...c, ref: "u1:ticket:42" })),
+  ]) {
+    assert.equal(verifyCapabilityToken(forged, lookupSecret, { issuer: ISSUER }), null);
+  }
+});
+
+const signedWith = (claims, key = SECRET) => {
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `${payload}.${createHmac("sha256", key).update(payload).digest("base64url")}`;
+};
+
+test("ref is a well-formed string of 1 to 200 characters, counted as code points; anything else isn't issued", () => {
+  const opts = { keyId: "k1", issuer: ISSUER };
+  // The last two hold an unpaired surrogate, which no two decoders are sure to read alike.
+  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"], "\uD800", "a\uDC00b"]) {
+    assert.throws(() => issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref }), /`ref` must be/, String(ref));
+  }
+  // At the cap, in ASCII and in characters that take two UTF-16 units each (400 units, 200 characters).
+  for (const ref of ["x", "x".repeat(200), "😀".repeat(200), `${"x".repeat(199)}😀`, "ticket é 票"]) {
+    const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref });
+    assert.equal(claimsOf(token).ref, ref);
+    assert.deepEqual(verifyCapabilityToken(token, lookupSecret, { issuer: ISSUER }), { artifactId: ARTIFACT_ID, ref });
+  }
+  // `ref: undefined` is no ref.
+  assert.equal("ref" in claimsOf(issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: undefined })), false);
+});
+
+test("a token is good or not whatever its ref: an unusable one is left out of the result, never refused", () => {
+  const claims = claimsOf(issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, context: { userId: "u1" } }));
+  // Correctly signed (minted elsewhere with the secret), carrying a `ref` this package wouldn't issue.
+  for (const ref of ["", "x".repeat(201), "😀".repeat(201), 42, null, true, { place: "t1" }, ["t1"], "a\uD800b"]) {
+    const result = verifyCapabilityToken(signedWith({ ...claims, ref }), lookupSecret, { issuer: ISSUER });
+    assert.deepEqual(result, { artifactId: ARTIFACT_ID, context: { userId: "u1" } }, JSON.stringify(ref));
+  }
+});
+
+test("the claims of a token with a ref and a context come in a fixed order", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_790_000_000_000 });
+  const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, ref: "u1:ticket:42", context: { userId: "u1" } });
+  assert.equal(
+    token,
+    signedWith({ artifactId: ARTIFACT_ID, iat: 1_790_000_000, exp: 1_790_001_800, kid: "k1", issuer: ISSUER, ref: "u1:ticket:42", ctx: { userId: "u1" } }),
+  );
+});
+
+test("createCapabilityAuthorize treats a token with a ref like any other, in every phase", async () => {
+  const authorize = createCapabilityAuthorize(lookupSecret, { issuer: ISSUER });
+  const opts = { keyId: "k1", issuer: ISSUER, context: { userId: "u1" } };
+  const withRef = issueCapabilityToken(ARTIFACT_ID, SECRET, { ...opts, ref: "u1:ticket:42" });
+  const without = issueCapabilityToken(ARTIFACT_ID, SECRET, opts);
+  const OTHER = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const outcome = async (token, ctx) => {
+    try {
+      return { ok: await authorize({ headers: { authorization: `Bearer ${token}` } }, ctx) };
+    } catch (err) {
+      return { status: err.statusCode, error: err.message };
+    }
+  };
+  assert.deepEqual(await outcome(withRef, { artifactId: ARTIFACT_ID, kind: "video", phase: "create" }), {
+    ok: { context: { userId: "u1" } },
+  });
+  for (const phase of ["create", "patch", "resolve", "status", "delete", "share"]) {
+    for (const kind of ["video", "thumbnail"]) {
+      for (const [artifactId, relatedTo] of [[ARTIFACT_ID, undefined], [OTHER, ARTIFACT_ID], [OTHER, undefined], [ARTIFACT_ID, OTHER]]) {
+        const ctx = { artifactId, relatedTo, kind, phase };
+        assert.deepEqual(await outcome(withRef, ctx), await outcome(without, ctx), JSON.stringify(ctx));
+      }
+    }
+  }
+});
+
+test("a view token's result is its artifactId and exp, whatever else its claims carry", () => {
+  const claims = claimsOf(issueViewToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER, expirySeconds: 60 }));
+  const viewKey = createHmac("sha256", SECRET).update("pulsevault view token v1").digest("base64url");
+  for (const extra of [{ ref: "u1:ticket:42" }, { ref: 42 }, { ctx: { userId: "u1" } }]) {
+    assert.deepEqual(verifyViewToken(signedWith({ ...claims, ...extra }, viewKey), lookupSecret, { issuer: ISSUER }), {
+      artifactId: ARTIFACT_ID,
+      exp: claims.exp,
+    });
+  }
+});
+
 test("rejects a token with a tampered signature", () => {
   const token = issueCapabilityToken(ARTIFACT_ID, SECRET, { keyId: "k1", issuer: ISSUER });
   const [payload] = token.split(".");

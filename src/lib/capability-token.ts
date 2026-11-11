@@ -28,6 +28,12 @@ export type CapabilityTokenClaims = {
    */
   use?: 'view';
   /**
+   * The host's key for the place this upload goes to (`issueCapabilityToken`'s `ref`), 1–200
+   * characters. A client reads it from the token of a pairing link (PROTOCOL.md §3.1, §5.6), so
+   * it is signed and nowhere else in the link. The server never acts on it.
+   */
+  ref?: string;
+  /**
    * Opaque host data (`issueCapabilityToken`'s `context`): who the upload is for, where it goes.
    * Signed with the rest, so it can't be changed by whoever holds the token; stored with the
    * artifact at create and handed back to every hook. JSON, at most `MAX_CONTEXT_BYTES` encoded.
@@ -42,6 +48,23 @@ const DEFAULT_CLOCK_TOLERANCE_SECONDS = 30;
  * `Authorization` header, so a context is an owner and a destination, not a record.
  */
 export const MAX_CONTEXT_BYTES = 1024;
+/**
+ * Cap on the `ref` claim, in characters (Unicode code points, as everywhere in the protocol): it
+ * rides in the token of every link, and is a key, not a record.
+ */
+const MAX_REF_LENGTH = 200;
+
+/**
+ * A usable `ref` claim: a string of 1 to `MAX_REF_LENGTH` characters, well-formed (no unpaired
+ * surrogate), so every client decodes the same key from it.
+ */
+const isRef = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value !== '' &&
+  value.isWellFormed() &&
+  // A code point is one or two UTF-16 units, so only a string between the two needs counting.
+  (value.length <= MAX_REF_LENGTH ||
+    (value.length <= 2 * MAX_REF_LENGTH && Array.from(value).length <= MAX_REF_LENGTH));
 
 /** `JSON.stringify` a context, refusing anything that isn't plain JSON or is too large. */
 function encodeContext(context: unknown): string {
@@ -103,6 +126,17 @@ export type IssueCapabilityTokenOptions = {
    * `getPulse`, so most hosts need no lookup table of their own. JSON, at most 1 KiB encoded.
    */
   context?: unknown;
+  /**
+   * The host's key for the place this upload goes to (`ref` claim), e.g. `"u1:ticket:42"` —
+   * one per owner and place, 1–200 characters, compared exactly (no case folding). Pulse reads
+   * it from the token of a pairing link and opens the recorder on that place's draft; of two
+   * links for a place it keeps the one that expires later. The key travels nowhere else, and a
+   * server that verifies its tokens refuses one whose `ref` was changed, so nobody can point
+   * someone's place at another upload. Readable by whoever holds the token, so not a secret;
+   * PulseVault never acts on it and hands it to no hook, so what the host's own hooks need goes
+   * in `context`.
+   */
+  ref?: string;
 };
 
 /**
@@ -118,6 +152,11 @@ export function issueCapabilityToken(
   secret: string,
   opts: IssueCapabilityTokenOptions,
 ): string {
+  if (opts.ref !== undefined && !isRef(opts.ref)) {
+    throw new TypeError(
+      `issueCapabilityToken: \`ref\` must be a non-empty, well-formed string of at most ${MAX_REF_LENGTH} characters`,
+    );
+  }
   const now = Math.floor(Date.now() / 1000);
   const claims: CapabilityTokenClaims = {
     artifactId,
@@ -125,6 +164,7 @@ export function issueCapabilityToken(
     exp: now + (opts.expirySeconds ?? DEFAULT_EXPIRY_SECONDS),
     kid: opts.keyId,
     issuer: opts.issuer,
+    ...(opts.ref !== undefined ? { ref: opts.ref } : {}),
     // Round-tripped through JSON so the claim is exactly what a verifier will read back.
     ...(opts.context !== undefined ? { ctx: JSON.parse(encodeContext(opts.context)) } : {}),
   };
@@ -192,7 +232,7 @@ function verifyToken(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
   use: 'upload' | 'view',
-): { artifactId: string; exp: number; context?: unknown } | null {
+): { artifactId: string; exp: number; ref?: string; context?: unknown } | null {
   const dot = token.indexOf('.');
   if (dot < 0) return null;
   const payload = token.slice(0, dot);
@@ -245,27 +285,33 @@ function verifyToken(
   return {
     artifactId: claims.artifactId,
     exp: claims.exp,
+    // The server never acts on `ref`, so one that isn't a usable key (a token minted elsewhere
+    // with the same secret) is left out, not a reason to refuse the token.
+    ...(isRef(claims.ref) ? { ref: claims.ref } : {}),
     ...(claims.ctx !== undefined ? { context: claims.ctx } : {}),
   };
 }
 
 /**
  * Verify a token minted by `issueCapabilityToken`. Returns the authorized
- * `artifactId` on success, or `null` for any failure (malformed token,
- * unknown `kid`, bad signature, expired, issued too far in the future,
- * issuer mismatch, or a view token) — deliberately collapsed to one failure
- * shape so callers can't accidentally branch on *why* a token failed and leak
- * which part was wrong to an attacker.
+ * `artifactId` (with the token's `ref` and `context`, when it has them) on
+ * success, or `null` for any failure (malformed token, unknown `kid`, bad
+ * signature, expired, issued too far in the future, issuer mismatch, or a view
+ * token) — deliberately collapsed to one failure shape so callers can't
+ * accidentally branch on *why* a token failed and leak which part was wrong to
+ * an attacker. A `ref` claim that isn't a string of 1–200 characters is left
+ * out of the result; it never fails the token.
  */
 export function verifyCapabilityToken(
   token: string,
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
-): { artifactId: string; context?: unknown } | null {
+): { artifactId: string; ref?: string; context?: unknown } | null {
   const verified = verifyToken(token, lookupSecret, opts, 'upload');
   if (!verified) return null;
   return {
     artifactId: verified.artifactId,
+    ...(verified.ref !== undefined ? { ref: verified.ref } : {}),
     ...(verified.context !== undefined ? { context: verified.context } : {}),
   };
 }
@@ -280,7 +326,8 @@ export function verifyViewToken(
   lookupSecret: LookupSecret,
   opts: VerifyCapabilityTokenOptions,
 ): { artifactId: string; exp: number } | null {
-  return verifyToken(token, lookupSecret, opts, 'view');
+  const verified = verifyToken(token, lookupSecret, opts, 'view');
+  return verified && { artifactId: verified.artifactId, exp: verified.exp };
 }
 
 /** Pull a bearer token from the `Authorization` header, falling back to `ctx.token` (the `resolve`-phase query-string forward). */
