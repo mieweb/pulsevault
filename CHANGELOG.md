@@ -40,6 +40,21 @@ the server does nothing it didn't do before. `/capabilities` reports `protocolRe
   host gives a place's links an expiry that never goes down. §3 now says how a link's parameters are encoded
   (`application/x-www-form-urlencoded`, UTF-8), and §3.1 how a client shows hints it can't trust.
 
+- **A Pulse icon for buttons**: the logo itself, centred in a square 24 × 24 box at its full
+  height, so it is the logo at any size and lines up with the square icons beside it. In full
+  colour (`assets/pulse-icon.svg`), one colour (`assets/pulse-icon-mono.svg`, `currentColor`) and
+  white (`assets/pulse-icon-white.svg`, for an `<img>` on a filled button), exported as
+  `@mieweb/pulsevault/assets/*` like the logo. The files are written from the logo by
+  `npm run icons`. See `assets/README.md`.
+
+### Changed
+
+- **The logo's heartbeat is redrawn as one even line** (`assets/pulse-logo.svg`,
+  `assets/pulse-logo-mono.svg`). It was a traced outline: enlarged, it showed spikes at the peaks,
+  bumps where it met the level ends, and a width that varied along it. It is now a single stroked
+  line of one width with round ends, following the same path, and the files are a third the size.
+  The outline of the logo is unchanged.
+
 ### Fixed
 
 - `verifyViewToken` returns exactly `{ artifactId, exp }`, as its type says: a view token minted
